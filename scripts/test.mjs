@@ -36899,11 +36899,12 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.equal(TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 }) !== null, true, "常量 TTL 放行");
     const expBad = structuredClone(plan); expBad.handle_expires_at = new Date(Date.parse(plan.frozen_at) + 1000).toISOString();
     assert.equal(TAL.mintPlanProblem(expBad), "handle_expires_at ≠ frozen_at + TTL", "到期早于签发+TTL 拒");
-    const dup = structuredClone(plan); dup.minted = [dup.minted[0], { ...dup.minted[0], target_id: "ta_" + "f".repeat(32) }];
-    assert.notEqual(TAL.mintPlanProblem(dup), null, "重复 handle 拒");
+    // P1-4 返修：dup 只改 handle（target_id 不动），且断言精确消息（红：改坏“handle 重复”守卫会返回 null）
+    const dup = structuredClone(plan); dup.minted[1] = { ...dup.minted[1], selection_handle: plan.minted[0].selection_handle };
+    assert.equal(TAL.mintPlanProblem(dup), "minted 的 selection_handle 重复", "重复 handle 拒");
 
     // mintPlanProblem 反向（逐刀钉）
-    const bad = (mut, why) => assert.notEqual(TAL.mintPlanProblem(mut(structuredClone(plan))), null, why);
+    const bad = (mut, why) => { const x = structuredClone(plan); mut(x); return assert.notEqual(TAL.mintPlanProblem(x), null, why); };
     bad((p) => { delete p.operation_id; }, "缺 operation_id");
     bad((p) => { p.plan_kind = "other"; }, "plan_kind 错");
     bad((p) => { p.minted = [p.minted[1], p.minted[0]]; }, "minted 未按 target_id 排序");
@@ -36916,6 +36917,14 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     bad((p) => { p.campaign_id = "osc_zzz"; }, "campaign_id 形坏");
     bad((p) => { p.before_ledger_sha256 = null; }, "before_sha 形坏");
     bad((p) => { p.minted[0].handle_expires_at = undefined; p.minted[0].extra = 1; }, "minted 项多键");
+    bad((p) => { p.campaign_id = campaignIdFor(r51Uuid(99)); }, "campaign_id 与 token 不匹配");
+
+    // R51 返修一补：applyMintPlan 产物必须过 validateLedger，否则不出 plan（不得落 staging）。
+    // 让 doc 里一条将被铸 handle 的 B1 记录带一个无关非法字段（键集违规），使 applyMintPlan 产物过不了校验。
+    const docBad = structuredClone(doc);
+    docBad.records[idA].bogus_extra = 1;
+    const pnull = TAL.buildMintPlan({ doc: docBad, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
+    assert.equal(pnull, null, "applyMintPlan 产物过不了 validateLedger → 不出 plan（红：删守卫会返回 plan）");
   });
 
   // §五 用：重置账本回 transition before 态（同 dir 重写）。
@@ -36934,7 +36943,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         const before = TAL.loadLedger(dir, { endpointId: EP51 }).sha256;
         const r = TAL.schemaUpgrade({ endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_fence", fromSchema: "1.0", toSchema: "1.1-transition", env, _inject: { beforeLedgerRename: () => { fs.rmSync(path.join(fx.maintDir, fx.tok + ".lease"), { force: true }); } } });
         assert.equal(r.ok, false, "删 lease 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase }));
-        assert.match(r.reason, /lease_lost|commit_failed/, "拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "fence_failed", "拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
         assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).sha256, before, "账本 SHA 不变");
       });
     }
@@ -36955,11 +36964,68 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         const before = TAL.loadLedger(dir, { endpointId: EP51 }).sha256;
         const r = TAL.mintSelectionHandles({ endpointId: EP51, capability: { kind: "mint_selection_handles", token: fx.tok }, plan, env, _inject: { beforeLedgerRename: () => { fs.rmSync(path.join(fx.maintDir, fx.tok + ".lease"), { force: true }); } } });
         assert.equal(r.ok, false, "mint 删 lease 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason }));
-        assert.match(r.reason, /lease_lost|commit_failed/, "拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "fence_failed", "拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
         assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).sha256, before, "账本 SHA 不变");
       });
     }
   });
+
+  // R51 返修一补：读回≠intended_after（written_mismatch）/ 栅栏四支（fence_failed）。（每题都有一条“当前逃逸”的变异刀，用变异刀反向自检。）
+  // 注：mutate 的 before_mismatch 是 TOCTOU 守卫——verifier 与 writeLedger 读同一账本，只有“verifier 读”与“writeLedger
+  // 读”之间发生真实竞态才会命中；单线程经公开接口无法确定性触发，故不单列测试（该状态由 verifier 的
+  // ledger_state_mismatch 覆盖，见 §一 capability 测试“before.ledger_sha256 与现场不符拒”）。
+  test("R51 返修一补：written_mismatch（读回 SHA ≠ step.intended_after）", () => r51WithRoot((root, dir) => {
+    const T51 = (i) => ({ runtime: "claude", project_root: "/p/r51/" + i, claude_session_id: "00000000-0000-4000-8000-" + String(i).padStart(12, "0") });
+    const r51Ok = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+    r51Seed(dir);
+    r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_p5_b1a", chatId: "oc_r51a", rootOm: "om_r51a", lineageId: "lin-a", bindingTarget: T51(1), now: Date.now() }), "B1a");
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    // intended_after.ledger_sha256 与真实预算不同（builtSha 与读回一致）→ 只能由“读回 ≠ intended_after”抓到。
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision, transitionAfterSha: r51Sha("f"), tok: preTok });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const r = TAL.schemaUpgrade({ endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_p5", fromSchema: "1.0", toSchema: "1.1-transition", env });
+    assert.equal(r.ok, false, "读回 SHA ≠ step.intended_after.ledger_sha256 必 written_mismatch：" + JSON.stringify(r));
+    assert.equal(r.reason, "written_mismatch", "" + JSON.stringify({ reason: r.reason, why: r.why }));
+  }));
+
+  test("R51 返修一补：栅栏四支（active 漂移 / 门漂移 / journal 漂移 / step 漂移）→ fence_failed 且账本 SHA 不变", () => r51WithRoot((root, dir) => {
+    const T51 = (i) => ({ runtime: "claude", project_root: "/p/r51/" + i, claude_session_id: "00000000-0000-4000-8000-" + String(i).padStart(12, "0") });
+    const r51Ok = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+    r51Seed(dir);
+    r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_p6_b1a", chatId: "oc_r51a", rootOm: "om_r51a", lineageId: "lin-a", bindingTarget: T51(1), now: Date.now() }), "B1a");
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    const frozenSha = r51ShaOf52(TAL.serializeLedger(TAL.applySchemaUpgrade(L0.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(preTok, EP51), request_key: "req_p6", from_schema: "1.0", to_schema: "1.1-transition" })));
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision, transitionAfterSha: frozenSha, tok: preTok });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const base = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_p6", fromSchema: "1.0", toSchema: "1.1-transition", env };
+    const jp = path.join(fx.maintDir, fx.tok + ".json");
+    const activeP = path.join(fx.maintDir, "active");
+    // 每支开头把 fixture 恢复干净（active 回本 token、门回本 token、journal phase/step 回 prepared），避免分支间污染。
+    const resetFixture = () => {
+      fs.rmSync(activeP, { force: true }); fs.symlinkSync(fx.tok, activeP);
+      try { fs.unlinkSync(fx.gateFile); } catch {}
+      createGate({ file: fx.gateFile, reason: "R51", token: fx.tok, now: T0 });
+      const jd = JSON.parse(fs.readFileSync(jp, "utf-8")); jd.phase = "osm_a_upgrading"; jd.steps.find((s) => s.kind === "schema_endpoint").state = "prepared"; fs.writeFileSync(jp, JSON.stringify(jd, null, 2) + "\n", { mode: 0o600 });
+    };
+    const runBranch = (mutate, name) => {
+      resetFixture();
+      const beforeSha = TAL.loadLedger(dir, { endpointId: EP51 }).sha256;
+      const r = TAL.schemaUpgrade({ ...base, _inject: { beforeLedgerRename: mutate } });
+      assert.equal(r.ok, false, name + " 必拒：" + JSON.stringify(r));
+      assert.equal(r.reason, "fence_failed", name + "（" + (r.why ?? "") + "）：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).sha256, beforeSha, name + " 账本 SHA 不变");
+    };
+    // (a) active 文件 token 改走（state 仍 active，token 变，指向合法但不同的 UUID）→ active 漂移
+    runBranch(() => { fs.rmSync(activeP, { force: true }); fs.symlinkSync(r51Uuid(5), activeP); }, "active 漂移");
+    // (b) 门失效（换 token）→ 门漂移
+    runBranch(() => { fs.unlinkSync(fx.gateFile); createGate({ file: fx.gateFile, reason: "R51", token: r51Uuid(4), now: T0 }); }, "门漂移");
+    // (c) journal phase 改走 → journal 漂移
+    runBranch(() => { const jd = JSON.parse(fs.readFileSync(jp, "utf-8")); jd.phase = "osm_b_strictening"; fs.writeFileSync(jp, JSON.stringify(jd, null, 2) + "\n", { mode: 0o600 }); }, "journal 漂移");
+    // (d) step 标 done（并补 after = intended_after，journal 仍合法）→ step 漂移
+    runBranch(() => { const jd = JSON.parse(fs.readFileSync(jp, "utf-8")); const se = jd.steps.find((s) => s.kind === "schema_endpoint"); se.state = "done"; se.after = structuredClone(se.intended_after); fs.writeFileSync(jp, JSON.stringify(jd, null, 2) + "\n", { mode: 0o600 }); }, "step 漂移");
+  }));
 
   test("R51 §五 mintSelectionHandles：三态 CAS + plan 绑定 + 集合等式 + written_mismatch", () => r51WithRoot((root, dir) => {
     // 账本：transition（2 null-B1），mint step 锚真账本 SHA（transitionAfterSha = 现场 SHA）。
@@ -37017,7 +37083,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       const r = TAL.mintSelectionHandles({ ...args, plan: p });
       assert.equal(r.reason, "plan_mismatch", why + "：" + JSON.stringify(r));
     };
-    badPlan((p) => { p.token = r51Uuid(5); }, "plan.token ≠ capability.token");
+    badPlan((p) => { p.token = r51Uuid(5); p.campaign_id = campaignIdFor(p.token); }, "plan.token ≠ capability.token");
     badPlan((p) => { p.endpoint = "endpoint_" + "9".repeat(24); }, "plan.endpoint ≠ endpointId");
     badPlan((p) => { p.request_key = "other-rk"; }, "plan.request_key ≠ capability.token");
     badPlan((p) => { p.before_ledger_sha256 = r51Sha("b"); }, "plan.before_sha ≠ step.before.ledger_sha256");

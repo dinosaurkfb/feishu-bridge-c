@@ -22,6 +22,7 @@ import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhile
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { campaignIdFor } from "./maintenance/owner-select-derived.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
@@ -1639,17 +1640,19 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     if (oldBytes !== null) { const pt = writeTmpBytes(dir, "ledger.json.prev", oldBytes); if (pt.tmp) ptTmp = pt.tmp; if (!pt.ok) return finalize({ ok: false, commit: "not_committed", reason: "tmp_unwritable", why: "prevTmp：" + pt.why, residue: outerResidue() }); }
 
     if (inj.afterTmp) inj.afterTmp();
-    let renameErr = null;
+    let renameErr = null, fenceFail = null;
     const fenced = commitWhileHeld(lockDir, () => {
       if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
       if (inj.beforeLedgerRename) inj.beforeLedgerRename();
       // R51 返修一 P1-1：提交点栅栏（rename 前、注入钩子之后最后时刻）——_fence 复核 active/gate/journal/step/lease
       if (_fence !== null) {
-        const fenceFail = typeof _fence === "function" ? _fence() : _fence;
-        if (fenceFail) { renameErr = new Error("fence:" + fenceFail); return; }
+        const f = typeof _fence === "function" ? _fence() : _fence;
+        if (f) { fenceFail = f; return; }
       }
       try { fs.renameSync(ltTmp, ledgerPath); ltTmp = null; } catch (err) { renameErr = err; }
     });
+    // R51 返修一：栅栏失败要有专名（不伪装成 renameErr/commit_failed）——why 带出失败分支名，reason 精确 fence_failed。
+    if (fenceFail !== null) return finalize({ ok: false, commit: "not_committed", reason: "fence_failed", why: "fence:" + fenceFail, residue: outerResidue() });
     // 提交阶段取锁异常投影（评审六 P2）：lock_lost 单列；reap_residue/reap_busy/io_error 保留原 reason 与 path/error，
     // 不折成瞬时 ledger_busy（持久残骸不能伪装成"稍后重试即可"）。
     if (!fenced.ok) return finalize({ ok: false, commit: "not_committed", reason: fenced.reason === "lock_lost" ? "lock_lost" : (fenced.reason ?? "ledger_busy"), why: fenced.why ?? fenced.reason ?? null, path: fenced.path ?? null, residue: outerResidue() });
@@ -2140,7 +2143,10 @@ export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, 
     expected_null_b1_ids: expectedNullB1Ids, minted,
     expected_ledger_sha256: null,
   };
-  plan.expected_ledger_sha256 = sha256(serializeLedger(applyMintPlan(doc, plan)));
+  // R51 返修一补：applyMintPlan 产物必须过整账本校验，不过则不出 plan（不得落 staging）。
+  const next = applyMintPlan(doc, plan);
+  if (!validateLedger(next, { endpointId }).ok) return null;
+  plan.expected_ledger_sha256 = sha256(serializeLedger(next));
   return plan;
 }
 
@@ -2178,6 +2184,7 @@ export function mintPlanProblem(plan) {
   if (plan.plan_kind !== "owner_select_mint_plan_v1") return "plan_kind 不对";
   if (typeof plan.token !== "string" || !UUID_SHAPE.test(plan.token)) return "token 不是 UUID";
   if (typeof plan.campaign_id !== "string" || !/^osc_[0-9a-f]{32}$/u.test(plan.campaign_id)) return "campaign_id 形状不对";
+  if (plan.campaign_id !== campaignIdFor(plan.token)) return "campaign_id 与 token 不匹配";
   if (typeof plan.endpoint !== "string" || !ENDPOINT_SHAPE.test(plan.endpoint)) return "endpoint 形状不对";
   if (typeof plan.request_key !== "string" || !REQUEST_KEY_SHAPE.test(plan.request_key)) return "request_key 形状不对";
   if (typeof plan.operation_id !== "string" || !UUID_SHAPE.test(plan.operation_id)) return "operation_id 不是 UUID";
@@ -2267,7 +2274,7 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
     });
   });
   const res = res0Out;
-  if (res0.fenceFail) return { ok: false, commit: "not_committed", reason: "lease_lost", why: "提交点栅栏：" + res0.fenceFail, ...wrNote(res) };
+  // fence 失败已由 writeLedger 以专名 fence_failed 报出（res0.fenceFail 是死分支：commitWhileHeld 从不返回它）。
   if (!res0.ok) return { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" };
   if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
   if (res.idempotent) return { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) };
@@ -2333,7 +2340,7 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
     });
     });
     const res = res0Out;
-    if (res0.fenceFail) return { ok: false, commit: "not_committed", reason: "lease_lost", why: "提交点栅栏：" + res0.fenceFail };
+    // fence 失败已由 writeLedger 以专名 fence_failed 报出（res0.fenceFail 是死分支：commitWhileHeld 从不返回它）。
     if (!res0.ok) return { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" };
     if (res.ok && typeof res.commit === "string" && res.commit.startsWith("committed")) {
     if (res.idempotent) return { ok: true, commit: "already", revision: res.revision, result: res.result, ...wrNote(res) };

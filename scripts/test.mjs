@@ -9,6 +9,7 @@
 
 import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem } from "./control-command.mjs";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -36553,6 +36554,9 @@ const r54WaitResult = (file, ms = 5000) => {
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf-8")) : null;
 };
 
+const r54Key = (n) => String(n).padStart(64, "0"); // 64hex key（#141 三轮 P2-6）
+const FORWARD_SHA_SENT = crypto.createHash("sha256").update("sent").digest("hex"); // P1-4：sent=true 时 final_text_sha256 必须等于它
+
 test("R54 转发结果落盘：三种结局投影 + claude 参数逐字 + 路由器 200ms 内返回 + jsonl/stderr 仍在（假 claude）", () => {
   const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-"));
   const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
@@ -36572,16 +36576,16 @@ test("R54 转发结果落盘：三种结局投影 + claude 参数逐字 + 路由
   };
 
   // ① 成功：stream-json 含 result 行（is_error=false）+ 助手文本 "sent"
-  deliver("k1", [
+  deliver(r54Key(1), [
     "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', model: 'fake-model', claude_code_version: '9.9.9-fake' }) + '\\n');",
     "process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'sent' }] } }) + '\\n');",
     "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 2, duration_ms: 1234 }) + '\\n');",
   ].join("\n"));
-  const r1 = r54WaitResult(path.join(runs, "k1.forward.result.json"));
+  const r1 = r54WaitResult(path.join(runs, r54Key(1) + ".forward.result.json"));
   assert.ok(r1, "跑完后 result.json 落盘（runner 等 claude 退出后投影）");
   assert.deepEqual(
     [r1.schema, r1.key, r1.target_name, r1.is_error, r1.subtype, r1.sent, r1.num_turns, r1.duration_ms, r1.exit_code],
-    [FORWARD_RESULT_SCHEMA, "k1", "现场会话", false, "success", true, 2, 1234, 0]);
+    [FORWARD_RESULT_SCHEMA, r54Key(1), "现场会话", false, "success", true, 2, 1234, 0]);
   assert.equal(r1.reason_first_line, "sent");
   assert.equal(r1.claude_code_version, "9.9.9-fake");
   assert.equal(r1.model, "fake-model");
@@ -36595,34 +36599,34 @@ test("R54 转发结果落盘：三种结局投影 + claude 参数逐字 + 路由
   assert.match(argv1[1], /帮我改一下代码/u, "指令原文在 prompt 里");
   assert.match(argv1[1], /现场会话/u, "目标会话名在 prompt 里");
   // jsonl / stderr 仍在（runner 接管 stdio 后 stdout 照落、stderr 照开）
-  assert.ok(fs.existsSync(path.join(runs, "k1.forward.jsonl")) && fs.existsSync(path.join(runs, "k1.forward.stderr.log")));
-  assert.match(fs.readFileSync(path.join(runs, "k1.forward.jsonl"), "utf-8"), /"type":"result"/u);
+  assert.ok(fs.existsSync(path.join(runs, r54Key(1) + ".forward.jsonl")) && fs.existsSync(path.join(runs, r54Key(1) + ".forward.stderr.log")));
+  assert.match(fs.readFileSync(path.join(runs, r54Key(1) + ".forward.jsonl"), "utf-8"), /"type":"result"/u);
 
   // ② #140 同款失败：result 行 is_error=true，文本是那句 400（多行 → reason 取第一行）
-  deliver("k2", "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 …model not found\\n请检查 settings 里的模型配置', num_turns: 1, duration_ms: 2500 }) + '\\n');");
-  const r2 = r54WaitResult(path.join(runs, "k2.forward.result.json"));
+  deliver(r54Key(2), "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 …model not found\\n请检查 settings 里的模型配置', num_turns: 1, duration_ms: 2500 }) + '\\n');");
+  const r2 = r54WaitResult(path.join(runs, r54Key(2) + ".forward.result.json"));
   assert.ok(r2);
   assert.deepEqual([r2.is_error, r2.sent, r2.subtype, r2.exit_code, r2.num_turns, r2.duration_ms], [true, false, "error_during_execution", 0, 1, 2500]);
   assert.equal(r2.reason_first_line, "API Error: 400 …model not found", "reason 只取第一行：" + JSON.stringify(r2.reason_first_line));
 
   // ③ 崩溃：进程退出但不输出 result 行（半截坏行也一样）
-  deliver("k3", "require('node:fs').writeSync(1, " + JSON.stringify('{"type":"assist') + ");process.exit(3);");
-  const r3 = r54WaitResult(path.join(runs, "k3.forward.result.json"));
+  deliver(r54Key(3), "require('node:fs').writeSync(1, " + JSON.stringify('{"type":"assist') + ");process.exit(3);");
+  const r3 = r54WaitResult(path.join(runs, r54Key(3) + ".forward.result.json"));
   assert.ok(r3);
   assert.deepEqual([r3.is_error, r3.subtype, r3.sent, r3.exit_code, r3.num_turns], [true, "crash", false, 3, null]);
   assert.equal(r3.reason_first_line, "no_result_line(exit=3)");
   assert.ok(Number.isFinite(r3.duration_ms), "崩溃按 wall clock 计时长（#140 里那 2–4 秒本身就是证据）");
-  assert.match(fs.readFileSync(path.join(runs, "k3.forward.jsonl"), "utf-8"), /"type":"assist/u, "半截行原样留在 jsonl 里");
+  assert.match(fs.readFileSync(path.join(runs, r54Key(3) + ".forward.jsonl"), "utf-8"), /"type":"assist/u, "半截行原样留在 jsonl 里");
 
   // ④ PATH 上没有 claude：起不来也落盘，reason 点名 claude_not_found
   const emptyBin = path.join(local, "empty"); fs.mkdirSync(emptyBin);
   fs.rmSync(path.join(bin, "claude"), { force: true });
-  deliver("k4", "", emptyBin);
-  const r4 = r54WaitResult(path.join(runs, "k4.forward.result.json"));
+  deliver(r54Key(4), "", emptyBin);
+  const r4 = r54WaitResult(path.join(runs, r54Key(4) + ".forward.result.json"));
   assert.ok(r4);
   assert.deepEqual([r4.is_error, r4.subtype, r4.claude_path, r4.sent], [true, "claude_not_found", null, false]);
   assert.equal(r4.reason_first_line, "claude_not_found");
-  assert.equal(fs.existsSync(path.join(runs, "k4.forward.jsonl")), false, "起不来就不该有 jsonl");
+  assert.equal(fs.existsSync(path.join(runs, r54Key(4) + ".forward.jsonl")), false, "起不来就不该有 jsonl");
 });
 
 test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执里那三个字）在 scripts/ 全仓消失（git grep 级扫描）", () => {
@@ -36681,18 +36685,18 @@ test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn �
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
   const now = Date.now();
   // R54 返修一：result 夹具用封闭全字段（读端走 readVerifiedDoc + forwardResultProblem），0600 落盘
-  const fullResult = (key, over = {}) => ({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, finished_at: new Date(now - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over });
+  const fullResult = (key, over = {}) => ({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: new Date(now - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over });
   const writeResult = (key, doc, mtimeMs) => {
     const f = path.join(runsDir, key + ".forward.result.json");
     fs.writeFileSync(f, JSON.stringify(doc) + "\n", { mode: 0o600 });
     if (mtimeMs !== undefined) fs.utimesSync(f, new Date(mtimeMs), new Date(mtimeMs));
   };
-  writeResult("kg", fullResult("kg"));
-  writeResult("kr", fullResult("kr", { is_error: true, sent: false, exit_code: 0, reason_first_line: "API Error: 400 …model not found", claude_code_version: "1.2.3-old", finished_at: new Date(now - 120e3).toISOString() }));
-  writeResult("kold", fullResult("kold", { is_error: true, sent: false, reason_first_line: "很旧的失败", claude_code_version: "0.0.1", finished_at: new Date(now - 25 * 3600e3).toISOString() }));
-  const orphan = path.join(runsDir, "ko.forward.jsonl");
+  writeResult(r54Key(11), fullResult(r54Key(11)));
+  writeResult(r54Key(12), fullResult(r54Key(12), { is_error: true, sent: false, exit_code: 0, reason_first_line: "API Error: 400 …model not found", claude_code_version: "1.2.3-old", finished_at: new Date(now - 120e3).toISOString() }));
+  writeResult(r54Key(13), fullResult(r54Key(13), { is_error: true, sent: false, reason_first_line: "很旧的失败", claude_code_version: "0.0.1", finished_at: new Date(now - 25 * 3600e3).toISOString() }));
+  const orphan = path.join(runsDir, r54Key(29) + ".forward.jsonl");
   fs.writeFileSync(orphan, "{}\n"); fs.utimesSync(orphan, new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
-  const fresh = path.join(runsDir, "kf.forward.jsonl");
+  const fresh = path.join(runsDir, r54Key(28) + ".forward.jsonl");
   fs.writeFileSync(fresh, "{}\n"); fs.utimesSync(fresh, new Date(now - 60e3), new Date(now - 60e3));
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, JSON.stringify(c));
@@ -36701,14 +36705,14 @@ test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn �
   assert.match(c.detail, /claude_code_version 1\.2\.3-old/u, "红条目点名版本：" + c.detail);
   assert.doesNotMatch(c.detail, /很旧的失败|0\.0\.1/u, "窗外积尘既不计数也不点名：" + c.detail);
   assert.match(c.detail, /缺结果的 key/u, "孤儿 jsonl 记「结果缺失」：" + c.detail);
-  assert.doesNotMatch(c.detail, /kf/u, "刚起还没跑完的 jsonl 不算结果缺失：" + c.detail);
+  assert.doesNotMatch(c.detail, /查不清/u, "⑯ 不为非 forward 键误报：" + c.detail);
 
   // 全绿（外加一台没转发结果的机器）：不红也不缺失 → true
   const m2 = doctorMachine();
   const root2 = m2.project("fwdok", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m2.writeTables({ projects: [{ id: "fwdok", root: root2, root_message_id: "om_root_fwdok", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
   const runs2 = path.join(root2, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runs2, { recursive: true });
-  fs.writeFileSync(path.join(runs2, "kok.forward.result.json"), JSON.stringify(fullResult("kok", { finished_at: new Date(now - 60e3).toISOString() })) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runs2, r54Key(14) + ".forward.result.json"), JSON.stringify(fullResult(r54Key(14), { finished_at: new Date(now - 60e3).toISOString() })) + "\n", { mode: 0o600 });
   const c2 = checkOf(doctorReport(m2.run()), "inbound_forward_result");
   assert.equal(c2.ok, true, c2.detail);
   assert.match(c2.detail, /共 1 条：绿 1/u, c2.detail);
@@ -36727,7 +36731,7 @@ test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn �
 const r54FullResult = (key, over = {}) => ({
   schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0,
   is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234,
-  claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true,
+  claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT,
   finished_at: new Date(Date.now() - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over,
 });
 
@@ -36755,7 +36759,7 @@ test("R54 返修一 P1-1：runs 盘点认识 forward 制品——全套制品 �
 
 test("R54 返修一 P1-2：forwardResultProblem 封闭校验（is_error 缺席/sent 与 exit 矛盾/多键/超长/未来时间都拦）+ doctor 坏形状记查不清并点名", () => {
   const now = Date.now();
-  const good = r54FullResult("k", { finished_at: new Date(now).toISOString() });
+  const good = r54FullResult(r54Key(25), { finished_at: new Date(now).toISOString() });
   assert.equal(FORWARD_RESULT_PROBLEM(good, { now }), null);
   assert.ok(FORWARD_RESULT_PROBLEM({ ...good, is_error: undefined }, { now }) !== null, "is_error 缺席按 problem（不是 false）");
   assert.ok(FORWARD_RESULT_PROBLEM({ ...good, sent: true, exit_code: 5 }, { now }) !== null, "sent=true 但 exit_code≠0 → problem");
@@ -36768,7 +36772,7 @@ test("R54 返修一 P1-2：forwardResultProblem 封闭校验（is_error 缺席/s
   const root = m.project("fwdcorrupt", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({ projects: [{ id: "fwdcorrupt", root, root_message_id: "om_root_fwdcorrupt", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
-  fs.writeFileSync(path.join(runsDir, "kc.forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key: "kc" }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(15) + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key: r54Key(15) }) + "\n", { mode: 0o600 });
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, JSON.stringify(c));
   assert.match(c.detail, /查不清 1/u, "坏形状记查不清：" + c.detail);
@@ -36782,14 +36786,14 @@ test("R54 返修一 P1-3：⑯ 读盘纪律——symlink 不跟随（合法绿�
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
   const now = Date.now();
   // 真 result（0600）：绿
-  fs.writeFileSync(path.join(runsDir, "kreal.forward.result.json"), JSON.stringify(r54FullResult("kreal", { finished_at: new Date(now - 60e3).toISOString() })) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(16) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(16), { finished_at: new Date(now - 60e3).toISOString() })) + "\n", { mode: 0o600 });
   // symlink 指向那份合法绿文件：O_NOFOLLOW 下必须查不清（不跟随），不能隔着 symlink 被读成绿
-  fs.symlinkSync(path.join(runsDir, "kreal.forward.result.json"), path.join(runsDir, "ksym.forward.result.json"));
+  fs.symlinkSync(path.join(runsDir, r54Key(16) + ".forward.result.json"), path.join(runsDir, r54Key(17) + ".forward.result.json"));
   // FIFO：读原语 O_NONBLOCK + fstat 普通文件核 → 不挂起、记查不清
   const fifo = path.join(runsDir, "kfifo.forward.result.json");
   execFileSync("mkfifo", [fifo]);
   // 坏 JSON（0600 普通文件）：记查不清
-  fs.writeFileSync(path.join(runsDir, "kbad.forward.result.json"), "{not json", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(23) + ".forward.result.json"), "{not json", { mode: 0o600 });
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, JSON.stringify(c));
   assert.match(c.detail, /共 4 条：绿 1、查不清 3/u, "桶之和 = 总数，symlink/FIFO/坏 JSON 全部查不清：" + c.detail);
@@ -36805,16 +36809,17 @@ test("R54 返修一 P1-4：孤儿判定看存活——started 在场且 runner_p
   const now = Date.now();
   const ago11m = new Date(now - 11 * 60e3).toISOString();
   // 活 runner：本测试进程自己活着，直接用 process.pid 当 runner_pid
-  fs.writeFileSync(path.join(runsDir, "klive".padEnd(10, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
-  fs.utimesSync(path.join(runsDir, "klive".padEnd(10, "0") + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
-  fs.writeFileSync(path.join(runsDir, "klive".padEnd(10, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "klive".padEnd(10, "0"), runner_pid: process.pid, claude_pid: 4242, started_at: ago11m }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
+  const psStart = (() => { const rr = spawnSync("ps", ["-o", "etime=", "-p", String(process.pid)], { encoding: "utf-8" }); const raw = (rr.stdout ?? "").trim(); if (!raw) return ago11m; const parts = raw.replace(/-/gu, ":").split(":").reverse(); let secs = 0; for (const [i, seg] of parts.entries()) { const n = Number(seg); if (!Number.isFinite(n)) return ago11m; secs += n * [1, 60, 3600, 86400][i]; } return new Date(Date.now() - secs * 1000).toISOString(); })();
+  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "1".padEnd(64, "0"), runner_pid: process.pid, claude_pid: 4242, started_at: ago11m, runner_start_at: psStart }) + "\n", { mode: 0o600 });
   // 死 runner：spawnSync 一个快退进程，结束后它的 pid 就是死的
   const deadChild = spawnSync("sleep", ["0.05"]);
   const deadPid = deadChild.pid;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); // 等它退透
-  fs.writeFileSync(path.join(runsDir, "kdead".padEnd(10, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
-  fs.utimesSync(path.join(runsDir, "kdead".padEnd(10, "0") + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
-  fs.writeFileSync(path.join(runsDir, "kdead".padEnd(10, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "kdead".padEnd(10, "0"), runner_pid: deadPid, claude_pid: 4243, started_at: ago11m }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, "2".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runsDir, "2".padEnd(64, "0") + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
+  fs.writeFileSync(path.join(runsDir, "2".padEnd(64, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "2".padEnd(64, "0"), runner_pid: deadPid, claude_pid: 4243, started_at: ago11m, runner_start_at: ago11m }) + "\n", { mode: 0o600 });
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, "死 runner 那条是结果缺失：" + JSON.stringify(c));
   assert.match(c.detail, /共 2 条：结果缺失 1、进行中 1/u, "活 runner → 进行中不红；死 runner → 结果缺失；桶和 = 总数：" + c.detail);
@@ -36845,13 +36850,13 @@ test("R54 返修一 P1-5：落盘纪律——目标已是 symlink 不跟随不�
   // (a) 目标已是 symlink：不跟随、不覆盖，stderr.log 留诊断
   const sentinel = path.join(local, "sentinel.json");
   fs.writeFileSync(sentinel, "keepme", { mode: 0o600 });
-  const symTarget = path.join(runs, "ksym.forward.result.json");
+  const symTarget = path.join(runs, r54Key(17) + ".forward.result.json");
   fs.symlinkSync(sentinel, symTarget);
-  deliver("ksym", successShim);
+  deliver(r54Key(17), successShim);
   let symNote = null;
   {
     const deadline = Date.now() + 3000;
-    const errFile = path.join(runs, "ksym.forward.stderr.log");
+    const errFile = path.join(runs, r54Key(17) + ".forward.stderr.log");
     while (Date.now() < deadline) {
       if (fs.existsSync(errFile) && /符号链接/u.test(fs.readFileSync(errFile, "utf-8"))) { symNote = true; break; }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
@@ -36862,14 +36867,14 @@ test("R54 返修一 P1-5：落盘纪律——目标已是 symlink 不跟随不�
   assert.equal(fs.readFileSync(sentinel, "utf-8"), "keepme", "被指文件字节不变");
   // (b) 8 MiB jsonl：只读尾部，1 秒内落结果
   const t0 = Date.now();
-  deliver("kbig", [
+  deliver(r54Key(18), [
     "for (let i = 0; i < 4; i++) process.stdout.write(\"x\".repeat(2 * 1024 * 1024) + \"\\n\");",
     "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 2, duration_ms: 1234 }) + '\\n');",
   ].join("\n"));
   const deadline = Date.now() + 1000;
   let big = null;
   while (Date.now() < deadline) {
-    const f = path.join(runs, "kbig.forward.result.json");
+    const f = path.join(runs, r54Key(18) + ".forward.result.json");
     if (fs.existsSync(f)) { big = JSON.parse(fs.readFileSync(f, "utf-8")); break; }
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
   }
@@ -36891,7 +36896,7 @@ test("R54 返修二 P1-1：源 result 行缺 is_error → 投影 malformed_resul
   const run = deliverToLiveSession({
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "msg_mal", createdAtMs: Date.now(),
-    projectRoot: proj, runsDir: runs, key: "kmal", env: { PATH: bin + path.delimiter + process.env.PATH },
+    projectRoot: proj, runsDir: runs, key: r54Key(19), env: { PATH: bin + path.delimiter + process.env.PATH },
   });
   const deadline = Date.now() + 5000;
   let r = null;
@@ -36919,7 +36924,7 @@ test("R54 返修二 P1-2：⑯ 按 key 聚合——完整转发只计一个桶�
   fs.writeFileSync(path.join(runsDir, key + ".forward.jsonl"), "{}\n", { mode: 0o600 });
   fs.utimesSync(path.join(runsDir, key + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
   fs.writeFileSync(path.join(runsDir, key + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key, runner_pid: 4242, claude_pid: 4243, started_at: ago11m }) + "\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, finished_at: ago11m, claude_path: "/x" }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: ago11m, claude_path: "/x" }) + "\n", { mode: 0o600 });
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, true, c.detail);
   assert.match(c.detail, /共 1 条：绿 1/u, "恰一个桶（红：绿 1 + 结果缺失 1）：" + c.detail);
@@ -36927,16 +36932,16 @@ test("R54 返修二 P1-2：⑯ 按 key 聚合——完整转发只计一个桶�
 
 test("R54 返修二 P1-3：key 与文件名绑定 + pid ≥1——错 key / runner_pid:0 / 错 key 的自称成功全部 problem，doctor 记查不清", () => {
   const now = Date.now();
-  const good = r54FullResult("k", { finished_at: new Date(now).toISOString() });
-  assert.match(FORWARD_RESULT_PROBLEM({ ...good, key: "other" }, { now, expectedKey: "k" }), /key 与文件名/u);
-  assert.match(FORWARD_STARTED_PROBLEM({ schema: FORWARD_STARTED_SCHEMA, key: "k", runner_pid: 0, claude_pid: 4243, started_at: new Date(now).toISOString() }, { now, expectedKey: "k" }), /runner_pid/u);
-  assert.match(FORWARD_RESULT_PROBLEM({ ...good, key: "other" }, { now, expectedKey: "k" }), /key 与文件名/u);
+  const good = r54FullResult(r54Key(41), { finished_at: new Date(now).toISOString() });
+  assert.match(FORWARD_RESULT_PROBLEM({ ...good, key: r54Key(40) }, { now, expectedKey: r54Key(41) }), /key 与文件名/u);
+  assert.match(FORWARD_STARTED_PROBLEM({ schema: FORWARD_STARTED_SCHEMA, key: r54Key(42), runner_pid: 0, claude_pid: 4243, started_at: new Date(now).toISOString(), runner_start_at: new Date(now).toISOString() }, { now, expectedKey: r54Key(42) }), /runner_pid/u);
+  assert.match(FORWARD_RESULT_PROBLEM({ ...good, key: r54Key(40) }, { now, expectedKey: r54Key(41) }), /key 与文件名/u);
   // doctor：文件名 kx 的 result 内容自称 key=ky → 查不清点名
   const m = doctorMachine();
   const root = m.project("fwdkeybad", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({ projects: [{ id: "fwdkeybad", root, root_message_id: "om_root_fwdkeybad", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
-  fs.writeFileSync(path.join(runsDir, "kx.forward.result.json"), JSON.stringify(r54FullResult("ky", { finished_at: new Date(now).toISOString() })) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(22) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(20), { finished_at: new Date(now).toISOString() })) + "\n", { mode: 0o600 });
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, JSON.stringify(c));
   assert.match(c.detail, /查不清 1/u, c.detail);
@@ -36948,7 +36953,7 @@ test("R54 返修二 P1-4：悬空 symlink 的 result → 查不清点名（不�
   const root = m.project("fwddang", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({ projects: [{ id: "fwddang", root, root_message_id: "om_root_fwddang", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
-  fs.symlinkSync(path.join(runsDir, "nowhere.json"), path.join(runsDir, "kdang.forward.result.json"));
+  fs.symlinkSync(path.join(runsDir, "nowhere.json"), path.join(runsDir, r54Key(43) + ".forward.result.json"));
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, JSON.stringify(c));
   assert.match(c.detail, /查不清 1/u, "悬空 symlink 记查不清（红：旧版 statSync ENOENT 直接跳过）：" + c.detail);
@@ -36970,7 +36975,7 @@ test("R54 返修二 P2-6：假 claude 阻塞 2 秒——路由器在子进程结
   const run = deliverToLiveSession({
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "msg_blk", createdAtMs: Date.now(),
-    projectRoot: proj, runsDir: runs, key: "kblk", env: { PATH: bin + path.delimiter + process.env.PATH },
+    projectRoot: proj, runsDir: runs, key: r54Key(21), env: { PATH: bin + path.delimiter + process.env.PATH },
   });
   const tReturn = Date.now();
   assert.ok(!fs.existsSync(run.resultPath), "路由器返回时子进程还没结束（结果未落盘）");
@@ -36997,6 +37002,74 @@ test("R54 返修二 P2-5：forward tmp 残骸进受控盘点（报 forward_run_c
   const inv = inventoryRuns({ runsDir, claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims") });
   assert.equal(inv.problems.filter((x) => x.reason === "unrecognized_entry").length, 0, "tmp 不再是不认识的条目：" + JSON.stringify(inv.problems));
   assert.ok(inv.problems.some((x) => x.reason === "forward_run_conflict" && /tmp/u.test(x.why)), "tmp 残骸按受控形状报出并点名：" + JSON.stringify(inv.problems));
+});
+
+// ── R54 返修三（Codex #141 三轮 4 P1）──
+
+test("R54 返修三 P1-1：源 result 行 num_turns 为负 → 投影 malformed_result，绝不进成功公式", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-f3-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true });
+  fs.writeFileSync(path.join(bin, "claude"), [
+    "#!/usr/bin/env node",
+    "require('node:fs').writeSync(1, JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: -1, duration_ms: 0 }) + '\\n');",
+    "process.exit(0);",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const run = deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "msg_f3a", createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key: r54Key(31), env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  const deadline = Date.now() + 5000;
+  let r = null;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(run.resultPath)) { r = JSON.parse(fs.readFileSync(run.resultPath, "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  assert.ok(r, "result 落盘");
+  assert.deepEqual([r.is_error, r.sent, r.subtype, r.reason_first_line], [true, false, "malformed_result", "malformed_result"], JSON.stringify(r));
+});
+
+test("R54 返修三 P1-2：forward 制品归属封闭——孤立 tmp 报 forward_write_residue、孤立 started 报 forward_incomplete，⑯ 不计入桶", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdown", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdown", root, root_message_id: "om_root_fwdown", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const kTmp = r54Key(32); const kStarted = r54Key(33);
+  fs.writeFileSync(path.join(runsDir, kTmp + ".forward.result.json.tmp.4242"), "{}", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, kStarted + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: kStarted, runner_pid: 4242, claude_pid: 4243, started_at: new Date(Date.now() - 11 * 60e3).toISOString(), runner_start_at: new Date(Date.now() - 11 * 60e3).toISOString() }) + "\n", { mode: 0o600 });
+  const inv = inventoryRuns({ runsDir, claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims") });
+  assert.ok(inv.problems.some((x) => x.key === kTmp && x.reason === "forward_write_residue"), "孤立 tmp → forward_write_residue：" + JSON.stringify(inv.problems));
+  assert.ok(inv.problems.some((x) => x.key === kStarted && x.reason === "forward_incomplete"), "孤立 started → forward_incomplete：" + JSON.stringify(inv.problems));
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.detail.includes("绿"), false, "⑯ 不计残骸/半制品：" + c.detail);
+});
+
+test("R54 返修三 P1-3：PID 存活不算实例证明——runner_start_at 与进程启动时刻不符 → 进行中未验证，本项 ok:null", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdpid", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdpid", root, root_message_id: "om_root_fwdpid", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const sleeper = spawn("sleep", ["30"], { stdio: "ignore", detached: true }); sleeper.unref();
+  const ago11m = new Date(Date.now() - 11 * 60e3).toISOString();
+  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), new Date(Date.now() - 11 * 60e3), new Date(Date.now() - 11 * 60e3));
+  // runner_pid 活着（sleeper），但 runner_start_at 自称 11 分钟前 —— 与该进程真实启动时刻差 >2s → unverified
+  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "1".padEnd(64, "0"), runner_pid: sleeper.pid, claude_pid: 4243, started_at: ago11m, runner_start_at: ago11m }) + "\n", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, null, "无法核验实例身份 → 本项 incomplete（ok:null）：" + JSON.stringify(c));
+  assert.match(c.detail, /进行中未验证 1/u, c.detail);
+  assert.match(c.detail, /尚无结果|转发进行中/u, "措辞点名进行中：" + c.detail);
+  sleeper.kill();
+});
+
+test("R54 返修三 P1-4：不可能组合拒——sent=true 配 reason=failed / 错 final_text_sha256 / is_error=true 配 sent=true 都 problem", () => {
+  const now = Date.now();
+  const base = { schema: FORWARD_RESULT_SCHEMA, key: r54Key(34), target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, finished_at: new Date(now).toISOString(), claude_path: "/x", final_text_sha256: FORWARD_SHA_SENT };
+  assert.equal(FORWARD_RESULT_PROBLEM({ ...base }, { now }), null);
+  assert.match(FORWARD_RESULT_PROBLEM({ ...base, reason_first_line: "failed" }, { now }), /sent=true/u, "sent=true + reason=failed 拒");
+  assert.match(FORWARD_RESULT_PROBLEM({ ...base, final_text_sha256: "f".repeat(64) }, { now }), /final_text_sha256/u, "sent=true + 错 SHA 拒");
+  assert.match(FORWARD_RESULT_PROBLEM({ ...base, is_error: true }, { now }), /is_error=true/u, "is_error=true + sent=true 拒");
 });
 
 summarySealed = true;

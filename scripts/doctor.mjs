@@ -59,7 +59,7 @@ import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
-import { forwardResultProblem, forwardStartedProblem } from "./forward-runner.mjs";
+import { forwardResultProblem, forwardStartedProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
@@ -736,7 +736,7 @@ export function runDoctor({
     const ORPHAN_AFTER = 10 * 60 * 1000;
     const RESULT_CAP = 64 * 1024;
     const SUFFIXES = [[".forward.result.json", "result"], [".forward.started.json", "started"], [".forward.stderr.log", "stderr"], [".forward.jsonl", "jsonl"]];
-    const buckets = { green: 0, red: 0, missing: 0, inflight: 0, unclear: 0 };
+    const buckets = { green: 0, red: 0, missing: 0, inflight: 0, inflightUnverified: 0, unclear: 0 };
     const redNote = [];
     const missingKeys = [];
     const unclearNote = [];
@@ -766,7 +766,7 @@ export function runDoctor({
         buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(path.basename(String(root)) + "（runs 读不出：" + String(err?.code ?? err?.message ?? err) + "）");
         continue;
       }
-      // P1-2：先按 key 聚合成快照，再逐 key 判桶
+      // P1-2：先按 key 聚合成快照，再逐 key 判桶；key 形状不符（非 64hex）→ 查不清（P2-6）
       const byKey = new Map();
       for (const n of names) {
         for (const [suffix, kind] of SUFFIXES) {
@@ -777,8 +777,25 @@ export function runDoctor({
           break;
         }
       }
+      // etime 无 locale 问题（macOS 无 etimes）："[dd-]hh:mm:ss" → 秒，start = now - 秒*1000
+      const etimeSecs = (pid) => {
+        const r = spawnSync("ps", ["-o", "etime=", "-p", String(pid)], { encoding: "utf-8" });
+        if (r.status !== 0) return null;
+        const raw = (r.stdout ?? "").trim();
+        if (!raw) return null;
+        const parts = raw.replace(/-/gu, ":").split(":").reverse();
+        let secs = 0;
+        for (const [i, seg] of parts.entries()) { const n = Number(seg); if (!Number.isFinite(n)) return null; secs += n * [1, 60, 3600, 86400][i]; }
+        return secs;
+      };
+      const procStartMs = (pid) => {
+        // R54 返修三 P1-3：进程启动时刻（etime 反推，无 locale 问题），取不到 → null（一律 unverified）
+        const secs = etimeSecs(pid);
+        return secs === null ? null : now - secs * 1000;
+      };
       for (const [key, parts] of byKey) {
         const unclear = (why) => { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：" + why); };
+        if (!FORWARD_KEY_RE.test(key)) { unclear("key 形状不对（须 64 位十六进制）"); continue; }
         if (parts.result !== undefined) {
           // 有 result：唯一终态来源，不再走孤儿判断
           const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key }), maxBytes: RESULT_CAP });
@@ -804,7 +821,14 @@ export function runDoctor({
         if (parts.started === undefined) { buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8)); continue; }
         const sv = readVerifiedDoc({ file: path.join(runsDir, parts.started), docValidator: (doc) => forwardStartedProblem(doc, { now, expectedKey: key }), maxBytes: 16 * 1024 });
         if (sv.ok === true) {
-          if (alive(sv.doc.runner_pid)) { buckets.inflight += 1; continue; } // 还在跑：不红
+          if (alive(sv.doc.runner_pid)) {
+            // R54 返修三 P1-3：PID 存活不算实例证明——runner_start_at 与 ps 启动时刻一致（±2s）才算
+            // 实例确认（inflight，不影响 ok）；取不到/不一致 → inflight_unverified，本项 ok:null。
+            const psMs = procStartMs(sv.doc.runner_pid);
+            const startMs = Date.parse(sv.doc.runner_start_at ?? "");
+            if (psMs !== null && Number.isFinite(startMs) && Math.abs(psMs - startMs) <= 2000) { buckets.inflight += 1; continue; }
+            buckets.inflightUnverified += 1; continue;
+          }
           if (now - Date.parse(sv.doc.started_at) < ORPHAN_AFTER) continue; // 刚死不久：宽限
           buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
           continue;
@@ -813,19 +837,24 @@ export function runDoctor({
         unclear("started " + String(sv.problem ?? "读不出"));
       }
     }
-    const scanned = buckets.green + buckets.red + buckets.missing + buckets.inflight + buckets.unclear; // 桶之和 = 总数
+    const scanned = buckets.green + buckets.red + buckets.missing + buckets.inflight + buckets.inflightUnverified + buckets.unclear; // 桶之和 = 总数
     const parts = [];
     if (buckets.green) parts.push("绿 " + buckets.green);
     if (buckets.red) parts.push("红 " + buckets.red);
     if (buckets.missing) parts.push("结果缺失 " + buckets.missing);
     if (buckets.inflight) parts.push("进行中 " + buckets.inflight);
+    if (buckets.inflightUnverified) parts.push("进行中未验证 " + buckets.inflightUnverified);
     if (buckets.unclear) parts.push("查不清 " + buckets.unclear);
     const body = scanned === 0 ? "近 24 小时没有转发结果（只盘 live_session 转发，没有转发就没有条目）"
       : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
         (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
         (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "") +
         (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "");
-    add("inbound_forward_result", "⑯ 入站转发结果", scanned === 0 || buckets.red + buckets.missing + buckets.unclear === 0, body, null);
+    // R54 返修三 P1-3：有无法核验实例身份的进行中转发 → 本项 incomplete（ok:null），不判绿也不判红
+    const ok17 = scanned === 0 ? true
+      : buckets.inflightUnverified > 0 ? null
+      : buckets.red + buckets.missing + buckets.unclear === 0;
+    add("inbound_forward_result", "⑯ 入站转发结果", ok17, body, null);
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

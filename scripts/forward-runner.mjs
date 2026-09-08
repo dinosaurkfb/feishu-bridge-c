@@ -32,12 +32,17 @@ import { ROLE_ENV } from "./live-session.mjs";
 export const FORWARD_RESULT_SCHEMA = "forward_result_v1";
 export const FORWARD_STARTED_SCHEMA = "forward_started_v1";
 const TAIL_READ_BYTES = 256 * 1024; // jsonl 只读尾部（#141 P1-5）
+/** key 形状：64 位十六进制 —— 与 outbound.mjs RUN_ENTRY_RE 的 key 组同源（#141 三轮 P2-6）。 */
+export const FORWARD_KEY_RE = /^[0-9a-f]{64}$/u;
+/** runner 进程自己的启动时刻（started.json 的 runner_start_at，#141 三轮 P1-3 实例核验用）。 */
+const RUNNER_STARTED_AT = new Date().toISOString();
 
 /** result.json 键集（封闭）：写端投影与读端校验共用这一份。 */
-const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,finished_at,is_error,key,model,num_turns,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
-const STARTED_KEYS = "claude_pid,key,runner_pid,started_at,schema".split(",").sort().join(",");
+const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,final_text_sha256,finished_at,is_error,key,model,num_turns,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
+const STARTED_KEYS = "claude_pid,key,runner_pid,runner_start_at,started_at,schema".split(",").sort().join(",");
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
 /** 源 result 行封闭校验（#141 二轮 P1-1）：缺/坏形状 → 投影为 is_error:true, subtype:"malformed_result"，
  *  绝不进成功公式。 */
@@ -46,8 +51,8 @@ export function resultLineProblem(line) {
   if (typeof line.is_error !== "boolean") return "is_error 缺席或非布尔";
   if (typeof line.subtype !== "string") return "subtype 缺席或非字符串";
   if (typeof line.result !== "string") return "result 缺席或非字符串";
-  if (!Number.isFinite(line.num_turns)) return "num_turns 不是有限数";
-  if (!Number.isFinite(line.duration_ms)) return "duration_ms 不是有限数";
+  if (!Number.isSafeInteger(line.num_turns) || line.num_turns < 0) return "num_turns 不是非负安全整数";
+  if (!Number.isSafeInteger(line.duration_ms) || line.duration_ms < 0) return "duration_ms 不是非负安全整数";
   return null;
 }
 const keysOf = (o) => Object.keys(o).sort().join(",");
@@ -62,7 +67,7 @@ export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null
   if (!isObj(doc)) return "result 文档不是对象";
   if (keysOf(doc) !== RESULT_KEYS) return "result 字段集不对";
   if (doc.schema !== FORWARD_RESULT_SCHEMA) return "schema 不认识: " + String(doc.schema);
-  if (typeof doc.key !== "string" || !doc.key || doc.key.includes("/") || doc.key.includes("\\")) return "key 形状不对";
+  if (typeof doc.key !== "string" || !FORWARD_KEY_RE.test(doc.key)) return "key 形状不对（须 64 位十六进制）";
   // R54 返修二 P1-3：key 与来源绑定 —— doctor 从文件名解析后传入，runner 写端传自己的 key。
   if (expectedKey !== null && doc.key !== expectedKey) return "key 与文件名/请求不符（" + doc.key + " ≠ " + expectedKey + "）";
   if (typeof doc.target_name !== "string" || doc.target_name.length > 200) return "target_name 形状不对";
@@ -70,15 +75,19 @@ export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null
   if (doc.exit_code !== null && !isSafeInt(doc.exit_code)) return "exit_code 形状不对";
   if (typeof doc.is_error !== "boolean") return "is_error 缺席或非布尔（缺席按 problem，不按 false）";
   if (doc.subtype !== null && (typeof doc.subtype !== "string" || doc.subtype.length > 200)) return "subtype 形状不对";
-  if (doc.num_turns !== null && !isSafeInt(doc.num_turns)) return "num_turns 形状不对";
+  if (doc.num_turns !== null && (!isSafeInt(doc.num_turns) || doc.num_turns < 0)) return "num_turns 形状不对（非负安全整数）";
   if (doc.duration_ms !== null && (!isSafeInt(doc.duration_ms) || doc.duration_ms < 0)) return "duration_ms 形状不对";
   if (!strOrNull(doc.claude_code_version, 200)) return "claude_code_version 形状不对";
   if (!strOrNull(doc.model, 200)) return "model 形状不对";
   if (!strOrNull(doc.reason_first_line, 200)) return "reason_first_line 形状不对";
   if (typeof doc.sent !== "boolean") return "sent 非布尔";
-  // sent === true 的充要前提：is_error=false 且 exit_code=0（result 行文本严格 "sent" 由写端公式保证，
-  // 不得从 assistant 文本补造 —— 校验器把可核的三个条件钉死）。
-  if (doc.sent === true && (doc.is_error !== false || doc.exit_code !== 0)) return "sent=true 但 is_error/exit_code 不满足";
+  // R54 返修三 P1-4：不可能组合拒。
+  if (doc.is_error === true && doc.sent !== false) return "is_error=true 时 sent 必须为 false";
+  // sent === true 的充要前提：is_error=false 且 exit_code=0 且 reason_first_line==="sent" 且
+  // final_text_sha256 === sha256("sent")（result 行文本严格 "sent" 由写端公式保证，不从 assistant 补造）。
+  if (doc.sent === true && (doc.is_error !== false || doc.exit_code !== 0 || doc.reason_first_line !== "sent")) return "sent=true 但 is_error/exit_code/reason_first_line 不满足";
+  if (doc.sent === true && doc.final_text_sha256 !== sha256Hex("sent")) return "sent=true 但 final_text_sha256 ≠ sha256(\"sent\")";
+  if (typeof doc.final_text_sha256 !== "string" || !FORWARD_KEY_RE.test(doc.final_text_sha256)) return "final_text_sha256 形状不对";
   if (!isCanonicalIso(doc.finished_at)) return "finished_at 不是规范化 ISO";
   if (Date.parse(doc.finished_at) > now + 60_000) return "finished_at 晚于写入时刻 +60s";
   if (doc.claude_path !== null && typeof doc.claude_path !== "string") return "claude_path 形状不对";
@@ -90,13 +99,16 @@ export function forwardStartedProblem(doc, { now = Date.now(), expectedKey = nul
   if (!isObj(doc)) return "started 文档不是对象";
   if (keysOf(doc) !== STARTED_KEYS) return "started 字段集不对";
   if (doc.schema !== FORWARD_STARTED_SCHEMA) return "schema 不认识: " + String(doc.schema);
-  if (typeof doc.key !== "string" || !doc.key || doc.key.includes("/") || doc.key.includes("\\")) return "key 形状不对";
+  if (typeof doc.key !== "string" || !FORWARD_KEY_RE.test(doc.key)) return "key 形状不对（须 64 位十六进制）";
   if (expectedKey !== null && doc.key !== expectedKey) return "key 与文件名/请求不符（" + doc.key + " ≠ " + expectedKey + "）";
   // R54 返修二 P1-3：pid 必须 ≥1 的安全整数 —— 0/负数会让 kill(0,0) 把整个进程组当活 runner。
   if (!isSafeInt(doc.runner_pid) || doc.runner_pid < 1) return "runner_pid 须 ≥1 的安全整数";
   if (!isSafeInt(doc.claude_pid) || doc.claude_pid < 1) return "claude_pid 须 ≥1 的安全整数";
   if (!isCanonicalIso(doc.started_at)) return "started_at 不是规范化 ISO";
   if (Date.parse(doc.started_at) > now + 60_000) return "started_at 晚于写入时刻 +60s";
+  // R54 返修三 P1-3：runner 自己的启动时刻——doctor 拿它跟 ps 的进程启动时刻核实例身份。
+  if (!isCanonicalIso(doc.runner_start_at)) return "runner_start_at 不是规范化 ISO";
+  if (Date.parse(doc.runner_start_at) > now + 60_000) return "runner_start_at 晚于写入时刻 +60s";
   return null;
 }
 
@@ -156,6 +168,7 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     model: initLine?.model ?? resultLine?.model ?? null,
     reason_first_line,
     sent: !malformed && !is_error && exitCode === 0 && resultText === "sent",
+    final_text_sha256: sha256Hex(resultText), // 源最终文本的 SHA（#141 三轮 P1-4：sent=true 时必须 === sha256("sent")）
     finished_at: new Date(finishedAt).toISOString(),
     claude_path: claudePath,
   };
@@ -186,7 +199,11 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
   const bytes = Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
   if (bytes.length > maxBytes) { noteErr(errPath, "result 超过大小上限（" + bytes.length + "），不落盘"); return; }
   try {
-    try { if (fs.lstatSync(targetPath).isSymbolicLink()) { noteErr(errPath, "目标已是符号链接，不跟随不覆盖：" + targetPath); return; } } catch { /* 不在更好 */ }
+    try {
+      if (fs.lstatSync(targetPath).isSymbolicLink()) { noteErr(errPath, "目标已是符号链接，不跟随不覆盖：" + targetPath); return; }
+    } catch (err) {
+      if (err?.code !== "ENOENT") { noteErr(errPath, "目标 lstat 失败（" + String(err?.code ?? err?.message ?? err) + "），停止写入：" + targetPath); return; } // #141 三轮 P2-5：只有 ENOENT 算缺席
+    }
     const tmp = targetPath + ".tmp." + process.pid;
     let fd = null;
     try {
@@ -294,7 +311,7 @@ function runForwardRunner(spec) {
   child.unref(); // 与旧路径一致（runner 死了 claude 不陪葬）；事件循环由下面的 keepalive 撑住等 close
   writeValidatedDoc(startedPath, errPath, {
     schema: FORWARD_STARTED_SCHEMA, key: spec.key, runner_pid: process.pid,
-    claude_pid: child.pid, started_at: new Date(startedAt).toISOString(),
+    claude_pid: child.pid, started_at: new Date(startedAt).toISOString(), runner_start_at: RUNNER_STARTED_AT,
   }, forwardStartedProblem, 16 * 1024, spec.key);
 
   let done = false;
@@ -316,7 +333,7 @@ if (isDirectRun(import.meta.url)) {
   let spec = null;
   try { spec = JSON.parse(process.argv[2] ?? ""); } catch { /* 下面统一拒 */ }
   const bad = !spec || typeof spec !== "object"
-    || typeof spec.key !== "string" || !spec.key || spec.key.includes("/") || spec.key.includes("\\") || spec.key === ".."
+    || typeof spec.key !== "string" || !FORWARD_KEY_RE.test(spec.key)
     || typeof spec.runsDir !== "string" || typeof spec.projectRoot !== "string"
     || typeof spec.targetName !== "string" || typeof spec.prompt !== "string";
   if (bad) {

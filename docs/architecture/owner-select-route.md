@@ -543,8 +543,8 @@ assert body 匹配正则 ^/feishu-select(?: (osh_[0-9a-f]{32}|orh_[0-9a-f]{32}|r
   候选集合恰一。
 - **折叠与拒绝的边界（PR #136 一轮回带）**：折叠只针对零宽字符、NBSP/全角空格、全角前缀与 ASCII 多空格；**C0 控制字符与换行/制表在折叠前即拒**
   （命令词或参数里出现 → `malformed_control`，绝不落成 ordinary 进模型）。**准入联合以外的任何状态（缺席/未知/非对象）一律投影为 unreadable → 拒**。
-  **执行器未接入期间**（⑦ 先于 ⑤/⑥ 落地）准入通过也**不得落 consumed**——落 `control-failed` 终态 `select_executor_absent`，claim 不被永久消费，
-  真执行器接入后同一 message 的重放可补做；测试注入准入只许依赖注入，**不许读环境变量**（生产不可达）。
+  **执行器未接入期间**（⑦ 先于 ⑤/⑥ 落地）准入通过也**不得落 consumed**——落 `control-failed` 终态 `select_executor_absent`；**该终态与其它 failed 一样是终态：
+  同一 message 的重放只回『之前已失败』，不再调用执行器；要重做必须发一条新消息**（PR #136 二轮裁定，改掉此前『重放可补做』的措辞——不给 failed→consumed 开可恢复转换）；测试注入准入只许依赖注入，**不许读环境变量**（生产不可达）。
 - **消费者穷举**：control 联合每加一种 kind，`inbound`（两链）、`repair-control-claim`（两链）、consumed/failed 记录读写、预览文案
   都必须按 kind 穷举，不得默认按 mode。
 - `request_rebind` 触发：终端 `/feishu-rebind`（走脚本）签发 `orh_` 并回执；`request_reaffirm`：

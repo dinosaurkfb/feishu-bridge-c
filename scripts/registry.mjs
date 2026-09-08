@@ -267,7 +267,7 @@ function ownerShapeOk(owner) {
     && typeof owner.token === "string" && owner.token.length > 0;
 }
 
-function readLockOwner(lockDir) {
+export function readLockOwner(lockDir) {
   let st;
   try { st = fs.lstatSync(lockDir); } catch { return { present: false, owner: null }; }
   if (st.isSymbolicLink()) {

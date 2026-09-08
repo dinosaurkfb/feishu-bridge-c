@@ -18,10 +18,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
+import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { campaignIdFor } from "./maintenance/owner-select-derived.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
@@ -354,6 +355,26 @@ export function familyOf(facts) {
   const tuple = [facts.binding, facts.session, facts.anchor, facts.locator_link_proof, facts.generation];
   for (const [name, row] of Object.entries(FAMILIES)) if (row.every((v, i) => v === tuple[i])) return name.startsWith("A4") ? "A4" : name;
   return null;
+}
+
+/** R51 §三：迁移盘点（纯函数，不验账本级合同）。输入域是 1.1-transition 形状的 doc（A 段语义：
+ *  live 记录已补显式四字段，selection_handle===null 才算 null-B1；1.0 形状字段缺位不在本合同域内）。
+ *  legacy = owner-select-route.md §8"存量范围"：binding_proof.kind=pairing 的 live +
+ *  locator_link_proof_ref.kind=f4_anchor 的 live + tombstone（forwarding_tombstone）proof_ref.kind=pairing（旧系，
+ *  新系是 owner_select_merge_v1）。计数单位是 proof 面，不是记录。*/
+export function migrationInventory(doc) {
+  let legacy = 0;
+  const nullB1 = [];
+  for (const [id, rec] of Object.entries(doc?.records ?? {})) {
+    if (rec.kind === "live") {
+      if (rec.binding_proof?.kind === "pairing") legacy++;
+      if (rec.locator_link_proof_ref?.kind === "f4_anchor") legacy++;
+      if (familyOf(rec.facts) === "B1" && (rec.selection_handle ?? null) === null) nullB1.push(id); // R53：1.0 形状字段缺位也计 null-B1
+    } else if (rec.kind === "forwarding_tombstone") {
+      if (rec.proof_ref?.kind === "pairing") legacy++;
+    }
+  }
+  return { legacy_proof_count: legacy, null_b1_count: nullB1.length, null_b1_ids: nullB1.sort() };
 }
 
 const targetProblem = (t) => {
@@ -1551,7 +1572,7 @@ function fsyncDir(dir) { let fd = null; try { fd = fs.openSync(dir, fs.constants
  * capability 校验通过后被调用。replay:{opType,inputs} 前置：命中即幂等（不写、返回原 result_revision）。
  * 释放失败折进四态结果（评审 P1-5），不在 finally 静默吞。
  */
-function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null, mutate, staleMs = LOCK_STALE_MS, allowAbsent = false, _inject = null }) {
+function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null, mutate, staleMs = LOCK_STALE_MS, allowAbsent = false, _inject = null, _fence = null }) {
   const inj = _inject ?? {};
   const { lock: lockDir, prev: prevPath, ledger: ledgerPath } = ledgerPaths(dir);
   const acq = gated ? acquirePublishLock : acquireLockUngated;
@@ -1607,7 +1628,7 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     }
     const nextV = validateLedger(m.next, { endpointId });
     if (!nextV.ok) return finalize({ ok: false, commit: "not_committed", reason: "would_corrupt", why: nextV.why });
-    const nextBytes = Buffer.from(JSON.stringify(m.next, null, 2) + "\n", "utf-8");
+    const nextBytes = serializeLedger(m.next);
     if (nextBytes.length > MAX_FILE_BYTES) return finalize({ ok: false, commit: "not_committed", reason: "over_capacity" });
 
     // 首次提交也要返回**刚落盘 operation 的 result**（评审三 P1-4）：取本笔（result_revision === 新 revision）。
@@ -1619,12 +1640,22 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     if (oldBytes !== null) { const pt = writeTmpBytes(dir, "ledger.json.prev", oldBytes); if (pt.tmp) ptTmp = pt.tmp; if (!pt.ok) return finalize({ ok: false, commit: "not_committed", reason: "tmp_unwritable", why: "prevTmp：" + pt.why, residue: outerResidue() }); }
 
     if (inj.afterTmp) inj.afterTmp();
-    let renameErr = null;
+    let renameErr = null, fenceFail = null;
     const fenced = commitWhileHeld(lockDir, () => {
-      if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
+      // 注入钩子在栅栏**之前**（返修一原语义：「rename 前、注入钩子之后最后时刻」）——
+      // 钩子处的 journal 改动必须被栅栏看见（R51 返修二补：投影刀的测试就靠这个次序）。
       if (inj.beforeLedgerRename) inj.beforeLedgerRename();
+      // R51 返修二 P1-1：栅栏在两次 rename **之前**——漂移时连 .prev 都不许被覆盖。
+      // （旧序先 rename .prev 再栅栏：主账本不变但 .prev 已被这次失败提交覆盖，持久变更不报告。）
+      if (_fence !== null) {
+        const f = typeof _fence === "function" ? _fence() : _fence;
+        if (f) { fenceFail = f; return; }
+      }
+      if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
       try { fs.renameSync(ltTmp, ledgerPath); ltTmp = null; } catch (err) { renameErr = err; }
     });
+    // R51 返修一：栅栏失败要有专名（不伪装成 renameErr/commit_failed）——why 带出失败分支名，reason 精确 fence_failed。
+    if (fenceFail !== null) return finalize({ ok: false, commit: "not_committed", reason: "fence_failed", why: "fence:" + fenceFail, residue: outerResidue() });
     // 提交阶段取锁异常投影（评审六 P2）：lock_lost 单列；reap_residue/reap_busy/io_error 保留原 reason 与 path/error，
     // 不折成瞬时 ledger_busy（持久残骸不能伪装成"稍后重试即可"）。
     if (!fenced.ok) return finalize({ ok: false, commit: "not_committed", reason: fenced.reason === "lock_lost" ? "lock_lost" : (fenced.reason ?? "ledger_busy"), why: fenced.why ?? fenced.reason ?? null, path: fenced.path ?? null, residue: outerResidue() });
@@ -1677,6 +1708,39 @@ export function fingerprintOf(opType, inputs) {
   return sha256(Buffer.from(JSON.stringify(stable({ op_type: opType, ...inputs })), "utf-8"));
 }
 
+/** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
+export const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
+
+/** 32 hex → UUID 形（OP_ID_SHAPE）：8-4-4-4-12，第 13 位 version 4、第 17 位 variant 8。 */
+const uuidFromHex = (hex) => hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-4" + hex.slice(13, 16) + "-8" + hex.slice(17, 20) + "-" + hex.slice(20, 32);
+/** R52 §一：schema_upgrade 的确定性 op key（owner-select-route.md §8.2"schema_upgrade 确定性"）——
+ *  随机 op id 会让 journal schema_endpoint step 的 intended_after.ledger_sha256 无法预先锚定；
+ *  确定性派生（token = capability.token 作盐）让编排可预算 intended_after、执行器与预算逐字可对。 */
+export function ownerSelectSchemaUpgradeOpId(token, endpoint) {
+  return uuidFromHex(sha256(Buffer.from(canonKey({ domain: "owner_select_schema_upgrade_v1", token, endpoint }), "utf-8")));
+}
+
+/** R52 §一：schema_upgrade 的纯应用函数（与执行器 mutate 同一函数，别另写）——
+ *  revision+1、schema 翻转、op 盖章（key = 调用方给的确定性 operation_id）、transition 同笔给全部
+ *  live 记录补四字段显式 null（已有值不动、非 live 不动、**不改任何记录 updated_at**）；strict 不补。 */
+export function applySchemaUpgrade(doc, { operation_id, request_key, from_schema, to_schema }) {
+  const inputs = { request_key, endpoint: doc.endpoint_id, from_schema, to_schema };
+  const next = structuredClone(doc);
+  next.revision = doc.revision + 1;
+  next.schema_version = to_schema;
+  next.operations[operation_id] = {
+    op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key,
+    fingerprint: fingerprintOf("schema_upgrade", inputs), result_revision: next.revision,
+    result: { endpoint: doc.endpoint_id, from_schema, to_schema },
+  };
+  if (from_schema !== "1.0") return next; // strict（1.1-transition→1.1）：四字段已存在，已有值不动；direct（1.0→1.1）直升同样补——R53 P1-3 cherry-pick
+  for (const rec of Object.values(next.records)) {
+    if (rec.kind !== "live") continue;
+    for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null;
+  }
+  return next;
+}
+
 /** 克隆、bump revision、盖一笔不可覆盖 operation（result 过 RESULT_SHAPE），再 mutateRecords。返回 next。 */
 function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
   const next = structuredClone(doc);
@@ -1697,12 +1761,18 @@ function stampAndBuild(doc, { opType, inputs, result, mutateRecords }) {
 // **不导出可接受任意 mutate 的通用 ungated writer**。
 
 /** 维护 capability 核验：读实文件（active / journal / gate / lease + ledger step）逐项独立核对，任一不过 → 结构化拒。 */
+// R51：owner_select 迁移三新种的 journal kind/phase/step 映射（owner-select-route.md §8.2；不 import owner-select-state.mjs ——
+// 那边 import 本模块，会成循环依赖，故本地常量与它各住一份、由测试钉死两处相等）。
+const OSM_KINDS = Object.freeze(["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"]);
+const OSM_KIND_TO_PHASE = Object.freeze({ owner_select_migration_a: "osm_a_upgrading", owner_select_migration_b: "osm_b_strictening", owner_select_migration_direct: "osm_direct" });
+const OSM_KIND_TO_UPGRADE_EDGE = Object.freeze({ owner_select_migration_a: "1.0->1.1-transition", owner_select_migration_b: "1.1-transition->1.1", owner_select_migration_direct: "1.0->1.1" });
 function _maintenanceVerifier(capability, endpointId, opType, env = process.env) {
   const fail = (reason, why) => ({ ok: false, reason, why });
   if (!capability || typeof capability !== "object") return fail("bad_capability", "capability 缺失");
-  const wantKind = opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
-  const wantPhase = opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
-  const wantSub = opType === "initialize_shadow" ? "init" : "cutover";
+  const isOsm = opType === "schema_upgrade" || opType === "mint_selection_handles";
+  const wantKind = isOsm ? null : opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
+  const wantPhase = isOsm ? null : opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
+  const wantSub = isOsm ? null : opType === "initialize_shadow" ? "init" : "cutover";
   const { token } = capability;
   // 维护目录 / 门位置一律从环境派生（评审 F1）：capability 只带 token/kind/endpointId，不信任其自述路径
   const maintDir = maintenanceDir(env);
@@ -1716,7 +1786,52 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   if (active.token !== token) return fail("operation_token_mismatch", "active 指向的 token 与 capability 不一致");
   const j = readJournal({ dir: maintDir, token });
   if (j.state !== "valid") return fail("journal_unreadable", "journal " + j.state + (j.why ? "：" + j.why : ""));
-  if (j.doc.schema_version !== JOURNAL_SCHEMA) return fail("journal_schema", "journal 不是 " + JOURNAL_SCHEMA);
+  if (j.doc.schema_version !== (isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : JOURNAL_SCHEMA)) return fail("journal_schema", "journal 不是 " + (isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : JOURNAL_SCHEMA));
+  // 门 + 租约共用核（init/cutover 与 owner_select 迁移同一段；原地提取不改顺序与语义）。
+  const gateLeaseProblem = () => {
+    const gate = readGate({ file: gateFile, now: Date.now() });
+    if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
+    if (gate.payload?.token !== token) return fail("gate_token_mismatch", "门 token 与 operation 不一致");
+    const holder = leaseHolder({ dir: maintDir, token });
+    if (!holder.present) return fail("lease_absent", "operation 租约不存在");
+    if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
+    if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
+    if (holder.at !== null && !isCanonicalIso(holder.at)) return fail("lease_payload_bad", "租约 owner.at 不是规范化 ISO");
+    return null;
+  };
+  if (isOsm) {
+    // R51 §一：owner_select 迁移的 capability —— kind/phase/step 与账本两态核验（§8.2）。
+    const gl = gateLeaseProblem();
+    if (gl !== null) return gl;
+    const k = j.doc.operation_kind;
+    if (!OSM_KINDS.includes(k)) return fail("operation_kind_mismatch", "operation_kind " + k + " 不属于 owner_select 三新种");
+    if (opType === "mint_selection_handles" && k !== "owner_select_migration_a") return fail("operation_kind_mismatch", "mint_selection_handles 仅 owner_select_migration_a（当前 " + k + "）");
+    const wantOsmPhase = OSM_KIND_TO_PHASE[k];
+    if (j.doc.phase !== wantOsmPhase) return fail("phase_mismatch", "阶段 " + j.doc.phase + " ≠ " + wantOsmPhase);
+    const stepKind = opType === "schema_upgrade" ? "schema_endpoint" : "mint";
+    const variant = k === "owner_select_migration_a" ? "transition" : k === "owner_select_migration_b" ? "strict" : "direct";
+    const wantStepId = opType === "schema_upgrade" ? "schema_endpoint:" + endpointId + ":" + variant : "mint:" + endpointId;
+    const st = j.doc.steps.find((s) => s.kind === stepKind && s.id === wantStepId);
+    if (!st) return fail("step_absent", "journal 无 " + wantStepId + " step");
+    if (st.state !== "prepared") return fail("step_not_prepared", stepKind + " step 状态 " + st.state);
+    if (st.target !== "ledger/" + endpointId + "/ledger.json") return fail("step_target_mismatch", stepKind + " step target 派生不符：" + st.target);
+    // 租约 fencing 内读账本现场：step 必须锚定账本两态之一——before 态（执行路径）或 after 态（崩溃窗口：
+    // 账本已提交、step 未 markStepDone —— 这是重放/already 支的可达前提，§8.2 mint 行“真正两态”的
+    // capability 投影；单一 before 核会让那两支不可达）。
+    const binding = commitWhileHeld(leasePath(maintDir, token), () => {
+      const ld = resolveEndpointDir(endpointId, { env });
+      if (!ld.ok) return ld;
+      const L = loadLedger(ld.dir, { endpointId });
+      if (!L.ok) return { ok: false, reason: L.reason, why: L.why ?? null };
+      const atBefore = st.before.ledger_sha256 === L.sha256 && (opType !== "schema_upgrade" || st.before.schema_version === L.doc.schema_version);
+      const atAfter = st.intended_after.ledger_sha256 === L.sha256 && (opType !== "schema_upgrade" || st.intended_after.schema_version === L.doc.schema_version);
+      if (!atBefore && !atAfter) return { ok: false, reason: "ledger_state_mismatch", why: "账本不处于该 step 的 before/after 两态（SHA 或 schema_version 不符）" };
+      return { ok: true, ledger: { dir: ld.dir, doc: L.doc, sha256: L.sha256 } };
+    });
+    if (!binding.ok || !binding.run) return fail("lease_lost", "本过程不再持有 operation 租约实例（commitWhileHeld：" + (binding?.reason ?? "lock_lost") + "）");
+    if (!binding.run.ok) return fail(binding.run.reason, binding.run.why ?? null);
+    return { ok: true, maintenanceDir: maintDir, doc: j.doc, osmStep: st, ledger: binding.run.ledger };
+  }
   if (j.doc.operation_kind !== wantKind) return fail("operation_kind_mismatch", "operation_kind " + j.doc.operation_kind + " ≠ " + wantKind);
   if (j.doc.phase !== wantPhase) return fail("phase_mismatch", "阶段 " + j.doc.phase + " ≠ " + wantPhase);
   // ledger step 已在且 prepared、target 与 endpoint 一致（WAL 已落）
@@ -1726,16 +1841,9 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   const m = /^ledger:(endpoint_[0-9a-f]{24}):(init|cutover)$/u.exec(ls.id);
   if (!m || m[2] !== wantSub || m[1] !== endpointId) return fail("ledger_step_identity", "ledger step 身份与 endpoint/kind 不符");
   if (!CHAIN.includes(ls.chain)) return fail("ledger_chain_bad", "ledger step 缺 chain 或非法");
-  // 门在且 token 与 journal 的 gate step intended_after 一致
-  const gate = readGate({ file: gateFile, now: Date.now() });
-  if (gate.state !== "active") return fail("gate_not_active", "门 " + gate.state + (gate.why ? "：" + gate.why : ""));
-  if (gate.payload?.token !== token) return fail("gate_token_mismatch", "门 token 与 operation 不一致");
-  // 租约存在且属于该 operation（leasePath(dir, token) 即 operation 专属）
-  const holder = leaseHolder({ dir: maintDir, token });
-  if (!holder.present) return fail("lease_absent", "operation 租约不存在");
-  if (holder.unreadable) return fail("lease_unreadable", "租约读不出：" + holder.why);
-  if (!holder.alive) return fail("lease_dead", "租约持有者 pid " + holder.pid + " 已不在");
-  if (holder.at !== null && !isCanonicalIso(holder.at)) return fail("lease_payload_bad", "租约 owner.at 不是规范化 ISO");
+  // 门在且 token 与 journal 的 gate step intended_after 一致；租约存在且属于该 operation（leasePath(dir, token) 即 operation 专属）
+  const gl = gateLeaseProblem();
+  if (gl !== null) return gl;
   // 评审 P1-3：capability 必须证明**当前进程确实持有**该 operation 租约实例（commitWhileHeld 的 token fencing），
   // 且 plan 必须由 journal 里已落盘的 ledger step 重建，不得接受调用方任意 planIn。重建后逐字段绑定 before/intended_after。
   const lpath = leasePath(maintDir, token);
@@ -1903,6 +2011,26 @@ const badTx = (d) => ({ ok: false, commit: "not_committed", reason: d.reason, wh
  *  否则 ledger-operation 的 commit_residue 分支 sees null，releaseRows 点不出账本主锁路径。 */
 const wrNote = (res) => ({ lockUncleared: res?.lockUncleared ?? null, residue: res?.residue ?? null });
 
+/** R51 返修二 P1-3：外层 operation lease 的 reapUncleared（<token>.lease.reap 交不还）不许丢——
+ *  段内已提交就保留 committed_*，但 commit 折成 committed_with_residue（编排不得据此记 done），
+ *  残骸投 residue/lockUncleared（带路径）。内层已有的投影优先，不覆盖。 */
+function foldLeaseResidue(res0, out) {
+  const r = res0?.reapUncleared;
+  if (!r) return out;
+  const p = String(r.path ?? "reap");
+  const residue = [...(Array.isArray(out.residue) ? out.residue : out.residue ? [String(out.residue)] : []), p];
+  return {
+    ...out,
+    // R51 返修三：replayed / already 带 lease 残骸时同样折成 committed_with_residue（编排不得据此记 done）；
+    // committed_durability_uncertain 语义更强，保留不动。
+    commit: out.commit === "committed_clean" || out.commit === "replayed" || out.commit === "already"
+      ? "committed_with_residue" : out.commit,
+    residue,
+    lockUncleared: out.lockUncleared ?? { reason: "reap_residue_uncleared", why: String(r.error ?? ""), path: p },
+    lock_state: out.lock_state ?? "unclear",
+  };
+}
+
 /** 普通（gated）事务的公共外壳：派生受验目录 → writeLedger(gated)。 */
 function gatedTx({ endpointId, requestKey, env, replay, _inject, mutate }) {
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
@@ -2007,6 +2135,269 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   if (reread.status !== "read" || reread.sha256 !== plan.sha256) return { ok: false, commit: res.commit, reason: "written_mismatch", why: "落盘 SHA 与蓝图不符", ...wrNote(res) };
   // P2-2（第 5 轮）：同上用统一投影，cutover 的 commit_residue 分支也能点名账本主锁。
   return { ok: true, commit: res.commit, revision: plan.intendedAfter.revision, result: res.result, sha256: plan.sha256, plan, ...wrNote(res) };
+}
+
+/* ─────────────────────────── owner_select 迁移执行器（R51） ─────────────────────────── */
+
+/** R51 §四：mint plan（纯函数三件套，owner-select-route.md §8"mint plan"段 + §8.2 mint 行）。
+ *  handle 128-bit CSPRNG 只在进 forward-only 段之前生成一次并固化进不可变 plan；operation_id 冻结进
+ *  plan（否则 expected_ledger_sha256 无法确定性重放）；before/expected SHA 均用 serializeLedger
+ *  同一序列化（与 writeLedger 落盘字节完全一致）。输入域：1.1-transition 形状的 doc。 */
+
+/** §三盘点 + §四铸造目标：null-B1 有序 id 集（buildMintPlan 与 mintSelectionHandles 的 CAS 集合同源）。 */
+
+/** 构造 mint plan（不落盘；plan 字节的持久化与 intended_blob 锚定在 R52 编排）。非法 now → null。 */
+/** 迁移期 selection_handle 有效期：唯一常量（owner-select-route.md §4 P2-2 拍定），编排与校验共用。 */
+export const OWNER_SELECT_HANDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, now, ttlMs }) {
+  const frozen = isCanonicalMs(now) ? canonicalIso(now) : null;
+  if (frozen === null || (ttlMs !== undefined && ttlMs !== OWNER_SELECT_HANDLE_TTL_MS)) return null;
+  const expires = canonicalIso(now + OWNER_SELECT_HANDLE_TTL_MS);
+  if (expires === null) return null;
+  const expectedNullB1Ids = migrationInventory(doc).null_b1_ids;
+  const minted = expectedNullB1Ids.map((targetId) => ({ target_id: targetId, selection_handle: "osh_" + crypto.randomBytes(16).toString("hex") }));
+  const operationId = crypto.randomUUID();
+  const plan = {
+    plan_kind: "owner_select_mint_plan_v1",
+    token, campaign_id: campaignId, endpoint: endpointId, request_key: requestKey,
+    operation_id: operationId, frozen_at: frozen, handle_expires_at: expires,
+    before_ledger_sha256: sha256(serializeLedger(doc)),
+    expected_null_b1_ids: expectedNullB1Ids, minted,
+    expected_ledger_sha256: null,
+  };
+  // R51 返修一补：applyMintPlan 产物必须过整账本校验，不过则不出 plan（不得落 staging）。
+  const next = applyMintPlan(doc, plan);
+  if (!validateLedger(next, { endpointId }).ok) return null;
+  plan.expected_ledger_sha256 = sha256(serializeLedger(next));
+  // R51 返修二 P2-6：builder 合同自洽——设完预算后成品自己过封闭校验器，不过不出 plan。
+  if (mintPlanProblem(plan) !== null) return null;
+  return plan;
+}
+
+/** 把 plan 应用到 before doc（纯函数，不落盘）：revision+1；op key = plan.operation_id；
+ *  每 target 记录写 handle/expiry/updated_at 且 origin 指向本 op（affected/origin 与 R32 因果合同）。 */
+export function applyMintPlan(doc, plan) {
+  const next = structuredClone(doc);
+  next.revision = doc.revision + 1;
+  const inputs = { request_key: plan.request_key, endpoint: plan.endpoint, expected_null_b1_ids: plan.expected_null_b1_ids };
+  next.operations[plan.operation_id] = {
+    op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles",
+    request_key: plan.request_key, fingerprint: fingerprintOf("mint_selection_handles", inputs),
+    result_revision: next.revision,
+    result: {
+      endpoint: plan.endpoint,
+      minted: plan.minted.map((m) => ({ target_id: m.target_id, selection_handle: m.selection_handle, handle_expires_at: plan.handle_expires_at })),
+      affected_live_ids_after_commit: plan.minted.map((m) => m.target_id),
+      proof_effects: [],
+    },
+  };
+  for (const m of plan.minted) {
+    const rec = next.records[m.target_id];
+    rec.selection_handle = m.selection_handle;
+    rec.handle_expires_at = plan.handle_expires_at;
+    rec.updated_at = plan.frozen_at;
+    rec.origin_operation_id = plan.operation_id;
+  }
+  return next;
+}
+
+/** mint plan 封闭形校验：键集、排序、handle 形、集合等式、时间规范、SHA 形。返回 null 或问题短句。 */
+export function mintPlanProblem(plan) {
+  if (!isObj(plan)) return "plan 不是对象";
+  if (keysOf(plan) !== "before_ledger_sha256,campaign_id,endpoint,expected_ledger_sha256,expected_null_b1_ids,frozen_at,handle_expires_at,minted,operation_id,plan_kind,request_key,token") return "plan 字段集不对";
+  if (plan.plan_kind !== "owner_select_mint_plan_v1") return "plan_kind 不对";
+  if (typeof plan.token !== "string" || !UUID_SHAPE.test(plan.token)) return "token 不是 UUID";
+  if (typeof plan.campaign_id !== "string" || !/^osc_[0-9a-f]{32}$/u.test(plan.campaign_id)) return "campaign_id 形状不对";
+  if (plan.campaign_id !== campaignIdFor(plan.token)) return "campaign_id 与 token 不匹配";
+  if (typeof plan.endpoint !== "string" || !ENDPOINT_SHAPE.test(plan.endpoint)) return "endpoint 形状不对";
+  if (typeof plan.request_key !== "string" || !REQUEST_KEY_SHAPE.test(plan.request_key)) return "request_key 形状不对";
+  if (typeof plan.operation_id !== "string" || !UUID_SHAPE.test(plan.operation_id)) return "operation_id 不是 UUID";
+  if (!isCanonicalIso(plan.frozen_at) || !isCanonicalIso(plan.handle_expires_at)) return "时间不是规范化 ISO";
+  if (Date.parse(plan.handle_expires_at) !== Date.parse(plan.frozen_at) + OWNER_SELECT_HANDLE_TTL_MS) return "handle_expires_at ≠ frozen_at + TTL";
+  if (!Array.isArray(plan.minted)) return "minted 不是数组";
+  const handleSet = new Set(plan.minted.map((m) => m.selection_handle));
+  if (handleSet.size !== plan.minted.length) return "minted 的 selection_handle 重复";
+  if (typeof plan.before_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.before_ledger_sha256)) return "before_ledger_sha256 形状不对";
+  if (typeof plan.expected_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.expected_ledger_sha256)) return "expected_ledger_sha256 形状不对";
+  if (!Array.isArray(plan.expected_null_b1_ids) || !plan.expected_null_b1_ids.every((x) => isId(x)) || plan.expected_null_b1_ids.some((x, i) => i > 0 && plan.expected_null_b1_ids[i - 1] >= x)) return "expected_null_b1_ids 不是有序去重 id 集";
+  if (!Array.isArray(plan.minted)) return "minted 不是数组";
+  if (plan.minted.length !== plan.expected_null_b1_ids.length) return "minted 长度与 expected_null_b1_ids 不等";
+  for (let i = 0; i < plan.minted.length; i++) {
+    const m = plan.minted[i];
+    if (!isObj(m) || keysOf(m) !== "selection_handle,target_id") return "minted 项字段集不对";
+    if (!isId(m.target_id)) return "minted 项 target_id 形状不对";
+    if (typeof m.selection_handle !== "string" || !SELECTION_HANDLE_SHAPE.test(m.selection_handle)) return "minted 项 handle 形状不对";
+    if (m.target_id !== plan.expected_null_b1_ids[i]) return "minted 未按 target_id 排序（应与 expected_null_b1_ids 逐位相等）";
+  }
+  return null;
+}
+
+/** R51 §二：schema_upgrade 窄事务（owner-select-route.md §6/§8）。
+ *  前置：fromSchema->toSchema ∈ VALID_UPGRADE_EDGES 且与 capability step 变体一致；strict/direct 当场重新盘点
+ *  （legacy 与 null-B1 全零才放行，不信任调用方盘点）。效果：schema_version 翻转 + 同笔给全部 live 记录补
+ *  四字段显式 null（已有值不动，tombstone/voided 不动）；重放纪律与既有一致（同 key 同 fp → replayed，
+ *  同 key 异 fp → request_conflict）。 */
+export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, toSchema, env = process.env, _inject = null } = {}) {
+  if (!capability || capability.kind !== "schema_upgrade") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
+  const cap = _maintenanceVerifier(capability, endpointId, "schema_upgrade", env);
+  if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
+  const edge = String(fromSchema) + "->" + String(toSchema);
+  if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
+  // R51 返修二 P1-4：request_key 公式在执行器边界强制（确定性派生，编排与执行器同源可预算）。
+  if (requestKey !== capability.token + ":schema:" + endpointId) return { ok: false, commit: "not_committed", reason: "request_key_mismatch", why: "schema 的 request_key 必须 === token + ':schema:' + endpoint" };
+  if (!VALID_UPGRADE_EDGES.includes(edge)) return { ok: false, commit: "not_committed", reason: "bad_upgrade_edge", why: edge };
+  const stepVariant = cap.osmStep.id.slice("schema_endpoint:".length).split(":")[1];
+  if (OSM_KIND_TO_UPGRADE_EDGE[cap.doc.operation_kind] !== edge || !"transition|strict|direct".split("|").includes(stepVariant)) {
+    return { ok: false, commit: "not_committed", reason: "edge_variant_mismatch", why: "capability step 变体 " + stepVariant + " 与边 " + edge + " 不一致" };
+  }
+  const d = resolveEndpointDir(endpointId, { env });
+  if (!d.ok) return badTx(d);
+  const inputs = { request_key: requestKey, endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema };
+  let builtSha = null; // 写前算好的预期 SHA（serializeLedger 同源），读回核锚它
+  const maintDir0 = cap.maintenanceDir, opToken = capability.token;
+  // P1-1：compare → build → 账本锁 → rename 全程包进同一次真实 lease 实例的 commitWhileHeld 栅栏；
+  //   提交点（rename 前）复核 active/gate/journal/step/lease，任一漂移 → rename 不执行。
+  const leasePath0 = leasePath(maintDir0, opToken);
+  // R51 返修一补：verifier 读账本通过后、writeLedger 重读前留一个测试注入点（生产不传）——
+  // 让测试在“verifier 读”与“writeLedger 读”之间确定性改账本，从而命中 mutate 的 before_mismatch。
+  if (typeof _inject?.afterVerify === "function") _inject.afterVerify();
+  let res0Out = null;
+  const res0 = commitWhileHeld(leasePath0, () => {
+    res0Out = writeLedger({
+      dir: d.dir, endpointId, gated: false, requestKey, _inject,
+      replay: () => [{ opType: "schema_upgrade", inputs }],
+      mutate: (currentDoc) => {
+      if (currentDoc === null) return { ok: false, reason: "absent" };
+      // strict/direct 当场重新盘点（§8：Codex 不以现场盘点作放行依据，实现单门内当场重盘）；transition 不盘（precheck 仅 B/direct）。
+      if (toSchema === "1.1") {
+        const inv = migrationInventory(currentDoc);
+        if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: "legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count };
+      }
+      // P1-2：锁内核当前 SHA === step.before.ledger_sha256（执行器与 journal 锚同源，不认自己构造的预算）
+      const curSha0 = sha256(serializeLedger(currentDoc));
+      if (curSha0 !== cap.osmStep.before.ledger_sha256) {
+        if (curSha0 === cap.osmStep.intended_after.ledger_sha256) return { ok: false, reason: "already", why: "账本已处于 step.intended_after" };
+        return { ok: false, reason: "before_mismatch", why: "锁内 current SHA ≠ step.before.ledger_sha256（" + curSha0.slice(0, 12) + " ≠ " + cap.osmStep.before.ledger_sha256.slice(0, 12) + "）" };
+      }
+      if (currentDoc.schema_version !== fromSchema) return { ok: false, reason: "schema_moved", why: "账本 schema_version " + currentDoc.schema_version + " ≠ fromSchema " + fromSchema };
+      // R52 §一：op key 确定性（token=capability.token 作盐）→ 编排可预算 intended_after；mutate 与 applySchemaUpgrade 同一函数。
+      const next = applySchemaUpgrade(currentDoc, {
+        operation_id: ownerSelectSchemaUpgradeOpId(capability.token, endpointId), request_key: requestKey, from_schema: fromSchema, to_schema: toSchema,
+      });
+      builtSha = sha256(serializeLedger(next));
+      // R51 返修二 P1-2：提交前核预算（写 tmp / rename 之前）——真实预算 ≠ step.intended_after 就不落盘。
+      if (builtSha !== cap.osmStep.intended_after.ledger_sha256) return { ok: false, reason: "intended_mismatch", why: "真实预算 ≠ step.intended_after.ledger_sha256（" + builtSha.slice(0, 12) + " ≠ " + cap.osmStep.intended_after.ledger_sha256.slice(0, 12) + "）" };
+      return { ok: true, next };
+    },
+      _fence: () => {
+        const act = readActive({ dir: maintDir0 });
+        if (act.state !== "active" || act.token !== opToken) return "active 漂移";
+        const g = readGate({ file: maintenanceGatePath(env), now: Date.now() });
+        if (g.state !== "active" || g.payload?.token !== opToken) return "门漂移";
+        const j2 = readJournal({ dir: maintDir0, token: opToken });
+        if (j2.state !== "valid" || j2.doc.phase !== cap.doc.phase) return "journal 漂移";
+        const st2 = j2.doc.steps.find((s) => s.kind === "schema_endpoint" && s.id === cap.osmStep.id);
+        if (!st2 || st2.state !== "prepared") return "step 漂移";
+        // R51 返修二 建议5：不只核 id + state——完整规范投影比较（before/intended_after 被换掉也拒）。
+        if (canonKey(st2) !== canonKey(cap.osmStep)) return "step 投影漂移";
+        const lk = readLockOwner(leasePath0);
+        if (!lk.present || !lk.owner || lk.owner.pid !== process.pid) return "lease 已非本进程";
+        return null;
+      },
+    });
+  });
+  const res = res0Out;
+  // fence 失败已由 writeLedger 以专名 fence_failed 报出（res0.fenceFail 是死分支：commitWhileHeld 从不返回它）。
+  // R51 返修二 P1-3：以下每个出口都折外层 operation lease 的 reapUncleared（不丢残骸、commit 非 clean）。
+  if (!res0.ok) return foldLeaseResidue(res0, { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" });
+  if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return foldLeaseResidue(res0, { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) });
+  if (res.idempotent) return foldLeaseResidue(res0, { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) });
+  const reread = loadLedger(d.dir, { endpointId });
+  if (!reread.ok || reread.sha256 !== builtSha || reread.sha256 !== cap.osmStep.intended_after.ledger_sha256 || reread.doc.schema_version !== toSchema) {
+    return foldLeaseResidue(res0, { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ step.intended_after.ledger_sha256（" + String(reread.sha256 ?? "?").slice(0, 12) + " ≠ " + cap.osmStep.intended_after.ledger_sha256.slice(0, 12) + "）", ...wrNote(res) });
+  }
+  return foldLeaseResidue(res0, { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) });
+}
+
+/** R51 §五：mint_selection_handles 窄事务（§8.2 mint 行两态 CAS）。三态：账本 === plan.before_sha →
+ *  再核集合等式（CAS，不信任 plan 自述）与 schema === 1.1-transition 后按 plan 重放；账本 ===
+ *  plan.expected_sha → already（崩溃窗口补 done）；两态皆非 → diverged。读回 SHA 必 === expected，
+ *  否则 written_mismatch（fail-closed，不重试不修）。capability 两态核之外的重放/already 支因此可达。 */
+export function mintSelectionHandles({ endpointId, capability, plan, env = process.env, _inject = null } = {}) {
+  if (!capability || capability.kind !== "mint_selection_handles") return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "kind 不符或缺失" };
+  const cap = _maintenanceVerifier(capability, endpointId, "mint_selection_handles", env);
+  if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
+  if (!isObj(plan) || mintPlanProblem(plan) !== null) return { ok: false, commit: "not_committed", reason: "bad_plan", why: "plan 缺失或封闭形不过" };
+  // plan 与 capability 对应值逐字绑定（§8.2：before_ledger_sha256 必 === mint step 的 before.ledger_sha256，
+  // expected_ledger_sha256 必 === intended_after.ledger_sha256 —— 两态核与三态判据同源）。
+  const st = cap.osmStep;
+  if (plan.token !== capability.token || plan.endpoint !== endpointId || plan.request_key !== capability.token) {
+    return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 的 token/endpoint/request_key 与 capability 不一致" };
+  }
+  if (plan.before_ledger_sha256 !== st.before.ledger_sha256 || plan.expected_ledger_sha256 !== st.intended_after.ledger_sha256) {
+    return { ok: false, commit: "not_committed", reason: "plan_mismatch", why: "plan 的 before/expected SHA 与 mint step 锚不一致" };
+  }
+  const d = resolveEndpointDir(endpointId, { env });
+  if (!d.ok) return badTx(d);
+  // R51 返修一补：verifier 读账本通过后、writeLedger 重读前留一个测试注入点（生产不传）——
+  // 让测试在“verifier 读”与“writeLedger 读”之间确定性改账本，从而命中 mutate 的 ledger_diverged。
+  if (typeof _inject?.afterVerify === "function") _inject.afterVerify();
+  let res0Out = null;
+  const res0 = commitWhileHeld(leasePath(cap.maintenanceDir, capability.token), () => {
+    res0Out = writeLedger({
+    dir: d.dir, endpointId, gated: false, requestKey: plan.request_key, _inject,
+    replay: () => [{ opType: "mint_selection_handles", inputs: { request_key: plan.request_key, endpoint: plan.endpoint, expected_null_b1_ids: plan.expected_null_b1_ids } }],
+    mutate: (currentDoc) => {
+      if (currentDoc === null) return { ok: false, reason: "absent" };
+      const curSha = sha256(serializeLedger(currentDoc));
+      if (curSha === plan.before_ledger_sha256) {
+        // 十四轮 P1：compare = 集合相等（出现额外 null-B1 也整笔拒，避免漏铸）；不信任 plan 自述的盘点。
+        const inv = migrationInventory(currentDoc);
+        if (canonKey(inv.null_b1_ids) !== canonKey(plan.expected_null_b1_ids)) return { ok: false, reason: "null_b1_set_mismatch", why: "账本 null-B1 集 ≠ plan.expected_null_b1_ids（" + inv.null_b1_ids.length + " vs " + plan.expected_null_b1_ids.length + "）" };
+        if (currentDoc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: "账本 schema_version " + currentDoc.schema_version };
+        const next = applyMintPlan(currentDoc, plan);
+        // R51 返修二 P1-2：提交前核预算——真实重放 SHA 必须 === plan.expected_ledger_sha256
+        //（=== intended_after 已在入口 plan_mismatch 核过；不等就不落盘，主账本与 .prev 均不变）。
+        const builtMintSha = sha256(serializeLedger(next));
+        if (builtMintSha !== plan.expected_ledger_sha256) return { ok: false, reason: "intended_mismatch", why: "真实预算 ≠ plan.expected_ledger_sha256（" + builtMintSha.slice(0, 12) + " ≠ " + plan.expected_ledger_sha256.slice(0, 12) + "）" };
+        return { ok: true, next };
+      }
+      // 崩溃窗口：账本已推进到 intended（同 operation 的 schema_upgrade 并发写的竞态也在此折入 diverged）。
+      if (curSha === plan.expected_ledger_sha256) return { ok: false, reason: "already", why: "账本已处于 plan.expected 态" };
+      return { ok: false, reason: "ledger_diverged", why: "账本既非 plan.before 也非 plan.expected 态" };
+    },
+      _fence: () => {
+        const act = readActive({ dir: cap.maintenanceDir });
+        if (act.state !== "active" || act.token !== capability.token) return "active 漂移";
+        const g = readGate({ file: maintenanceGatePath(env), now: Date.now() });
+        if (g.state !== "active" || g.payload?.token !== capability.token) return "门漂移";
+        const j2 = readJournal({ dir: cap.maintenanceDir, token: capability.token });
+        if (j2.state !== "valid" || j2.doc.phase !== cap.doc.phase) return "journal 漂移";
+        const st2 = j2.doc.steps.find((s) => s.kind === "mint" && s.id === cap.osmStep.id);
+        if (!st2 || st2.state !== "prepared") return "step 漂移";
+        // R51 返修二 建议5：完整规范投影比较（before/intended_after 被换掉也拒）。
+        if (canonKey(st2) !== canonKey(cap.osmStep)) return "step 投影漂移";
+        const lk = readLockOwner(leasePath(cap.maintenanceDir, capability.token));
+        if (!lk.present || !lk.owner || lk.owner.pid !== process.pid) return "lease 已非本进程";
+        return null;
+      },
+    });
+    });
+    const res = res0Out;
+    // fence 失败已由 writeLedger 以专名 fence_failed 报出（res0.fenceFail 是死分支：commitWhileHeld 从不返回它）。
+    // R51 返修二 P1-3：以下每个出口都折外层 operation lease 的 reapUncleared。
+    if (!res0.ok) return foldLeaseResidue(res0, { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" });
+    if (res.ok && typeof res.commit === "string" && res.commit.startsWith("committed")) {
+    if (res.idempotent) return foldLeaseResidue(res0, { ok: true, commit: "already", revision: res.revision, result: res.result, ...wrNote(res) });
+    const reread = loadLedger(d.dir, { endpointId });
+    if (!reread.ok || reread.sha256 !== plan.expected_ledger_sha256) {
+      return foldLeaseResidue(res0, { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ plan.expected_ledger_sha256（fail-closed，不重试不修）", ...wrNote(res) });
+    }
+    return foldLeaseResidue(res0, { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) });
+  }
+  if (!res.ok && res.reason === "already") return foldLeaseResidue(res0, { ok: true, commit: "already", sha256: plan.expected_ledger_sha256, ...wrNote(res) });
+  return foldLeaseResidue(res0, { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) });
 }
 
 /* ─────────────────────────── 普通（gated）事务 ─────────────────────────── */

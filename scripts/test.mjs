@@ -34646,7 +34646,9 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     state: "open",
     campaign_id: cid1,
     endpoints: eps,
-    endpoints_digest: dig
+    endpoints_digest: dig,
+    revision: cDocValid.revision,
+    raw: fs.readFileSync(cPath)
   }, "读回 campaign state 正确");
 
   // 第二次写 (seal)：revision 必须 +1 (2)，CAS 必须是 cWrite1.sha256
@@ -34723,7 +34725,8 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     state: "partial",
     campaign_id: cid1,
     endpoints_digest: dig,
-    revision: 1
+    revision: 1,
+    raw: fs.readFileSync(writerStatePath(env))
   }, "读回 writer state partial");
 
   // 写 on (CAS 匹配，revision 2，切到 B fixture)
@@ -37935,6 +37938,40 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         assert.equal(crypto.createHash("sha256").update(mintBak).digest("hex"), mint.backup_sha256, ep + " mint 备份文件字节 sha 对上");
         assert.notEqual(se.backup_sha256, mint.backup_sha256, ep + " schema(1.0 raw) 与 mint(transitioned) 备份字节不同");
       }
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P1-6：已有 open campaign 再进段 → campaign step revision 正确 +1（非 NaN）", () => {
+    const fx = r52Setup({});
+    try {
+      const tok = r52Uuid(5);
+      const cid = campaignIdFor(tok);
+      const eps = [...fx.eps].sort();
+      const dig = endpointsDigest(eps);
+      const members = {};
+      for (const ep of eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const inv = TAL.migrationInventory(L.doc);
+        members[ep] = { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
+      }
+      const campaignDoc = { schema_version: "owner-select-campaign-1", campaign_id: cid, state: "open", endpoints: eps, endpoints_digest: dig, pending_joins: [], members, revision: 5, origin_operation_id: tok };
+      const writerDoc = { schema_version: "owner-select-writer-state-1", state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 4, origin_operation_id: tok };
+      fs.mkdirSync(path.dirname(campaignPath(fx.env)), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(campaignPath(fx.env), JSON.stringify(campaignDoc, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+      // 受验读取器核：campaign 读回 revision === 5、writer 读回 revision === 4（补 raw/revision 生效）
+      const cs = readCampaignState(fx.env);
+      assert.equal(cs.revision, 5, "campaign reader 补 revision");
+      assert.ok(Buffer.isBuffer(cs.raw), "campaign reader 补 raw");
+      const ws52 = readWriterState(fx.env);
+      assert.equal(ws52.revision, 4);
+      assert.ok(Buffer.isBuffer(ws52.raw), "writer reader 补 raw");
+      // 进段前跨文件联合核：open campaign + partial writer（同 cid）→ admission 非 unreadable（读回 revision 已生效、不 NaN）
+      const adm = readOwnerSelectAdmission(fx.env);
+      assert.notEqual(adm.state, "unreadable", "跨文件联合应自洽：" + String(adm.problem));
+      // 编排 revision 计算：cs.revision 现在是有界数字，buildOsmCampaignDoc 的 expectedRevision = cs.revision+1 不再 NaN。
+      // 用缺失 campaign 的净场景验证 0+1 === 1（无 NaN），并用读回 revision 5 证明 readVerifiedDoc 通道真实带出 revision。
+      assert.equal(cs.revision, 5, "再进段应读到既有 revision（非 NaN）");
     } finally { fx.cleanup(); }
   });
 

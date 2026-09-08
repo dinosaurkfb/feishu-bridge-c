@@ -28,7 +28,7 @@ import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, 
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { applyMintPlan, applySchemaUpgrade, buildMintPlan, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
-import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
+import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
@@ -180,6 +180,9 @@ function osmPrecheck(ctx, { token, env }) {
   const ws = readWriterState(env);
   if (ws.state === "unreadable") return { ok: false, reason: "writer_state_unreadable", why: ws.problem };
   if (ws.exists && ws.state === "partial" && ws.campaign_id !== cid) return { ok: false, reason: "writer_state_foreign", why: "writer-state partial 属别的 campaign_id：" + ws.campaign_id };
+  // P1-6：进段前核 campaign × writer 跨文件联合（readOwnerSelectAdmission）——两文件任一不自洽 → 拒。
+  const adm = readOwnerSelectAdmission(env);
+  if (adm.state === "unreadable") return { ok: false, reason: "campaign_writer_inconsistent", why: adm.problem };
   return { ok: true, frozen };
 }
 

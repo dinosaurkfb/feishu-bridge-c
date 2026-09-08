@@ -37174,6 +37174,56 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.equal(fs.readFileSync(path.join(dir, "ledger.json.prev"), "utf-8"), "r51-prev-sentinel", ".prev 字节不变");
   }));
 
+  test("R51 返修三：schema 重放（replayed）+ lease reap EIO → committed_with_residue 且 residue 点名 .lease.reap", () => r51WithRoot((root, dir) => {
+    const T51 = (i) => ({ runtime: "claude", project_root: "/p/r51/" + i, claude_session_id: "00000000-0000-4000-8000-" + String(i).padStart(12, "0") });
+    const r51Ok = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+    r51Seed(dir);
+    r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_p9_b1a", chatId: "oc_r51a", rootOm: "om_r51a", lineageId: "lin-a", bindingTarget: T51(1), now: Date.now() }), "B1a");
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    const frozenSha = r51ShaOf52(TAL.serializeLedger(TAL.applySchemaUpgrade(L0.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(preTok, EP51), request_key: preTok + ":schema:" + EP51, from_schema: "1.0", to_schema: "1.1-transition" })));
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision, transitionAfterSha: frozenSha, tok: preTok });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const args = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: preTok + ":schema:" + EP51, fromSchema: "1.0", toSchema: "1.1-transition", env };
+    const first = r51Ok(TAL.schemaUpgrade(args), "首次执行");
+    assert.equal(first.commit, "committed_clean", "前置：首笔干净提交");
+    // 重放 + 释放段对 .lease.reap 的 rm 抛 EIO（第 2 次命中 = 执行器外层；第 1 次是 verifier 读栅栏）
+    const origRm = fs.rmSync; let reapHits = 0;
+    fs.rmSync = (p, ...rest) => { if (typeof p === "string" && p.endsWith(".lease.reap")) { reapHits += 1; if (reapHits === 2) { const e = new Error("injected EIO"); e.code = "EIO"; throw e; } } return origRm.call(fs, p, ...rest); };
+    let rep;
+    try { rep = TAL.schemaUpgrade(args); }
+    finally { fs.rmSync = origRm; }
+    assert.equal(reapHits, 2, "注入命中两次");
+    assert.equal(rep.ok, true, "重放算数：" + JSON.stringify(rep));
+    assert.equal(rep.commit, "committed_with_residue", "replayed 带 lease 残骸必须折成 committed_with_residue（红：原样 replayed 编排会记 done）：" + JSON.stringify(rep));
+    assert.deepEqual(rep.residue, [path.join(fx.maintDir, fx.tok + ".lease.reap")], "residue 列表恰点名 .lease.reap：" + JSON.stringify(rep.residue));
+    fs.rmSync(path.join(fx.maintDir, fx.tok + ".lease.reap"), { force: true });
+  }));
+
+  test("R51 返修三：mint after 态（already）+ lease reap EIO → committed_with_residue 且 residue 点名 .lease.reap", () => r51WithRoot((root, dir) => {
+    r51SeedTransition(dir, { nullB1Count: 1 });
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    const plan = TAL.buildMintPlan({ doc: L0.doc, token: preTok, campaignId: campaignIdFor(preTok), endpointId: EP51, requestKey: preTok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
+    assert.equal(TAL.mintPlanProblem(plan), null);
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: "1.0", ledgerRevision: 2, transitionAfterSha: L0.sha256, tok: preTok, nullB1Count: 1 });
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "mint").intended_after.ledger_sha256 = plan.expected_ledger_sha256; });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const args = { endpointId: EP51, capability: { kind: "mint_selection_handles", token: fx.tok }, plan, env };
+    const first = TAL.mintSelectionHandles(args);
+    assert.ok(first.ok && first.commit === "committed_clean", "前置：首笔干净提交：" + JSON.stringify(first));
+    const origRm = fs.rmSync; let reapHits = 0;
+    fs.rmSync = (p, ...rest) => { if (typeof p === "string" && p.endsWith(".lease.reap")) { reapHits += 1; if (reapHits === 2) { const e = new Error("injected EIO"); e.code = "EIO"; throw e; } } return origRm.call(fs, p, ...rest); };
+    let already;
+    try { already = TAL.mintSelectionHandles(args); }
+    finally { fs.rmSync = origRm; }
+    assert.equal(reapHits, 2, "注入命中两次");
+    assert.equal(already.ok, true, "after 态算数：" + JSON.stringify(already));
+    assert.equal(already.commit, "committed_with_residue", "already 带 lease 残骸必须折成 committed_with_residue：" + JSON.stringify(already));
+    assert.deepEqual(already.residue, [path.join(fx.maintDir, fx.tok + ".lease.reap")], "residue 列表恰点名 .lease.reap：" + JSON.stringify(already.residue));
+    fs.rmSync(path.join(fx.maintDir, fx.tok + ".lease.reap"), { force: true });
+  }));
+
   test("R51 返修二补 刀3（mint 栅栏投影）：beforeLedgerRename 里改 mint step 的 intended_after → fence_failed（投影漂移）且账本与 .prev 不变", () => r51WithRoot((root, dir) => {
     r51SeedTransition(dir, { nullB1Count: 1 });
     const L0 = TAL.loadLedger(dir, { endpointId: EP51 });

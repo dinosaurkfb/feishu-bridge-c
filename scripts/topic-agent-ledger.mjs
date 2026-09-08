@@ -2021,7 +2021,10 @@ function foldLeaseResidue(res0, out) {
   const residue = [...(Array.isArray(out.residue) ? out.residue : out.residue ? [String(out.residue)] : []), p];
   return {
     ...out,
-    commit: out.commit === "committed_clean" ? "committed_with_residue" : out.commit,
+    // R51 返修三：replayed / already 带 lease 残骸时同样折成 committed_with_residue（编排不得据此记 done）；
+    // committed_durability_uncertain 语义更强，保留不动。
+    commit: out.commit === "committed_clean" || out.commit === "replayed" || out.commit === "already"
+      ? "committed_with_residue" : out.commit,
     residue,
     lockUncleared: out.lockUncleared ?? { reason: "reap_residue_uncleared", why: String(r.error ?? ""), path: p },
     lock_state: out.lock_state ?? "unclear",

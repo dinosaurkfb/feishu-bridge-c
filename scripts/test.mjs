@@ -38681,6 +38681,64 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 返修二：forward 段内三条反例——B/direct 当场盘点非零、seal 前现场非 open（进段后执行该步前改坏，绝非进门前 precheck）", () => {
+    const corruptLedgerToNullB1 = (fx, ep) => {
+      const rid = "ta_" + ep.slice(-6).padStart(32, "c"); // 合法 hex topic_agent_id
+      const doc = r52Doc10(ep, [rid]); // 合法 1.0 形状，带一条 live（selection_handle 缺位 → 计 null-B1）
+      fs.writeFileSync(path.join(fx.ledgerRoot, ep, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      assert.equal(TAL.validateLedger(doc, { endpointId: ep }).ok, true, ep + " 改坏后仍合法");
+      assert.equal(TAL.migrationInventory(doc).null_b1_count > 0, true, ep + " 改坏后 null-B1 非零");
+    };
+    // ── #1：B forward 段内 b-loop 当场盘点非零 → precheck_failed 停门（进段后）──
+    {
+      const fx = r53SetupB({});
+      try {
+        // 进段后、b-precheck 前（a-seal done 后）把账本改坏 → b-loop 当场盘点非零。
+        fx.ctx.afterStep = (id) => { if (typeof id === "string" && id.endsWith(":seal")) { for (const ep of fx.eps) corruptLedgerToNullB1(fx, ep); } };
+        const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+        assert.equal(r.ok, false, "B forward b-loop 当场盘点非零必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "precheck_failed", "拒因 precheck_failed：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.phase, "osm_b_strictening", "停门不收敛");
+      } finally { fx.cleanup(); }
+    }
+    // ── #2：direct forward 段内当场盘点非零 → precheck_failed 停门（进段后）──
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        // direct 初始账本：1.0 且两计数 0（空 records，同 direct 全程夹具）
+        for (const ep of fx.eps) {
+          const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+          const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+          dd.records = {};
+          const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+          seedOp.result = { seeded_ids: [] };
+          fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+        }
+        // 进段后、b-precheck 前（a-open done 后）把账本改坏 → direct 当场盘点非零。
+        fx.ctx.afterStep = (id) => { if (typeof id === "string" && id.endsWith(":open")) { for (const ep of fx.eps) corruptLedgerToNullB1(fx, ep); } };
+        const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
+        assert.equal(r.ok, false, "direct forward 当场盘点非零必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "precheck_failed", "拒因 precheck_failed：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.phase, "osm_direct", "停门不收敛");
+      } finally { fx.cleanup(); }
+    }
+    // ── #3：B forward 段内 seal 前现场非 open → campaign_state_bad 停门（进段后）──
+    {
+      const fx = r53SetupB({});
+      try {
+        fx.ctx.afterStep = (id) => { if (id === "osm:forward-entered") {
+          const cid = campaignIdFor(r52Uuid(2));
+          const openDoc = JSON.parse(fs.readFileSync(campaignPath(fx.env), "utf-8"));
+          fs.writeFileSync(campaignPath(fx.env), JSON.stringify({ ...openDoc, state: "sealed", pending_joins: [] }, null, 2) + "\n", { mode: 0o600 });
+        } };
+        const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+        assert.equal(r.ok, false, "B forward seal 前现场非 open 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "campaign_state_bad", "拒因 campaign_state_bad");
+        assert.equal(r.phase, "osm_b_strictening", "停门不收敛");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
     // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
     const run = (kind, ctxFn) => {

@@ -878,7 +878,10 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
 }
 
 /** ── B 前置（§二.1）：campaign open（cid 取自文件）+ pending_joins 空 + writer partial 同 id + 每 ep transition 计数 0 ── */
-function osmPrecheckB(ctx, { env }) {
+function osmPrecheckB(ctx, { env, j }) {
+  // 返修二 P1-1 复用：两链 runtime 必已受验支持过渡（非仅 A）。
+  const rtB = runtimeTransitionCapable({ env, j });
+  if (!rtB.ok) return { ok: false, reason: "precheck_failed", why: "runtime_not_transition_capable" + (rtB.why ? "：" + rtB.why : "") };
   const cs = readCampaignState(env);
   if (cs.state === "unreadable") return { ok: false, reason: "campaign_unreadable", why: cs.problem };
   if (!cs.exists) return { ok: false, reason: "campaign_absent", why: "B 前置要求 campaign open（文件缺席）" };
@@ -906,7 +909,10 @@ function osmPrecheckB(ctx, { env }) {
 }
 
 /** ── direct 前置（§三.1）：冻结集 = initDone 收据；每 ep 1.0 且两计数 0；campaign absent|complete；writer off|on ── */
-function osmPrecheckDirect(ctx, { env }) {
+function osmPrecheckDirect(ctx, { env, j }) {
+  // 返修二 P1-1 复用：两链 runtime 必已受验支持过渡（非仅 A）。
+  const rtD = runtimeTransitionCapable({ env, j });
+  if (!rtD.ok) return { ok: false, reason: "precheck_failed", why: "runtime_not_transition_capable" + (rtD.why ? "：" + rtD.why : "") };
   // P1-2（R52 返修一）：用唯一聚合 aggregateEndpointReceipts——任一端点收据 conflict/in-flight/duplicate/unreadable
   //   → 整体 precheck_failed（why 点名），绝不拿剩余子集（自建 aggregateInitDone 已废）；R53 direct 天然继承。
   const agg = aggregateEndpointReceipts({ dir: ctx.dir });

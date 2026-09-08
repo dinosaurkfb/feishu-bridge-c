@@ -56,6 +56,7 @@ import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/l
 import { reconcileLegacyEndpoint } from "./m1a/reconcile.mjs";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
+import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
@@ -855,6 +856,38 @@ export function runDoctor({
       : buckets.inflightUnverified + buckets.pending > 0 ? null
       : true;
     add("inbound_forward_result", "⑯ 入站转发结果", ok17, body, null);
+  }
+  // ── ⑰ owner_select 对账（设计稿 §9；只读不修）：逐 initDone endpoint 核账本一致性/存量计数/
+  // handle 卫生，campaign × writer_state 状态链直读互证；判据在 maintenance/owner-select-doctor.mjs。
+  {
+    const dir17 = maintenanceDir();
+    if (dir17 === null) {
+      add("owner_select_reconcile", "⑰ owner_select 对账", null, "家目录查不出来，维护目录未知", null);
+    } else {
+      const rec = ownerSelectReconcile({ maintenanceDir: dir17, now });
+      const parts = [];
+      if (rec.summary.green) parts.push("绿 " + rec.summary.green);
+      if (rec.summary.block) parts.push("block " + rec.summary.block);
+      if (rec.summary.unclear) parts.push("查不清 " + rec.summary.unclear);
+      const epProblems = rec.endpoints.flatMap((e) => e.problems.map((p) => e.endpointId.slice(0, 20) + "：" + p));
+      const chainText = rec.chain.unclear !== null ? "查不清（" + rec.chain.unclear + "）"
+        : rec.chain.problems.length > 0 ? "block（" + rec.chain.problems.slice(0, 3).join("；") + "）"
+        : rec.chain.state === null ? "说不清" : rec.chain.state;
+      const countText = rec.endpoints.filter((e) => e.counts !== null)
+        .map((e) => e.endpointId.slice(0, 16) + "（" + e.counts.schema_version + "：legacy " + e.counts.legacy_proof_count + " / null-B1 " + e.counts.null_b1_count + "）").join("、");
+      const body = (rec.summary.total === 0 && rec.chain.state === null && rec.chain.problems.length === 0 && rec.chain.unclear === null)
+        ? "没有 initDone 的 endpoint（接入账本后出现）；" + rec.intentNote
+        : (rec.notApplicable ? rec.notApplicable + "；" : "") + "对账 " + rec.summary.total + " 个：" + (parts.join("、") || "无") +
+          (epProblems.length ? "；问题：" + epProblems.slice(0, 3).join("；") : "") +
+          "；状态链：" + chainText +
+          (countText ? "；存量计数：" + countText : "") +
+          (rec.chain.note ? "；" + rec.chain.note : "") +
+          "；" + rec.intentNote;
+      const hasBlock = rec.summary.block > 0 || rec.chain.problems.length > 0;
+      const hasUnclear = rec.summary.unclear > 0 || rec.chain.unclear !== null;
+      // P2-6：项名不硬编码 ⑰——编号在 R54 ⑯（#141）合并后核对
+      add("owner_select_reconcile", "⑰ owner_select 对账", hasBlock || hasUnclear ? false : true, body, null);
+    }
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

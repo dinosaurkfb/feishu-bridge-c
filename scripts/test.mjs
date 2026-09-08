@@ -54,6 +54,7 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor } from "./doctor.mjs";
+import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
@@ -38301,7 +38302,481 @@ test("R54 返修七 P1：未知 arch / 非法 endianness 先封闭拒绝——�
 });
 
 
+// ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──
+
+const R56_T0 = "2026-09-07T10:00:00.000Z";
+const R56_EPS = ["endpoint_" + "1".repeat(24), "endpoint_" + "2".repeat(24)];
+const r56Uuid = (n) => (String(n).repeat(8) + "-1111-1111-1111-111111111111").slice(0, 36);
+const r56Id = (n) => "ta_" + String(n).repeat(4).padEnd(32, "0");
+const r56B1 = (id, ep, { handle = null, origin = "00000000-0000-0000-0000-000000000002" } = {}) => ({
+  kind: "live", topic_agent_id: id, chat_id: "oc_" + id.slice(3, 11),
+  created_at: R56_T0, updated_at: R56_T0, origin_operation_id: origin,
+  binding_target: { runtime: "claude", project_root: "/p/r56", claude_session_id: "00000000-0000-4000-8000-" + id.slice(3, 15).padEnd(12, "0") },
+  aliases: { session_id: null, root_om: "om_" + id.slice(3, 11) },
+  anchor_candidate: null, generation_lineage_id: "lin_" + id.slice(3, 11),
+  binding_proof: null, locator_link_proof_ref: null,
+  facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" },
+  selection_handle: handle ?? null, handle_expires_at: handle ? "2099-01-01T00:00:00.000Z" : null, rebind_handle: null, rebind_expires_at: null,
+});
+const r56Ledger = (ep, { schema = "1.1", b1s = [] } = {}) => {
+  const b1Ids = b1s.map((b) => b.id);
+  const handles = b1s.filter((b) => b.handle != null);
+  const ops = {
+    "00000000-0000-0000-0000-000000000001": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+    "00000000-0000-0000-0000-000000000002": { op_type: "seed", terminal_kind: "seed", request_key: "seed_b1s", fingerprint: TAL.fingerprintOf("seed", { request_key: "seed_b1s", candidates: b1Ids }), result_revision: 2, result: { seeded_ids: b1Ids } },
+    "00000000-0000-0000-0000-000000000003": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "seed_schema_upgrade", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "seed_schema_upgrade", endpoint: ep, from_schema: "1.0", to_schema: schema }), result_revision: 3, result: { endpoint: ep, from_schema: "1.0", to_schema: schema } },
+  };
+  let revision = 3;
+  if (handles.length > 0) {
+    revision = 4;
+    ops["00000000-0000-0000-0000-000000000004"] = { op_type: "mint_selection_handles", terminal_kind: "mint_selection_handles", request_key: "r56-mint", fingerprint: TAL.fingerprintOf("mint_selection_handles", { request_key: "r56-mint", endpoint: ep, expected_null_b1_ids: b1Ids }), result_revision: 4, result: { endpoint: ep, minted: handles.map((b) => ({ target_id: b.id, selection_handle: b.handle, handle_expires_at: "2099-01-01T00:00:00.000Z" })), affected_live_ids_after_commit: b1Ids, proof_effects: [] } };
+  }
+  return {
+    schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude",
+    authority_mode: "shadow", revision, operations: ops,
+    records: Object.fromEntries(b1s.map((b) => [b.id, r56B1(b.id, ep, { handle: b.handle, origin: b.handle != null ? "00000000-0000-0000-0000-000000000004" : "00000000-0000-0000-0000-000000000002" })])),
+  };
+};
+const r56InitJournal = (ep) => {
+  const ats = "2026-09-07T10:00:00.000Z";
+  const idx = R56_EPS.findIndex((x) => x === ep);
+  const tok = r56Uuid(7 + idx + 1);
+  const sha = "b".repeat(64);
+  const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+  const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+  const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+  const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+  const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: ats, chain: null });
+  const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+  const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+  const doc = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "r56", started_at: ats, updated_at: ats, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep], notes: [] };
+  return { doc, tok };
+};
+const r56Campaign = (state, eps = R56_EPS, memberSchema = "1.1") => {
+  return {
+    schema_version: CAMPAIGN_SCHEMA, campaign_id: campaignIdFor(r56Uuid(2)), state, endpoints: eps,
+    endpoints_digest: endpointsDigest(eps), pending_joins: [],
+    members: Object.fromEntries(eps.map((ep) => {
+      return [ep, { schema_version: memberSchema, legacy_proof_count: 0, null_b1_count: 0 }];
+    })),
+    revision: 1, origin_operation_id: r56Uuid(2),
+  };
+};
+const r56Writer = (state, campaign) => ({ schema_version: WRITER_STATE_SCHEMA, state, campaign_id: state === "off" ? null : campaign.campaign_id, endpoints_digest: state === "off" ? null : campaign.endpoints_digest, origin_operation_id: r56Uuid(3), revision: 1 });
+const r56Plant = (m, { ledgerOver = {}, campaign = null, writer = null, allowInvalid = false } = {}) => {
+  for (const ep of R56_EPS) {
+    fs.mkdirSync(path.join(m.ledgerDir, ep), { recursive: true, mode: 0o700 });
+    const doc = r56Ledger(ep, ledgerOver[ep] ?? {});
+    fs.writeFileSync(path.join(m.ledgerDir, ep, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    const v = TAL.validateLedger(doc, { endpointId: ep });
+    if (!allowInvalid) assert.equal(v.ok, true, "R56 夹具账本自洽（" + ep.slice(0, 16) + "）：" + JSON.stringify(v));
+    const { doc: jdoc } = r56InitJournal(ep);
+    fs.writeFileSync(path.join(m.maintDir, jdoc.token + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  }
+  if (campaign !== null) fs.writeFileSync(path.join(m.ledgerDir, "owner-select-campaign.json"), JSON.stringify(campaign, null, 2) + "\n", { mode: 0o600 });
+  if (writer !== null) fs.writeFileSync(path.join(m.ledgerDir, "owner-select-writer-state.json"), JSON.stringify(writer, null, 2) + "\n", { mode: 0o600 });
+};
+// 两个 ep 都挂同一把合法 handle 的 strict 夹具（handle 重复用例复用）
+const r56StrictLedgerOver = () => {
+  const out = {};
+  for (const [i, ep] of R56_EPS.entries()) {
+    out[ep] = { schema: "1.1", b1s: [{ id: r56Id(i), handle: "osh_" + "a".repeat(32) }] };
+  }
+  return out;
+};
+
+test("R56 ⑰ 绿：两 ep strict 无存量 + campaign complete + writer on → 全绿、桶之和 = 总数", () => {
+  const m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "桶之和 = 总数（2 = 2）：" + c.detail);
+  assert.match(c.detail, /状态链：on/u, c.detail);
+  assert.match(c.detail, /intent 未纳入/u, c.detail);
+});
+
+test("R56 ⑰ block：strict 存量非零 / writer on 而 campaign 未 complete / campaign 多出未 initDone ep / handle 重复 / 有 handle 无到期", () => {
+  // (a) strict 下 null-B1 ≠ 0（ep1 无 handle）
+  let m = doctorMachine();
+  {
+    const over = {};
+    for (const [i, ep] of R56_EPS.entries()) {
+      over[ep] = i === 0
+        ? { schema: "1.1", b1s: [{ id: r56Id(0) }] }
+        : { schema: "1.1", b1s: [{ id: r56Id(1), handle: "osh_" + "a".repeat(32) }] };
+    }
+    r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  }
+  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /block 1/u, c.detail);
+  assert.match(c.detail, /1\.1 strict 要求 B1/u, "细粒度文案来自唯一校验器：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 1、block 1/u, "桶之和 = 总数：" + c.detail);
+
+  // (b) writer on 而 campaign 非 complete（open）
+  m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("open"), writer: r56Writer("on", r56Campaign("open")) });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /writer on 但 campaign 不是 complete/u, c.detail);
+
+  // (c) campaign 多出未 initDone 的 ep
+  m = doctorMachine();
+  const eps3 = [...R56_EPS, "endpoint_" + "9".repeat(24)];
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete", eps3), writer: r56Writer("on", r56Campaign("complete", eps3)) });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /未 initDone 的 endpoint/u, c.detail);
+
+  // (d) handle 重复（同一把 osh_ 挂在两个 B1 上）
+  m = doctorMachine();
+  {
+    const over = {};
+    for (const [i, ep] of R56_EPS.entries()) {
+      over[ep] = { schema: "1.1", b1s: [{ id: r56Id(i), handle: "osh_" + "a".repeat(32) }, { id: r56Id(i + 4), handle: "osh_" + "a".repeat(32) }] };
+    }
+    r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  }
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /G-handle/u, "细粒度文案来自唯一校验器（G-handle）：" + c.detail);
+
+  // (e) 有 handle 无到期
+  m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  {
+    const f = path.join(m.ledgerDir, R56_EPS[1], "ledger.json");
+    const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+    const rec = Object.values(d.records).find((x) => x.selection_handle !== null);
+    rec.handle_expires_at = null;
+    fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+  }
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /1\.1 strict 要求 B1/u, "细粒度文案来自唯一校验器（strict 规则先撞）：" + c.detail);
+});
+
+test("R56 ⑰ 查不清：收据 conflict 与 writer_state 坏文件都 fail-closed 点名", () => {
+  // (a) 收据矛盾（同 ep 双 init）
+  let m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver() });
+    const { doc: dup, tok: dupOrigTok } = r56InitJournal(R56_EPS[0]);
+  const dupTok = r56Uuid(5);
+  // 文内 token 全量替换 → 合法的第二笔 init（同 ep）→ 收据 conflict（而非 journal 读不出）
+  const dupText = JSON.stringify(dup).split(dupOrigTok).join(dupTok);
+  fs.writeFileSync(path.join(m.maintDir, dupTok + ".json"), JSON.stringify(JSON.parse(dupText), null, 2) + "\n", { mode: 0o600 });
+let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清/u, c.detail);
+  assert.match(c.detail, /收据 conflict/u, "conflict endpoint 专用文案：" + c.detail);
+
+  // (b) writer_state 坏文件
+  m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  fs.writeFileSync(path.join(m.ledgerDir, "owner-select-writer-state.json"), "{not json", { mode: 0o600 });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /writer_state 读不出/u, c.detail);
+});
+
+test("R56 ⑰ 过渡期：transition + null-B1 计数 opaque 报数不 block；partial 链相容", () => {
+  const m = doctorMachine();
+  const over = {};
+  for (const [i, ep] of R56_EPS.entries()) {
+    over[ep] = { schema: "1.1-transition", b1s: [{ id: r56Id(i) }, { id: r56Id(i + 2) }] };
+  }
+  r56Plant(m, { ledgerOver: over, campaign: r56Campaign("open", R56_EPS, "1.1-transition"), writer: r56Writer("partial", r56Campaign("open", R56_EPS, "1.1-transition")) });
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, "过渡期不 block：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "桶之和 = 总数：" + c.detail);
+  assert.match(c.detail, /null-B1 2/u, "过渡期报 opaque 计数（不点名 id）：" + c.detail);
+  assert.match(c.detail, /状态链：partial/u, c.detail);
+});
+
+test("R56 ⑰ campaign complete 但 ep 账本仍 transition → 状态链 block 点名「应全 strict」", () => {
+  const m = doctorMachine();
+  const over = {};
+  for (const [i, ep] of R56_EPS.entries()) {
+    over[ep] = i === 0
+      ? { schema: "1.1", b1s: [{ id: r56Id(i), handle: "osh_" + "a".repeat(32) }] }
+      : { schema: "1.1-transition", b1s: [{ id: r56Id(i) }, { id: r56Id(i + 2) }] };
+  }
+  r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /campaign complete 但 .*（应全 strict）/u, "状态链点名 schema 相容违规：" + c.detail);
+});
+
+// ── R56 返修一（Codex #143 一轮 4 P1 + 3 P2）──
+
+test("R56 返修一 P1-1：账本读不出（symlink/坏 JSON）→ 该 endpoint「查不清」点名，不误 block、不抛；另一 ep 照常对账", () => {
+  // (a) symlink：裸读会跟随目标（读到合法账本），受验读必须拒
+  let m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const good = fs.readFileSync(path.join(m.ledgerDir, R56_EPS[0], "ledger.json"));
+  const side = path.join(m.ledgerDir, R56_EPS[0], "real.json");
+  fs.writeFileSync(side, good, { mode: 0o600 });
+  fs.rmSync(path.join(m.ledgerDir, R56_EPS[0], "ledger.json"));
+  fs.symlinkSync(side, path.join(m.ledgerDir, R56_EPS[0], "ledger.json"));
+  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清 1/u, "symlink 账本 → 查不清（改前 block）：" + c.detail);
+  assert.match(c.detail, /符号链接/u, "点名 granular why：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 1、查不清 1/u, "另一 ep 照常对账、total 恰 2：" + c.detail);
+
+  // (b) 坏 JSON
+  m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  fs.writeFileSync(path.join(m.ledgerDir, R56_EPS[1], "ledger.json"), "{ 坏", { mode: 0o600 });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清 1/u, "坏 JSON → 查不清（改前 block）：" + c.detail);
+});
+
+test("R56 返修一 P1-1：受验读取先行后，损坏账本的细粒度文案来自唯一校验器（validateLedger why），不再维护第二套", () => {
+  // strict 下 null-B1：validateLedger 结构化 why 直接可读（原 raw 守卫层已删）
+  const m = doctorMachine();
+  {
+    const over = {};
+    for (const [i, ep] of R56_EPS.entries()) {
+      over[ep] = i === 0
+        ? { schema: "1.1", b1s: [{ id: r56Id(0) }] }
+        : { schema: "1.1", b1s: [{ id: r56Id(1), handle: "osh_" + "a".repeat(32) }] };
+    }
+    r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  }
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /1\.1 strict 要求 B1/u, "唯一校验器的结构化 why：" + c.detail);
+});
+
+test("R56 返修一 P1-2：过期 handle 仍存活 → block「handle 已过期未清理」；边界 now===expires_at 算过期；未过期不动", () => {
+  const m = doctorMachine();
+  const over = {};
+  for (const [i, ep] of R56_EPS.entries()) {
+    over[ep] = { schema: "1.1", b1s: [{ id: r56Id(i), handle: "osh_" + "a".repeat(32) }] };
+  }
+  r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  // ep1 的 handle 改成已过期（R56_T0）；ep2 保持远期
+  const f = path.join(m.ledgerDir, R56_EPS[1], "ledger.json");
+  const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+  for (const rec of Object.values(d.records)) if (rec.selection_handle !== null) rec.handle_expires_at = R56_T0;
+  for (const op of Object.values(d.operations)) {
+    if (op.op_type === "mint_selection_handles") for (const mi of op.result.minted) if (mi.target_id !== r56Id(0)) mi.handle_expires_at = R56_T0;
+  }
+  fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+  const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  let rec;
+  try {
+    // 直调（可注入 now）：now = expiry 恰等 → 算过期
+    rec = ownerSelectReconcile({ maintenanceDir: m.maintDir, now: Date.parse(R56_T0) });
+  } finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  const ep1 = rec.endpoints.find((e) => e.endpointId === R56_EPS[1]);
+  const ep2 = rec.endpoints.find((e) => e.endpointId === R56_EPS[0]);
+  assert.equal(ep1.status, "block", "过期（边界含等号）→ block：" + JSON.stringify(ep1));
+  assert.match(ep1.problems.join("；"), /handle 已过期未清理/u);
+  assert.equal(ep2.status, "ok", "未过期不动：" + JSON.stringify(ep2));
+  // 过边界一点：同样 block
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  try { rec = ownerSelectReconcile({ maintenanceDir: m.maintDir, now: Date.parse(R56_T0) + 1 }); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  assert.equal(rec.endpoints.find((e) => e.endpointId === R56_EPS[1]).status, "block");
+});
+
+test("R56 返修一 P1-3：收据冲突 endpoint 恰进「查不清」一桶——不进 initDone 集、total 不重复、不参与 campaign 成员关系", () => {
+  const m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  // 终态 init + 进行中 cutover（judge 报 conflict 但 initDone===true 的形态——旧代码双算）
+  const { doc: cutDoc, tok: cutTokOld } = r56InitJournal(R56_EPS[0]);
+  const cutTok = r56Uuid(5);
+  const cut = JSON.parse(JSON.stringify(cutDoc).split(cutTokOld).join(cutTok));
+  cut.operation_kind = "ledger_cutover";
+  cut.phase = "ledger_cutting_over";
+  const lstep = cut.steps.find((st) => st.kind === "ledger");
+  lstep.id = "ledger:" + R56_EPS[0] + ":cutover";
+  lstep.state = "prepared";
+  lstep.before = { endpoint_id: R56_EPS[0], operation_id: cutTok, fingerprint: "b".repeat(64), authority_mode: "shadow", revision: 1, ledger_sha256: "b".repeat(64), bijection_digest: null };
+  lstep.intended_after = { endpoint_id: R56_EPS[0], operation_id: cutTok, fingerprint: "b".repeat(64), authority_mode: "authoritative", revision: 2, ledger_sha256: "c".repeat(64), bijection_digest: "c".repeat(64) };
+  lstep.after = null;
+  fs.writeFileSync(path.join(m.maintDir, cutTok + ".json"), JSON.stringify(cut, null, 2) + "\n", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /对账 2 个：绿 1、查不清 1/u, "total 恰 2（改前 ep1 双算）：" + c.detail);
+  assert.match(c.detail, /收据 conflict/u, c.detail);
+});
+
+test("R56 返修一 P1-4：零收据 + 账本根缺席 → ok:true「尚未接入」；一份收据 + 根缺席 → fail-closed 查不清", () => {
+  // (a) 全新机器：无收据、根缺席
+  let m = doctorMachine();
+  fs.rmSync(m.ledgerDir, { recursive: true, force: true });
+  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, "零收据 + 根缺席不误红：" + c.detail);
+  assert.match(c.detail, /尚未接入/u, "文案点名尚未接入（改前是「没有 initDone 的 endpoint」）：" + c.detail);
+  // (b) 一份收据 + 根缺席 → 查不清（改前 block「有 init 收据但账本缺席」）
+  m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  fs.rmSync(path.join(m.maintDir, r56InitJournal(R56_EPS[1]).tok + ".json"));
+  fs.rmSync(m.ledgerDir, { recursive: true, force: true });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清 1/u, "有收据但根缺席 → fail-closed 查不清（改前 block）：" + c.detail);
+});
+
+test("R56 返修一 P2-5：「迁移进行中」只认 journal 1.4 owner_select kinds——普通 ledger_init active 不冒充迁移（无 note）；1.4 迁移 → note 且不 block", () => {
+  // (a) active 的 1.2 ledger_init（in-flight）→ 不产生「迁移进行中」note
+  let m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const ep = R56_EPS[0], sha = "b".repeat(64);
+  const tok = r56Uuid(6);
+  const initState = (o = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...o });
+  const ed = {
+    timer: (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: R56_T0, chain: null }),
+    stub: (ch) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: R56_T0, chain: null }),
+    cur: (ch) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: R56_T0, chain: null, backup: null, backup_sha256: null, backup_bytes: null }),
+    gate: () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: R56_T0, chain: null }),
+  };
+  const j12 = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "r56fix1", started_at: R56_T0, updated_at: R56_T0, phase: "ledger_initializing", steps: [...["claude", "codex"].flatMap((ch) => [ed.timer(ch), ed.stub(ch), ed.cur(ch)]), ed.gate(), { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }), after: null, state: "prepared", at: R56_T0, chain: "claude" }], notes: [] };
+  fs.writeFileSync(path.join(m.maintDir, tok + ".json"), JSON.stringify(j12, null, 2) + "\n", { mode: 0o600 });
+  fs.symlinkSync(tok, path.join(m.maintDir, "active"));
+  let saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  let rec;
+  try { rec = ownerSelectReconcile({ maintenanceDir: m.maintDir }); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  assert.equal(rec.chain.note, null, "1.2 ledger_init 的 active 不冒充「迁移进行中」（改前有 note）：" + JSON.stringify(rec.chain));
+
+  // (b) active 的 1.4 owner_select_migration_a → 仍报「迁移进行中」且不 block
+  m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const tok14 = r56Uuid(8);
+  const cid14 = campaignIdFor(tok14);
+  const dig14 = endpointsDigest(R56_EPS);
+  const enterDone14 = () => ["claude", "codex"].flatMap((ch) => ([
+    { id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: R56_T0, chain: null },
+    { id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok14, after: "versions/maintenance-" + tok14, state: "done", at: R56_T0, chain: null },
+    { id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", intended_after: "versions/maintenance-" + tok14, after: "versions/maintenance-" + tok14, state: "done", at: R56_T0, chain: null, backup: null, backup_sha256: null, backup_bytes: null },
+  ])).concat([{ id: "gate", kind: "gate", target: "gate", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok14 }, after: { token: tok14, txnUncleared: null }, state: "done", at: R56_T0, chain: null }]);
+  const j14 = { schema_version: "1.4", operation_kind: "owner_select_migration_a", token: tok14, reason: "r56fix1", started_at: R56_T0, updated_at: R56_T0, phase: "osm_a_upgrading", steps: [
+    ...enterDone14(),
+    { kind: "campaign", id: "campaign:" + cid14 + ":open", state: "prepared", at: R56_T0, target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null }, intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid14, endpoints: R56_EPS, endpoints_digest: dig14 } },
+    ...R56_EPS.flatMap((epX, i) => {
+      const tSha = ("7" + i).repeat(32).slice(0, 64);
+      return [
+        { kind: "schema_endpoint", id: "schema_endpoint:" + epX + ":transition", state: "prepared", at: R56_T0, target: "ledger/" + epX + "/ledger.json", chain: null, backup: path.join(m.maintDir, tok14 + ".staged", "backup-" + i + ".json"), backup_sha256: tSha, backup_bytes: 10, before: { schema_version: "1.0", revision: 1, ledger_sha256: tSha }, intended_after: { schema_version: "1.1-transition", revision: 2, ledger_sha256: "5".repeat(64) } },
+        { kind: "mint", id: "mint:" + epX, state: "prepared", at: R56_T0, target: "ledger/" + epX + "/ledger.json", chain: null, backup: path.join(m.maintDir, tok14 + ".staged", "backup-mint-" + i + ".json"), backup_sha256: "5".repeat(64), backup_bytes: 10, before: { revision: 2, null_b1_count: 1, ledger_sha256: "5".repeat(64) }, intended_after: { revision: 3, null_b1_count: 0, ledger_sha256: "9".repeat(64) }, intended_blob: { path: path.join(m.maintDir, tok14 + ".staged", "intended", "mint-" + epX + ".json"), bytes: 10, sha256: "f".repeat(64) } },
+      ];
+    }),
+    { kind: "writer_state", id: "writer_state:" + cid14 + ":partial", state: "prepared", at: R56_T0, target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null, before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 }, intended_after: { exists: true, sha256: "6".repeat(64), state: "partial", campaign_id: cid14, endpoints_digest: dig14, revision: 1 } }
+  ], notes: [] };
+  fs.writeFileSync(path.join(m.maintDir, tok14 + ".json"), JSON.stringify(j14, null, 2) + "\n", { mode: 0o600 });
+  fs.rmSync(path.join(m.maintDir, "active"), { force: true });
+  fs.symlinkSync(tok14, path.join(m.maintDir, "active"));
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  try { rec = ownerSelectReconcile({ maintenanceDir: m.maintDir }); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  assert.match(String(rec.chain.note ?? ""), /迁移进行中/u, "1.4 owner_select 迁移仍报进行中：" + JSON.stringify(rec.chain));
+  // note 路径本身不产生状态链 block（进行中归 ⑩/维护门）；夹具里 in-flight WAL 与 done 收据并存的
+  // 收据级 conflict 归 P1-3 的逐 endpoint fail-closed，与本断言正交。
+  assert.ok(!rec.chain.problems.some((p) => p.includes("迁移进行中")), "note 不变成 block：" + JSON.stringify(rec.chain));
+});
+
+test("R56 返修一 P2-6/P2-7：项名不硬编码 ⑰；诊断正文不输出 handle 前缀（只记 opaque id 与计数）", () => {
+  const m = doctorMachine();
+  // 两把同一 handle 挂两个 B1 → validateLedger 的 G-handle why 里有 handle 值，诊断正文必须脱敏
+  const over = {};
+  for (const [i, ep] of R56_EPS.entries()) {
+    over[ep] = { schema: "1.1", b1s: [{ id: r56Id(i), handle: "osh_" + "a".repeat(32) }, { id: r56Id(i + 4), handle: "osh_" + "a".repeat(32) }] };
+  }
+  r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  const rep = doctorReport(m.run());
+  const c = checkOf(rep, "owner_select_reconcile");
+  assert.equal(c.name, "⑰ owner_select 对账", "编号定名（R54 ⑯ 已入 main）：" + c.name);
+  assert.doesNotMatch(c.detail, /osh_[0-9a-f]{4}/u, "正文不输出 handle 前缀：" + c.detail);
+  assert.match(c.detail, /G-handle|不唯一/u, "重复仍点名（脱敏后）：" + c.detail);
+});
+
+// ── R56 返修二（Codex #143 二轮 2 P1 + 3 P2）──
+
+test("R56 返修二 P1-1：账本根缺席判定复用唯一根校验器——悬空 symlink 根 / 父链 symlink / 根是文件 → 查不清，绝不「尚未接入」", () => {
+  // (a) 悬空 symlink 根：existsSync=false → 改前误判「尚未接入」
+  let m = doctorMachine();
+  fs.rmSync(m.ledgerDir, { recursive: true, force: true });
+  fs.symlinkSync(path.join(m.home, "no-such-target"), m.ledgerDir);
+  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "悬空 symlink 根 → 查不清（改前 ok:true 尚未接入）：" + c.detail);
+  assert.match(c.detail, /账本根不可信.*root_symlink/u, c.detail);
+  // (b) 父链 symlink：bridge 目录外指 → root_not_canonical
+  m = doctorMachine();
+  const bridgeDir = path.join(m.home, ".claude", "feishu-bridge");
+  const elsewhere = path.join(m.home, "elsewhere");
+  fs.mkdirSync(elsewhere, { recursive: true });
+  fs.renameSync(bridgeDir, path.join(elsewhere, "bridge"));
+  fs.symlinkSync(path.join(elsewhere, "bridge"), bridgeDir);
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "父链 symlink → 查不清：" + c.detail);
+  assert.match(c.detail, /账本根不可信.*root_not_canonical/u, c.detail);
+  // (c) 根位置是普通文件
+  m = doctorMachine();
+  fs.rmSync(m.ledgerDir, { recursive: true, force: true });
+  fs.writeFileSync(m.ledgerDir, "x", { mode: 0o600 });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "根是文件 → 查不清：" + c.detail);
+  assert.match(c.detail, /账本根不可信/u, c.detail);
+});
+
+test("R56 返修二 P2-3：收据不可信的 endpoint 只报一次 receipt unclear——campaign 检查不再对它生成「收录未 initDone」chain block", () => {
+  const m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const { doc: cutDoc, tok: cutTokOld } = r56InitJournal(R56_EPS[0]);
+  const cutTok = r56Uuid(5);
+  const cut = JSON.parse(JSON.stringify(cutDoc).split(cutTokOld).join(cutTok));
+  cut.operation_kind = "ledger_cutover";
+  cut.phase = "ledger_cutting_over";
+  const lstep = cut.steps.find((st) => st.kind === "ledger");
+  lstep.id = "ledger:" + R56_EPS[0] + ":cutover";
+  lstep.state = "prepared";
+  lstep.before = { endpoint_id: R56_EPS[0], operation_id: cutTok, fingerprint: "b".repeat(64), authority_mode: "shadow", revision: 1, ledger_sha256: "b".repeat(64), bijection_digest: null };
+  lstep.intended_after = { endpoint_id: R56_EPS[0], operation_id: cutTok, fingerprint: "b".repeat(64), authority_mode: "authoritative", revision: 2, ledger_sha256: "c".repeat(64), bijection_digest: "c".repeat(64) };
+  lstep.after = null;
+  fs.writeFileSync(path.join(m.maintDir, cutTok + ".json"), JSON.stringify(cut, null, 2) + "\n", { mode: 0o600 });
+  const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  let rec;
+  try { rec = ownerSelectReconcile({ maintenanceDir: m.maintDir }); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /收据 conflict/u, "该 ep 恰以 receipt unclear 报一次：" + c.detail);
+  assert.ok(rec.chain.problems.every((p) => !p.includes(R56_EPS[0])), "chain.problems 不含收据不可信的 ep（改前有「campaign 收录未 initDone」）：" + JSON.stringify(rec.chain));
+});
+
+test("R56 返修二 P2-4：编号定名「⑰ owner_select 对账」（R54 ⑯ 已入 main，不再漂移）", () => {
+  const m = doctorMachine();
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.name, "⑰ owner_select 对账", "编号定名（改前无 ⑰）：" + c.name);
+});
+
+test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂、该 endpoint 查不清", () => {
+  const m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const f = path.join(m.ledgerDir, R56_EPS[0], "ledger.json");
+  fs.rmSync(f);
+  execFileSync("mkfifo", [f]);
+  const t0 = Date.now();
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.ok(Date.now() - t0 < 30000, "不挂");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清 1/u, "FIFO → 该 endpoint 查不清：" + c.detail);
+});
+
+
+
+
+
 summarySealed = true;
+
+
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
 if (TEST_FILTER.length > 0) {

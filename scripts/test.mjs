@@ -38739,6 +38739,46 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R53 返修三：B/direct 复用返修二三件——typed commit check（strict failDirFsync→commit_unclear）/ staged 残骸（symlink→staged_residue）/ 恢复屏障（seal 窗 failDirFsync→recovery_seal_failed）", () => {
+    // ① typed commit check：B strict 写 duck 返回 durability_uncertain → commit_unclear 停门、step 不记 done（非 R53 原生 if(!r.ok)）
+    {
+      const fx = r53SetupB({ crashAfter: 12 }); // strict A done 后崩（strict B prepared）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        const r = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r.ok === false, "B strict failDirFsync 停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "commit_unclear", "typed commit check：durability_uncertain → commit_unclear（原生 if(!r.ok) 会放过）");
+        const j = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(j.doc.steps.filter((s) => s.kind === "schema_endpoint").find((s) => s.state !== "done").state, "prepared", "strict step 不记 done");
+      } finally { fx.cleanup(); }
+    }
+    // ② 恢复屏障：B seal 恢复窗（现场===intended）注入目录 fsync 失败 → recovery_seal_failed、seal step 不记 done
+    {
+      const fx = r53SetupB({});
+      try {
+        // 第一步：seal 写后即崩（写成功但 step 未 done）→ 现场===intended 的恢复窗。
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.endsWith(":seal")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.ok(crashed, "B seal 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        // 第二步：恢复 forward，注入目录 fsync 失败 → 恢复窗 barrier 拒 → seal step 不记 done。
+        fx.ctx.afterWrite = null;
+        const r2 = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r2.ok === false && r2.reason === "recovery_seal_failed", "目录 fsync 失败 → recovery_seal_failed：" + JSON.stringify({ reason: r2.reason, why: r2.why, phase: r2.phase }));
+        const jj = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(jj.doc.steps.find((s) => s.id.endsWith(":seal")).state, "prepared", "seal step 不记 done（目录 fsync 失败）");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
     // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
     const run = (kind, ctxFn) => {

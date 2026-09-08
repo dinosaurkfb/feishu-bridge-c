@@ -182,6 +182,30 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
   return { ok: true };
 }
 
+/** 返修三：B/direct 恢复窗 re-seal 专用包装（与 A 的 recoveryBarrier 同工艺；allowed 白名单 = ledger 根两个状态文件）。 */
+function barrierCampaign(env, intended, dir, inject) {
+  return recoveryBarrier({ dir, allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json", inject, verify: () => {
+    const a = readCampaignState(env);
+    const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id
+      && JSON.stringify(a.endpoints) === JSON.stringify(intended.endpoints) && a.endpoints_digest === intended.endpoints_digest;
+    return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
+  } });
+}
+function barrierWriter(env, intended, dir, inject) {
+  return recoveryBarrier({ dir, allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json", inject, verify: () => {
+    const a = readWriterState(env);
+    const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id && a.endpoints_digest === intended.endpoints_digest;
+    return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
+  } });
+}
+function barrierLedger(ep, dir, intended, inject) {
+  return recoveryBarrier({ dir, inject, verify: () => {
+    const a = loadLedger(dir, { endpointId: ep });
+    const ok = a.ok && a.sha256 === intended.ledger_sha256 && a.doc.schema_version === intended.schema_version && a.doc.revision === intended.revision;
+    return ok ? { ok: true } : { ok: false, why: "重读投影 ≠ intended（sha/schema/revision）" };
+  } });
+}
+
 /** P1-3（返修二 P1-1）：核**两条链**的已装 runtime 是否支持过渡（§8 进门前置）。
  *  目标从**受验 journal** 的 `current:<chain>.before` 取（绝不读桩 manifest 的 original_current——
  *  那是自由字段，可被改成 `../../../escape-runtime` 之类逃逸路径）。每个 before 必须精确为
@@ -643,9 +667,15 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(sealDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "seal 预算漂移", phase };
           const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: sealDoc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
-          if (w.commit !== "committed") return { ok: false, reason: "commit_residue", phase, commit: w.commit, why: w.why ?? null };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 返修三 测试注入点：写后读回前
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "sealed") return { ok: false, reason: "written_mismatch", why: "seal 写后读回 ≠ intended_after", phase };
+        } else {
+          // 返修三：恢复窗（现场 === intended）先 fsync+受验重读+无残骸才记 done。
+          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -673,10 +703,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         if (!d.ok) return { ok: false, reason: d.reason, why: ep, phase };
         const L = loadLedger(d.dir, { endpointId: ep });
         if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1") {
-          // 现场已 after → 补 done
+          // 现场已 after → 补 done。返修三：先 barrier 才记 done。
+          const rb = barrierLedger(ep, d.dir, st.intended_after, _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         } else {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.1-transition", toSchema: "1.1", env, _inject });
-          if (!r.ok) return { ok: false, reason: r.reason, why: r.why ?? null, phase, commit: r.commit ?? "not_committed" };
+          const sc = stepCommitCheck(r, "ledger");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
           if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 执行器读回 SHA ≠ 进段预算", phase };
         }
         const m = stepDone(st.id, st.intended_after);
@@ -702,9 +735,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(completeDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "complete 预算漂移", phase };
           const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: completeDoc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
-          if (w.commit !== "committed") return { ok: false, reason: "commit_residue", phase, commit: w.commit, why: w.why ?? null };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "complete") return { ok: false, reason: "written_mismatch", why: "complete 写后读回 ≠ intended_after", phase };
+        } else {
+          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -727,8 +764,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(rebuild)) !== intended.sha256) return { ok: false, reason: "writer_budget_drift", why: "on 预算漂移", phase };
           const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const adm = readOwnerSelectAdmission(env);
           if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
+        } else {
+          const rb = barrierWriter(env, intended, path.dirname(writerStatePath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -756,9 +798,14 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(rebuild.doc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "open 预算漂移", phase };
           const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: rebuild.doc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           copyBackup(path.join(ctx.dir, token + ".staged", "backup-campaign.json"), serializeLedger(rebuild.doc)); // seal/complete 步备份合同
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "open") return { ok: false, reason: "written_mismatch", why: "open 写后读回 ≠ intended_after", phase };
+        } else {
+          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -785,10 +832,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const d = resolveEndpointDir(ep, { env });
         const L = loadLedger(d.dir, { endpointId: ep });
         if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1") {
-          // 已 after
+          // 已 after。返修三：先 barrier 才记 done。
+          const rb = barrierLedger(ep, d.dir, st.intended_after, _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         } else {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1", env, _inject });
-          if (!r.ok) return { ok: false, reason: r.reason, why: r.why ?? null, phase, commit: r.commit ?? "not_committed" };
+          const sc = stepCommitCheck(r, "ledger");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
           if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 读回 ≠ 预算", phase };
         }
         const m = stepDone(st.id, st.intended_after);
@@ -812,8 +862,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(sealDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "seal 预算漂移", phase };
           const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: sealDoc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "sealed") return { ok: false, reason: "written_mismatch", why: "seal 写后读回 ≠ intended_after", phase };
+        } else {
+          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -837,8 +892,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(completeDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "complete 预算漂移", phase };
           const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: completeDoc, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "complete") return { ok: false, reason: "written_mismatch", why: "complete 写后读回 ≠ intended_after", phase };
+        } else {
+          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -860,8 +920,13 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (shaHex(serializeLedger(rebuild)) !== intended.sha256) return { ok: false, reason: "writer_budget_drift", why: "on 预算漂移", phase };
           const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const adm = readOwnerSelectAdmission(env);
           if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
+        } else {
+          const rb = barrierWriter(env, intended, path.dirname(writerStatePath(env)), _inject);
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -940,7 +1005,11 @@ function osmPrecheckDirect(ctx, { env, j }) {
 /** ── B 进段准备（§二.2）：seal + 每 ep precheck/strict + complete + writer on，全部 prepared ── */
 function osmPrepareForwardB(ctx, { token, env, frozen, cid, digest }) {
   const stagedDir = path.join(ctx.dir, token + ".staged");
-  fs.mkdirSync(stagedDir, { recursive: true, mode: 0o700 });
+  try { mkdirDurable(stagedDir, ctx.dir); }
+  catch (err) {
+    if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
+    return { ok: false, reason: "io_error", why: "建 staged 目录：" + errText(err) };
+  }
   const cs = readCampaignState(env);
   if (!cs.exists || cs.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "seal 前重读 campaign 非 open" };
   const ws = readWriterState(env);
@@ -952,11 +1021,13 @@ function osmPrepareForwardB(ctx, { token, env, frozen, cid, digest }) {
   const campaignBefore = { exists: true, sha256: cs.sha256, state: cs.state, campaign_id: cs.campaign_id, endpoints: cs.endpoints, endpoints_digest: cs.endpoints_digest };
   const sealAfter = { exists: true, sha256: shaHex(serializeLedger(sealDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
   const completeAfter = { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
-  // 备份
-  const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), fs.readFileSync(campaignPath(env)));
+  // 备份（用读取器 raw，同 A；copyBackup 复用分支已 sealReusedFile）
+  const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), cs.raw);
   if (!cb.ok) return { ok: false, reason: cb.reason, why: "campaign 备份" };
-  const wb = copyBackup(path.join(stagedDir, "backup-writer-state.json"), fs.readFileSync(writerStatePath(env)));
+  const wb = copyBackup(path.join(stagedDir, "backup-writer-state.json"), ws.raw);
   if (!wb.ok) return { ok: false, reason: wb.reason, why: "writer-state 备份" };
+  try { fsyncDir(stagedDir); }
+  catch (err) { return { ok: false, reason: "backup_dir_fsync_failed", why: "fsync staged 目录：" + errText(err) }; }
   const writerAfter = { exists: true, sha256: shaHex(serializeLedger(buildOsmWriterDoc({ token, cid, digest, expectedRevision: ws.revision + 1, state: "on" }))), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 };
   const at = new Date(ctx.now()).toISOString();
   const steps = [];
@@ -996,13 +1067,19 @@ function osmPrepareForwardDirect(ctx, { token, env, frozen }) {
   const completeAfter = { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
   const writerAfter = { exists: true, sha256: shaHex(serializeLedger(buildOsmWriterDoc({ token, cid, digest, expectedRevision: (ws.exists ? ws.revision : 0) + 1, state: "on" }))), state: "on", campaign_id: cid, endpoints_digest: digest, revision: (ws.exists ? ws.revision : 0) + 1 };
   const stagedDir = path.join(ctx.dir, token + ".staged");
-  fs.mkdirSync(stagedDir, { recursive: true, mode: 0o700 });
+  try { mkdirDurable(stagedDir, ctx.dir); }
+  catch (err) {
+    if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
+    return { ok: false, reason: "io_error", why: "建 staged 目录：" + errText(err) };
+  }
   let campaignBackup = { backup: null, backup_sha256: null, backup_bytes: null };
   if (cs.exists) {
-    const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), fs.readFileSync(campaignPath(env)));
+    const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), cs.raw);
     if (!cb.ok) return { ok: false, reason: cb.reason, why: "campaign 备份" };
     campaignBackup = { backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: cb.sha256, backup_bytes: cb.bytes };
   }
+  try { fsyncDir(stagedDir); }
+  catch (err) { return { ok: false, reason: "backup_dir_fsync_failed", why: "fsync staged 目录：" + errText(err) }; }
   const at = new Date(ctx.now()).toISOString();
   const steps = [];
   steps.push({ kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: openAfter, ...campaignBackup });

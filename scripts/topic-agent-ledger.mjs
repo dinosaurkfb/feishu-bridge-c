@@ -2232,6 +2232,9 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   // P1-1：compare → build → 账本锁 → rename 全程包进同一次真实 lease 实例的 commitWhileHeld 栅栏；
   //   提交点（rename 前）复核 active/gate/journal/step/lease，任一漂移 → rename 不执行。
   const leasePath0 = leasePath(maintDir0, opToken);
+  // R51 返修一补：verifier 读账本通过后、writeLedger 重读前留一个测试注入点（生产不传）——
+  // 让测试在“verifier 读”与“writeLedger 读”之间确定性改账本，从而命中 mutate 的 before_mismatch。
+  if (typeof _inject?.afterVerify === "function") _inject.afterVerify();
   let res0Out = null;
   const res0 = commitWhileHeld(leasePath0, () => {
     res0Out = writeLedger({
@@ -2305,6 +2308,9 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
   }
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);
+  // R51 返修一补：verifier 读账本通过后、writeLedger 重读前留一个测试注入点（生产不传）——
+  // 让测试在“verifier 读”与“writeLedger 读”之间确定性改账本，从而命中 mutate 的 ledger_diverged。
+  if (typeof _inject?.afterVerify === "function") _inject.afterVerify();
   let res0Out = null;
   const res0 = commitWhileHeld(leasePath(cap.maintenanceDir, capability.token), () => {
     res0Out = writeLedger({

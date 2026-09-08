@@ -907,9 +907,11 @@ function osmPrecheckB(ctx, { env }) {
 
 /** ── direct 前置（§三.1）：冻结集 = initDone 收据；每 ep 1.0 且两计数 0；campaign absent|complete；writer off|on ── */
 function osmPrecheckDirect(ctx, { env }) {
-  const agg = aggregateInitDone(ctx.dir);
-  if (!agg.ok) return { ok: false, reason: "receipts_unreadable", why: agg.why };
-  const frozen = [...new Set(agg.endpoints)].sort();
+  // P1-2（R52 返修一）：用唯一聚合 aggregateEndpointReceipts——任一端点收据 conflict/in-flight/duplicate/unreadable
+  //   → 整体 precheck_failed（why 点名），绝不拿剩余子集（自建 aggregateInitDone 已废）；R53 direct 天然继承。
+  const agg = aggregateEndpointReceipts({ dir: ctx.dir });
+  if (!agg.ok) return { ok: false, reason: "precheck_failed", why: agg.why ?? null };
+  const frozen = [...new Set(agg.endpoints.filter((e) => e.initDone === true).map((e) => e.endpointId))].sort();
   if (frozen.length === 0) return { ok: false, reason: "frozen_set_empty", why: "无任何 initDone 收据的 endpoint，冻结集为空" };
   for (const ep of frozen) {
     const d = resolveEndpointDir(ep, { env });
@@ -1091,7 +1093,7 @@ export function osmReopening(ctx, token, lease, env = process.env) {
     if (mi && L.sha256 !== mi.after.ledger_sha256) incomplete.push({ id: mi.id, why: "当前账本 SHA ≠ 最后（mint）step.after（" + String(L.sha256).slice(0, 12) + " ≠ " + mi.after.ledger_sha256.slice(0, 12) + "）" });
     if (!op) incomplete.push({ id: se.id, why: "账本内不含本 operation 的 schema_upgrade op（" + opId.slice(0, 8) + "）" });
     else if (op.request_key !== token + ":schema:" + ep) incomplete.push({ id: se.id, why: "schema_upgrade 的 request_key 非本 operation 派生键" });
-    else if (op.result?.from_schema !== "1.0" || op.result?.to_schema !== se.after.schema_version) incomplete.push({ id: se.id, why: "schema_upgrade 的 from/to 与 step.after 不符（" + String(op.result?.from_schema) + "→" + String(op.result?.to_schema) + "）" });
+    else if (op.result?.from_schema !== se.before.schema_version || op.result?.to_schema !== se.after.schema_version) incomplete.push({ id: se.id, why: "schema_upgrade 的 from/to 与 step.before/after 不符（" + String(op.result?.from_schema) + "→" + String(op.result?.to_schema) + "，应 " + se.before.schema_version + "→" + se.after.schema_version + "）" });
     else if (op.result_revision < se.intended_after.revision) incomplete.push({ id: se.id, why: "schema_upgrade 的 result_revision（" + op.result_revision + "）早于 journal 意图（" + se.intended_after.revision + "）" });
     else if (L.doc.revision < op.result_revision) incomplete.push({ id: se.id, why: "账本当前 revision 早于本事务" });
     const mop = mi ? Object.values(L.doc.operations).find((o) => o.op_type === "mint_selection_handles" && o.request_key === token) : null;

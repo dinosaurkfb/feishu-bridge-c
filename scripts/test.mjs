@@ -38409,7 +38409,6 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
-  test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
   // ── R53 夹具：B 的前置状态（open campaign + partial writer + transition 账本计数 0）──
   const r53SetupB = ({ crashAfter = null } = {}) => {
     const fx = r52Setup({ twoEps: true, noReceipts: true, crashAfter });
@@ -38598,13 +38597,13 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       seB.intended_after.ledger_sha256 = r52Sha("7");
       fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj.doc, null, 2) + "\n", { mode: 0o600 });
       const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
-      assert.equal(ex.ok, false, "written_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
-      process.stderr.write("R53K5 ex=" + JSON.stringify({ ok: ex.ok, reason: ex.reason, why: ex.why, phase: ex.phase }) + "\n");
-      assert.equal(ex.reason, "written_mismatch", "written_mismatch");
+      assert.equal(ex.ok, false, "intended_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
+      assert.equal(ex.reason, "intended_mismatch", "intended_mismatch（main R51 预算≠intended 提前拒）");
       const jj2 = readJournal({ dir: fx.dir, token: tok });
       assert.equal(jj2.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":strict").state, "prepared", "epB strict step 不记 done");
-      // 修复（按现场重算锚）→ 续跑 done
-      const shaReal = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] }).sha256;
+      // 修复（按现场重算锚：intended_after 应为 epB 的 strict SHA——applySchemaUpgrade transition→strict 预算）→ 续跑 done
+      const LBe = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] });
+      const shaReal = r52ShaOf(TAL.serializeLedger(TAL.applySchemaUpgrade(LBe.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(tok, fx.eps[1]), request_key: tok + ":schema:" + fx.eps[1], from_schema: "1.1-transition", to_schema: "1.1" })));
       const jj3 = readJournal({ dir: fx.dir, token: tok });
       jj3.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":strict").intended_after.ledger_sha256 = shaReal;
       fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj3.doc, null, 2) + "\n", { mode: 0o600 });

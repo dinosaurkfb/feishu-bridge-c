@@ -1698,7 +1698,7 @@ export function fingerprintOf(opType, inputs) {
 }
 
 /** 账本落盘字节（与 writeLedger 同一函数——plan 的 expected_ledger_sha256 必须用同一序列化重演算）。 */
-const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
+export const serializeLedger = (doc) => Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
 
 /** 32 hex → UUID 形（OP_ID_SHAPE）：8-4-4-4-12，第 13 位 version 4、第 17 位 variant 8。 */
 const uuidFromHex = (hex) => hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-4" + hex.slice(13, 16) + "-8" + hex.slice(17, 20) + "-" + hex.slice(20, 32);
@@ -2219,6 +2219,12 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
         const inv = migrationInventory(currentDoc);
         if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: "legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count };
       }
+      // P1-2：锁内核当前 SHA === step.before.ledger_sha256（执行器与 journal 锚同源，不认自己构造的预算）
+      const curSha0 = sha256(serializeLedger(currentDoc));
+      if (curSha0 !== cap.osmStep.before.ledger_sha256) {
+        if (curSha0 === cap.osmStep.intended_after.ledger_sha256) return { ok: false, reason: "already", why: "账本已处于 step.intended_after" };
+        return { ok: false, reason: "before_mismatch", why: "锁内 current SHA ≠ step.before.ledger_sha256（" + curSha0.slice(0, 12) + " ≠ " + cap.osmStep.before.ledger_sha256.slice(0, 12) + "）" };
+      }
       if (currentDoc.schema_version !== fromSchema) return { ok: false, reason: "schema_moved", why: "账本 schema_version " + currentDoc.schema_version + " ≠ fromSchema " + fromSchema };
       // R52 §一：op key 确定性（token=capability.token 作盐）→ 编排可预算 intended_after；mutate 与 applySchemaUpgrade 同一函数。
       const next = applySchemaUpgrade(currentDoc, {
@@ -2231,8 +2237,8 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
   if (res.idempotent) return { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) };
   const reread = loadLedger(d.dir, { endpointId });
-  if (!reread.ok || reread.sha256 !== builtSha || reread.doc.schema_version !== toSchema) {
-    return { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA/schema 与预期不符", ...wrNote(res) };
+  if (!reread.ok || reread.sha256 !== builtSha || reread.sha256 !== cap.osmStep.intended_after.ledger_sha256 || reread.doc.schema_version !== toSchema) {
+    return { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ step.intended_after.ledger_sha256（" + String(reread.sha256 ?? "?").slice(0, 12) + " ≠ " + cap.osmStep.intended_after.ledger_sha256.slice(0, 12) + "）", ...wrNote(res) };
   }
   return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
 }

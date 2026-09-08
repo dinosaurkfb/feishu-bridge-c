@@ -36568,6 +36568,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   // A 迁移 fixture（osm_a_upgrading）：campaign:open + schema_endpoint:transition + mint + writer_state:partial，
   // 锚点用调用方给的账本现场（真 SHA/schema/revision）；blob 文件真落盘（内容任意，journalProblem 只核形状，
   // blob 与 plan 字节的一致性是 R52 重放合同）。
+  const r51ShaOf52 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
   const r51FixtureA = ({ root, ledgerSha, ledgerSchema, ledgerRevision, nullB1Count = 2, tok = r51Uuid(9), now = T0, transitionAfterSha = null }) => {
     const maintDir = path.join(root, "maint");
     fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
@@ -36652,7 +36653,9 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   test("R51 §一 capability：schema_upgrade/mint_selection_handles fail-closed 核验（读实文件，不信任自述）", () => r51WithRoot((root, dir) => {
     r51Seed(dir);
     const L = TAL.loadLedger(dir, { endpointId: EP51 });
-    const fx = r51FixtureA({ root, ledgerSha: L.sha256, ledgerSchema: L.doc.schema_version, ledgerRevision: L.doc.revision });
+    const preTok = r51Uuid(9);
+    const frozenSha = r51ShaOf52(TAL.serializeLedger(TAL.applySchemaUpgrade(L.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(preTok, EP51), request_key: "req_r51_up", from_schema: "1.0", to_schema: "1.1-transition" })));
+    const fx = r51FixtureA({ root, ledgerSha: L.sha256, ledgerSchema: L.doc.schema_version, ledgerRevision: L.doc.revision, transitionAfterSha: frozenSha, tok: preTok });
     const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
     const args = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_r51_up", fromSchema: "1.0", toSchema: "1.1-transition", env };
 
@@ -36720,7 +36723,10 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const b1b = r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_b1b", chatId: "oc_r51b", rootOm: "om_r51b", lineageId: "lin-b", bindingTarget: T51(2), now: Date.now() }), "B1b").result.created_id;
     r51Ok(TAL.voidPending({ endpointId: EP51, requestKey: "req_void1", b1Id: b1b, reason: "manual", now: Date.now() }), "void");
     const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
-    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision });
+    // P1-2：intended 用进段前冻结的 applySchemaUpgrade 预算（不再事后回填）
+    const preTok = r51Uuid(9); // 预先定 token → 预算可先算（intended 进段前冻结）
+    const frozenSha = r51ShaOf52(TAL.serializeLedger(TAL.applySchemaUpgrade(L0.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(preTok, EP51), request_key: "req_up1", from_schema: "1.0", to_schema: "1.1-transition" })));
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision, transitionAfterSha: frozenSha, tok: preTok });
     const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
     const args = { endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_up1", fromSchema: "1.0", toSchema: "1.1-transition", env };
 
@@ -36740,15 +36746,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
     assert.equal(after.doc.records[b1b].kind, "voided_audit", "voided 不动");
 
-    // ── 重放：同 requestKey 重调 → replayed。先回填 intended_after.ledger_sha256 = 执行后读回值
-    // （模拟 R52 markStepDone 前的回填：§8.2 schema_endpoint 行"ledger_sha256 = after 读回"），
-    // capability 的 after 态核才能放行到 writeLedger 的 requestKey 重放前置。──
-    fx.rewrite((d) => {
-      d.steps.find((s) => s.kind === "schema_endpoint").intended_after.ledger_sha256 = res.sha256;
-      const mint = d.steps.find((s) => s.kind === "mint");
-      mint.before.ledger_sha256 = res.sha256; // 状态链闭合：mint.before 与 schema_endpoint.intended_after 同步
-      mint.backup_sha256 = res.sha256;        // 备份恒需合同：backup_sha256 === before.ledger_sha256
-    });
+    // ── 重放：同 requestKey 重调 → replayed（intended 已是进段前冻结的预算，after 态核直接放行）──
     const rep = TAL.schemaUpgrade(args);
     assert.ok(rep.ok && rep.commit === "replayed", "同 key 重放：" + JSON.stringify(rep));
     assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).doc.revision, after.doc.revision, "重放不 bump revision");

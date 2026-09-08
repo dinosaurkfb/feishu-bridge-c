@@ -37910,6 +37910,34 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 返修一 P1-5：备份字节出处——schema 备份=raw 1.0、mint 备份 sha=三方等式（mint.before===schema.intended_after===备份sha）", () => {
+    const fx = r52Setup({ crashAfter: 8 }); // 进段后崩（steps 已写、staged 仍在）
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      const tok = readActive({ dir: fx.dir }).token;
+      const j52 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j52.doc.phase, "osm_a_upgrading");
+      for (const ep of fx.eps) {
+        const se = j52.doc.steps.find((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":transition");
+        const mint = j52.doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
+        // 三方等式：mint.before.ledger_sha256 === schema.intended_after.ledger_sha256 === mint 备份字节 sha
+        assert.equal(mint.before.ledger_sha256, se.intended_after.ledger_sha256, ep + " mint.before === schema.intended_after");
+        assert.equal(mint.backup_sha256, mint.before.ledger_sha256, ep + " mint 备份 sha === mint.before.ledger_sha256");
+        // schema 备份 = raw 1.0 字节，其 sha === schema.before.ledger_sha256
+        assert.equal(se.backup_sha256, se.before.ledger_sha256, ep + " schema 备份 sha === schema.before.ledger_sha256（raw 1.0）");
+        // 读回两组备份文件字节核 sha
+        assert.equal(fs.existsSync(se.backup), true, ep + " schema 备份文件在场");
+        const seBak = fs.readFileSync(se.backup, "utf-8");
+        assert.equal(crypto.createHash("sha256").update(seBak).digest("hex"), se.backup_sha256, ep + " schema 备份文件字节 sha 对上");
+        const mintBak = fs.readFileSync(mint.backup, "utf-8");
+        assert.equal(crypto.createHash("sha256").update(mintBak).digest("hex"), mint.backup_sha256, ep + " mint 备份文件字节 sha 对上");
+        assert.notEqual(se.backup_sha256, mint.backup_sha256, ep + " schema(1.0 raw) 与 mint(transitioned) 备份字节不同");
+      }
+    } finally { fx.cleanup(); }
+  });
+
   test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
     // ── 1. mint 段 commit_residue：failDirFsync → committed_durability_uncertain → 停门、step 不记 done ──
     {

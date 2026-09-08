@@ -253,14 +253,21 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     }
     const planBlob = { path: planFile, bytes: planBytes.length, sha256: shaHex(planBytes) };
 
-    // ③ 账本备份进 staged（backup_sha256 === before.ledger_sha256 的合同）
+    // ③ 账本备份进 staged（P1-5：schema 步备份 = 受验读取器读到的 1.0 原始字节——backup_sha === before.ledger_sha256；
+    //    mint 步备份 = serializeLedger(applySchemaUpgrade(...)) 的确定性字节——三方等式
+    //    mint.before.ledger_sha256 === schema.intended_after.ledger_sha256 === mint 备份 sha；不得从状态投影重新 JSON 化）。
     const backupFile = path.join(stagedDir, "backup-ledger-" + ep + ".json");
     const b = copyBackup(backupFile, L.bytes ?? serializeLedger(L.doc));
     if (!b.ok) return { ok: false, reason: b.reason, why: ep + "：" + (b.why ?? "") };
+    const mintBackupFile = path.join(stagedDir, "backup-mint-" + ep + ".json");
+    const mb = copyBackup(mintBackupFile, serializeLedger(next));
+    if (!mb.ok) return { ok: false, reason: mb.reason, why: ep + " mint 备份：" + (mb.why ?? "") };
+    if (mb.sha256 !== schemaAfter.ledger_sha256) return { ok: false, reason: "mint_backup_sha_mismatch", why: ep + " mint 备份 sha ≠ schema.intended_after.ledger_sha256", rollbackSafe: false };
 
     perEp.push({
       ep, plan, planBlob, schemaAfter,
       backupFile, backupSha: b.sha256, backupBytes: b.bytes,
+      mintBackupFile, mintBackupSha: mb.sha256, mintBackupBytes: mb.bytes,
       schemaBefore: { schema_version: "1.0", revision: L.doc.revision, ledger_sha256: L.sha256 },
       mintBefore: { revision: L.doc.revision + 1, null_b1_count: inv.null_b1_count, ledger_sha256: schemaAfter.ledger_sha256 },
       mintAfter: { revision: L.doc.revision + 2, null_b1_count: 0, ledger_sha256: plan.expected_ledger_sha256 },
@@ -281,12 +288,18 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
   let campaignBackup = { backup: null, backup_sha256: null, backup_bytes: null };
   let writerBackup = { backup: null, backup_sha256: null, backup_bytes: null };
   if (cs.exists) {
-    const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), Buffer.from(JSON.stringify(cs.raw ?? campaignBefore, null, 2) + "\n", "utf-8"));
+    // P1-5：campaign 备份 = 读取器 raw 原始字节（读回核 sha === 读取器 sha），不得从状态投影重新 JSON 化。
+    const rawBytes = fs.readFileSync(campaignPath(env));
+    if (shaHex(rawBytes) !== cs.sha256) return { ok: false, reason: "campaign_backup_raw_mismatch", why: "campaign 备份 raw sha ≠ 读取器 sha", rollbackSafe: false };
+    const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), rawBytes);
     if (!cb.ok) return { ok: false, reason: cb.reason, why: "campaign 备份：" + (cb.why ?? "") };
     campaignBackup = { backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: cb.sha256, backup_bytes: cb.bytes };
   }
   if (ws.exists) {
-    const wb = copyBackup(path.join(stagedDir, "backup-writer-state.json"), Buffer.from(JSON.stringify(ws.raw ?? writerBefore, null, 2) + "\n", "utf-8"));
+    // P1-5：writer_state 备份 = 读取器 raw 原始字节（读回核 sha === 读取器 sha），不得从状态投影重新 JSON 化。
+    const rawBytes = fs.readFileSync(writerStatePath(env));
+    if (shaHex(rawBytes) !== ws.sha256) return { ok: false, reason: "writer_backup_raw_mismatch", why: "writer-state 备份 raw sha ≠ 读取器 sha", rollbackSafe: false };
+    const wb = copyBackup(path.join(stagedDir, "backup-writer-state.json"), rawBytes);
     if (!wb.ok) return { ok: false, reason: wb.reason, why: "writer-state 备份：" + (wb.why ?? "") };
     writerBackup = { backup: path.join(stagedDir, "backup-writer-state.json"), backup_sha256: wb.sha256, backup_bytes: wb.bytes };
   }
@@ -299,7 +312,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
   steps.push({ kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: campaignAfter, ...campaignBackup });
   for (const p of perEp) {
     steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + p.ep + ":transition", state: "prepared", at, target: "ledger/" + p.ep + "/ledger.json", chain: null, before: p.schemaBefore, intended_after: p.schemaAfter, backup: p.backupFile, backup_sha256: p.schemaBefore.ledger_sha256, backup_bytes: p.backupBytes });
-    steps.push({ kind: "mint", id: "mint:" + p.ep, state: "prepared", at, target: "ledger/" + p.ep + "/ledger.json", chain: null, before: p.mintBefore, intended_after: p.mintAfter, intended_blob: p.planBlob, backup: p.backupFile, backup_sha256: p.mintBefore.ledger_sha256, backup_bytes: p.backupBytes });
+    steps.push({ kind: "mint", id: "mint:" + p.ep, state: "prepared", at, target: "ledger/" + p.ep + "/ledger.json", chain: null, before: p.mintBefore, intended_after: p.mintAfter, intended_blob: p.planBlob, backup: p.mintBackupFile, backup_sha256: p.mintBefore.ledger_sha256, backup_bytes: p.mintBackupBytes });
   }
   steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, ...writerBackup });
 

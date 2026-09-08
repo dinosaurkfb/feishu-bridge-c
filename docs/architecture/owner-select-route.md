@@ -349,7 +349,7 @@ lease、install-surface 锁、active 清理语义与 `ledger_init`/`ledger_cutov
 纪律一致。**A / direct 的进门前置（九轮 P1-3）**：当前 runtime **必已受验支持** transition/strict
 schema 与 1.4 journal——即**先经普通 `maintenance_install` 装过渡版 runtime**（独立一次、需 Frank
 授权的装），再进 A/direct；未装即拒进段。崩溃恢复只从 journal 记的 step 集续跑。
-**「已受验支持」的客观判据（#138 一轮 P1-3 回带）**：`osmPrecheck` 只读核对 `~/.claude/feishu-bridge/runtime/current` 指向的**已装版本目录**——manifest 完整（`verifyRuntime` ok），且该目录内 `scripts/maintenance/journal.mjs` 导出 `OWNER_SELECT_JOURNAL_SCHEMA === "1.4"`、`scripts/topic-agent-ledger.mjs` 导出 `SCHEMA_VERSIONS` 含 `"1.1-transition"` 与 `"1.1"`（动态 import 已装目录内的模块，只读、不执行任何事务）；读不出、缺导出、值不符 → `precheck_failed: runtime_not_transition_capable`，拒进段。核的是**已装**的那份，不是仓库工作树里的这份。
+**「已受验支持」的客观判据（#138 一轮 P1-3 回带）**：`osmPrecheck` 只读核对 `~/.claude/feishu-bridge/runtime/current` 指向的**已装版本目录**——manifest 完整（`verifyRuntime` ok），且该目录内 `scripts/maintenance/journal.mjs` 导出 `OWNER_SELECT_JOURNAL_SCHEMA === "1.4"`、`scripts/topic-agent-ledger.mjs` 导出 `SCHEMA_VERSIONS` 含 `"1.1-transition"` 与 `"1.1"`（经**子进程探针**动态 import 已装目录内的模块：`scripts/maintenance/runtime-capability-probe.mjs` 随 runtime 一起装，编排用 `execFileSync(process.execPath, [探针, 已装目录], {timeout})` 同步等它打出一行 JSON；探针只 import 已装目录内的模块、只读、不执行任何事务；非零退出 / 超时 / 输出不合法同样拒）；读不出、缺导出、值不符 → `precheck_failed: runtime_not_transition_capable`，拒进段。核的是**已装**的那份，不是仓库工作树里的这份。
 
 ### 8.2 journal 1.4 封闭数据联合（十轮 P1-2：不是流程表，是可直译 journalProblem 合同；回带 `maintenance-gate.md`）
 

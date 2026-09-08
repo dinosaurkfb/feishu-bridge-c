@@ -10311,10 +10311,13 @@ test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim
     },
   });
   assert.equal(acquired.ok, true);
+  // R55：默认准入改读真状态 —— repair 子进程给一个空账本根（双缺席 → off），原「默认 off 收敛」断言保持成立
+  const repairLedger = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r55-codex-ledger-"));
+  fs.chmodSync(repairLedger, 0o700);
 
   const repair = (...args) => spawnSync(process.execPath, [
     path.join(ROOT, "scripts", "codex", "repair-control-claim.mjs"), ...args,
-  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home } });
+  ], { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FEISHU_BRIDGE_LEDGER_DIR: repairLedger } });
 
   // 1. 预览校验：按 kind 投影文案（P2），不得报「控制意图 ?」或「目标模式」
   const preview = repair("--thread-id", THREAD_A, "--key", key);

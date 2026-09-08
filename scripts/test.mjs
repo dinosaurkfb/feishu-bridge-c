@@ -37666,6 +37666,46 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 ②b P1-1 顶层：真跑 maintenance-gate.mjs --exit --apply（隔离 HOME）在 osm_a 各提交点后崩 → 只向前收敛 done、handle 不重生成", () => {
+    // 复用 ② 的崩溃点：8=进段后 9=campaign open 12=mint epA（代表段内不同提交点）。
+    for (const crashAfter of [8, 9, 12]) {
+      const fx = r52Setup({ crashAfter });
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "崩溃点 " + crashAfter + " 模拟崩溃穿出");
+        // 模拟接管者：交还同 pid 契约下未释放的 operation lease 与安装面锁。
+        const act52 = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act52.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const handlesBefore = {};
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          handlesBefore[ep] = L.ok ? Object.values(L.doc.records).filter((rec) => rec.kind === "live" && (rec.selection_handle ?? null) !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]) : [];
+        }
+        // 真正以子进程跑 CLI：--exit --apply 必须路由到 osmExit（P1-1 分派），而非通用 rollback。
+        let cliStdout = "", cliCode = null;
+        try { cliStdout = execFileSync(process.execPath, [path.resolve("scripts", "maintenance-gate.mjs"), "--exit", "--apply"], { encoding: "utf-8", env: fx.env, stdio: ["ignore", "pipe", "pipe"] }); cliCode = 0; }
+        catch (e) { cliCode = e.status ?? null; cliStdout = String(e.stdout ?? "") + String(e.stderr ?? ""); }
+        assert.equal(cliCode, 0, "CLI --exit --apply 退出码 0（崩溃点 " + crashAfter + "）：" + JSON.stringify({ cliCode, cliStdout: String(cliStdout).slice(0, 400) }));
+        // 收敛 done + active 已清（绝不回退 / 绝不留下未完成终态）。
+        const afterActive = readActive({ dir: fx.dir });
+        const j52 = readJournal({ dir: fx.dir, token: act52.token });
+        assert.equal(afterActive.state, "absent", "崩溃点 " + crashAfter + " active 已清");
+        assert.equal(j52.doc.phase, "done", "崩溃点 " + crashAfter + " 收敛到 done（绝不回退）：" + j52.doc.phase);
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          assert.ok(L.ok, "恢复后账本可读");
+          assert.equal(L.doc.schema_version, "1.1-transition", ep + " 已 transition");
+          const handlesAfter = Object.values(L.doc.records).filter((rec) => rec.kind === "live" && rec.selection_handle !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]);
+          for (const h of handlesBefore[ep]) assert.ok(handlesAfter.some((x) => x[0] === h[0] && x[1] === h[1] && x[2] === h[2]), "崩溃点 " + crashAfter + " " + ep + " handle 不重生成");
+        }
+        assert.equal(readCampaignState(fx.env).state, "open", "崩溃点 " + crashAfter + " campaign open");
+        assert.equal(readWriterState(fx.env).state, "partial", "崩溃点 " + crashAfter + " writer partial");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   // 手工 drained 1.4 journal（plan 矩阵/回退场景用）：token 已知，可直接预置 staged plan。
   const r52EnterSteps = (tok, cur = { claude: "versions/0123456789abcdef", codex: "versions/0123456789abcdef" }) => {
     const sha = r52Sha("0");

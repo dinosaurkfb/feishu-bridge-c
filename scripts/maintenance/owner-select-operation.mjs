@@ -28,7 +28,7 @@ import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, 
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { applyMintPlan, applySchemaUpgrade, buildMintPlan, fingerprintOf, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, OWNER_SELECT_HANDLE_TTL_MS, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
-import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writeWriterState } from "./owner-select-state.mjs";
+import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
@@ -121,6 +121,33 @@ function sealReusedFile(file, dir) {
   try { dfd = fs.openSync(dir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
   catch (err) { return { ok: false, why: errText(err) }; }
   finally { try { if (dfd !== null) fs.closeSync(dfd); } catch { /* 已关 */ } }
+  return { ok: true };
+}
+
+/** P1-4（返修二）：恢复记 done 屏障 —— 发现现场 === intended（崩溃窗口）后，先 fsync 目标目录、
+ *  无锁/tmp 残骸，再受验重读 + 完整投影 === intended，才许 markStepDone。任一失败 → 不记 done（停门）。
+ *  `allowed` 为目录里合法制品的白名单谓词；子目录跳过。返回 { ok:true } 或 { ok:false, why }。 */
+function recoveryBarrier({ dir, verify, inject = null, allowed = null } = {}) {
+  let dfd = null;
+  try {
+    if (inject?.failDirFsync) throw Object.assign(new Error("注入目录 fsync 失败"), { code: "EIO" });
+    dfd = fs.openSync(dir, fs.constants.O_RDONLY);
+    fs.fsyncSync(dfd);
+  } catch (err) { return { ok: false, why: errText(err) }; }
+  finally { try { if (dfd !== null) fs.closeSync(dfd); } catch { /* 已关 */ } }
+  try {
+    for (const n of fs.readdirSync(dir)) {
+      let st = null;
+      try { st = fs.lstatSync(path.join(dir, n)); } catch { continue; }
+      if (st.isDirectory()) continue;
+      if (allowed !== null && allowed(n)) continue;
+      if (allowed === null && (n === "ledger.json" || n === "ledger.json.prev" || n === "ledger.lock"
+        || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json")) continue;
+      return { ok: false, why: "tmp/锁残骸：" + n };
+    }
+  } catch (err) { return { ok: false, why: errText(err) }; }
+  const v = verify();
+  if (!v.ok) return { ok: false, why: v.why ?? "重读投影 ≠ intended" };
   return { ok: true };
 }
 
@@ -441,6 +468,21 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "open") return { ok: false, reason: "written_mismatch", why: "campaign 写后读回 ≠ intended_after", phase };
         }
+        // P1-4：恢复（现场 === intended）必须先 fsync 目标目录、无 tmp/锁残骸、受验重读+完整投影 === intended，才记 done。
+        if (atIntended) {
+          const rb = recoveryBarrier({
+            dir: path.dirname(campaignPath(env)),
+            allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
+            inject: _inject,
+            verify: () => {
+              const a = readCampaignState(env);
+              const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id
+                && JSON.stringify(a.endpoints) === JSON.stringify(intended.endpoints) && a.endpoints_digest === intended.endpoints_digest;
+              return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
+            },
+          });
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
+        }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -455,7 +497,16 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         if (!d.ok) return { ok: false, reason: d.reason, why: ep, phase };
         const L = loadLedger(d.dir, { endpointId: ep });
         if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === st.intended_after.schema_version) {
-          // 现场已 after（崩溃窗口）→ 补 done
+          // 现场已 after（崩溃窗口）→ 补 done。P1-4：先 fsync 目录、无残骸、受验重读+完整投影 === intended。
+          const rb = recoveryBarrier({
+            dir: d.dir, inject: _inject,
+            verify: () => {
+              const a = loadLedger(d.dir, { endpointId: ep });
+              const ok = a.ok && a.sha256 === st.intended_after.ledger_sha256 && a.doc.schema_version === st.intended_after.schema_version && a.doc.revision === st.intended_after.revision;
+              return ok ? { ok: true } : { ok: false, why: "重读投影 ≠ intended（sha/schema/revision）" };
+            },
+          });
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         } else {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1-transition", env, _inject });
           const sc = stepCommitCheck(r);
@@ -483,6 +534,16 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const r = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token }, plan, env, _inject });
         const sc = stepCommitCheck(r);
         if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
+        // P1-4：执行器返回 ok 后，编排层受验重读账本并逐字段核 intended_after，才记 done（不信执行器自报）。
+        if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：执行器返回 ok 后、重读账本前
+        const dd = resolveEndpointDir(ep, { env });
+        if (!dd.ok) return { ok: false, reason: dd.reason, why: ep, phase };
+        const after = loadLedger(dd.dir, { endpointId: ep });
+        const ia = st.intended_after;
+        const invA = after.ok ? migrationInventory(after.doc) : null;
+        if (!(after.ok && after.sha256 === ia.ledger_sha256 && after.doc.revision === ia.revision && invA.null_b1_count === ia.null_b1_count)) {
+          return { ok: false, reason: "written_mismatch", why: "mint 执行器返回 ok 但账本读回 ≠ intended_after（" + (after.ok ? "sha/rev/null_b1_count" : after.reason) + "）", phase };
+        }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -505,6 +566,20 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const after = readWriterState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "partial") return { ok: false, reason: "written_mismatch", why: "writer-state 写后读回 ≠ intended_after", phase };
+        }
+        // P1-4：恢复（现场 === intended）必须先 fsync 目标目录、无 tmp/锁残骸、受验重读+完整投影 === intended，才记 done。
+        if (atIntended) {
+          const rb = recoveryBarrier({
+            dir: path.dirname(writerStatePath(env)),
+            allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
+            inject: _inject,
+            verify: () => {
+              const a = readWriterState(env);
+              const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id && a.endpoints_digest === intended.endpoints_digest;
+              return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
+            },
+          });
+          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };

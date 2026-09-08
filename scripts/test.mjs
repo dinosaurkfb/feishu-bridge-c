@@ -38024,6 +38024,57 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R52 返修二 P1-4：恢复记 done 条件补全——campaign 恢复窗口先 fsync+无残骸+受验重读才记 done（目录 fsync 失败→不记）；mint 执行器返回 ok 但账本被改→不记 done", () => {
+    // ── counter #2：mint 执行器返回 ok 后账本被改（afterWrite 注入）→ 编排层受验重读 ≠ intended_after → 不记 done ──
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const dfx = r52DrainedFixture({ fx, tok });
+        let tampered = null;
+        fx.ctx.afterWrite = (id) => {
+          if (id === "mint:" + ep) {
+            const lf = path.join(fx.ledgerRoot, ep, "ledger.json");
+            fs.writeFileSync(lf, "tampered-not-json", { mode: 0o600 });
+            tampered = id;
+          }
+        };
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.equal(tampered, "mint:" + ep, "执行器返回 ok 后账本被改（afterWrite 命中）");
+        assert.ok(r.ok === false, "账本被改 → 不记 done：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "written_mismatch", "拒因 written_mismatch（账本读回 ≠ intended_after）");
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        const mintStep = jj.doc.steps.find((s) => s.kind === "mint");
+        assert.equal(mintStep.state, "prepared", "mint step 不记 done（账本被改）");
+      } finally { fx.cleanup(); }
+    }
+    // ── counter #1：campaign 恢复窗口（现场 === intended）注入目录 fsync 失败 → recovery_seal_failed，campaign 不记 done ──
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const tok = r52Uuid(5);
+        const cid = campaignIdFor(tok);
+        const campId = "campaign:" + cid + ":open";
+        const dfx = r52DrainedFixture({ fx, tok });
+        // 第一步：campaign 写后即崩（写成功但 step 未 done）→ 现场 === intended 的恢复窗口。
+        fx.ctx.afterWrite = (id) => { if (id === campId) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.ok(crashed, "campaign 写后崩");
+        releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        // 第二步：恢复 forward，注入目录 fsync 失败 → 恢复窗口的 recoveryBarrier 拒 → campaign 不记 done。
+        fx.ctx.afterWrite = null;
+        const r2 = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r2.ok === false && r2.reason === "recovery_seal_failed", "目录 fsync 失败 → recovery_seal_failed：" + JSON.stringify({ reason: r2.reason, why: r2.why, phase: r2.phase }));
+        const jj2 = readJournal({ dir: fx.dir, token: tok });
+        const campStep = jj2.doc.steps.find((s) => s.id === campId);
+        assert.equal(campStep.state, "prepared", "campaign step 不记 done（目录 fsync 失败）");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
     // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
     {

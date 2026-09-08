@@ -169,7 +169,7 @@ export function issueReaffirmIntent({ endpointId, targetId, authorizedOwner, cha
     // 受验清理：只动本 target 的过期项（§8.1「先受验清理该 target 的过期项」；他 target 的过期项归其下次签发清理）
     const cleaned = [];
     for (const [k, e] of Object.entries(doc.entries)) {
-      if (e.target_id === targetId && Date.parse(e.expires_at) <= now) { cleaned.push(k); delete doc.entries[k]; }
+      if (e.target_id === targetId && Date.parse(e.expires_at) <= nowMs) { cleaned.push(k); delete doc.entries[k]; }
     }
     // CAS：no-existing-intent = 该 target 下无任何未清 intent（不是「忽略过期项」——否则同 target 堆积）
     if (Object.values(doc.entries).some((e) => e.target_id === targetId)) {

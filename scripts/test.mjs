@@ -39434,7 +39434,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
   test("R57b 签发：issueReaffirmIntent 签 rfh_（entry 封闭九键、expires_at=issued_at+TTL、digest 按 §8.1 公式、family 入摘要）", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_1", 31, "sess-b-31");
-    const issued = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue");
+    const issued = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
     assert.match(issued.reaffirm_handle, /^rfh_[0-9a-f]{32}$/u, "rfh_ 形状");
     const doc = readIntentsB(dir);
     assert.ok(doc, "intent 文件已写");
@@ -39474,24 +39474,24 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
   test("R57b 签发 CAS：同 target 已有未清 intent → 拒（reaffirm_intent_exists）；同锁内先受验清理该 target 过期项再签", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_3", 33, "sess-b-33");
-    const first = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue#1");
-    const second = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B + 1000 });
+    const first = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#1");
+    const second = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B + 1000 });
     assert.equal(second.ok, false, "已有未清 intent → 拒");
     assert.equal(second.reason, "reaffirm_intent_exists");
     const doc1 = readIntentsB(dir);
     assert.deepEqual(Object.keys(doc1.entries), [first.reaffirm_handle], "拒时不新增");
     // 过期后重签：旧项受验清理、新 handle 签发
-    const later = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B + 7 * 86400e3 + 1 }), "过期后重签");
+    const later = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B + 7 * 86400e3 + 1 }), "过期后重签");
     assert.notEqual(later.reaffirm_handle, first.reaffirm_handle);
     const doc2 = readIntentsB(dir);
     assert.deepEqual(Object.keys(doc2.entries), [later.reaffirm_handle], "过期旧项已清、恰一新项");
     assert.equal(later.cleaned.length, 1, "清理清单点名旧 handle");
     // 别的 target 不受影响（清理只动本 target）
     const b3b = seedB3B(dir, "r57b_3b", 34, "sess-b-34");
-    talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue#其他target");
+    talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#其他target");
     const before = readIntentsB(dir);
     const staleHandle = Object.keys(before.entries).find((h) => before.entries[h].target_id === b3b);
-    const later2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B + 7 * 86400e3 + 1 }), "过期后重签#其他");
+    const later2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B + 7 * 86400e3 + 1 }), "过期后重签#其他");
     const doc3 = readIntentsB(dir);
     assert.equal(Object.keys(doc3.entries).length, 2, "另一 target 的未过期 intent 不动");
     assert.ok(Object.keys(doc3.entries).includes(later.reaffirm_handle), "前一 target 的 intent 仍在");
@@ -39502,33 +39502,33 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b3 = seedB3B(dir, "r57b_4", 35, "sess-b-35");
     const f = path.join(dir, "reaffirm-intents.json");
     fs.writeFileSync(f, "{ 坏", { mode: 0o600 });
-    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B });
+    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
     assert.equal(r.ok, false, "坏 JSON 拒");
     assert.equal(r.reason, "reaffirm_intents_unreadable");
     fs.unlinkSync(f);
     fs.writeFileSync(f, JSON.stringify({ schema_version: "reaffirm-intents-1", entries: {} }), { mode: 0o644 });
-    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B });
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
     assert.equal(r.ok, false, "非 0600 拒");
     assert.equal(r.reason, "reaffirm_intents_unreadable", "非 0600 拒");
     fs.chmodSync(f, 0o600);
     fs.linkSync(f, path.join(dir, "reaffirm-intents.alias.json"));
-    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B });
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
     assert.equal(r.reason, "reaffirm_intents_unreadable", "硬链接数 >1 拒");
     fs.unlinkSync(path.join(dir, "reaffirm-intents.alias.json"));
     // 可读其余条目自洽 → 仍可签发（之前存在的合法 entry 不丢）
     fs.writeFileSync(f, JSON.stringify({ schema_version: "reaffirm-intents-1", entries: {} }), { mode: 0o600 });
-    talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "恢复后可签");
+    talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "恢复后可签");
   }));
 
   test("R57b 签发范围与输入：B1 不可 reaffirm（reaffirm_scope）；target 非 live；chatId 与记录不符 → 拒", () => withLedgerB((root, dir) => {
     const b1 = talOkB(TAL.createB1({ endpointId: EP57B, requestKey: "r57b_scope_b1", chatId: "oc_r57b", rootOm: "om_scope", lineageId: "lin_scope", bindingTarget: TGTB(36), now: T0B }), "createB1");
-    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b1.result.created_id, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B });
+    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b1.result.created_id, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
     assert.equal(r.ok, false);
     assert.equal(r.reason, "reaffirm_scope", "B1 不在 reaffirm 族");
-    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: "ta_" + "f".repeat(32), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B });
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: "ta_" + "f".repeat(32), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
     assert.equal(r.reason, "target_not_live", "不在账本");
     const b3 = seedB3B(dir, "r57b_5", 37, "sess-b-37");
-    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_other", now: T0B });
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_other", clock: () => T0B });
     assert.equal(r.reason, "chat_mismatch", "chatId 与记录不符");
   }));
 
@@ -39540,11 +39540,11 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const tChat = seedB3B(dir, "r57b_c2", 42, "sess-b-42");
     const tFam = seedB3B(dir, "r57b_c3", 43, "sess-b-43");
     const tDig = seedB3B(dir, "r57b_c4", 44, "sess-b-44");
-    const iSender = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tSender, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue sender");
-    const iChat = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tChat, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue chat");
-    const iFam = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tFam, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue family");
-    const iDig = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tDig, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue digest");
-    const consume = (handle, over = {}) => RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000, ...over });
+    const iSender = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tSender, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue sender");
+    const iChat = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tChat, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue chat");
+    const iFam = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tFam, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue family");
+    const iDig = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tDig, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue digest");
+    const consume = (handle, over = {}) => RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...over });
     // ① sender ≠ intent.authorized_owner
     let r = consume(iSender.reaffirm_handle, { sender: "ou_stranger" });
     assert.equal(r.ok, false); assert.equal(r.reason, "sender_mismatch", "sender 核");
@@ -39569,9 +39569,9 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
   test("R57b 消费（preserved 支）：B3(pairing) 重签——binding 保留、link 重签 owner_selected_route_v1、§6 preserved 键集、intent 清除、产物过 validateLedger", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_p", 46, "sess-b-46");
-    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
     const revBefore = loadOkB(dir).revision;
-    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 }), "consume");
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "consume");
     assert.equal(res.cleared, true, "intent 已清");
     const doc = loadOkB(dir);
     assert.equal(doc.revision, revBefore + 1, "恰一笔 ledger op");
@@ -39623,8 +39623,8 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
       const v0 = TAL.validateLedger(doc, { endpointId: EP57B });
       assert.equal(v0.ok, true, "owner_select 夹具自洽：" + JSON.stringify(v0));
-      const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue");
-      const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 }), "consume");
+      const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+      const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "consume");
       const doc2 = loadOkB(dir);
       const opEntry = Object.values(doc2.operations).find((o) => o.op_type === "owner_select_reaffirm");
       const r = opEntry.result;
@@ -39653,11 +39653,11 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   test("R57b 崩溃恢复两支：①ledger 已提交 + intent 未清 → 同 handle 重发幂等返原 result、只清 intent、账本不再变；②ledger 未提交 + intent 在 → 清后可安全重跑", () => withLedgerB((root, dir) => {
     // ①：直接调 ledger op（绕过消费编排的清 intent 步）模拟「提交后、清前崩」。
     const b3 = seedB3B(dir, "r57b_r1", 47, "sess-b-47");
-    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue");
-    const direct = talOkB(TAL.ownerSelectReaffirm({ endpointId: EP57B, targetId: b3, targetFamily: "B3", expectedOldProofClosureDigest: intent.entry.expected_old_proof_closure_digest, reaffirmHandle: intent.reaffirm_handle, authorizedBy: "ou_owner57b", chatId: "oc_r57b", selectedSessionId: "sess-b-47", selectedRootOm: "om_rb47", selectionMessageId: "om_sel57b", now: T0B + 1000 }), "直接 ledger op");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const direct = talOkB(TAL.ownerSelectReaffirm({ endpointId: EP57B, targetId: b3, targetFamily: "B3", expectedOldProofClosureDigest: intent.entry.expected_old_proof_closure_digest, reaffirmHandle: intent.reaffirm_handle, authorizedBy: "ou_owner57b", chatId: "oc_r57b", selectedSessionId: "sess-b-47", selectedRootOm: "om_rb47", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "直接 ledger op");
     assert.ok(readIntentsB(dir), "intent 未清（崩溃现场）");
     const rev = loadOkB(dir).revision;
-    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 2000 }), "恢复重发");
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 2000 }), "恢复重发");
     assert.equal(res.idempotent, true, "按 request_key 判已完成（幂等重放，不再写账本）");
     assert.equal(res.result.new_link_proof.selection_handle, intent.reaffirm_handle, "返存量证明（rfh_ 在重签 link 里）");
     assert.equal(loadOkB(dir).revision, rev, "账本不再变");
@@ -39666,19 +39666,19 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.ok(afterDoc === null || Object.keys(afterDoc.entries).length === 0, "恢复后 intent 清干净");
     // ②：签发 → 消费被拒（sender 不符）→ intent 仍在 → 改对后同一 intent 消费成功。
     const b3b = seedB3B(dir, "r57b_r2", 48, "sess-b-48");
-    const intent2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue#2");
-    const bad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_stranger", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 });
+    const intent2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
+    const bad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_stranger", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
     assert.equal(bad.ok, false);
     assert.ok(readIntentsB(dir), "失败后 intent 仍在（可重跑）");
-    const ok2 = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 }), "重跑成功");
+    const ok2 = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "重跑成功");
     assert.equal(ok2.cleared, true);
     assert.equal(loadOkB(dir).records[b3b].locator_link_proof_ref.kind, "owner_selected_route_v1");
   }));
 
   test("R57b ledger op 直调防错：intent 缺席的 handle 拒（reaffirm_handle_unknown）、过期 intent 拒（reaffirm_intent_expired）、schema 1.0 拒", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_d1", 49, "sess-b-49");
-    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue");
-    let r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 7 * 86400e3 + 1 });
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    let r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 7 * 86400e3 + 1 });
     assert.equal(r.ok, false, "过期拒");
     assert.equal(r.reason, "reaffirm_intent_expired");
     // 同一 seam 的 clock 注入形态（P1-5）：不传 now，时钟已跨过到期 → 同拒
@@ -39686,11 +39686,11 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(r.ok, false);
     assert.equal(r.reason, "reaffirm_intent_expired", "clock seam 同判");
     assert.ok(readIntentsB(dir), "过期拒不清 intent（等签发侧受验清理）");
-    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: "rfh_" + "1".repeat(32), sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 });
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: "rfh_" + "1".repeat(32), sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
     assert.equal(r.reason, "reaffirm_handle_unknown", "无此 intent");
     // 消费成功后同 handle 再发 → unknown（一个 handle 恰消费一次）
-    talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 }), "首次消费");
-    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", now: T0B + 1000 });
+    talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "首次消费");
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
     assert.equal(r.reason, "reaffirm_handle_unknown", "已消费再发 → unknown（要重做请重新签发）");
   }));
 
@@ -39698,7 +39698,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
   test("R57b /feishu-select rfh 支：partial 准入下真执行器成功（changed=true）；osh 支仍 select_executor_absent 终态；准入 off 仍拒", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_s1", 51, "sess-b-51");
-    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
     const ctx = { senderId: "ou_owner57b", chatId: "oc_r57b", endpointId: EP57B, messageId: "om_sel57b", env: process.env, now: T0B + 1000 };
     // osh 支：partial 准入先拒（§12 partial 只放 rfh）；on 准入下才轮到执行器——仍 absent 终态（另单）
     let out = SA.executeSelectControl({ control: "select", handle: "osh_" + "2".repeat(32), handle_kind: "osh" }, { selectAdmissionFn: () => ({ state: "partial" }), ...ctx });
@@ -39713,7 +39713,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.match(out.text, /已按你的确认重签/u, "成功文案");
     assert.equal(loadOkB(dir).records[b3].locator_link_proof_ref.kind, "owner_selected_route_v1", "真执行器改了账本");
     // 准入 off → 仍拒（rfh 也不越过三态准入）
-    const i2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: seedB3B(dir, "r57b_s2", 52, "sess-b-52"), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", now: T0B }), "issue#2");
+    const i2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: seedB3B(dir, "r57b_s2", 52, "sess-b-52"), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
     out = SA.executeSelectControl({ control: "select", handle: i2.reaffirm_handle, handle_kind: "rfh" }, { selectAdmissionFn: () => ({ state: "off" }), ...ctx });
     assert.equal(out.ok, false);
     assert.equal(out.reason, "select_off", "off 拒");

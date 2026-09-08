@@ -3241,8 +3241,9 @@ export function ownerSelectReaffirm({ endpointId, targetId, targetFamily, expect
         return { ok: false, reason: "selection_mismatch", why: "selected_* 与记录当前别名不符" };
       }
       if (rec.binding_proof === null || rec.locator_link_proof_ref === null) return { ok: false, reason: "reaffirm_scope", why: "无证记录不可 reaffirm" };
-      const nowMs = Number.isFinite(now) ? now : clock(); // R57a 返修一 P1-5：锁内采样
+      const nowMs = Number.isFinite(now) ? now : clock(); // 事件记账时间
       const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      const lockMs = clock(); // R57a 返修二 P1-2：锁内时钟（reaffirm 无 TTL 字段，保持 seam 一致）
       const ownerSelectBinding = rec.binding_proof.kind === "owner_select_v1";
       const opIdRef = { id: null };
       const newLink = () => ({ kind: "owner_selected_route_v1", authorized_by: authorizedBy, authorized_at: iso, by_identity: "owner_authorization", selected_root_om: rec.aliases.root_om, selected_session_id: rec.aliases.session_id, selection_handle: reaffirmHandle, selection_operation_id: null });

@@ -35589,12 +35589,18 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
   ], { encoding: "utf-8" });
 
   const concOut = JSON.parse(concOutRaw);
-  const results = [concOut.r1, concOut.r2];
-  const committed = results.filter(r => r.commit === "committed");
-  const failed = results.filter(r => r.commit === "not_committed");
-  assert.equal(committed.length, 1, "真正并发写入：恰好一个进程 committed（结果：" + concOutRaw + "）");
-  assert.equal(failed.length, 1, "真正并发写入：另一个进程必须 not_committed");
-  assert.ok(["lock_busy", "cas_mismatch"].includes(failed[0].reason), "未成功进程的 reason 必须是 lock_busy 或 cas_mismatch，实际为: " + failed[0].reason);
+  assert.equal(concOut.r1.commit, "not_committed", "非持有者子进程 1 必须被拒");
+  assert.equal(concOut.r1.reason, "maintenance_capability_required", "非持有者子进程 1 拒绝原因必须是 maintenance_capability_required（实际：" + JSON.stringify(concOut.r1) + "）");
+  assert.equal(concOut.r2.commit, "not_committed", "非持有者子进程 2 必须被拒");
+  assert.equal(concOut.r2.reason, "maintenance_capability_required", "非持有者子进程 2 拒绝原因必须是 maintenance_capability_required（实际：" + JSON.stringify(concOut.r2) + "）");
+
+  const cFileAfterSub = path.join(ledgerDir, "owner-select-campaign.json");
+  assert.equal(fs.existsSync(cFileAfterSub), false, "两个非持有者子进程都不得写入文件");
+
+  // 持有者进程才能提交
+  const rHolder = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
+  assert.equal(rHolder.commit, "committed", "持有租约的当前进程提交成功（结果：" + JSON.stringify(rHolder) + "）");
+  assert.equal(fs.existsSync(cFileAfterSub), true, "持有者落盘成功");
 });
 
 summarySealed = true;

@@ -20,6 +20,7 @@ import {
 } from "./owner-select-derived.mjs";
 import {
   maintenanceDir,
+  leasePath,
   readActive,
   readJournal,
   leaseHolder,
@@ -306,7 +307,7 @@ const OSM_KIND_TO_FORWARD_PHASE = Object.freeze({
  *   - writer: state, campaign_id, endpoints_digest, revision
  * step.before.{exists, sha256} === 现场
  */
-function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256 }) {
+function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256, skipLeaseCommit = false }) {
   if (!isObj(capability) || typeof capability.token !== "string" || !UUID_SHAPE.test(capability.token) || typeof capability.stepId !== "string" || capability.stepId.length === 0) {
     return { ok: false, reason: "maintenance_capability_required", why: "capability 缺失或形状无效" };
   }
@@ -347,6 +348,19 @@ function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeE
   }
   if (holder.at !== null && !isCanonicalIso(holder.at)) {
     return { ok: false, reason: "maintenance_capability_required", why: "lease_payload_bad：租约 owner.at 不是规范化 ISO" };
+  }
+
+  // 证明当前进程持有真实 lease 实例
+  if (!skipLeaseCommit) {
+    const lpath = leasePath(mDir, capability.token);
+    const leaseProof = commitWhileHeld(lpath, () => ({ ok: true }));
+    if (!leaseProof.ok || leaseProof.reapUncleared) {
+      return {
+        ok: false,
+        reason: "maintenance_capability_required",
+        why: "lease_not_held：本进程未持有 operation 租约实例（" + (leaseProof.reapUncleared ? "lease_reap_uncleared" : (leaseProof.reason ?? "lock_lost")) + "）"
+      };
+    }
   }
 
   const jRes = readJournal({ dir: mDir, token: capability.token, env });
@@ -450,6 +464,25 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
     }
     if (!isObj(capability) || typeof capability.token !== "string" || !UUID_SHAPE.test(capability.token) || typeof capability.stepId !== "string" || capability.stepId.length === 0) {
       return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "capability 形状无效" };
+    }
+
+    const mDir = maintenanceDir(env);
+    if (!mDir) {
+      return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "维护目录取不到" };
+    }
+    const holder = leaseHolder({ dir: mDir, token: capability.token });
+    if (!holder.present) {
+      return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: "lease_absent：operation 租约不存在" };
+    }
+    const lpath = leasePath(mDir, capability.token);
+    const leaseProof = commitWhileHeld(lpath, () => ({ ok: true }));
+    if (!leaseProof.ok || leaseProof.reapUncleared) {
+      return {
+        ok: false,
+        commit: "not_committed",
+        reason: "maintenance_capability_required",
+        why: "lease_not_held：本进程未持有 operation 租约实例（" + (leaseProof.reapUncleared ? "lease_reap_uncleared" : (leaseProof.reason ?? "lock_lost")) + "）",
+      };
     }
 
     const lockDir = path.join(root, "owner-select-state.lock");
@@ -562,21 +595,66 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
       }
 
       let fenceErr = null;
+      let fenceCapReason = null;
+      let fenceCapWhy = null;
+      const mDir = maintenanceDir(env);
+      const lpath = mDir && capability?.token ? leasePath(mDir, capability.token) : null;
+
       const fenced = commitWhileHeld(lockDir, () => {
-        try {
-          fs.renameSync(tmpPath, targetFile);
-          renameLanded = true;
-        } catch (err) {
-          fenceErr = err;
+        if (!lpath) {
+          fenceCapReason = "maintenance_capability_required";
+          fenceCapWhy = "维护目录不可用或 token 无效";
+          return;
+        }
+        const leaseFence = commitWhileHeld(lpath, () => {
+          // 提交栅栏内用 commitWhileHeld 证明本进程持有真实 lease 实例并重读 active / gate / journal
+          const recheck = verifyMaintenanceCapability({
+            capability,
+            env,
+            targetKind,
+            doc,
+            beforeExists,
+            beforeSha256: beforeSha,
+            skipLeaseCommit: true,
+          });
+          if (!recheck.ok) {
+            fenceCapReason = recheck.reason;
+            fenceCapWhy = recheck.why;
+            return;
+          }
+          try {
+            fs.renameSync(tmpPath, targetFile);
+            renameLanded = true;
+          } catch (err) {
+            fenceErr = err;
+          }
+        });
+        if (!leaseFence.ok || leaseFence.reapUncleared) {
+          if (!fenceCapReason) {
+            fenceCapReason = "maintenance_capability_required";
+            fenceCapWhy = "提交栅栏内本进程未持有 operation 租约实例: " + (leaseFence.reapUncleared ? "lease_reap_uncleared" : (leaseFence.reason ?? "lock_lost"));
+          }
         }
       });
+
+      if (fenceCapReason !== null) {
+        cleanupTmp();
+        if (renameLanded) {
+          return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: fenceCapReason, why: fenceCapWhy });
+        }
+        const out = { ok: false, commit: "not_committed", reason: fenceCapReason, why: fenceCapWhy };
+        if (tmpResidue) out.residue = tmpResidue;
+        return exitWithLock(out);
+      }
 
       if (!fenced.ok || fenceErr !== null) {
         cleanupTmp();
         if (renameLanded) {
           return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "fenced_commit_failed", why: String(fenced.reason ?? fenceErr) });
         }
-        return exitWithLock({ ok: false, commit: "not_committed", reason: "rename_failed", why: String(fenced.reason ?? fenceErr) });
+        const out = { ok: false, commit: "not_committed", reason: "rename_failed", why: String(fenced.reason ?? fenceErr) };
+        if (tmpResidue) out.residue = tmpResidue;
+        return exitWithLock(out);
       }
 
       try {

@@ -108,6 +108,7 @@ import {
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
 import { FORWARD_RESULT_SCHEMA, FORWARD_STARTED_SCHEMA, forwardResultProblem as FORWARD_RESULT_PROBLEM, forwardStartedProblem as FORWARD_STARTED_PROBLEM, resultLineProblem as RESULT_LINE_PROBLEM } from "./forward-runner.mjs";
+import { readProcessStartTime } from "./process-start-time.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
@@ -36700,7 +36701,7 @@ test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn �
   fs.writeFileSync(fresh, "{}\n"); fs.utimesSync(fresh, new Date(now - 60e3), new Date(now - 60e3));
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, JSON.stringify(c));
-  assert.match(c.detail, /共 3 条：绿 1、红 1、结果缺失 1/u, "桶之和 = 总数（1+1+1=3）：" + c.detail);
+  assert.match(c.detail, /共 4 条：绿 1、红 1、结果缺失 1、刚起还没结果 1/u, "桶之和 = 总数（kf 1 分钟 = 刚起还没结果）：" + c.detail);
   assert.match(c.detail, /最近的红：\S+ —— API Error: 400/u, "红条目点名 reason_first_line：" + c.detail);
   assert.match(c.detail, /claude_code_version 1\.2\.3-old/u, "红条目点名版本：" + c.detail);
   assert.doesNotMatch(c.detail, /很旧的失败|0\.0\.1/u, "窗外积尘既不计数也不点名：" + c.detail);
@@ -36801,29 +36802,58 @@ test("R54 返修一 P1-3：⑯ 读盘纪律——symlink 不跟随（合法绿�
   assert.match(c.detail, /JSON 解析失败/u, "坏 JSON 点名：" + c.detail);
 });
 
-test("R54 返修一 P1-4：孤儿判定看存活——started 在场且 runner_pid 活着 → 进行中不红；已死 → 结果缺失", () => {
+test("R54 返修四 P1-2/P2-3：孤儿判定——实例核验通过 → 进行中；核不了 → 未验证（ok:null）；started 缺席 <10 分钟 → 刚起还没结果（≥10 分钟 → 结果缺失）；读取器注入密闭", () => {
   const m = doctorMachine();
   const root = m.project("fwdlive", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({ projects: [{ id: "fwdlive", root, root_message_id: "om_root_fwdlive", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
   const now = Date.now();
   const ago11m = new Date(now - 11 * 60e3).toISOString();
-  // 活 runner：本测试进程自己活着，直接用 process.pid 当 runner_pid
-  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
-  fs.utimesSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
-  const psStart = (() => { const rr = spawnSync("ps", ["-o", "etime=", "-p", String(process.pid)], { encoding: "utf-8" }); const raw = (rr.stdout ?? "").trim(); if (!raw) return ago11m; const parts = raw.replace(/-/gu, ":").split(":").reverse(); let secs = 0; for (const [i, seg] of parts.entries()) { const n = Number(seg); if (!Number.isFinite(n)) return ago11m; secs += n * [1, 60, 3600, 86400][i]; } return new Date(Date.now() - secs * 1000).toISOString(); })();
-  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "1".padEnd(64, "0"), runner_pid: process.pid, claude_pid: 4242, started_at: ago11m, runner_start_at: psStart }) + "\n", { mode: 0o600 });
-  // 死 runner：spawnSync 一个快退进程，结束后它的 pid 就是死的
+  const writeJsonl = (key, mtimeMs) => {
+    const f = path.join(runsDir, key + ".forward.jsonl");
+    fs.writeFileSync(f, "{}\n", { mode: 0o600 });
+    if (mtimeMs !== undefined) fs.utimesSync(f, new Date(mtimeMs), new Date(mtimeMs));
+  };
+  const writeStarted = (key, doc) => fs.writeFileSync(path.join(runsDir, key + ".forward.started.json"), JSON.stringify(doc) + "\n", { mode: 0o600 });
+  const K1 = "1".padEnd(64, "0"); const K2 = "2".padEnd(64, "0"); const K3 = "3".padEnd(64, "0"); const K4 = "4".padEnd(64, "0");
   const deadChild = spawnSync("sleep", ["0.05"]);
   const deadPid = deadChild.pid;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); // 等它退透
-  fs.writeFileSync(path.join(runsDir, "2".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
-  fs.utimesSync(path.join(runsDir, "2".padEnd(64, "0") + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
-  fs.writeFileSync(path.join(runsDir, "2".padEnd(64, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "2".padEnd(64, "0"), runner_pid: deadPid, claude_pid: 4243, started_at: ago11m, runner_start_at: ago11m }) + "\n", { mode: 0o600 });
-  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
-  assert.equal(c.ok, false, "死 runner 那条是结果缺失：" + JSON.stringify(c));
-  assert.match(c.detail, /共 2 条：结果缺失 1、进行中 1/u, "活 runner → 进行中不红；死 runner → 结果缺失；桶和 = 总数：" + c.detail);
-  assert.match(c.detail, /缺结果的 key/u, c.detail);
+  // k1：活 runner（本测试进程）+ started 可核（注入读取器返回与 runner_start_at 一致的启动时刻）
+  writeJsonl(K1, now - 11 * 60e3);
+  writeStarted(K1, { schema: FORWARD_STARTED_SCHEMA, key: K1, runner_pid: process.pid, claude_pid: 4242, started_at: ago11m, runner_start_at: ago11m });
+  // k2：死 runner + started（runner_start_at 也是 11 分钟前，但 pid 已死 → 核不了）
+  writeJsonl(K2, now - 11 * 60e3);
+  writeStarted(K2, { schema: FORWARD_STARTED_SCHEMA, key: K2, runner_pid: deadPid, claude_pid: 4243, started_at: ago11m, runner_start_at: ago11m });
+  // k3：无 started，11 分钟 → 结果缺失
+  writeJsonl(K3, now - 11 * 60e3);
+  // k4：无 started，1 分钟 → 刚起还没结果（pending）
+  writeJsonl(K4, now - 60e3);
+  // 读取器注入（P2-3）：活 pid → 与 runner_start_at 一致；其余 pid → unavailable。密闭，不依赖真机 ps。
+  const injected = (pid) => pid === process.pid
+    ? { state: "ok", startMs: Date.parse(ago11m) }
+    : { state: "unavailable", why: "injected" };
+  const saved = ["FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_REGISTRY"].map((k) => [k, process.env[k]]);
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = m.maintDir;
+  process.env.FEISHU_BRIDGE_REGISTRY = m.files.registry;
+  let rep;
+  try { rep = runDoctor({ home: m.home, registryFile: m.files.registry, routesFile: m.files.routes, providersFile: m.files.providers, processStartTime: injected }); }
+  finally { for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  const c = checkOf(rep, "inbound_forward_result");
+  assert.equal(c.ok, false, "结果缺失仍在（进行中/未验证不掩盖缺失）：" + JSON.stringify(c));
+  assert.match(c.detail, /共 4 条：结果缺失 1、刚起还没结果 1、进行中 1、进行中未验证 1/u, "桶之和 = 总数（恰进一桶）：" + c.detail);
+  assert.match(c.detail, /有 1 条转发进行中，尚无结果/u, "unverified 的 ok:null 措辞：" + c.detail);
+  // 只有 pending（1 分钟、无 started）的机器 → ok:null 而非 ok:true
+  const m2 = doctorMachine();
+  const root2 = m2.project("fwdpend", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m2.writeTables({ projects: [{ id: "fwdpend", root: root2, root_message_id: "om_root_fwdpend", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runs2 = path.join(root2, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runs2, { recursive: true });
+  fs.writeFileSync(path.join(runs2, "9".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runs2, "9".padEnd(64, "0") + ".forward.jsonl"), new Date(now - 60e3), new Date(now - 60e3));
+  const c2 = checkOf(doctorReport(m2.run()), "inbound_forward_result");
+  assert.equal(c2.ok, null, "仅 pending → ok:null：" + JSON.stringify(c2));
+  assert.match(c2.detail, /刚起还没结果 1/u, c2.detail);
 });
 
 test("R54 返修一 P1-5：落盘纪律——目标已是 symlink 不跟随不覆盖；8 MiB jsonl 仍 1 秒内落结果", () => {
@@ -37070,6 +37100,28 @@ test("R54 返修三 P1-4：不可能组合拒——sent=true 配 reason=failed /
   assert.match(FORWARD_RESULT_PROBLEM({ ...base, reason_first_line: "failed" }, { now }), /sent=true/u, "sent=true + reason=failed 拒");
   assert.match(FORWARD_RESULT_PROBLEM({ ...base, final_text_sha256: "f".repeat(64) }, { now }), /final_text_sha256/u, "sent=true + 错 SHA 拒");
   assert.match(FORWARD_RESULT_PROBLEM({ ...base, is_error: true }, { now }), /is_error=true/u, "is_error=true + sent=true 拒");
+});
+
+test("R54 返修四 P1-1：读取器用固定 /bin/ps（PATH 假 ps 不执行、不影响结果）+ unavailable 严格化", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-pst-"));
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin, { recursive: true });
+  const marker = path.join(local, "fake-ps-ran");
+  const fakePs = [
+    "#!/usr/bin/env node",
+    "require('node:fs').writeFileSync(" + JSON.stringify(marker) + ", 'ran');",
+    "process.stdout.write('Wed Jan 1 00:00:00 2020\n');",
+  ].join("\n") + "\n";
+  fs.writeFileSync(path.join(bin, "ps"), fakePs, { mode: 0o700 });
+  const savedPath = process.env.PATH;
+  process.env.PATH = bin + path.delimiter + (savedPath ?? "");
+  try {
+    const r = readProcessStartTime(process.pid, { platform: "darwin" });
+    assert.equal(fs.existsSync(marker), false, "PATH 上的假 ps 没被执行（读取器固定 /bin/ps）");
+    assert.equal(r.state, "ok", JSON.stringify(r));
+    assert.ok(r.startMs > Date.now() - 24 * 3600e3, "startMs 是真启动时刻（不是假 ps 的 2020）：" + JSON.stringify(r));
+    assert.equal(readProcessStartTime(0, { platform: "darwin" }).state, "unavailable", "pid 0 → unavailable");
+    assert.equal(readProcessStartTime(process.pid, { platform: "sunos" }).state, "unavailable", "不支持平台 → unavailable");
+  } finally { process.env.PATH = savedPath; }
 });
 
 summarySealed = true;

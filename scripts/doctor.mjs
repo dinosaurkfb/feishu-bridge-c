@@ -59,6 +59,7 @@ import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
+import { readProcessStartTime } from "./process-start-time.mjs";
 import { forwardResultProblem, forwardStartedProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
@@ -115,6 +116,8 @@ export function runDoctor({
   launchctl = undefined,
   // **默认不执行状态入口脚本**：它们是外部代码，可能写盘 —— 只有显式要求才跑，副作用属于登记入口自己的信任边界。
   probeProviders = false,
+  // R54 返修四 P2-3：进程启动时刻读取器可注入（测试密闭，不依赖真机 ps）；默认 = 可信读取器。
+  processStartTime = (pid) => readProcessStartTime(pid),
 } = {}) {
   const ctx = machineContext({ home });
   registryFile = registryFile ?? ctx.registryFile;
@@ -736,11 +739,10 @@ export function runDoctor({
     const ORPHAN_AFTER = 10 * 60 * 1000;
     const RESULT_CAP = 64 * 1024;
     const SUFFIXES = [[".forward.result.json", "result"], [".forward.started.json", "started"], [".forward.stderr.log", "stderr"], [".forward.jsonl", "jsonl"]];
-    const buckets = { green: 0, red: 0, missing: 0, inflight: 0, inflightUnverified: 0, unclear: 0 };
+    const buckets = { green: 0, red: 0, missing: 0, pending: 0, inflight: 0, inflightUnverified: 0, unclear: 0 };
     const redNote = [];
     const missingKeys = [];
     const unclearNote = [];
-    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err?.code === "EPERM" ? true : false; } };
     // fd 绑定 stat（O_NOFOLLOW|O_NONBLOCK，不读内容）：jsonl 的年龄来源；悬空 symlink/FIFO/并发变化 → problem，不 fail-open
     const fdStat = (file) => {
       let fd = null;
@@ -788,11 +790,6 @@ export function runDoctor({
         for (const [i, seg] of parts.entries()) { const n = Number(seg); if (!Number.isFinite(n)) return null; secs += n * [1, 60, 3600, 86400][i]; }
         return secs;
       };
-      const procStartMs = (pid) => {
-        // R54 返修三 P1-3：进程启动时刻（etime 反推，无 locale 问题），取不到 → null（一律 unverified）
-        const secs = etimeSecs(pid);
-        return secs === null ? null : now - secs * 1000;
-      };
       for (const [key, parts] of byKey) {
         const unclear = (why) => { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：" + why); };
         if (!FORWARD_KEY_RE.test(key)) { unclear("key 形状不对（须 64 位十六进制）"); continue; }
@@ -817,31 +814,32 @@ export function runDoctor({
           continue;
         }
         const age = now - (vj.mtimeMs ?? 0);
-        if (age < ORPHAN_AFTER || age > WINDOW) continue; // 刚起还没跑完的不算；超窗的积尘也不算
-        if (parts.started === undefined) { buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8)); continue; }
-        const sv = readVerifiedDoc({ file: path.join(runsDir, parts.started), docValidator: (doc) => forwardStartedProblem(doc, { now, expectedKey: key }), maxBytes: 16 * 1024 });
-        if (sv.ok === true) {
-          if (alive(sv.doc.runner_pid)) {
-            // R54 返修三 P1-3：PID 存活不算实例证明——runner_start_at 与 ps 启动时刻一致（±2s）才算
-            // 实例确认（inflight，不影响 ok）；取不到/不一致 → inflight_unverified，本项 ok:null。
-            const psMs = procStartMs(sv.doc.runner_pid);
-            const startMs = Date.parse(sv.doc.runner_start_at ?? "");
-            if (psMs !== null && Number.isFinite(startMs) && Math.abs(psMs - startMs) <= 2000) { buckets.inflight += 1; continue; }
-            buckets.inflightUnverified += 1; continue;
-          }
-          if (now - Date.parse(sv.doc.started_at) < ORPHAN_AFTER) continue; // 刚死不久：宽限
+        if (age > WINDOW) continue; // 超窗积尘不算
+        // R54 返修四 P1-2：一律先读 started.json 并做实例核验——10 分钟宽限只延迟「结果缺失」，
+        // 不绕过实例核验。started 缺席才看 age：<10 分钟 → pending（ok:null），≥10 分钟 → 结果缺失。
+        if (parts.started === undefined) {
+          if (age < ORPHAN_AFTER) { buckets.pending += 1; continue; } // 刚起还没结果
           buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
           continue;
         }
-        if (sv.absent) { buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8)); continue; }
-        unclear("started " + String(sv.problem ?? "读不出"));
+        const sv = readVerifiedDoc({ file: path.join(runsDir, parts.started), docValidator: (doc) => forwardStartedProblem(doc, { now, expectedKey: key }), maxBytes: 16 * 1024 });
+        if (sv.ok !== true) {
+          if (sv.absent) { buckets.pending += 1; continue; } // started 在盘点后消失：按刚起处理（不 fail-open 成缺失）
+          unclear("started " + String(sv.problem ?? "读不出")); continue;
+        }
+        // 实例核验：PID 存活不算证明——runner_start_at 与可信读取器的进程启动时刻一致（±2s）才算进行中
+        const ps = processStartTime(sv.doc.runner_pid);
+        const startMs = Date.parse(sv.doc.runner_start_at ?? "");
+        if (ps.state === "ok" && Number.isFinite(startMs) && Math.abs(ps.startMs - startMs) <= 2000) { buckets.inflight += 1; continue; }
+        buckets.inflightUnverified += 1; continue;
       }
     }
-    const scanned = buckets.green + buckets.red + buckets.missing + buckets.inflight + buckets.inflightUnverified + buckets.unclear; // 桶之和 = 总数
+    const scanned = buckets.green + buckets.red + buckets.missing + buckets.pending + buckets.inflight + buckets.inflightUnverified + buckets.unclear; // 桶之和 = 总数
     const parts = [];
     if (buckets.green) parts.push("绿 " + buckets.green);
     if (buckets.red) parts.push("红 " + buckets.red);
     if (buckets.missing) parts.push("结果缺失 " + buckets.missing);
+    if (buckets.pending) parts.push("刚起还没结果 " + buckets.pending);
     if (buckets.inflight) parts.push("进行中 " + buckets.inflight);
     if (buckets.inflightUnverified) parts.push("进行中未验证 " + buckets.inflightUnverified);
     if (buckets.unclear) parts.push("查不清 " + buckets.unclear);
@@ -852,9 +850,11 @@ export function runDoctor({
         (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "") +
         (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "");
     // R54 返修三 P1-3：有无法核验实例身份的进行中转发 → 本项 incomplete（ok:null），不判绿也不判红
+    // R54 返修四 P1-2：无法核验实例身份 / 刚起还没结果 → 本项 incomplete（ok:null）
     const ok17 = scanned === 0 ? true
-      : buckets.inflightUnverified > 0 ? null
-      : buckets.red + buckets.missing + buckets.unclear === 0;
+      : buckets.red + buckets.missing + buckets.unclear > 0 ? false
+      : buckets.inflightUnverified + buckets.pending > 0 ? null
+      : true;
     add("inbound_forward_result", "⑯ 入站转发结果", ok17, body, null);
   }
 

@@ -118,6 +118,9 @@ export function runDoctor({
   probeProviders = false,
   // R54 返修四 P2-3：进程启动时刻读取器可注入（测试密闭，不依赖真机 ps）；默认 = 可信读取器。
   processStartTime = (pid) => readProcessStartTime(pid),
+  // R54 返修五 P1-2：⑯ runs 盘点可注入（测试密闭——「盘点后、打开前消失」无法在同步进程里确定性复现）；
+  // 生产恒 null → fs.readdirSync。注入函数接收 runsDir，返回名字数组。
+  forwardRunsList = null,
 } = {}) {
   const ctx = machineContext({ home });
   registryFile = registryFile ?? ctx.registryFile;
@@ -762,7 +765,7 @@ export function runDoctor({
       if (typeof root !== "string" || !path.isAbsolute(root)) continue; // root 不成形的项目 ⑤⑥ 已点名
       const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
       let names;
-      try { names = fs.readdirSync(runsDir); }
+      try { names = typeof forwardRunsList === "function" ? forwardRunsList(runsDir) : fs.readdirSync(runsDir); }
       catch (err) {
         if (err?.code === "ENOENT") continue; // 没有转发就没有这项条目
         buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(path.basename(String(root)) + "（runs 读不出：" + String(err?.code ?? err?.message ?? err) + "）");
@@ -779,17 +782,7 @@ export function runDoctor({
           break;
         }
       }
-      // etime 无 locale 问题（macOS 无 etimes）："[dd-]hh:mm:ss" → 秒，start = now - 秒*1000
-      const etimeSecs = (pid) => {
-        const r = spawnSync("ps", ["-o", "etime=", "-p", String(pid)], { encoding: "utf-8" });
-        if (r.status !== 0) return null;
-        const raw = (r.stdout ?? "").trim();
-        if (!raw) return null;
-        const parts = raw.replace(/-/gu, ":").split(":").reverse();
-        let secs = 0;
-        for (const [i, seg] of parts.entries()) { const n = Number(seg); if (!Number.isFinite(n)) return null; secs += n * [1, 60, 3600, 86400][i]; }
-        return secs;
-      };
+      // R54 返修五 P2-5：走 PATH 的旧 etimeSecs() 已删——启动时刻一律走受验读取器（process-start-time.mjs）。
       for (const [key, parts] of byKey) {
         const unclear = (why) => { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：" + why); };
         if (!FORWARD_KEY_RE.test(key)) { unclear("key 形状不对（须 64 位十六进制）"); continue; }
@@ -824,7 +817,13 @@ export function runDoctor({
         }
         const sv = readVerifiedDoc({ file: path.join(runsDir, parts.started), docValidator: (doc) => forwardStartedProblem(doc, { now, expectedKey: key }), maxBytes: 16 * 1024 });
         if (sv.ok !== true) {
-          if (sv.absent) { buckets.pending += 1; continue; } // started 在盘点后消失：按刚起处理（不 fail-open 成缺失）
+          // R54 返修五 P1-2：started 盘点后消失——按 jsonl 年龄重判（宽限内=刚起，超窗=结果缺失），
+          // 不无条件 pending（否则 11 分钟旧 jsonl 被谎报成「刚起还没结果」）。
+          if (sv.absent) {
+            if (age < ORPHAN_AFTER) { buckets.pending += 1; continue; }
+            buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
+            continue;
+          }
           unclear("started " + String(sv.problem ?? "读不出")); continue;
         }
         // 实例核验：PID 存活不算证明——runner_start_at 与可信读取器的进程启动时刻一致（±2s）才算进行中

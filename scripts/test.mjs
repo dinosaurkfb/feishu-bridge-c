@@ -37124,6 +37124,83 @@ test("R54 返修四 P1-1：读取器用固定 /bin/ps（PATH 假 ps 不执行、
   } finally { process.env.PATH = savedPath; }
 });
 
+// ── R54 返修五（Codex #141 五轮 2 P1 + 3 P2）──
+
+test("R54 返修五 P1-1：CLK_TCK 受验读取——auxv AT_CLKTCK=250 参与换算；getconf 兜底；皆取不到 → unavailable（绝不猜 100）", () => {
+  const BTIME = 1700000000, TICKS = 5000;
+  // /proc/<pid>/stat：右括号后 fields[19] = starttime（第 22 字段）
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\nintr 0 0\n";
+  const AT_CLKTCK = 17;
+  const auxvBuf = (pairs) => { const b = Buffer.alloc(pairs.length * 16); pairs.forEach(([t, v], i) => { b.writeBigUInt64LE(BigInt(t), i * 16); b.writeBigUInt64LE(BigInt(v), i * 16 + 8); }); return b; };
+  const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+  // ① auxv 带 AT_CLKTCK=250（混入其它 entry 证明会扫描）→ 换算按 250
+  const files1 = { "/proc/self/auxv": auxvBuf([[6, 4096], [AT_CLKTCK, 250], [3, 65539]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const r1 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files1 ? files1[p] : noent()), spawnSync: () => { throw new Error("auxv 命中时不该调 getconf"); } });
+  assert.equal(r1.state, "ok", JSON.stringify(r1));
+  assert.equal(r1.startMs, BTIME * 1000 + TICKS * (1000 / 250), "按 AT_CLKTCK=250 换算（猜 100 时此断言红）");
+  // ② auxv 没有 AT_CLKTCK → /usr/bin/getconf 兜底（固定绝对路径、PATH 清空、有超时）
+  const files2 = { "/proc/self/auxv": auxvBuf([[6, 4096]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const calls = [];
+  const r2 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files2 ? files2[p] : noent()), spawnSync: (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0, stdout: "250\n" }; } });
+  assert.equal(r2.state, "ok", JSON.stringify(r2));
+  assert.equal(r2.startMs, BTIME * 1000 + TICKS * (1000 / 250), "getconf CLK_TCK=250 参与换算");
+  assert.deepEqual(calls, [{ cmd: "/usr/bin/getconf", args: ["CLK_TCK"], opts: { encoding: "utf-8", timeout: 2000, maxBuffer: 1024, env: { PATH: "" } } }], "getconf 固定绝对路径 + PATH 清空 + 超时");
+  // ③ 皆取不到 → unavailable（绝不回退 100）
+  const files3 = { "/proc/self/auxv": Buffer.alloc(0), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const r3 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files3 ? files3[p] : noent()), spawnSync: () => ({ status: 1, stdout: "" }) });
+  assert.equal(r3.state, "unavailable", JSON.stringify(r3));
+  assert.match(String(r3.why), /CLK_TCK/u, "why 点名 CLK_TCK");
+  // ④ getconf 输出不是整数 → unavailable
+  const r4 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files3 ? files3[p] : noent()), spawnSync: () => ({ status: 0, stdout: "junk\n" }) });
+  assert.equal(r4.state, "unavailable", JSON.stringify(r4));
+});
+
+test("R54 返修五 P2-3：读取器 spawnSync 注入密闭——固定绝对路径/参数被调用；成功解析、非零退出、error(超时) → unavailable", () => {
+  const calls = [];
+  const spawn = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0, stdout: "Wed Jan 01 00:00:00 2020\n" }; };
+  const r = readProcessStartTime(4242, { platform: "darwin", spawnSync: spawn });
+  assert.equal(r.state, "ok", JSON.stringify(r));
+  assert.equal(r.startMs, Date.parse("Wed Jan 01 00:00:00 2020"), "解析成功");
+  assert.equal(calls.length, 1, "恰调一次");
+  assert.equal(calls[0].cmd, "/bin/ps", "固定绝对路径");
+  assert.deepEqual(calls[0].args, ["-o", "lstart=", "-p", "4242"]);
+  assert.equal(calls[0].opts.env.PATH, "", "子进程 PATH 清空");
+  assert.ok(calls[0].opts.timeout >= 1000 && calls[0].opts.maxBuffer >= 1024, "有超时与 maxBuffer 上限");
+  assert.equal(readProcessStartTime(4242, { platform: "darwin", spawnSync: () => ({ status: 1, stdout: "" }) }).state, "unavailable", "非零退出 → unavailable");
+  assert.equal(readProcessStartTime(4242, { platform: "darwin", spawnSync: () => ({ error: new Error("timed out"), status: null }) }).state, "unavailable", "超时/error → unavailable");
+  assert.equal(readProcessStartTime(4242, { platform: "darwin", spawnSync: () => ({ status: 0, stdout: "   " }) }).state, "unavailable", "空输出 → unavailable");
+});
+
+test("R54 返修五 P1-2：started 盘点后消失按 jsonl 年龄重判——<10 分钟 → 刚起；11 分钟 → 结果缺失（不无条件 pending）", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdgone", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdgone", root, root_message_id: "om_root_fwdgone", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  // 两个 key：磁盘上都只有 jsonl（started 不在盘上），注入的盘点谎称 started 在场——即「盘点后、打开前被删」。
+  const K5 = "5".padEnd(64, "0"), K6 = "6".padEnd(64, "0"), K9 = "9".padEnd(64, "0");
+  for (const [k, ageMs] of [[K5, 11 * 60e3], [K6, 60e3]]) {
+    const f = path.join(runsDir, k + ".forward.jsonl");
+    fs.writeFileSync(f, "{}\n", { mode: 0o600 });
+    fs.utimesSync(f, new Date(now - ageMs), new Date(now - ageMs));
+  }
+  // 接线探针：K9 只注入 phantom result 名（盘上什么都没有）→ 只有注入真到达 ⑯ 才会记「查不清 1」；
+  // 没接线的旧代码读不到 K9，断言红（测试不会空转绿）。
+  const phantom = (dir) => fs.readdirSync(dir).concat([K5 + ".forward.started.json", K6 + ".forward.started.json", K9 + ".forward.result.json"]);
+  const saved = ["FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_REGISTRY"].map((k) => [k, process.env[k]]);
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = m.maintDir;
+  process.env.FEISHU_BRIDGE_REGISTRY = m.files.registry;
+  let rep;
+  try { rep = runDoctor({ home: m.home, registryFile: m.files.registry, routesFile: m.files.routes, providersFile: m.files.providers, forwardRunsList: phantom }); }
+  finally { for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  const c = checkOf(rep, "inbound_forward_result");
+  assert.equal(c.ok, false, "结果缺失仍在：" + JSON.stringify(c));
+  assert.match(c.detail, /共 3 条：结果缺失 1、刚起还没结果 1、查不清 1/u, "接线探针（查不清 1=K9）+ 11 分钟 → 结果缺失、1 分钟 → 刚起（无条件 pending 或未接线时此断言红）：" + c.detail);
+});
+
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -18824,8 +18824,14 @@ test("R52a：feishu-select 解析封闭（bare/单 handle/坏 handle/别链前�
   assert.notEqual(controlIntentProblem({ control: "select", handle: 12345, handle_kind: "osh" }), null, "数字 handle 报 problem 不抛");
 });
 
-test("R52a item 三：selectAdmission 默认 off（fail-closed）+ selectReject 四支（off/partial/on/unreadable + rfh 放行）", () => {
-  assert.deepEqual(selectAdmission(), { state: "off" }, "默认 fail-closed（R50 合并前）");
+test("R52a item 三：selectReject 四支（off/partial/on/unreadable + rfh 放行）+ R55 默认准入接真状态", () => {
+  // R55：默认实现 = readOwnerSelectAdmission —— 账本根不存在/读不出 → unreadable（fail-closed 方向不变）
+  const emptyLedger = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r55-empty-ledger-"));
+  fs.chmodSync(emptyLedger, 0o700);
+  const noRoot = selectAdmission({ FEISHU_BRIDGE_LEDGER_DIR: path.join(emptyLedger, "not-there") });
+  assert.equal(noRoot.state, "unreadable", "账本根不存在 → unreadable：" + JSON.stringify(noRoot));
+  // 两个状态文件都缺席的账本根 → off（不再是硬编码 off，而是真读出来的 off）
+  assert.deepEqual(selectAdmission({ FEISHU_BRIDGE_LEDGER_DIR: emptyLedger }), { state: "off" }, "缺席 = off（真读取）");
   assert.deepEqual(selectReject({ state: "off" }, "osh"), { reason: "select_off", text: "选择功能未开放（迁移未开始）" });
   assert.deepEqual(selectReject({ state: "unreadable" }, "osh"), { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" });
   assert.deepEqual(selectReject({ state: "partial" }, "osh"), { reason: "select_partial_not_rfh", text: "迁移期间只接受 rfh_ 重确认 handle" });
@@ -18888,6 +18894,9 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   const templateFile = path.join(local, "chain-config.json");
   const templateConfig = { ...TPL, senders: [{ open_id: "333", role: "participant" }] };
   fs.writeFileSync(templateFile, JSON.stringify(templateConfig));
+  // R55：默认准入改读真状态 —— 给入口一个空账本根（campaign/writer_state 双缺席 → off），本测试原「默认 off」断言保持成立
+  const ledgerDir = fs.mkdtempSync(path.join(fs.realpathSync(local), "r55-ledger-"));
+  fs.chmodSync(ledgerDir, 0o700);
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
     id: "ctl", root, name: "控制演示", root_message_id: "om_select", expires_at: "2099-01-01T00:00:00Z",
     session_id: "aily_claude_ctl", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z",
@@ -18900,7 +18909,7 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
     } }) }] });
     return spawnSync(process.execPath, [entry], {
       encoding: "utf-8",
-      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
         AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_claude_ctl", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope, ...extraEnv },
     });
   };
@@ -19038,7 +19047,88 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   assert.equal(executorCalls, 1, "执行器总调用次数保持为 1");
 });
 
+test("R55：/feishu-select 准入默认接真状态 —— writer_state off/partial/on/坏文件 × 真入口，四种文案与终态（放行仍 select_executor_absent）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r55-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const ledgerDir = path.join(fs.realpathSync(local), "ledger"); fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerDir, 0o700);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: "333", role: "participant" }] }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "r55", root, name: "R55 准入演示", root_message_id: "om_r55", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_r55", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const run = (body, messageId) => {
+    const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> " + body;
+    const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+      id: messageId, sessionID: "aily_r55", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content,
+    } }) }] });
+    return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_r55", AILY_CLI_RUN_ID: "run_r55", FAKE_AILY_ENVELOPE: envelope },
+    });
+  };
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
+  const logicalTaskKey = resolveProject({ root, registryFile, templateFile }).mapping.logical_task_key;
+  const failedError = (messageId) => JSON.parse(fs.readFileSync(path.join(claimsDir, claimKey(messageId, logicalTaskKey) + ".failed.json"), "utf-8")).error;
+
+  // 临时维护目录的四种状态投影：直接写 0600 状态文件（准入只读）
+  const tok = "00000000-0000-4000-8000-00000000000a";
+  const cid = "osc_" + "c".repeat(32);
+  const eps = ["endpoint_111111111111111111111111", "endpoint_222222222222222222222222"];
+  const dig = endpointsDigest(eps);
+  const wDoc = (state) => ({
+    schema_version: WRITER_STATE_SCHEMA, campaign_id: state === "off" ? null : cid,
+    endpoints_digest: state === "off" ? null : dig, origin_operation_id: tok, revision: 1, state,
+  });
+  const cDoc = (state) => ({
+    schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state,
+    endpoints: eps, endpoints_digest: dig, pending_joins: [],
+    members: Object.fromEntries(eps.map((ep) => [ep, state === "complete"
+      ? { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }
+      : { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 1 }])),
+    revision: 1, origin_operation_id: tok,
+  });
+  const rmBoth = () => { fs.rmSync(path.join(ledgerDir, WRITER_STATE_FILE), { force: true }); fs.rmSync(path.join(ledgerDir, CAMPAIGN_FILE), { force: true }); };
+  const writeWriter = (state, body) => fs.writeFileSync(path.join(ledgerDir, WRITER_STATE_FILE), body ?? JSON.stringify(wDoc(state)) + "\n", { mode: 0o600 });
+  const writeCampaign = (state) => fs.writeFileSync(path.join(ledgerDir, CAMPAIGN_FILE), JSON.stringify(cDoc(state)) + "\n", { mode: 0o600 });
+
+  // ① writer off（campaign 缺席）→ 未开放
+  rmBoth(); writeWriter("off");
+  let r = run("/feishu-select osh_" + "a".repeat(32), "msg_r55_off");
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /已拒绝 · 选择功能未开放（迁移未开始）/u, r.stdout);
+  assert.equal(failedError("msg_r55_off"), "select_off");
+
+  // ② partial（campaign open + writer partial）→ 非 rfh 拒
+  rmBoth(); writeWriter("partial"); writeCampaign("open");
+  r = run("/feishu-select osh_" + "a".repeat(32), "msg_r55_partial");
+  assert.match(r.stdout, /已拒绝 · 迁移期间只接受 rfh_ 重确认 handle/u, r.stdout);
+  assert.equal(failedError("msg_r55_partial"), "select_partial_not_rfh");
+
+  // ③ partial + rfh → 放行 → 执行器未接入 → failed(select_executor_absent) 终态
+  r = run("/feishu-select rfh_" + "b".repeat(32), "msg_r55_partial_rfh");
+  assert.match(r.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, r.stdout);
+  assert.equal(failedError("msg_r55_partial_rfh"), "select_executor_absent");
+
+  // ④ on（campaign complete strict + writer on）→ 放行 → 同样 select_executor_absent
+  rmBoth(); writeWriter("on"); writeCampaign("complete");
+  r = run("/feishu-select osh_" + "a".repeat(32), "msg_r55_on");
+  assert.match(r.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, r.stdout);
+  assert.equal(failedError("msg_r55_on"), "select_executor_absent");
+
+  // ⑤ 坏文件（writer_state 非法 JSON，campaign 在场）→ 查不清
+  rmBoth(); writeCampaign("open"); writeWriter("bad", "{not json");
+  r = run("/feishu-select osh_" + "a".repeat(32), "msg_r55_bad");
+  assert.match(r.stdout, /已拒绝 · 选择功能状态读不清，未执行/u, r.stdout);
+  assert.equal(failedError("msg_r55_bad"), "select_writer_state_unreadable");
+
+  assert.equal(fs.readdirSync(receiptsDir).filter((n) => n.startsWith("select-rejected-")).length, 5, "四种结局都落了 select-rejected 回执");
+});
+
 test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {
+  // R55：默认准入改读真状态 —— repair 子进程给一个空账本根（双缺席 → off），本测试原「默认 off 收敛」断言保持成立
+  const repairLedger = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r55-repair-ledger-"));
+  fs.chmodSync(repairLedger, 0o700);
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-select-repair-"));
   const root = path.join(local, "project");
   fs.mkdirSync(root);
@@ -19077,7 +19167,7 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
 
   const repair = (...args) => spawnSync(process.execPath, [
     path.resolve("scripts", "repair-control-claim.mjs"), ...args,
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile } });
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: repairLedger } });
 
   // 1. 预览：按 select kind 投影
   const preview = repair("--project", root, "--key", key);

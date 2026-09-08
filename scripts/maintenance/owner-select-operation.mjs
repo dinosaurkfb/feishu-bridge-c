@@ -39,6 +39,7 @@ const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "ledger_reopening",
 
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
+const deepEq = (a, b) => { if (a === b) return true; if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => deepEq(x, b[i])); if (a && b && typeof a === "object" && typeof b === "object") return JSON.stringify(a) === JSON.stringify(b); return false; };
 const shaHex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
 const readlinkOrNull = (p) => { try { return { state: "value", value: fs.readlinkSync(p) }; } catch (err) { return err?.code === "ENOENT" ? { state: "absent", value: null } : { state: "unclear", value: null, why: errText(err) }; } };
@@ -125,30 +126,41 @@ function sealReusedFile(file, dir) {
   return { ok: true };
 }
 
-/** P1-4（返修二）：恢复记 done 屏障 —— 发现现场 === intended（崩溃窗口）后，先 fsync 目标目录、
- *  无锁/tmp 残骸，再受验重读 + 完整投影 === intended，才许 markStepDone。任一失败 → 不记 done（停门）。
- *  `allowed` 为目录里合法制品的白名单谓词；子目录跳过。返回 { ok:true } 或 { ok:false, why }。 */
-function recoveryBarrier({ dir, verify, inject = null, allowed = null } = {}) {
+/** 返修三（#138 三轮 P1）统一屏障：四类 step 记 done 前（首次 clean 提交 + 恢复支）统一走这一套——
+ *  ① fsync 目标目录；② 受验重读原始字节 + 完整投影逐字段 === step.intended_after；③ 残骸盘点为空。
+ *  任一失败 → { ok:false, why }，调用方不记 done（fail-closed）。
+ *  `readVerified` 返回 { ok, projection }（projection 为平整对象，逐字段与 intended 比）；
+ *  `residueAllowed(n)` 决定目标目录里哪个名字合法（含合法子目录）；其余全是残骸。
+ *  残骸 fail-closed：只忽略确定的 ENOENT；lstat 其它异常（EIO/EACCES…）→ 查不清阻断；
+ *  未知目录、ledger.lock、state file 锁、`.reap`/`.reaped-*` 一律算残骸（不进允许制品）。 */
+let __sealCalls = 0;
+export const __sealCallCount = () => __sealCalls;
+export const __resetSealCalls = () => { __sealCalls = 0; };
+function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed = null, inject = null }) {
+  __sealCalls++;
   let dfd = null;
   try {
     if (inject?.failDirFsync) throw Object.assign(new Error("注入目录 fsync 失败"), { code: "EIO" });
-    dfd = fs.openSync(dir, fs.constants.O_RDONLY);
+    dfd = fs.openSync(targetDir, fs.constants.O_RDONLY);
     fs.fsyncSync(dfd);
   } catch (err) { return { ok: false, why: errText(err) }; }
   finally { try { if (dfd !== null) fs.closeSync(dfd); } catch { /* 已关 */ } }
-  try {
-    for (const n of fs.readdirSync(dir)) {
-      let st = null;
-      try { st = fs.lstatSync(path.join(dir, n)); } catch { continue; }
-      if (st.isDirectory()) continue;
-      if (allowed !== null && allowed(n)) continue;
-      if (allowed === null && (n === "ledger.json" || n === "ledger.json.prev" || n === "ledger.lock"
-        || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json")) continue;
-      return { ok: false, why: "tmp/锁残骸：" + n };
+  const rv = readVerified();
+  if (!rv.ok) return { ok: false, why: rv.why ?? "受验重读失败" };
+  if (intended !== null && typeof intended === "object") {
+    for (const [k, v] of Object.entries(intended)) {
+      if (!deepEq(rv.projection?.[k], v)) return { ok: false, why: "投影≠intended：" + k };
     }
-  } catch (err) { return { ok: false, why: errText(err) }; }
-  const v = verify();
-  if (!v.ok) return { ok: false, why: v.why ?? "重读投影 ≠ intended" };
+  }
+  let names;
+  try { names = fs.readdirSync(targetDir); }
+  catch (err) { return { ok: false, why: "readdir：" + errText(err) }; }
+  for (const n of names) {
+    let st = null;
+    try { st = fs.lstatSync(path.join(targetDir, n)); }
+    catch (err) { if (err?.code === "ENOENT") continue; return { ok: false, why: "lstat：" + errText(err) }; }
+    if (residueAllowed === null || !residueAllowed(n)) return { ok: false, why: "残骸：" + n + (st.isDirectory() ? "（目录）" : "") };
+  }
   return { ok: true };
 }
 
@@ -466,24 +478,16 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：写后读回前（返修一 ③）
-          const after = readCampaignState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "open") return { ok: false, reason: "written_mismatch", why: "campaign 写后读回 ≠ intended_after", phase };
         }
-        // P1-4：恢复（现场 === intended）必须先 fsync 目标目录、无 tmp/锁残骸、受验重读+完整投影 === intended，才记 done。
-        if (atIntended) {
-          const rb = recoveryBarrier({
-            dir: path.dirname(campaignPath(env)),
-            allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
-            inject: _inject,
-            verify: () => {
-              const a = readCampaignState(env);
-              const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id
-                && JSON.stringify(a.endpoints) === JSON.stringify(intended.endpoints) && a.endpoints_digest === intended.endpoints_digest;
-              return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
-            },
-          });
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
-        }
+        // 返修三：首次 clean 提交与恢复支（现场===intended）统一走 sealAndVerifyStep，再记 done。
+        const s = sealAndVerifyStep({
+          targetDir: path.dirname(campaignPath(env)),
+          readVerified: () => { const a = readCampaignState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints: a.endpoints, endpoints_digest: a.endpoints_digest } }; },
+          intended,
+          residueAllowed: (n) => ENDPOINT_SHAPE.test(n) || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
+          inject: _inject,
+        });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -497,23 +501,22 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const d = resolveEndpointDir(ep, { env });
         if (!d.ok) return { ok: false, reason: d.reason, why: ep, phase };
         const L = loadLedger(d.dir, { endpointId: ep });
-        if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === st.intended_after.schema_version) {
-          // 现场已 after（崩溃窗口）→ 补 done。P1-4：先 fsync 目录、无残骸、受验重读+完整投影 === intended。
-          const rb = recoveryBarrier({
-            dir: d.dir, inject: _inject,
-            verify: () => {
-              const a = loadLedger(d.dir, { endpointId: ep });
-              const ok = a.ok && a.sha256 === st.intended_after.ledger_sha256 && a.doc.schema_version === st.intended_after.schema_version && a.doc.revision === st.intended_after.revision;
-              return ok ? { ok: true } : { ok: false, why: "重读投影 ≠ intended（sha/schema/revision）" };
-            },
-          });
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
-        } else {
+        const schemaAtIntended = L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === st.intended_after.schema_version;
+        if (!schemaAtIntended) {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1-transition", env, _inject });
           const sc = stepCommitCheck(r, "ledger");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
-          if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 执行器读回 SHA ≠ 进段预算", phase };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：写后读回前
         }
+        // 返修三：schema 首次（写后）与恢复支（现场已 after）统一 sealAndVerifyStep。
+        const s = sealAndVerifyStep({
+          targetDir: d.dir,
+          readVerified: () => { const a = loadLedger(d.dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { schema_version: a.doc.schema_version, revision: a.doc.revision, ledger_sha256: a.sha256 } : {} }; },
+          intended: st.intended_after,
+          residueAllowed: (n) => n === "ledger.json" || n === "ledger.json.prev",
+          inject: _inject,
+        });
+        if (!s.ok) return { ok: false, reason: schemaAtIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -524,27 +527,39 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
     for (const st of doc.steps.filter((s) => s.kind === "mint")) {
       const ep = st.id.slice("mint:".length);
       if (st.state !== "done") {
-        const blob = st.intended_blob;
-        const pb = readStagedVerified(blob.path, { sha256: blob.sha256, bytes: blob.bytes });
-        if (!pb.ok) return { ok: false, reason: "mint_plan_unreadable", why: ep + "：" + pb.why, phase };
-        let plan;
-        try { plan = JSON.parse(pb.buf.toString("utf-8")); }
-        catch (err) { return { ok: false, reason: "mint_plan_corrupt", why: ep + "：" + errText(err), phase }; }
-        const pp = mintPlanProblem(plan);
-        if (pp !== null) return { ok: false, reason: "mint_plan_corrupt", why: ep + "：" + pp, phase };
-        const r = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token }, plan, env, _inject });
-        const sc = stepCommitCheck(r, "ledger");
-        if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
-        // P1-4：执行器返回 ok 后，编排层受验重读账本并逐字段核 intended_after，才记 done（不信执行器自报）。
-        if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：执行器返回 ok 后、重读账本前
         const dd = resolveEndpointDir(ep, { env });
         if (!dd.ok) return { ok: false, reason: dd.reason, why: ep, phase };
-        const after = loadLedger(dd.dir, { endpointId: ep });
         const ia = st.intended_after;
-        const invA = after.ok ? migrationInventory(after.doc) : null;
-        if (!(after.ok && after.sha256 === ia.ledger_sha256 && after.doc.revision === ia.revision && invA.null_b1_count === ia.null_b1_count)) {
-          return { ok: false, reason: "written_mismatch", why: "mint 执行器返回 ok 但账本读回 ≠ intended_after（" + (after.ok ? "sha/rev/null_b1_count" : after.reason) + "）", phase };
+        // 恢复支：mint 已提交（现场===intended，journal step 仍 prepared）→ 不重跑执行器，统一 sealAndVerifyStep。
+        const mintAtIntended = (() => {
+          const a = loadLedger(dd.dir, { endpointId: ep });
+          if (!a.ok) return false;
+          const inv = migrationInventory(a.doc);
+          return a.sha256 === ia.ledger_sha256 && a.doc.revision === ia.revision && inv.null_b1_count === ia.null_b1_count;
+        })();
+        if (!mintAtIntended) {
+          const blob = st.intended_blob;
+          const pb = readStagedVerified(blob.path, { sha256: blob.sha256, bytes: blob.bytes });
+          if (!pb.ok) return { ok: false, reason: "mint_plan_unreadable", why: ep + "：" + pb.why, phase };
+          let plan;
+          try { plan = JSON.parse(pb.buf.toString("utf-8")); }
+          catch (err) { return { ok: false, reason: "mint_plan_corrupt", why: ep + "：" + errText(err), phase }; }
+          const pp = mintPlanProblem(plan);
+          if (pp !== null) return { ok: false, reason: "mint_plan_corrupt", why: ep + "：" + pp, phase };
+          const r = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token }, plan, env, _inject });
+          const sc = stepCommitCheck(r, "ledger");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：执行器返回 ok 后、重读账本前
         }
+        // 返修三：mint 首次（写后）与恢复支（现场===intended）统一 sealAndVerifyStep。
+        const s = sealAndVerifyStep({
+          targetDir: dd.dir,
+          readVerified: () => { const a = loadLedger(dd.dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { revision: a.doc.revision, null_b1_count: migrationInventory(a.doc).null_b1_count, ledger_sha256: a.sha256 } : {} }; },
+          intended: ia,
+          residueAllowed: (n) => n === "ledger.json" || n === "ledger.json.prev",
+          inject: _inject,
+        });
+        if (!s.ok) return { ok: false, reason: mintAtIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -565,23 +580,16 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          const after = readWriterState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "partial") return { ok: false, reason: "written_mismatch", why: "writer-state 写后读回 ≠ intended_after", phase };
         }
-        // P1-4：恢复（现场 === intended）必须先 fsync 目标目录、无 tmp/锁残骸、受验重读+完整投影 === intended，才记 done。
-        if (atIntended) {
-          const rb = recoveryBarrier({
-            dir: path.dirname(writerStatePath(env)),
-            allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
-            inject: _inject,
-            verify: () => {
-              const a = readWriterState(env);
-              const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id && a.endpoints_digest === intended.endpoints_digest;
-              return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
-            },
-          });
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
-        }
+        // 返修三：writer 首次（写后）与恢复支（现场===intended）统一 sealAndVerifyStep。
+        const s = sealAndVerifyStep({
+          targetDir: path.dirname(writerStatePath(env)),
+          readVerified: () => { const a = readWriterState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints_digest: a.endpoints_digest, revision: a.revision } }; },
+          intended,
+          residueAllowed: (n) => ENDPOINT_SHAPE.test(n) || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
+          inject: _inject,
+        });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);

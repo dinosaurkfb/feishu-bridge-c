@@ -229,7 +229,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52, stepCommitCheck as stepCommitCheck52 } from "./maintenance/owner-select-operation.mjs";
+import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52, stepCommitCheck as stepCommitCheck52, __sealCallCount as sealCallCount52, __resetSealCalls as resetSealCalls52 } from "./maintenance/owner-select-operation.mjs";
 import * as MOS from "./maintenance-owner-select.mjs";
 import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
 import { installSurfaceLockPath } from "./install-surface-lock.mjs";
@@ -38092,6 +38092,60 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         const jj2 = readJournal({ dir: fx.dir, token: tok });
         const campStep = jj2.doc.steps.find((s) => s.id === campId);
         assert.equal(campStep.state, "prepared", "campaign step 不记 done（目录 fsync 失败）");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修三：统一屏障——mint already 恢复支走屏障（failDirFsync→recovery_seal_failed 不记 done）；ledger.lock 残骸 fail-closed（schema 不推进 done）；首次 clean 提交也过屏障（计数=步骤数）", () => {
+    // ① mint already 恢复支（mint 已提交、step 仍 prepared）注入 failDirFsync → 必 recovery_seal_failed 且 step 保持 prepared。
+    {
+      const fx = r52Setup({});
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("mint:")) throw Object.assign(new Error("crash@mint"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "mint 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r.ok === false, "mint already 恢复 failDirFsync 停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "mint already 恢复支走屏障 → recovery_seal_failed");
+        const j = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(j.doc.steps.find((s) => s.kind === "mint" && s.state !== "done").state, "prepared", "mint step 不记 done（恢复窗 failDirFsync）");
+      } finally { fx.cleanup(); }
+    }
+    // ② ledger.lock 残骸 fail-closed：schema 已提交、step prepared、ledger.lock 在场 → 恢复不得推进 done。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@schema"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "schema 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const ep = fx.eps[0];
+        fs.writeFileSync(path.join(fx.ledgerRoot, ep, "ledger.lock"), "stuck", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "ledger.lock 残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "ledger.lock 残骸 → schema step 不推进 done");
+        const j = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(j.doc.steps.find((s) => s.kind === "schema_endpoint").state, "prepared", "schema step 不记 done（ledger.lock 在场）");
+      } finally { fx.cleanup(); }
+    }
+    // ③ 首次 clean 提交也过屏障：计数器 == 已提交 step 数（twoEps:false 下 campaign+schema+mint+writer = 4 步）。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        resetSealCalls52();
+        const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(r.ok, "全程成功：" + JSON.stringify({ reason: r.reason, phase: r.phase }));
+        assert.equal(r.phase, "done");
+        assert.equal(sealCallCount52(), 4, "sealAndVerifyStep 被调用 4 次（每个 clean 提交 step 一次）");
       } finally { fx.cleanup(); }
     }
   });

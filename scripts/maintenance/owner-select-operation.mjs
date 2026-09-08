@@ -27,15 +27,13 @@ import { chainFacts } from "./precheck.mjs";
 import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, updateJournal, verifyBackup } from "./journal.mjs";
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { applyMintPlan, applySchemaUpgrade, buildMintPlan, fingerprintOf, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
+import { applyMintPlan, applySchemaUpgrade, buildMintPlan, fingerprintOf, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, OWNER_SELECT_HANDLE_TTL_MS, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
 import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const CHAINS = ["claude", "codex"];
 
-/** handle TTL 拍定为单一常量（owner-select-route.md §4 P2-2：实现单开工前拍定）：迁移期 selection_handle 30 天。 */
-export const OSM_HANDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** forward-only 的 osm 段 + 复用 ledger 的重开族（journal.mjs 的 FORWARD_ONLY_PHASES 已含全部）。 */
 const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "ledger_reopening", "reopening_incomplete"]);
 
@@ -219,6 +217,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     //    mint 在 schema 之后执行，plan.before_ledger_sha256 必 === mint step before 的 ledger_sha256）
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1-transition" }); // 与执行器 requestKey 同源
+    // P2-3：schema_upgrade 的 request_key 派生公式（§8.2 已回带合同）固定为 token + ":schema:" + ep，两处（进段预算 / 执行器 / 重开核验）必须逐字一致。
     const schemaAfter = { schema_version: "1.1-transition", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) };
 
     // ② pre-forward 矩阵：staged mint plan 盘点（缺席 → 建；恰一份身份/锚全符 → 复用；其它 → fail-closed 不删不改）
@@ -247,7 +246,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     } else if (probe.why !== "文件不在") {
       return { ok: false, reason: "mint_plan_unreadable", why: ep + "：" + probe.why, rollbackSafe: false };
     } else {
-      plan = buildMintPlan({ doc: next, token, campaignId: cid, endpointId: ep, requestKey: token, now: ctx.now(), ttlMs: OSM_HANDLE_TTL_MS });
+      plan = buildMintPlan({ doc: next, token, campaignId: cid, endpointId: ep, requestKey: token, now: ctx.now(), ttlMs: OWNER_SELECT_HANDLE_TTL_MS });
       if (plan === null || mintPlanProblem(plan) !== null) return { ok: false, reason: "plan_build_failed", why: ep + " 的 mint plan 构造失败或形状不过", rollbackSafe: false };
       const bytes = mintPlanBytes(plan);
       const w = writePlanFileOExcl(planFile, bytes);

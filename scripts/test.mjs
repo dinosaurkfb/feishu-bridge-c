@@ -229,7 +229,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, OSM_HANDLE_TTL_MS, mintPlanBytes as mintPlanBytes52 } from "./maintenance/owner-select-operation.mjs";
+import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52 } from "./maintenance/owner-select-operation.mjs";
 import * as MOS from "./maintenance-owner-select.mjs";
 import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
 import { installSurfaceLockPath } from "./install-surface-lock.mjs";
@@ -37741,7 +37741,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   };
   const r52WritePlan = (fx, tok, ep, ledgerDoc, mutate = null) => {
     const next = TAL.applySchemaUpgrade(ledgerDoc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(tok, ep), request_key: tok + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1-transition" });
-    let plan = TAL.buildMintPlan({ doc: next, token: tok, campaignId: campaignIdFor(tok), endpointId: ep, requestKey: tok, now: Date.parse(T052), ttlMs: OSM_HANDLE_TTL_MS });
+    let plan = TAL.buildMintPlan({ doc: next, token: tok, campaignId: campaignIdFor(tok), endpointId: ep, requestKey: tok, now: Date.parse(T052), ttlMs: TAL.OWNER_SELECT_HANDLE_TTL_MS });
     if (mutate) { mutate(plan); if (TAL.mintPlanProblem(plan) !== null) throw new Error("测试预置 plan 形坏"); }
     const bytes = mintPlanBytes52(plan);
     const intendedDir = path.join(fx.dir, tok + ".staged", "intended");
@@ -38238,6 +38238,22 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       assert.ok(ex.incomplete.some((i) => /fingerprint/.test(String(i.why))), "指纹不符被点名：" + JSON.stringify(ex.incomplete));
       assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留门不撤");
       assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "active", "门保留");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P2：ownerSelectStatus 对坏 journal / 收据冲突投影成「查不清」并点名，非空集合", () => {
+    const fx = r52Setup({});
+    try {
+      // 坏 journal：把一个收据文件写坏 → aggregateEndpointReceipts unreadable → receiptsProblem 查不清点名。
+      const badTok = r52Uuid(1);
+      fs.writeFileSync(path.join(fx.dir, badTok + ".json"), "{ not json", { mode: 0o600 });
+      const st = MOS.ownerSelectStatus(fx.ctx, { env: fx.env });
+      assert.ok(st.receiptsProblem, "坏 journal → receiptsProblem（查不清）非空：" + JSON.stringify(st.receiptsProblem));
+      assert.match(String(st.receiptsProblem), /journal|读不出|收据/, "点名原因：" + String(st.receiptsProblem));
+      assert.equal(st.endpoints.length, 0, "查不清时不许枚举子集为空集合");
+      // 渲染含查不清文案
+      const txt = MOS.renderOwnerSelectStatus(st);
+      assert.match(txt, /查不清/, "渲染含查不清：" + txt);
     } finally { fx.cleanup(); }
   });
 

@@ -849,7 +849,8 @@ export function runDoctor({
       : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
         (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
         (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "") +
-        (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "");
+        (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "") +
+        (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "");
     // R54 返修三 P1-3：有无法核验实例身份的进行中转发 → 本项 incomplete（ok:null），不判绿也不判红
     const ok17 = scanned === 0 ? true
       : buckets.inflightUnverified > 0 ? null

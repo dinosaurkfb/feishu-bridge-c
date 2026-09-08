@@ -523,9 +523,9 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
       const residue = finalizeLockOnce();
       if (residue !== null) {
         if (renameLanded) {
-          return { ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
+          return { ...res, ok: false, commit: "lock_residue", reason: "lock_release_residue", why: residue, lock: lockDir, target: fileName };
         }
-        return { ok: false, commit: "not_committed", reason: res.reason, why: res.why, lockResidue: residue, lock: lockDir };
+        return { ...res, ok: false, commit: "not_committed", reason: res.reason, why: res.why, lockResidue: residue, lock: lockDir };
       }
       return res;
     };

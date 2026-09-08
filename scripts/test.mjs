@@ -35873,6 +35873,115 @@ test("R50 返修六 P2-1：tmp 清理用 tmpCreated 防误删、直调 unlinkSyn
   }
 });
 
+test("R50 返修八 P2-1：exitWithLock 双故障（tmp 删除失败 + 锁释放失败）同时发生时保留 ...res 带出两份残骸", () => {
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const tok = "00000000-0000-4000-8000-000000000028";
+  const cid = campaignIdFor(tok);
+  const eps = ["endpoint_111111111111111111111111"];
+  const dig = endpointsDigest(eps);
+  const now = "2026-09-07T10:00:00.000Z";
+
+  const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-p2-1-dual-test-"));
+  const ledgerDir = path.join(tmpRoot, "ledger");
+  fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+  const maintDir = path.join(tmpRoot, "maint");
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const gateFile = path.join(tmpRoot, "maintenance.gate");
+  const lockDir = path.join(ledgerDir, "owner-select-state.lock");
+  const env = {
+    FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
+  };
+
+  const cDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      [eps[0]]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok
+  };
+  const payload = JSON.stringify(cDoc, null, 2) + "\n";
+  const actualSha = sha256(payload);
+
+  const { capCampaignOpen: capability } = setupMaintFixtureA({ maintDir, tok, cid, eps, now, gateFile });
+  const jPath = path.join(maintDir, tok + ".json");
+  const jDoc = JSON.parse(fs.readFileSync(jPath, "utf-8"));
+  const step = jDoc.steps.find((s) => s.id === capability.stepId);
+  step.intended_after.sha256 = actualSha;
+  fs.writeFileSync(jPath, JSON.stringify(jDoc, null, 2) + "\n", { mode: 0o600 });
+
+  const origFsync = fs.fsyncSync;
+  const origUnlink = fs.unlinkSync;
+  const origRm = fs.rmSync;
+
+  let injectFsyncError = false;
+  let injectUnlinkEacces = false;
+  let throwLockRelease = false;
+
+  fs.fsyncSync = function(fd) {
+    if (injectFsyncError) {
+      const err = new Error("EIO: disk error");
+      err.code = "EIO";
+      throw err;
+    }
+    return origFsync.apply(this, arguments);
+  };
+
+  fs.unlinkSync = function(p) {
+    if (injectUnlinkEacces && String(p).includes(".tmp")) {
+      const err = new Error("EACCES: permission denied");
+      err.code = "EACCES";
+      throw err;
+    }
+    return origUnlink.apply(this, arguments);
+  };
+
+  fs.rmSync = function(p, opts) {
+    if (throwLockRelease && String(p) === lockDir) {
+      const err = new Error("EIO: lock release error");
+      err.code = "EIO";
+      throw err;
+    }
+    return origRm.apply(this, arguments);
+  };
+
+  try {
+    injectFsyncError = true;
+    injectUnlinkEacces = true;
+    throwLockRelease = true;
+    const rDual = writeCampaignState({ env, expectedSha256: null, doc: cDoc, capability });
+    assert.equal(rDual.ok, false);
+    assert.equal(rDual.commit, "not_committed");
+    assert.ok(rDual.residue, "双故障时 tmp 删除失败的 residue 绝不可丢失（保留 ...res）");
+    assert.equal(rDual.residue.reason, "tmp_unlink_failed");
+    assert.equal(rDual.residue.why, "EACCES");
+    assert.ok(rDual.residue.path.includes(".tmp"));
+    assert.ok(rDual.lockResidue, "双故障时锁释放失败的 lockResidue 必须带出");
+    assert.match(rDual.lockResidue, /lock_release_throw|EIO/u);
+    assert.equal(rDual.lock, lockDir);
+  } finally {
+    fs.fsyncSync = origFsync;
+    fs.unlinkSync = origUnlink;
+    fs.rmSync = origRm;
+    injectFsyncError = false;
+    injectUnlinkEacces = false;
+    throwLockRelease = false;
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(lockDir + ".reap", { recursive: true, force: true }); } catch { /* ignore */ }
+    const orphans = fs.readdirSync(ledgerDir).filter(f => f.includes(".tmp"));
+    for (const o of orphans) {
+      try { fs.unlinkSync(path.join(ledgerDir, o)); } catch { /* ignore */ }
+    }
+  }
+});
+
 test("R50 返修六 P2-2：下沉 canonKey/sha256 到 canon.mjs 叶子模块消除环路，颠倒 import 顺序无死锁", () => {
   const repoRoot = path.resolve(moduleDir(import.meta.url), "..");
   const journalPath = path.join(repoRoot, "scripts", "maintenance", "journal.mjs");

@@ -31,6 +31,7 @@ import {
 import { maintenanceGatePath, readGate } from "../maintenance-gate-core.mjs";
 
 export {
+  readVerifiedDoc,
   CAMPAIGN_STATES,
   WRITER_STATES,
   CAMPAIGN_ID_SHAPE,
@@ -179,7 +180,11 @@ function fsyncDir(dir) {
 }
 
 /** 受验读状态文件：fd 绑定、O_NOFOLLOW、普通文件、单硬链接、mode 恰 0600、≤1MiB、JSON 校验 */
-function readVerifiedDoc({ file, docValidator }) {
+/**
+ * fd 绑定有界读原语（#141 P1-3 doctor 读转发制品复用）：O_NOFOLLOW|O_NONBLOCK 打开、同 fd fstat、
+ * 普通文件、单硬链接、0600、大小上限（默认 owner-select 状态文件的 1 MiB，doctor 处收窄到 64 KiB）。
+ */
+function readVerifiedDoc({ file, docValidator, maxBytes = MAX_STATE_FILE_BYTES }) {
   let fd = null;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
@@ -194,7 +199,7 @@ function readVerifiedDoc({ file, docValidator }) {
     const mode = st.mode & 0o777;
     if (mode !== 0o600) return { ok: false, problem: "mode 不是 0600: " + mode.toString(8) };
     if (fs.lstatSync(file).isSymbolicLink()) return { ok: false, problem: "文件是符号链接" };
-    if (st.size > MAX_STATE_FILE_BYTES) return { ok: false, problem: "文件大小超过上限（" + st.size + " > " + MAX_STATE_FILE_BYTES + "）" };
+    if (st.size > maxBytes) return { ok: false, problem: "文件大小超过上限（" + st.size + " > " + maxBytes + "）" };
 
     const buf = Buffer.alloc(st.size);
     let off = 0;

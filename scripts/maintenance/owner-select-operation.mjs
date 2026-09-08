@@ -92,10 +92,36 @@ function copyBackup(dest, bytes) {
     if (err?.code !== "EEXIST") return { ok: false, reason: "backup_write_failed", why: errText(err) };
     const v = readStagedVerified(dest, { sha256: sha, bytes: bytes.length });
     if (!v.ok) return { ok: false, reason: "backup_mismatch", why: "备份已在场但 sha 不符（" + (v.why ?? "") + "）" };
+    // P1-2：复用必须重新 seal（受验 fd fsync + fsync staged/ 父目录）——上一轮目录屏障失败留下的文件，本轮复用要重新刷。
+    const s = sealReusedFile(dest, path.dirname(dest));
+    if (!s.ok) return { ok: false, reason: "backup_seal_failed", why: "复用备份重新 seal 失败（" + s.why + "）" };
     return { ok: true, sha256: sha, bytes: bytes.length };
   }
   try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
   return { ok: true, sha256: sha, bytes: bytes.length };
+}
+
+/** P1-2（返修二）：复用前重新 seal —— 上一轮写入未刷盘（写入失败或目录屏障失败）留在场上的文件，
+ *  本轮复用要在受验 fd（O_RDONLY|O_NOFOLLOW|O_NONBLOCK，核普通文件/0600/单硬链接）上 fsync(file)，
+ *  再 fsync 正确父目录（plan 的 intended/、backup 的 staged/），才算「可跨崩溃存活」进 forward-only。
+ *  返回 { ok:true } 或 { ok:false, why }。 */
+function sealReusedFile(file, dir) {
+  let fd = null;
+  try { fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
+  catch (err) { return { ok: false, why: errText(err) }; }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return { ok: false, why: "不是普通文件" };
+    if (st.nlink !== 1) return { ok: false, why: "硬链接数不是 1" };
+    if ((st.mode & 0o777) !== 0o600) return { ok: false, why: "mode 不是 0600" };
+    fs.fsyncSync(fd);
+  } catch (err) { return { ok: false, why: errText(err) }; }
+  finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+  let dfd = null;
+  try { dfd = fs.openSync(dir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
+  catch (err) { return { ok: false, why: errText(err) }; }
+  finally { try { if (dfd !== null) fs.closeSync(dfd); } catch { /* 已关 */ } }
+  return { ok: true };
 }
 
 /** P1-3（返修二 P1-1）：核**两条链**的已装 runtime 是否支持过渡（§8 进门前置）。
@@ -262,6 +288,9 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
       plan = parsed;
       // P1-4 (b)：plan 来自文件 → journal 锚用盘上原始字节的 sha（不重新序列化）；非规范但合法的序列化以文件为准。
       planBytes = probe.buf;
+      // P1-2：复用必须重新 seal（受验 fd fsync + fsync intended/ 父目录）——上一轮目录屏障失败留下的 plan，本轮复用要重新刷。
+      const seal = sealReusedFile(planFile, path.dirname(planFile));
+      if (!seal.ok) return { ok: false, reason: "plan_seal_failed", why: ep + "：复用 plan 重新 seal 失败（" + seal.why + "）", rollbackSafe: false };
     } else if (probe.why !== "文件不在") {
       return { ok: false, reason: "mint_plan_unreadable", why: ep + "：" + probe.why, rollbackSafe: false };
     } else {

@@ -37943,6 +37943,36 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 返修二 P1-2：staged 复用必须重新 seal——plan 复用分支与 backup EEXIST 分支都在受验 fd 上 fsync(file)+fsync 父目录（注入计数断言）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      const tok = r52Uuid(5);
+      const ep = fx.eps[0];
+      const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+      assert.ok(L.ok, "账本可读");
+      // 预置 plan（复用分支）+ 预置 ledger 备份（backup EEXIST 分支）——模拟上一轮 fsync 失败留在场的文件。
+      const preset = r52WritePlan(fx, tok, ep, L.doc);
+      const planFile = preset.planFile;
+      const backupFile = path.join(fx.dir, tok + ".staged", "backup-ledger-" + ep + ".json");
+      fs.writeFileSync(backupFile, L.bytes, { mode: 0o600 });
+      const dfx = r52DrainedFixture({ fx, tok });
+      // 注入 fsync 计数：把受验 fd 的 path 映射出来，统计 planFile / backupFile 的 fsync 次数。
+      const _realOpen = fs.openSync, _realFsync = fs.fsyncSync;
+      const fdPath = new Map();
+      let planFsync = 0, backupFsync = 0;
+      fs.openSync = function (...a) { const fd = _realOpen.apply(fs, a); fdPath.set(fd, String(a[0])); return fd; };
+      fs.fsyncSync = function (fd) { const p = fdPath.get(fd) ?? ""; if (p === planFile) planFsync++; if (p === backupFile) backupFsync++; return _realFsync.call(fs, fd); };
+      try {
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok, "复用路径收敛：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+      } finally {
+        fs.openSync = _realOpen; fs.fsyncSync = _realFsync;
+      }
+      assert.ok(planFsync > 0, "plan 复用分支在受验 fd 上 fsync(file)：planFsync=" + planFsync);
+      assert.ok(backupFsync > 0, "backup EEXIST 分支在受验 fd 上 fsync(file)：backupFsync=" + backupFsync);
+    } finally { fx.cleanup(); }
+  });
+
   test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
     // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
     {

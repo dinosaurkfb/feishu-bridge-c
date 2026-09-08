@@ -378,6 +378,11 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 （前 32 hex 按 8-4-4-4-12 排、版本位置 4、变体位置 8——与 OP_ID_SHAPE 相容），升版不改任何记录的 `updated_at`（只补显式 null），
 于是 `applySchemaUpgrade(beforeDoc, { operation_id, request_key, from, to })` 是纯函数，编排用它算 intended_after，执行器 `schemaUpgrade` 用同一函数产 next 并读回核等。
 `mint` 同理已由 plan 冻结 `operation_id`。
+**执行器与 journal step 的 CAS（PR #137 一轮回带）**：`schemaUpgrade` / `mintSelectionHandles` 在账本写锁内核 `current SHA === step.before.ledger_sha256`（不等且 ≠ intended → `before_mismatch`；
+=== intended → replayed/already），读回核 `=== step.intended_after.ledger_sha256`（否则 `written_mismatch`）；intended 在进 forward 段前冻结，**绝不提交后回填**。
+compare→build→账本锁→rename 全程处于**同一真实 lease 实例**的 `commitWhileHeld` 栅栏内，提交点复核 active/gate/journal/step。
+**mint plan 身份与有效期**：TTL 唯一常量 `OWNER_SELECT_HANDLE_TTL_MS`（账本模块单一出处，编排 import），`mintPlanProblem` 核 `handle_expires_at === frozen_at + TTL`、
+`campaign_id === campaignIdFor(token)`、`minted[*].selection_handle` 全局唯一，且 `applyMintPlan` 产物过 `validateLedger` 才可落 staging。
 
 **状态链闭合（PR #135 一轮 P1-4/P1-5/P1-6 回带；"步数闭合"之外还要"状态链闭合"）**：
 - 逐 endpoint：A 的 `schema_endpoint:<ep>:transition.intended_after.{revision,ledger_sha256}` **===** `mint:<ep>.before.{revision,ledger_sha256}`；

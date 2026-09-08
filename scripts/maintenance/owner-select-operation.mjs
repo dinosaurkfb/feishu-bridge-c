@@ -20,7 +20,7 @@ import { execFileSync } from "node:child_process";
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
 import { runtimeRoot, switchCurrentTarget, verifyRuntime } from "../runtime-install.mjs";
 import { moduleDir } from "../direct-run.mjs";
-import { readStagedVerified, removeStagedPlan } from "../m1b/staged-plan.mjs";
+import { fsyncDir, mkdirDurable, readStagedVerified, removeStagedPlan } from "../m1b/staged-plan.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
 import { chainFacts } from "./precheck.mjs";
@@ -71,13 +71,20 @@ function writePlanFileOExcl(file, bytes) {
   return { ok: true };
 }
 
-/** 复制备份字节到本 operation 私有目录（O_EXCL 0600 + fsync），返回 {sha256, bytes}。 */
+/** 备份字节落本 operation 私有 staged/ 目录。P1-4 (c)：文件已在场 → readStagedVerified 核其 sha ===
+ *  预期字节 sha 则复用（去掉一律 O_EXCL），不符 → fail-closed；缺席 → O_EXCL 0600 fd 写 + fsync。返回 {sha256, bytes}。 */
 function copyBackup(dest, bytes) {
+  const sha = shaHex(bytes);
   let fd = null;
   try { fd = fs.openSync(dest, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600); }
-  catch (err) { return { ok: false, reason: "backup_write_failed", why: errText(err) }; }
+  catch (err) {
+    if (err?.code !== "EEXIST") return { ok: false, reason: "backup_write_failed", why: errText(err) };
+    const v = readStagedVerified(dest, { sha256: sha, bytes: bytes.length });
+    if (!v.ok) return { ok: false, reason: "backup_mismatch", why: "备份已在场但 sha 不符（" + (v.why ?? "") + "）" };
+    return { ok: true, sha256: sha, bytes: bytes.length };
+  }
   try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
-  return { ok: true, sha256: shaHex(bytes), bytes: bytes.length };
+  return { ok: true, sha256: sha, bytes: bytes.length };
 }
 
 /** P1-3：核当前 runtime（env.HOME 下 claude 链 current）已装版本模块是否支持过渡（§8 进门前置）。
@@ -184,7 +191,10 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
   const digest = endpointsDigest(frozen);
   const stagedDir = path.join(ctx.dir, token + ".staged");
   const intendedDir = path.join(stagedDir, "intended");
-  fs.mkdirSync(intendedDir, { recursive: true, mode: 0o700 });
+  // P1-4 (a)：用 R46 建根原语逐层建 staged 树（父目录在场、非递归、lstat 核 symlink/0700、fsync 父目录作屏障），
+  //   不再 mkdirSync({recursive:true})——staged/ 被预埋成外指 symlink 时在此拒。
+  try { mkdirDurable(stagedDir, ctx.dir); mkdirDurable(intendedDir, stagedDir); }
+  catch (err) { return { ok: false, reason: err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK" ? "staged_residue" : "io_error", why: "建 staged 树：" + errText(err), rollbackSafe: false }; }
 
   // 现场投影（campaign / writer_state）——备份规则按 kind：before.exists → 备份到 staged/
   const cs = readCampaignState(env);
@@ -211,7 +221,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     // ② pre-forward 矩阵：staged mint plan 盘点（缺席 → 建；恰一份身份/锚全符 → 复用；其它 → fail-closed 不删不改）
     const planFile = path.join(intendedDir, "mint-" + ep + ".json");
     const probe = readStagedPlanBytes(planFile);
-    let plan = null;
+    let plan = null, planBytes = null;
     if (probe.ok) {
       // 文件在场：按 §8 矩阵逐项核身份与重演算；文件本身的 0600/单硬链接/普通文件已由 readStagedPlanBytes 核过。
       let parsed;
@@ -229,6 +239,8 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
         return { ok: false, reason: "mint_plan_mismatch", why: ep + " 的 staged plan 身份/锚不符（不删不改，等人工）", rollbackSafe: false };
       }
       plan = parsed;
+      // P1-4 (b)：plan 来自文件 → journal 锚用盘上原始字节的 sha（不重新序列化）；非规范但合法的序列化以文件为准。
+      planBytes = probe.buf;
     } else if (probe.why !== "文件不在") {
       return { ok: false, reason: "mint_plan_unreadable", why: ep + "：" + probe.why, rollbackSafe: false };
     } else {
@@ -237,8 +249,8 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
       const bytes = mintPlanBytes(plan);
       const w = writePlanFileOExcl(planFile, bytes);
       if (!w.ok) return { ok: false, reason: w.reason, why: ep + "：" + (w.why ?? ""), rollbackSafe: false };
+      planBytes = bytes;
     }
-    const planBytes = mintPlanBytes(plan);
     const planBlob = { path: planFile, bytes: planBytes.length, sha256: shaHex(planBytes) };
 
     // ③ 账本备份进 staged（backup_sha256 === before.ledger_sha256 的合同）
@@ -278,6 +290,9 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
     if (!wb.ok) return { ok: false, reason: wb.reason, why: "writer-state 备份：" + (wb.why ?? "") };
     writerBackup = { backup: path.join(stagedDir, "backup-writer-state.json"), backup_sha256: wb.sha256, backup_bytes: wb.bytes };
   }
+  // P1-4 (d)：所有备份（含 ledger/campaign/writer）落盘后才 fsync staged/ 目录作目录屏障，之后才许进段提交。
+  try { fsyncDir(stagedDir); }
+  catch (err) { return { ok: false, reason: "backup_dir_fsync_failed", why: "fsync staged 目录：" + errText(err), rollbackSafe: false }; }
 
   const at = new Date(ctx.now()).toISOString();
   const steps = [];

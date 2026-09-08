@@ -49,8 +49,9 @@ export function planProblem(plan) {
 
 const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
-/** 建 0700 目录（父目录必须已在场，非递归新建本级），fsync 其父目录作屏障；已在场复用，但 mode 必须仍是 0700（private 目录不许降级）。 */
-function mkdirDurable(dir, parentToFsync) {
+/** 建 0700 目录（父目录必须已在场，非递归新建本级），fsync 其父目录作屏障；已在场复用，但 mode 必须仍是 0700（private 目录不许降级）。
+ *  P1-4：osm 迁移的 staged 树复用本原语（逐层 symlink/0700/fsync 父目录校验），不再 mkdirSync({recursive:true})。 */
+export function mkdirDurable(dir, parentToFsync) {
   // 三轮 P1④：父目录必须已在场，非递归新建本级 —— 根缺席不是 stage 的活，不许 recursive 顺手建链。
   try { fs.mkdirSync(dir, { recursive: false, mode: 0o700 }); } catch (err) { if (err?.code !== "EEXIST") throw err; }
   // P1-3：lstat 不跟随 —— .staged / intended 被预埋成外指 symlink 时必须在此拒，不能 statSync 跟随放行照写。
@@ -88,7 +89,7 @@ function writeExclDurable(file, bytes) {
   try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
-function fsyncDir(dir) {
+export function fsyncDir(dir) {
   let dfd = null;
   try { dfd = fs.openSync(dir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
   catch (err) { if (!dirFsyncIgnorable(err?.code)) throw err; }

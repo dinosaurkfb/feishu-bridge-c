@@ -37873,6 +37873,43 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
+    // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const dfx = r52DrainedFixture({ fx, tok });
+        const ext = path.join(fx.base, "external-staged");
+        fs.mkdirSync(ext, { recursive: true, mode: 0o700 });
+        fs.symlinkSync(ext, path.join(fx.dir, tok + ".staged"));
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "staged symlink 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "staged_residue", "staged symlink 拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(fs.existsSync(path.join(ext, "intended")), false, "外指目录未写盘");
+      } finally { fx.cleanup(); }
+    }
+    // (c)：备份已在场但 sha 不符 → fail-closed（backup_mismatch），不复用、不覆盖。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const dfx = r52DrainedFixture({ fx, tok });
+        const stagedDir = path.join(fx.dir, tok + ".staged");
+        fs.mkdirSync(stagedDir, { recursive: true, mode: 0o700 });
+        const bak = path.join(stagedDir, "backup-ledger-" + ep + ".json");
+        fs.writeFileSync(bak, "nothing".repeat(40), { mode: 0o600 });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "备份 sha 不符必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "backup_mismatch", "备份 sha 不符拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        const j52 = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(j52.doc.phase, "drained", "未进段，仍 drained");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
     // ── 1. mint 段 commit_residue：failDirFsync → committed_durability_uncertain → 停门、step 不记 done ──
     {

@@ -724,22 +724,37 @@ export function runDoctor({
   }
 
   // ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
-  // forward-runner 落在 <root>/.runtime-data/inbound/runs/<key>.forward.result.json（issue #140）。
-  // 读盘纪律（#141 P1-3）：result/started 一律走 readVerifiedDoc（O_NOFOLLOW|O_NONBLOCK、同 fd fstat、
-  // 普通文件、单硬链接、0600、64 KiB 上限）+ forwardResultProblem/forwardStartedProblem 封闭校验，
-  // 坏形状 → 查不清并点名（不是跳过）；readdirSync 只把 ENOENT 折成"没有条目"。
-  // 孤儿判定（#141 P1-4）：有 jsonl 无 result 时看 started.json——缺席且 >10 分钟 → 结果缺失；
-  // runner_pid 存活（EPERM 视为存活）→ 进行中不红；已死且 >10 分钟 → 结果缺失。
+  // forward-runner 落在 <root>/.runtime-data/inbound/runs/<key>.forward.*（issue #140）。
+  // 读盘纪律（#141 二轮 P1-4）：一律先走 readVerifiedDoc（fd 绑定，O_NOFOLLOW|O_NONBLOCK），只把
+  // ENOENT 折成缺席；EIO/悬空 symlink/FIFO/并发变化 → 查不清并点名；不做受验读取前的 statSync fail-open。
+  // 按 key 聚合（#141 二轮 P1-2）：runs 目录先聚成 {key: {jsonl, stderr, started, result}} 快照，
+  // 每个 key 恰进一个终态桶（绿/红/进行中/结果缺失/查不清）；有 result 的 key 不再走孤儿判断。
+  // key 绑定（#141 二轮 P1-3）：doctor 从文件名解析 key 传入校验器，doc.key 与文件名不符 → 查不清。
   // 24h 窗口罩住一切：更早的积尘不算当前健康度，否则一次旧故障永远红着，这项就失去了信号。
   {
     const WINDOW = 24 * 3600 * 1000;
     const ORPHAN_AFTER = 10 * 60 * 1000;
     const RESULT_CAP = 64 * 1024;
+    const SUFFIXES = [[".forward.result.json", "result"], [".forward.started.json", "started"], [".forward.stderr.log", "stderr"], [".forward.jsonl", "jsonl"]];
     const buckets = { green: 0, red: 0, missing: 0, inflight: 0, unclear: 0 };
     const redNote = [];
     const missingKeys = [];
     const unclearNote = [];
     const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err?.code === "EPERM" ? true : false; } };
+    // fd 绑定 stat（O_NOFOLLOW|O_NONBLOCK，不读内容）：jsonl 的年龄来源；悬空 symlink/FIFO/并发变化 → problem，不 fail-open
+    const fdStat = (file) => {
+      let fd = null;
+      try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+        const st = fs.fstatSync(fd);
+        if (!st.isFile() || st.nlink !== 1) return { problem: "不是普通文件或硬链接数不为 1" };
+        return { ok: true, mtimeMs: st.mtimeMs };
+      } catch (err) {
+        if (err?.code === "ENOENT") return { absent: true };
+        return { problem: "open/fstat 失败: " + String(err?.code ?? err?.message ?? err) };
+      }
+      finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+    };
     for (const p of projects) {
       const root = p?.root;
       if (typeof root !== "string" || !path.isAbsolute(root)) continue; // root 不成形的项目 ⑤⑥ 已点名
@@ -751,36 +766,51 @@ export function runDoctor({
         buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(path.basename(String(root)) + "（runs 读不出：" + String(err?.code ?? err?.message ?? err) + "）");
         continue;
       }
+      // P1-2：先按 key 聚合成快照，再逐 key 判桶
+      const byKey = new Map();
       for (const n of names) {
-        if (n.endsWith(".forward.result.json")) {
-          const file = path.join(runsDir, n);
-          let mtimeMs = 0;
-          try { mtimeMs = fs.statSync(file).mtimeMs; } catch { continue; }
-          if (now - mtimeMs > WINDOW) continue;
-          const v = readVerifiedDoc({ file, docValidator: (doc) => forwardResultProblem(doc, { now }), maxBytes: RESULT_CAP });
-          if (v.ok !== true) { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(n.slice(0, -".forward.result.json".length).slice(-8) + "：" + String(v.problem ?? "读不出")); continue; }
+        for (const [suffix, kind] of SUFFIXES) {
+          if (!n.endsWith(suffix)) continue;
+          const key = n.slice(0, -suffix.length);
+          if (!byKey.has(key)) byKey.set(key, {});
+          byKey.get(key)[kind] = n;
+          break;
+        }
+      }
+      for (const [key, parts] of byKey) {
+        const unclear = (why) => { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：" + why); };
+        if (parts.result !== undefined) {
+          // 有 result：唯一终态来源，不再走孤儿判断
+          const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key }), maxBytes: RESULT_CAP });
+          if (v.ok !== true) { if (v.absent) unclear("result 读不出（并发变化）"); else unclear(String(v.problem ?? "读不出")); continue; }
           const at = Date.parse(v.doc.finished_at ?? "");
-          if (now - (Number.isFinite(at) ? at : mtimeMs) > WINDOW) continue; // 文档自称的完成时间在窗外 → 积尘
+          if (now - (Number.isFinite(at) ? at : (v.mtimeMs ?? 0)) > WINDOW) continue; // 窗外积尘
           if (v.doc.is_error === true || v.doc.sent !== true) {
             buckets.red += 1;
-            if (redNote.length < 3) redNote.push(String(v.doc.key ?? n).slice(-8) + " —— " + String(v.doc.reason_first_line ?? "原因不明") + (v.doc.claude_code_version ? "（claude_code_version " + v.doc.claude_code_version + "）" : "（版本未知）"));
+            if (redNote.length < 3) redNote.push(key.slice(-8) + " —— " + String(v.doc.reason_first_line ?? "原因不明") + (v.doc.claude_code_version ? "（claude_code_version " + v.doc.claude_code_version + "）" : "（版本未知）"));
           } else buckets.green += 1;
-        } else if (n.endsWith(".forward.jsonl")) {
-          let st;
-          try { st = fs.statSync(path.join(runsDir, n)); } catch { continue; }
-          const age = now - st.mtimeMs;
-          if (age < ORPHAN_AFTER || age > WINDOW) continue; // 刚起还没跑完的不算；超窗的积尘也不算
-          const key = n.slice(0, -".forward.jsonl".length);
-          const sv = readVerifiedDoc({ file: path.join(runsDir, key + ".forward.started.json"), docValidator: (doc) => forwardStartedProblem(doc, { now }), maxBytes: 16 * 1024 });
-          if (sv.ok === true) {
-            if (alive(sv.doc.runner_pid)) { buckets.inflight += 1; continue; } // 还在跑：不红
-            if (now - Date.parse(sv.doc.started_at) < ORPHAN_AFTER) continue; // 刚死不久：宽限
-            buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
-            continue;
-          }
-          if (sv.absent) { buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8)); continue; }
-          buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "（started " + String(sv.problem ?? "读不出") + "）");
+          continue;
         }
+        // 无 result：孤儿判定（jsonl 是年龄与存亡的依据；缺席的 key 没有可判的制品，跳过）
+        if (parts.jsonl === undefined) continue;
+        const vj = fdStat(path.join(runsDir, parts.jsonl)); // jsonl 只取同 fd fstat 时间，不整读内容（可达数 MiB）
+        if (vj.ok !== true) {
+          if (vj.absent) { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：jsonl 在盘点后消失（并发变化）"); }
+          else unclear(String(vj.problem ?? "jsonl 读不出")); // EIO / 悬空 symlink / FIFO / 并发变化：不 fail-open
+          continue;
+        }
+        const age = now - (vj.mtimeMs ?? 0);
+        if (age < ORPHAN_AFTER || age > WINDOW) continue; // 刚起还没跑完的不算；超窗的积尘也不算
+        if (parts.started === undefined) { buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8)); continue; }
+        const sv = readVerifiedDoc({ file: path.join(runsDir, parts.started), docValidator: (doc) => forwardStartedProblem(doc, { now, expectedKey: key }), maxBytes: 16 * 1024 });
+        if (sv.ok === true) {
+          if (alive(sv.doc.runner_pid)) { buckets.inflight += 1; continue; } // 还在跑：不红
+          if (now - Date.parse(sv.doc.started_at) < ORPHAN_AFTER) continue; // 刚死不久：宽限
+          buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
+          continue;
+        }
+        if (sv.absent) { buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8)); continue; }
+        unclear("started " + String(sv.problem ?? "读不出"));
       }
     }
     const scanned = buckets.green + buckets.red + buckets.missing + buckets.inflight + buckets.unclear; // 桶之和 = 总数

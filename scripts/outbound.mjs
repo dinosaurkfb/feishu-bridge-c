@@ -189,7 +189,7 @@ export function runRouteSha256({ bindingId, claudeSessionId, originGenerationId,
 
 // runs 目录里受控的条目形状（key + 已知 sidecar；.tmp.* 是原子落盘的中间态）。
 // R54 返修一 P1-1：forward.result.json / forward.started.json 是 forward-runner 的受控 sidecar。
-const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|publish-claim\.json\.reaplock|stderr\.log|watch\.log|forward\.jsonl|forward\.stderr\.log|forward\.result\.json|forward\.started\.json|(?:published\.json|publish-failed\.json)\.tmp\.[^/]+)$/u;
+const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|publish-claim\.json\.reaplock|stderr\.log|watch\.log|forward\.jsonl|forward\.stderr\.log|forward\.result\.json|forward\.started\.json|(?:published\.json|publish-failed\.json|forward\.result\.json|forward\.started\.json)\.tmp\.[^/]+)$/u;
 // 转发型记录（live-session 投递）允许的全部 sidecar；多一样都是冲突。
 const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "forward.result.json", "forward.started.json", "terminal"]);
 // delivery-claims 目录里受控的条目形状：claim 目录、笔记，以及 **claim.mjs 受控状态集里每一种状态**的记录

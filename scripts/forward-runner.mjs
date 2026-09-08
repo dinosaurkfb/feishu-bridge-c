@@ -38,6 +38,18 @@ const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,finis
 const STARTED_KEYS = "claude_pid,key,runner_pid,started_at,schema".split(",").sort().join(",");
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** 源 result 行封闭校验（#141 二轮 P1-1）：缺/坏形状 → 投影为 is_error:true, subtype:"malformed_result"，
+ *  绝不进成功公式。 */
+export function resultLineProblem(line) {
+  if (!isObj(line) || line.type !== "result") return "不是 result 行";
+  if (typeof line.is_error !== "boolean") return "is_error 缺席或非布尔";
+  if (typeof line.subtype !== "string") return "subtype 缺席或非字符串";
+  if (typeof line.result !== "string") return "result 缺席或非字符串";
+  if (!Number.isFinite(line.num_turns)) return "num_turns 不是有限数";
+  if (!Number.isFinite(line.duration_ms)) return "duration_ms 不是有限数";
+  return null;
+}
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const isSafeInt = (v) => Number.isSafeInteger(v);
 const strOrNull = (v, cap) => (v === null ? true : typeof v === "string" && v.length <= cap);
@@ -46,13 +58,15 @@ const strOrNull = (v, cap) => (v === null ? true : typeof v === "string" && v.le
  * result.json 的唯一封闭校验器（#141 P1-2）：写端落盘前自校验、doctor 读端共用。
  * problem 非空 → 写端不落盘 / 读端按查不清点名。
  */
-export function forwardResultProblem(doc, { now = Date.now() } = {}) {
+export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null } = {}) {
   if (!isObj(doc)) return "result 文档不是对象";
   if (keysOf(doc) !== RESULT_KEYS) return "result 字段集不对";
   if (doc.schema !== FORWARD_RESULT_SCHEMA) return "schema 不认识: " + String(doc.schema);
   if (typeof doc.key !== "string" || !doc.key || doc.key.includes("/") || doc.key.includes("\\")) return "key 形状不对";
+  // R54 返修二 P1-3：key 与来源绑定 —— doctor 从文件名解析后传入，runner 写端传自己的 key。
+  if (expectedKey !== null && doc.key !== expectedKey) return "key 与文件名/请求不符（" + doc.key + " ≠ " + expectedKey + "）";
   if (typeof doc.target_name !== "string" || doc.target_name.length > 200) return "target_name 形状不对";
-  if (doc.pid !== null && !isSafeInt(doc.pid)) return "pid 形状不对";
+  if (doc.pid !== null && (!isSafeInt(doc.pid) || doc.pid < 1)) return "pid 形状不对（须 ≥1 的安全整数或 null）";
   if (doc.exit_code !== null && !isSafeInt(doc.exit_code)) return "exit_code 形状不对";
   if (typeof doc.is_error !== "boolean") return "is_error 缺席或非布尔（缺席按 problem，不按 false）";
   if (doc.subtype !== null && (typeof doc.subtype !== "string" || doc.subtype.length > 200)) return "subtype 形状不对";
@@ -72,12 +86,15 @@ export function forwardResultProblem(doc, { now = Date.now() } = {}) {
 }
 
 /** started.json 的封闭校验器（#141 P1-4）。 */
-export function forwardStartedProblem(doc, { now = Date.now() } = {}) {
+export function forwardStartedProblem(doc, { now = Date.now(), expectedKey = null } = {}) {
   if (!isObj(doc)) return "started 文档不是对象";
   if (keysOf(doc) !== STARTED_KEYS) return "started 字段集不对";
   if (doc.schema !== FORWARD_STARTED_SCHEMA) return "schema 不认识: " + String(doc.schema);
   if (typeof doc.key !== "string" || !doc.key || doc.key.includes("/") || doc.key.includes("\\")) return "key 形状不对";
-  if (!isSafeInt(doc.runner_pid) || !isSafeInt(doc.claude_pid)) return "pid 形状不对";
+  if (expectedKey !== null && doc.key !== expectedKey) return "key 与文件名/请求不符（" + doc.key + " ≠ " + expectedKey + "）";
+  // R54 返修二 P1-3：pid 必须 ≥1 的安全整数 —— 0/负数会让 kill(0,0) 把整个进程组当活 runner。
+  if (!isSafeInt(doc.runner_pid) || doc.runner_pid < 1) return "runner_pid 须 ≥1 的安全整数";
+  if (!isSafeInt(doc.claude_pid) || doc.claude_pid < 1) return "claude_pid 须 ≥1 的安全整数";
   if (!isCanonicalIso(doc.started_at)) return "started_at 不是规范化 ISO";
   if (Date.parse(doc.started_at) > now + 60_000) return "started_at 晚于写入时刻 +60s";
   return null;
@@ -115,10 +132,12 @@ function parseRunLines(lines) {
  */
 function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false }) {
   const { resultLine, initLine } = parseRunLines(lines);
+  const malformed = resultLine !== null && resultLineProblem(resultLine) !== null; // #141 二轮 P1-1：坏形状绝不进成功公式
   const crashed = !notFound && resultLine === null;
-  const resultText = resultLine !== null && typeof resultLine.result === "string" ? resultLine.result : "";
-  const is_error = notFound || crashed || resultLine.is_error === true;
+  const resultText = !malformed && resultLine !== null && typeof resultLine.result === "string" ? resultLine.result : "";
+  const is_error = notFound || crashed || malformed || resultLine.is_error === true;
   const reason_first_line = notFound ? "claude_not_found"
+    : malformed ? "malformed_result"
     : crashed ? "no_result_line" + (exitCode === null ? "" : "(exit=" + exitCode + ")")
     : resultText.split("\n", 1)[0];
   return {
@@ -128,27 +147,33 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     pid,
     exit_code: exitCode,
     is_error,
-    subtype: notFound ? "claude_not_found" : crashed ? "crash" : (resultLine.subtype ?? null),
-    num_turns: crashed || notFound || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
+    subtype: notFound ? "claude_not_found" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
+    num_turns: crashed || notFound || malformed || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
     duration_ms: notFound ? null
       : crashed ? Math.max(0, finishedAt - startedAt)
-      : Number.isFinite(resultLine.duration_ms) ? resultLine.duration_ms : null,
+      : (malformed || !Number.isFinite(resultLine.duration_ms)) ? null : resultLine.duration_ms,
     claude_code_version: initLine?.claude_code_version ?? initLine?.version ?? null,
     model: initLine?.model ?? resultLine?.model ?? null,
     reason_first_line,
-    sent: !is_error && exitCode === 0 && resultText === "sent",
+    sent: !malformed && !is_error && exitCode === 0 && resultText === "sent",
     finished_at: new Date(finishedAt).toISOString(),
     claude_path: claudePath,
   };
 }
 
 /** 目录 fsync（rename 后持久化目录项；测试可注入失败）。 */
+// 目录 fsync：只忽略受控的不支持错误（#141 二轮 P2-5）；其余返回错误，由调用方记 stderr.log。
 function fsyncDirOf(dir) {
   let dfd = null;
   try {
     dfd = fs.openSync(dir, fs.constants.O_RDONLY);
     fs.fsyncSync(dfd);
-  } catch { /* 目录 fsync 在部分文件系统上不可用：忽略（与仓里 dirFsyncIgnorable 同判） */ }
+    return null;
+  } catch (err) {
+    const code = String(err?.code ?? err?.message ?? err);
+    if (code === "EINVAL" || code === "ENOTSUP" || code === "EPERM") return null; // 受控：文件系统不支持目录 fsync
+    return code;
+  }
   finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
 }
 
@@ -168,7 +193,12 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
       fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
       fs.writeFileSync(fd, bytes);
       fs.fsyncSync(fd);
-    } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+    } catch (err) {
+      // rename 之前失败：清自己建的 tmp（#141 二轮 P2-5），再上抛走统一记診断
+      try { fs.rmSync(tmp, { force: true }); } catch { /* 清不掉就留着交盘点 */ }
+      throw err;
+    }
+    finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
     try {
       fs.renameSync(tmp, targetPath);
     } catch (err) {
@@ -180,7 +210,8 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
       noteErr(errPath, "落盘读回 SHA 不等：" + targetPath);
       return;
     }
-    fsyncDirOf(path.dirname(targetPath));
+    const dirErr = fsyncDirOf(path.dirname(targetPath));
+    if (dirErr !== null) noteErr(errPath, "目录 fsync 失败（" + dirErr + "）：" + path.dirname(targetPath));
   } catch (err) {
     noteErr(errPath, String(err?.code ?? err?.message ?? err).slice(0, 200));
   }
@@ -191,8 +222,8 @@ function noteErr(errPath, line) {
 }
 
 /** 写端自校验（#141 P1-2）：problem 非空 → 不落盘、记 stderr.log。 */
-function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes) {
-  const problem = problemFn(doc, { now: Date.now() });
+function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expectedKey) {
+  const problem = problemFn(doc, { now: Date.now(), expectedKey });
   if (problem !== null) { noteErr(errPath, "自校验失败不落盘（" + path.basename(targetPath) + "）：" + problem); return; }
   writeDocFile(targetPath, errPath, doc, maxBytes);
 }
@@ -201,8 +232,9 @@ function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes) {
 function readJsonlLines(file) {
   let fd = null;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.nlink !== 1) return []; // 非普通文件 / 多硬链接：不读（#141 二轮 P2-5）
     const start = Math.max(0, st.size - TAIL_READ_BYTES);
     const buf = Buffer.alloc(st.size - start);
     let off = 0;
@@ -232,7 +264,7 @@ function runForwardRunner(spec) {
   if (claudePath === null) {
     writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
       spec, startedAt: Date.now(), finishedAt: Date.now(), notFound: true,
-    }), forwardResultProblem, 64 * 1024);
+    }), forwardResultProblem, 64 * 1024, spec.key);
     return;
   }
 
@@ -253,7 +285,7 @@ function runForwardRunner(spec) {
     // spawn 同步抛（罕见：参数形不对）：也按 crash 落盘，不许 runner 崩了不写结果
     writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
       spec, lines: readJsonlLines(jsonlPath), claudePath, startedAt, finishedAt: Date.now(),
-    }), forwardResultProblem, 64 * 1024);
+    }), forwardResultProblem, 64 * 1024, spec.key);
     return;
   } finally {
     fs.closeSync(out);
@@ -263,7 +295,7 @@ function runForwardRunner(spec) {
   writeValidatedDoc(startedPath, errPath, {
     schema: FORWARD_STARTED_SCHEMA, key: spec.key, runner_pid: process.pid,
     claude_pid: child.pid, started_at: new Date(startedAt).toISOString(),
-  }, forwardStartedProblem, 16 * 1024);
+  }, forwardStartedProblem, 16 * 1024, spec.key);
 
   let done = false;
   const keepalive = setInterval(() => {}, 60_000);
@@ -274,7 +306,7 @@ function runForwardRunner(spec) {
     writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
       spec, pid: child.pid, exitCode, lines: readJsonlLines(jsonlPath),
       claudePath, startedAt, finishedAt: Date.now(),
-    }), forwardResultProblem, 64 * 1024);
+    }), forwardResultProblem, 64 * 1024, spec.key);
   };
   child.on("error", () => finish(null));
   child.on("close", (code) => finish(Number.isFinite(code) ? code : null));

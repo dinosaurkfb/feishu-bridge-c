@@ -217,7 +217,7 @@ function readVerifiedDoc({ file, docValidator, maxBytes = MAX_STATE_FILE_BYTES }
     }
     const p = docValidator(doc);
     if (p !== null) return { ok: false, problem: p };
-    return { ok: true, doc, sha256: sha, bytes: buf.length };
+    return { ok: true, doc, sha256: sha, bytes: buf.length, mtimeMs: st.mtimeMs }; // 同 fd fstat 时间（#141 二轮 P1-4）
   } catch (err) {
     return { ok: false, problem: errCode(err) };
   } finally {

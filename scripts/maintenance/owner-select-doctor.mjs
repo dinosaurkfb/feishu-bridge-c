@@ -17,8 +17,11 @@
  *      journal 1.4 进行中的迁移只报「迁移进行中（phase）」不判 block（那归 ⑩/维护门）。
  */
 
+import fs from "node:fs";
+import path from "node:path";
+
 import { isCanonicalIso } from "../canonical-time.mjs";
-import { loadByEndpoint, validateLedger, familyOf, migrationInventory } from "../topic-agent-ledger.mjs";
+import { loadByEndpoint, validateLedger, familyOf, migrationInventory, ledgerRootFor } from "../topic-agent-ledger.mjs";
 import { aggregateEndpointReceipts } from "./ledger-receipt.mjs";
 import { readCampaignState, readWriterState, readOwnerSelectAdmission } from "./owner-select-state.mjs";
 import { readActive, readJournal } from "./journal.mjs";
@@ -32,6 +35,13 @@ const OWNER_SELECT_LINK_KEYS = "authorized_at,authorized_by,by_identity,kind,sel
 const PRODUCER_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** 裸读账本（非受验 JSON 读）：第一层专用守卫跑在它上面（#137 四轮验收：纵深保留、守卫可测）。读不出 → null。 */
+function readRawLedger(ep, env) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(ledgerRootFor(env), ep, "ledger.json"), "utf-8"));
+  } catch { return null; }
+}
 
 /** 单条 live 记录的账本一致性 + handle 卫生检查。返回问题短句数组（空 = 干净）。 */
 function checkLiveRecord(doc, rec, schema) {
@@ -124,11 +134,10 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
 
   // ── 收据聚合：任一收据说不清 → 整项查不清点名，不猜 ──
   const agg = aggregateEndpointReceipts({ dir: maintenanceDir });
-  if (!agg.ok) {
-    const why = agg.unreadable?.length > 0
-      ? "收据 journal 读不出 " + agg.unreadable.length + " 个（如 " + agg.unreadable[0].token.slice(0, 8) + "：" + agg.unreadable[0].why + "）"
-      : "收据矛盾：" + (agg.why ?? "说不清");
-    return { endpoints, chain: { ...chain, unclear: why }, summary, intentNote: INTENT_NOTE };
+  // R56 补（#137 四轮验收刀1）：journal 读不出才整项查不清；conflict（重复/矛盾）由后面的
+  // 逐 endpoint 循环记「查不清」并带「收据 conflict」文案，其余 endpoint 照常对账。
+  if (agg.unreadable?.length > 0) {
+    return { endpoints, chain: { ...chain, unclear: "收据 journal 读不出 " + agg.unreadable.length + " 个（如 " + agg.unreadable[0].token.slice(0, 8) + "：" + agg.unreadable[0].why + "）" }, summary, intentNote: INTENT_NOTE };
   }
   const initDone = agg.endpoints.filter((e) => e.initDone === true);
   const initDoneSet = new Set(initDone.map((e) => e.endpointId));
@@ -137,6 +146,30 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
   const schemaByEndpoint = new Map();
   for (const ep of initDone) {
     const entry = { endpointId: ep.endpointId, status: "ok", problems: [], counts: null };
+    // 第一层：裸读账本上的专用守卫（具体文案 —— 删守卫 = 文案消失 = 测试转红；纵深在第二层兜底）
+    const rawDoc = readRawLedger(ep.endpointId, env);
+    if (rawDoc !== null) {
+      for (const rec of Object.values(rawDoc.records ?? {})) {
+        if (rec?.kind !== "live") continue;
+        for (const p of checkLiveRecord(rawDoc, rec, rawDoc.schema_version)) {
+          entry.problems.push(rec.topic_agent_id.slice(0, 12) + "：" + p);
+        }
+      }
+      const seenHandles = new Map();
+      for (const rec of Object.values(rawDoc.records ?? {})) {
+        if (rec?.kind !== "live") continue;
+        for (const h of [rec.selection_handle ?? null, rec.rebind_handle ?? null]) {
+          if (h === null) continue;
+          if (seenHandles.has(h)) entry.problems.push("handle 重复（endpoint 内须全局唯一）：" + h.slice(0, 12) + "（" + seenHandles.get(h).slice(0, 12) + " 与 " + rec.topic_agent_id.slice(0, 12) + "）");
+          else seenHandles.set(h, rec.topic_agent_id);
+        }
+      }
+      const inv = migrationInventory(rawDoc);
+      entry.counts = { schema_version: rawDoc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
+      if (rawDoc.schema_version === "1.1" && (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0)) {
+        entry.problems.push("strict 下存量非零：legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count);
+      }
+    }
     const L = loadByEndpoint(ep.endpointId, { env });
     if (!L.ok) {
       entry.status = "block";
@@ -238,7 +271,7 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
 
   // 查不清的 endpoint（收据层面的矛盾已由 agg.ok 兜底；此处兜逐 endpoint 的不确定）
   for (const ep of agg.endpoints) {
-    if (ep.state === "conflict") {
+    if (ep.state === "conflict" || ep.state === "duplicate_or_conflict") {
       endpoints.push({ endpointId: ep.endpointId, status: "unclear", problems: ["收据 conflict：" + (agg.why ?? "说不清")], counts: null });
       summary.total += 1; summary.unclear += 1;
     }

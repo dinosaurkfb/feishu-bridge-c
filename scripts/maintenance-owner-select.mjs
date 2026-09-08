@@ -18,7 +18,7 @@ import { readActive, readJournal, TERMINAL_PHASES } from "./maintenance/journal.
 import { campaignIdFor, readCampaignState, readWriterState } from "./maintenance/owner-select-state.mjs";
 import { osmEnter, osmExit } from "./maintenance/owner-select-operation.mjs";
 import { loadLedger, migrationInventory, resolveEndpointDir } from "./topic-agent-ledger.mjs";
-import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 
 /** 参数封闭：--status 不带别的；--migrate-a 可选 --wait-ms / --apply；每 flag 至多一次。 */
 export function parseMaintenanceOwnerSelectArgs(argv) {
@@ -49,23 +49,11 @@ export function ownerSelectStatus(ctx, { env = process.env } = {}) {
   }
   const cs = readCampaignState(env);
   const ws = readWriterState(env);
-  // 冻结集与每 ep 盘点（只读）
-  let names = [];
-  try { names = fs.readdirSync(ctx.dir); } catch { names = []; }
-  const frozen = [];
-  for (const n of names) {
-    if (!/^[0-9a-f-]{36}\.json$/u.test(n)) continue;
-    const tok = n.slice(0, -5);
-    const j = readJournal({ dir: ctx.dir, token: tok });
-    if (j.state !== "valid") continue;
-    if (j.doc.operation_kind !== "ledger_init") continue;
-    const ls = j.doc.steps.find((s) => s.kind === "ledger");
-    const ep = typeof ls?.target === "string" ? ls.target : null;
-    if (ep === null || frozen.includes(ep)) continue;
-    const r = endpointReceipt(ctx.dir, ep);
-    if (r.ok && r.initDone === true) frozen.push(ep);
-  }
-  frozen.sort();
+  // 冻结集与每 ep 盘点（只读）——P1-2：用唯一聚合 aggregateEndpointReceipts，任一收据 conflict/in-flight/
+  // unreadable → 整体投影成「查不清」（receiptsProblem 点名），绝不静默枚举剩余子集。
+  const agg = aggregateEndpointReceipts({ dir: ctx.dir });
+  const receiptsProblem = agg.ok ? null : agg.why ?? null;
+  const frozen = [...new Set(agg.ok ? agg.endpoints.filter((e) => e.initDone === true).map((e) => e.endpointId) : [])].sort();
   const endpoints = frozen.map((ep) => {
     const d = resolveEndpointDir(ep, { env });
     if (!d.ok) return { endpointId: ep, why: d.reason };
@@ -74,7 +62,7 @@ export function ownerSelectStatus(ctx, { env = process.env } = {}) {
     const inv = migrationInventory(L.doc);
     return { endpointId: ep, schemaVersion: L.doc.schema_version, revision: L.doc.revision, legacyProofCount: inv.legacy_proof_count, nullB1Count: inv.null_b1_count };
   });
-  return { activeOp, campaign: { exists: cs.exists, state: cs.state, campaignId: cs.campaign_id }, writerState: { exists: ws.exists, state: ws.state, campaignId: ws.campaign_id }, endpoints };
+  return { activeOp, campaign: { exists: cs.exists, state: cs.state, campaignId: cs.campaign_id }, writerState: { exists: ws.exists, state: ws.state, campaignId: ws.campaign_id }, receiptsProblem, endpoints };
 }
 
 export function renderOwnerSelectStatus(st) {
@@ -83,6 +71,7 @@ export function renderOwnerSelectStatus(st) {
   else parts.push("没有活动 owner_select operation");
   parts.push("campaign：" + (st.campaign.exists ? st.campaign.state + "（" + st.campaign.campaignId + "）" : "absent"));
   parts.push("writer-state：" + (st.writerState.exists ? st.writerState.state + "（" + st.writerState.campaignId + "）" : "off（缺席）"));
+  if (st.receiptsProblem) { parts.push("冻结集：查不清（" + st.receiptsProblem + "）"); return parts.join("\n"); }
   if (st.endpoints.length === 0) parts.push("冻结集：空（无 initDone 收据 endpoint）");
   else parts.push("冻结集（initDone 收据）：" + st.endpoints.length + " 个 endpoint");
   for (const e of st.endpoints) {

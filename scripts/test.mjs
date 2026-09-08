@@ -37583,9 +37583,9 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     return { ctx, env, dir, gateFile, base, home, ledgerRoot, eps, problems, cleanup: () => { const fix = (d) => { try { fs.chmodSync(d, 0o700); } catch { return; } let ns = []; try { ns = fs.readdirSync(d); } catch { return; } for (const n of ns) { const p = path.join(d, n); try { const st = fs.lstatSync(p); if (st.isDirectory()) fix(p); else fs.chmodSync(p, 0o600); } catch { /* gone */ } } }; fix(base); fs.rmSync(base, { recursive: true, force: true }); } };
   };
   // 种一份 done 的 ledger_init 收据（1.2 journal，shape 同 seedLedgerInitReceipt）。
-  const r52SeedReceipt = (maintDir, ep) => {
+  const r52SeedReceipt = (maintDir, ep, tokOverride = null) => {
     fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
-    const tok = r52Uuid(1 + (ep.charCodeAt(ep.length - 1) % 9));
+    const tok = tokOverride ?? r52Uuid(1 + (ep.charCodeAt(ep.length - 1) % 9));
     const at = T052, sha = r52Sha("b");
     const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
     const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
@@ -37801,6 +37801,22 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         assert.equal(r.reason, "mint_plan_mismatch", "before SHA 不符拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
       } finally { fx.cleanup(); }
     }
+  });
+
+  test("R52 返修一 P1-2：冻结集 fail-closed——同 ep 双 initDone 收据（conflict）混在两份 ok 里 → precheck_failed，不拿剩余子集迁移", () => {
+    const fx = r52Setup({});
+    try {
+      // r52Setup 已为 epA/epB 各种一份 initDone 收据；对 epA 再种一份（不同 token）→ 同 endpoint 双 init = conflict。
+      const tok = r52Uuid(5);
+      const epA = fx.eps[0];
+      r52SeedReceipt(fx.dir, epA, r52Uuid(6)); // 合法且不同于 epA 的 r52Uuid(8) → 同 endpoint 双 init = conflict
+      const dfx = r52DrainedFixture({ fx, tok });
+      const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+      assert.ok(r.ok === false, "conflict 收据混入必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "precheck_failed", "拒因（why 点名 ep）：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      const j52 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j52.doc.phase, "drained", "未进段，仍 drained");
+    } finally { fx.cleanup(); }
   });
 
   test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {

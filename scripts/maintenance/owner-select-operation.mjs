@@ -27,7 +27,7 @@ import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { applyMintPlan, applySchemaUpgrade, buildMintPlan, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
 import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
-import { endpointReceipt } from "./ledger-receipt.mjs";
+import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const CHAINS = ["claude", "codex"];
@@ -103,9 +103,11 @@ function osmExitAction(phase) {
 /** ── drained 只读前置（§二.2；失败留在 drained，rollbackSafe）── */
 function osmPrecheck(ctx, { token, env }) {
   // 冻结集 = 全部有效初始化收据（initDone）的 endpoint，有序去重非空（§8：open 的初始集来源）。
-  const agg = aggregateInitDone(ctx.dir);
-  if (!agg.ok) return { ok: false, reason: "receipts_unreadable", why: agg.why };
-  const frozen = [...new Set(agg.endpoints)].sort();
+  // P1-2：改用唯一聚合 aggregateEndpointReceipts——任一收据 conflict / in-flight / duplicate / unreadable
+  //   → 整体 precheck_failed（why 点名 ep），绝不拿剩余子集迁移（自建 aggregateInitDone 会静默跳过矛盾收据）。
+  const agg = aggregateEndpointReceipts({ dir: ctx.dir });
+  if (!agg.ok) return { ok: false, reason: "precheck_failed", why: agg.why ?? null };
+  const frozen = [...new Set(agg.endpoints.filter((e) => e.initDone === true).map((e) => e.endpointId))].sort();
   if (frozen.length === 0) return { ok: false, reason: "frozen_set_empty", why: "无任何 initDone 收据的 endpoint，冻结集为空（迁移无从谈起）" };
   for (const ep of frozen) {
     if (!ENDPOINT_SHAPE.test(ep)) return { ok: false, reason: "bad_endpoint_receipt", why: "收据 endpoint 形状不对：" + ep };
@@ -130,28 +132,7 @@ function osmPrecheck(ctx, { token, env }) {
   return { ok: true, frozen };
 }
 
-/** 枚举全部 initDone 的 endpoint（枚举 journal → 取 ledger step 的 endpoint_id → endpointReceipt 判定 initDone）。 */
-function aggregateInitDone(maintDir) {
-  let names = [];
-  try { names = fs.readdirSync(maintDir).filter((n) => n.endsWith(".json") && /^[0-9a-f-]{36}\.json$/u.test(n)); }
-  catch (err) { return err?.code === "ENOENT" ? { ok: true, endpoints: [] } : { ok: false, why: errText(err) }; }
-  const endpoints = [];
-  const seenEp = new Set();
-  for (const n of names) {
-    const tok = n.slice(0, -5);
-    const j = readJournal({ dir: maintDir, token: tok });
-    if (j.state !== "valid") return { ok: false, why: tok.slice(0, 8) + "：" + (j.why ?? j.state) }; // 任一 journal 读不出 → fail-closed，不许对冻结集猜
-    if (j.doc.schema_version !== "1.2" && j.doc.schema_version !== "1.3") continue; // 1.1/1.4 不参与账本收据索引
-    if (j.doc.operation_kind !== "ledger_init" && j.doc.operation_kind !== "ledger_cutover") continue;
-    const ls = j.doc.steps.find((s) => s.kind === "ledger");
-    const ep = typeof ls?.target === "string" ? ls.target : null;
-    if (ep === null || !ENDPOINT_SHAPE.test(ep) || seenEp.has(ep)) continue;
-    seenEp.add(ep);
-    const r = endpointReceipt(maintDir, ep);
-    if (r.ok && r.initDone === true) endpoints.push(ep);
-  }
-  return { ok: true, endpoints };
-}
+
 
 /** ── pre-forward 状态矩阵（§二.3）+ 备份 + 进段 step body（§二.4；全部只写本 operation 私有目录）── */
 function osmPrepareForward(ctx, { token, frozen, env }) {

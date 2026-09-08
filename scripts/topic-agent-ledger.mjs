@@ -2121,10 +2121,13 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
 /** §三盘点 + §四铸造目标：null-B1 有序 id 集（buildMintPlan 与 mintSelectionHandles 的 CAS 集合同源）。 */
 
 /** 构造 mint plan（不落盘；plan 字节的持久化与 intended_blob 锚定在 R52 编排）。非法 now → null。 */
+/** 迁移期 selection_handle 有效期：唯一常量（owner-select-route.md §4 P2-2 拍定），编排与校验共用。 */
+export const OWNER_SELECT_HANDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, now, ttlMs }) {
   const frozen = isCanonicalMs(now) ? canonicalIso(now) : null;
-  if (frozen === null || !Number.isSafeInteger(ttlMs) || ttlMs < 0) return null;
-  const expires = canonicalIso(now + ttlMs);
+  if (frozen === null || (ttlMs !== undefined && ttlMs !== OWNER_SELECT_HANDLE_TTL_MS)) return null;
+  const expires = canonicalIso(now + OWNER_SELECT_HANDLE_TTL_MS);
   if (expires === null) return null;
   const expectedNullB1Ids = migrationInventory(doc).null_b1_ids;
   const minted = expectedNullB1Ids.map((targetId) => ({ target_id: targetId, selection_handle: "osh_" + crypto.randomBytes(16).toString("hex") }));
@@ -2179,6 +2182,10 @@ export function mintPlanProblem(plan) {
   if (typeof plan.request_key !== "string" || !REQUEST_KEY_SHAPE.test(plan.request_key)) return "request_key 形状不对";
   if (typeof plan.operation_id !== "string" || !UUID_SHAPE.test(plan.operation_id)) return "operation_id 不是 UUID";
   if (!isCanonicalIso(plan.frozen_at) || !isCanonicalIso(plan.handle_expires_at)) return "时间不是规范化 ISO";
+  if (Date.parse(plan.handle_expires_at) !== Date.parse(plan.frozen_at) + OWNER_SELECT_HANDLE_TTL_MS) return "handle_expires_at ≠ frozen_at + TTL";
+  if (!Array.isArray(plan.minted)) return "minted 不是数组";
+  const handleSet = new Set(plan.minted.map((m) => m.selection_handle));
+  if (handleSet.size !== plan.minted.length) return "minted 的 selection_handle 重复";
   if (typeof plan.before_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.before_ledger_sha256)) return "before_ledger_sha256 形状不对";
   if (typeof plan.expected_ledger_sha256 !== "string" || !SHA_SHAPE.test(plan.expected_ledger_sha256)) return "expected_ledger_sha256 形状不对";
   if (!Array.isArray(plan.expected_null_b1_ids) || !plan.expected_null_b1_ids.every((x) => isId(x)) || plan.expected_null_b1_ids.some((x, i) => i > 0 && plan.expected_null_b1_ids[i - 1] >= x)) return "expected_null_b1_ids 不是有序去重 id 集";

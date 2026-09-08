@@ -36839,7 +36839,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     });
     records[idH].origin_operation_id = R51_MINT_OP;
     const doc = { ...r51Doc(records), revision: 3, operations: r51SeedOps([idA, idB, idH, "ta_" + "3".repeat(32)]) };
-    const plan = TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    const plan = TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
     assert.deepEqual(Object.keys(plan).sort(), ["before_ledger_sha256", "campaign_id", "endpoint", "expected_ledger_sha256", "expected_null_b1_ids", "frozen_at", "handle_expires_at", "minted", "operation_id", "plan_kind", "request_key", "token"], "plan 键集封闭");
     assert.equal(plan.plan_kind, "owner_select_mint_plan_v1");
     assert.match(plan.operation_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, "operation_id UUID");
@@ -36848,7 +36848,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.equal(plan.endpoint, EP51);
     assert.equal(plan.request_key, tok);
     assert.equal(plan.frozen_at, T0, "frozen_at 规范化");
-    assert.equal(plan.handle_expires_at, new Date(Date.parse(T0) + 3600_000).toISOString(), "handle_expires_at = frozen+ttl");
+    assert.equal(plan.handle_expires_at, new Date(Date.parse(T0) + 30 * 24 * 60 * 60 * 1000).toISOString(), "handle_expires_at = frozen+TTL");
     assert.equal(plan.before_ledger_sha256, r51ShaOf(JSON.stringify(doc, null, 2) + "\n"), "before_sha 与 readLedger 同算法");
     assert.deepEqual(plan.expected_null_b1_ids, TAL.migrationInventory(doc).null_b1_ids, "expected 集合 = 盘点");
     assert.deepEqual(plan.minted.map((m) => m.target_id), plan.expected_null_b1_ids, "minted 按 target_id 排序且集合相等");
@@ -36885,12 +36885,22 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
 
     // 空集分支：null_b1_count===0 仍生成 plan（空 op 也占 revision）
     const emptyDoc = { ...r51Doc({}), revision: 2, operations: { ["00000000-0000-0000-0000-000000000001"]: r51SeedOps([])["00000000-0000-0000-0000-000000000001"], [R51_OP]: r51SeedOps([])[R51_OP] } };
-    const empty = TAL.buildMintPlan({ doc: emptyDoc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    const empty = TAL.buildMintPlan({ doc: emptyDoc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
     assert.deepEqual(empty.minted, []);
     assert.deepEqual(empty.expected_null_b1_ids, []);
     assert.equal(TAL.mintPlanProblem(empty), null, "空集 plan 过封闭形");
     const nextEmpty = TAL.applyMintPlan(emptyDoc, empty);
     assert.equal(nextEmpty.revision, 3, "空 op 仍 revision+1");
+
+    // P1-4：TTL 唯一常量 + expires === frozen+TTL + handle 全局唯一
+    assert.equal(TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 0 }), null, "ttl 0 拒（不接受调用方 TTL）");
+    const ttlBad = TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 12345 });
+    assert.equal(ttlBad, null, "非常量 TTL 拒");
+    assert.equal(TAL.buildMintPlan({ doc, token: tok, campaignId: campaignIdFor(tok), endpointId: EP51, requestKey: tok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 }) !== null, true, "常量 TTL 放行");
+    const expBad = structuredClone(plan); expBad.handle_expires_at = new Date(Date.parse(plan.frozen_at) + 1000).toISOString();
+    assert.equal(TAL.mintPlanProblem(expBad), "handle_expires_at ≠ frozen_at + TTL", "到期早于签发+TTL 拒");
+    const dup = structuredClone(plan); dup.minted = [dup.minted[0], { ...dup.minted[0], target_id: "ta_" + "f".repeat(32) }];
+    assert.notEqual(TAL.mintPlanProblem(dup), null, "重复 handle 拒");
 
     // mintPlanProblem 反向（逐刀钉）
     const bad = (mut, why) => assert.notEqual(TAL.mintPlanProblem(mut(structuredClone(plan))), null, why);
@@ -36952,6 +36962,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   });
 
   test("R51 §五 mintSelectionHandles：三态 CAS + plan 绑定 + 集合等式 + written_mismatch", () => r51WithRoot((root, dir) => {
+    try {
     // 账本：transition（2 null-B1），mint step 锚真账本 SHA（transitionAfterSha = 现场 SHA）。
     r51SeedTransition(dir);
     const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
@@ -36959,7 +36970,8 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: "1.0", ledgerRevision: 2, transitionAfterSha: L0.sha256 });
     const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
     const cap = { kind: "mint_selection_handles", token: fx.tok };
-    const plan = TAL.buildMintPlan({ doc: L0.doc, token: fx.tok, campaignId: fx.cid, endpointId: EP51, requestKey: fx.tok, now: Date.parse(T0), ttlMs: 3600_000 });
+    const plan = TAL.buildMintPlan({ doc: L0.doc, token: fx.tok, campaignId: fx.cid, endpointId: EP51, requestKey: fx.tok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
+    console.error("R53DBG plan.minted:", JSON.stringify(plan?.minted));
     assert.equal(TAL.mintPlanProblem(plan), null, "前提：plan 封闭形合法");
     // 绑定核前提：plan.expected_ledger_sha256 === step.intended_after.ledger_sha256（§8.2 mint 交叉等式）
     fx.rewrite((d) => { d.steps.find((s) => s.kind === "mint").intended_after.ledger_sha256 = plan.expected_ledger_sha256; });
@@ -36995,6 +37007,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       se.intended_after.ledger_sha256 = L1.sha256;
       se.backup_sha256 = L1.sha256;
     });
+    console.error("R53DBG forged.minted:", typeof forged.minted, forged.minted?.length);
     const cast = TAL.mintSelectionHandles({ ...args, plan: forged });
     assert.equal(cast.reason, "null_b1_set_mismatch", "伪造 plan 的集合等式拒：" + JSON.stringify(cast));
 

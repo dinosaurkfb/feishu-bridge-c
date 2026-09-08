@@ -515,7 +515,7 @@ migrate_repair**（合同冲突）；不批量/不后台；取不到 owner 动�
 自动进行。**
 
 ## 9. doctor
-- **⑯**：对 **`facts.locator_link_proof=present` 的 live 记录**，断言 kind/selected_*===aliases.*/
+- **⑰**（编号回带：⑯ 已被 R54「入站转发结果」占用，owner_select 对账定为 ⑰）：对 **`facts.locator_link_proof=present` 的 live 记录**，断言 kind/selected_*===aliases.*/
   按 §7.2 G13′（按来源 op `proof_effects` 判产证/保留）核来源相容 + G-handle；binding=
   owner_select_v1 另核六字段等。
 - **存量计数**：严格后恒 0，非 0 block；过渡期报 opaque id+计数。

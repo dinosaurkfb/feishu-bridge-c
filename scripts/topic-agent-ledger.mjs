@@ -1642,13 +1642,14 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     if (inj.afterTmp) inj.afterTmp();
     let renameErr = null, fenceFail = null;
     const fenced = commitWhileHeld(lockDir, () => {
-      if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
-      if (inj.beforeLedgerRename) inj.beforeLedgerRename();
-      // R51 返修一 P1-1：提交点栅栏（rename 前、注入钩子之后最后时刻）——_fence 复核 active/gate/journal/step/lease
+      // R51 返修二 P1-1：栅栏提到两次 rename **之前**——漂移时连 .prev 都不许被覆盖。
+      // （旧序先 rename .prev 再栅栏：主账本不变但 .prev 已被这次失败提交覆盖，持久变更不报告。）
       if (_fence !== null) {
         const f = typeof _fence === "function" ? _fence() : _fence;
         if (f) { fenceFail = f; return; }
       }
+      if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
+      if (inj.beforeLedgerRename) inj.beforeLedgerRename();
       try { fs.renameSync(ltTmp, ledgerPath); ltTmp = null; } catch (err) { renameErr = err; }
     });
     // R51 返修一：栅栏失败要有专名（不伪装成 renameErr/commit_failed）——why 带出失败分支名，reason 精确 fence_failed。
@@ -2008,6 +2009,23 @@ const badTx = (d) => ({ ok: false, commit: "not_committed", reason: d.reason, wh
  *  否则 ledger-operation 的 commit_residue 分支 sees null，releaseRows 点不出账本主锁路径。 */
 const wrNote = (res) => ({ lockUncleared: res?.lockUncleared ?? null, residue: res?.residue ?? null });
 
+/** R51 返修二 P1-3：外层 operation lease 的 reapUncleared（<token>.lease.reap 交不还）不许丢——
+ *  段内已提交就保留 committed_*，但 commit 折成 committed_with_residue（编排不得据此记 done），
+ *  残骸投 residue/lockUncleared（带路径）。内层已有的投影优先，不覆盖。 */
+function foldLeaseResidue(res0, out) {
+  const r = res0?.reapUncleared;
+  if (!r) return out;
+  const p = String(r.path ?? "reap");
+  const residue = [...(Array.isArray(out.residue) ? out.residue : out.residue ? [String(out.residue)] : []), p];
+  return {
+    ...out,
+    commit: out.commit === "committed_clean" ? "committed_with_residue" : out.commit,
+    residue,
+    lockUncleared: out.lockUncleared ?? { reason: "reap_residue_uncleared", why: String(r.error ?? ""), path: p },
+    lock_state: out.lock_state ?? "unclear",
+  };
+}
+
 /** 普通（gated）事务的公共外壳：派生受验目录 → writeLedger(gated)。 */
 function gatedTx({ endpointId, requestKey, env, replay, _inject, mutate }) {
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
@@ -2147,6 +2165,8 @@ export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, 
   const next = applyMintPlan(doc, plan);
   if (!validateLedger(next, { endpointId }).ok) return null;
   plan.expected_ledger_sha256 = sha256(serializeLedger(next));
+  // R51 返修二 P2-6：builder 合同自洽——设完预算后成品自己过封闭校验器，不过不出 plan。
+  if (mintPlanProblem(plan) !== null) return null;
   return plan;
 }
 
@@ -2219,6 +2239,8 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   if (!cap.ok) return { ok: false, commit: "not_committed", reason: "maintenance_capability_required", why: cap.reason + (cap.why ? "：" + cap.why : "") };
   const edge = String(fromSchema) + "->" + String(toSchema);
   if (typeof requestKey !== "string" || !REQUEST_KEY_SHAPE.test(requestKey)) return { ok: false, commit: "not_committed", reason: "bad_request_key" };
+  // R51 返修二 P1-4：request_key 公式在执行器边界强制（确定性派生，编排与执行器同源可预算）。
+  if (requestKey !== capability.token + ":schema:" + endpointId) return { ok: false, commit: "not_committed", reason: "request_key_mismatch", why: "schema 的 request_key 必须 === token + ':schema:' + endpoint" };
   if (!VALID_UPGRADE_EDGES.includes(edge)) return { ok: false, commit: "not_committed", reason: "bad_upgrade_edge", why: edge };
   const stepVariant = cap.osmStep.id.slice("schema_endpoint:".length).split(":")[1];
   if (OSM_KIND_TO_UPGRADE_EDGE[cap.doc.operation_kind] !== edge || !"transition|strict|direct".split("|").includes(stepVariant)) {
@@ -2259,6 +2281,8 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
         operation_id: ownerSelectSchemaUpgradeOpId(capability.token, endpointId), request_key: requestKey, from_schema: fromSchema, to_schema: toSchema,
       });
       builtSha = sha256(serializeLedger(next));
+      // R51 返修二 P1-2：提交前核预算（写 tmp / rename 之前）——真实预算 ≠ step.intended_after 就不落盘。
+      if (builtSha !== cap.osmStep.intended_after.ledger_sha256) return { ok: false, reason: "intended_mismatch", why: "真实预算 ≠ step.intended_after.ledger_sha256（" + builtSha.slice(0, 12) + " ≠ " + cap.osmStep.intended_after.ledger_sha256.slice(0, 12) + "）" };
       return { ok: true, next };
     },
       _fence: () => {
@@ -2270,6 +2294,8 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
         if (j2.state !== "valid" || j2.doc.phase !== cap.doc.phase) return "journal 漂移";
         const st2 = j2.doc.steps.find((s) => s.kind === "schema_endpoint" && s.id === cap.osmStep.id);
         if (!st2 || st2.state !== "prepared") return "step 漂移";
+        // R51 返修二 建议5：不只核 id + state——完整规范投影比较（before/intended_after 被换掉也拒）。
+        if (canonKey(st2) !== canonKey(cap.osmStep)) return "step 投影漂移";
         const lk = readLockOwner(leasePath0);
         if (!lk.present || !lk.owner || lk.owner.pid !== process.pid) return "lease 已非本进程";
         return null;
@@ -2278,14 +2304,15 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   });
   const res = res0Out;
   // fence 失败已由 writeLedger 以专名 fence_failed 报出（res0.fenceFail 是死分支：commitWhileHeld 从不返回它）。
-  if (!res0.ok) return { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" };
-  if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
-  if (res.idempotent) return { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) };
+  // R51 返修二 P1-3：以下每个出口都折外层 operation lease 的 reapUncleared（不丢残骸、commit 非 clean）。
+  if (!res0.ok) return foldLeaseResidue(res0, { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" });
+  if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return foldLeaseResidue(res0, { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) });
+  if (res.idempotent) return foldLeaseResidue(res0, { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) });
   const reread = loadLedger(d.dir, { endpointId });
   if (!reread.ok || reread.sha256 !== builtSha || reread.sha256 !== cap.osmStep.intended_after.ledger_sha256 || reread.doc.schema_version !== toSchema) {
-    return { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ step.intended_after.ledger_sha256（" + String(reread.sha256 ?? "?").slice(0, 12) + " ≠ " + cap.osmStep.intended_after.ledger_sha256.slice(0, 12) + "）", ...wrNote(res) };
+    return foldLeaseResidue(res0, { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ step.intended_after.ledger_sha256（" + String(reread.sha256 ?? "?").slice(0, 12) + " ≠ " + cap.osmStep.intended_after.ledger_sha256.slice(0, 12) + "）", ...wrNote(res) });
   }
-  return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
+  return foldLeaseResidue(res0, { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) });
 }
 
 /** R51 §五：mint_selection_handles 窄事务（§8.2 mint 行两态 CAS）。三态：账本 === plan.before_sha →
@@ -2324,7 +2351,12 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
         const inv = migrationInventory(currentDoc);
         if (canonKey(inv.null_b1_ids) !== canonKey(plan.expected_null_b1_ids)) return { ok: false, reason: "null_b1_set_mismatch", why: "账本 null-B1 集 ≠ plan.expected_null_b1_ids（" + inv.null_b1_ids.length + " vs " + plan.expected_null_b1_ids.length + "）" };
         if (currentDoc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: "账本 schema_version " + currentDoc.schema_version };
-        return { ok: true, next: applyMintPlan(currentDoc, plan) };
+        const next = applyMintPlan(currentDoc, plan);
+        // R51 返修二 P1-2：提交前核预算——真实重放 SHA 必须 === plan.expected_ledger_sha256
+        //（=== intended_after 已在入口 plan_mismatch 核过；不等就不落盘，主账本与 .prev 均不变）。
+        const builtMintSha = sha256(serializeLedger(next));
+        if (builtMintSha !== plan.expected_ledger_sha256) return { ok: false, reason: "intended_mismatch", why: "真实预算 ≠ plan.expected_ledger_sha256（" + builtMintSha.slice(0, 12) + " ≠ " + plan.expected_ledger_sha256.slice(0, 12) + "）" };
+        return { ok: true, next };
       }
       // 崩溃窗口：账本已推进到 intended（同 operation 的 schema_upgrade 并发写的竞态也在此折入 diverged）。
       if (curSha === plan.expected_ledger_sha256) return { ok: false, reason: "already", why: "账本已处于 plan.expected 态" };
@@ -2339,6 +2371,8 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
         if (j2.state !== "valid" || j2.doc.phase !== cap.doc.phase) return "journal 漂移";
         const st2 = j2.doc.steps.find((s) => s.kind === "mint" && s.id === cap.osmStep.id);
         if (!st2 || st2.state !== "prepared") return "step 漂移";
+        // R51 返修二 建议5：完整规范投影比较（before/intended_after 被换掉也拒）。
+        if (canonKey(st2) !== canonKey(cap.osmStep)) return "step 投影漂移";
         const lk = readLockOwner(leasePath(cap.maintenanceDir, capability.token));
         if (!lk.present || !lk.owner || lk.owner.pid !== process.pid) return "lease 已非本进程";
         return null;
@@ -2347,17 +2381,18 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
     });
     const res = res0Out;
     // fence 失败已由 writeLedger 以专名 fence_failed 报出（res0.fenceFail 是死分支：commitWhileHeld 从不返回它）。
-    if (!res0.ok) return { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" };
+    // R51 返修二 P1-3：以下每个出口都折外层 operation lease 的 reapUncleared。
+    if (!res0.ok) return foldLeaseResidue(res0, { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" });
     if (res.ok && typeof res.commit === "string" && res.commit.startsWith("committed")) {
-    if (res.idempotent) return { ok: true, commit: "already", revision: res.revision, result: res.result, ...wrNote(res) };
+    if (res.idempotent) return foldLeaseResidue(res0, { ok: true, commit: "already", revision: res.revision, result: res.result, ...wrNote(res) });
     const reread = loadLedger(d.dir, { endpointId });
     if (!reread.ok || reread.sha256 !== plan.expected_ledger_sha256) {
-      return { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ plan.expected_ledger_sha256（fail-closed，不重试不修）", ...wrNote(res) };
+      return foldLeaseResidue(res0, { ok: false, commit: res.commit, reason: "written_mismatch", why: "读回 SHA ≠ plan.expected_ledger_sha256（fail-closed，不重试不修）", ...wrNote(res) });
     }
-    return { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) };
+    return foldLeaseResidue(res0, { ok: true, commit: res.commit, revision: res.revision, result: res.result, sha256: reread.sha256, ...wrNote(res) });
   }
-  if (!res.ok && res.reason === "already") return { ok: true, commit: "already", sha256: plan.expected_ledger_sha256, ...wrNote(res) };
-  return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
+  if (!res.ok && res.reason === "already") return foldLeaseResidue(res0, { ok: true, commit: "already", sha256: plan.expected_ledger_sha256, ...wrNote(res) });
+  return foldLeaseResidue(res0, { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) });
 }
 
 /* ─────────────────────────── 普通（gated）事务 ─────────────────────────── */

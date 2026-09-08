@@ -38019,13 +38019,15 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         miB.backup_sha256 = r52Sha("8");
         fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj.doc, null, 2) + "\n", { mode: 0o600 });
         const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
-        assert.equal(ex.ok, false, "written_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
-        assert.equal(ex.reason, "written_mismatch", "written_mismatch：" + JSON.stringify({ reason: ex.reason }));
+        assert.equal(ex.ok, false, "intended_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
+        assert.equal(ex.reason, "intended_mismatch", "intended_mismatch（main R51 预算≠intended 提前拒）：" + JSON.stringify({ reason: ex.reason }));
         assert.equal(ex.phase, "osm_a_upgrading", "phase 不变");
         const jj2 = readJournal({ dir: fx.dir, token: tok });
         assert.equal(jj2.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition").state, "prepared", "epB schema step 不记 done");
-        // 修复（按现场重算锚：epB 账本已 transition，读回真 SHA；状态链闭合同步 mint.before/backup）→ 续跑 done
-        const shaReal = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] }).sha256;
+        // 修复（按现场重算锚：intended_after 应为 epB 的 transitioned SHA——用 applySchemaUpgrade 确定性预算，
+        //  不能取当前 1.0 账本 SHA；状态链闭合同步 mint.before/backup）→ 续跑 done
+        const LBe = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] });
+        const shaReal = r52ShaOf(TAL.serializeLedger(TAL.applySchemaUpgrade(LBe.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(tok, fx.eps[1]), request_key: tok + ":schema:" + fx.eps[1], from_schema: "1.0", to_schema: "1.1-transition" })));
         const jj3 = readJournal({ dir: fx.dir, token: tok });
         jj3.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition").intended_after.ledger_sha256 = shaReal;
         const mi3 = jj3.doc.steps.find((s) => s.id === "mint:" + fx.eps[1]);

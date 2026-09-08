@@ -733,7 +733,8 @@ const RESULT_SHAPE = Object.freeze({
   attach_a2: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A2")
     || (keysOf(r) === "affected_id,affected_live_ids_after_commit,anchor_candidate,handle_expires_at,proof_effects,selection_handle,terminal_family"
         && isId(r.affected_id) && r.terminal_family === "A2"
-        && ((r.selection_handle === null && r.handle_expires_at === null) || (SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.handle_expires_at)))
+        // R57a 返修一 P1-3：新形 attach_a2 的 result handle/expiry 不得双 null（合同要求实际签发）
+        && SELECTION_HANDLE_SHAPE.test(r.selection_handle) && isCanonicalIso(r.handle_expires_at)
         && OM_SHAPE.test(r.anchor_candidate)
         && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.affected_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.affected_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "none"),
@@ -1443,6 +1444,42 @@ export function validateLedger(doc, { endpointId } = {}) {
       const pr = prodOp.result;
       if (pr.rebind_handle !== rec.rebind_handle || pr.rebind_expires_at !== rec.rebind_expires_at) {
         return bad(id + "：rebind_handle 与产生 op result 逐字不符 (G-handle)");
+      }
+    }
+  }
+
+  // R57a 返修一 P1-3（G-handle 反向不变量，§7.2）：产生 op 在场且未被后续消费覆盖 ⇒ live handle 必须非空
+  // 且与产生 result 逐字相等（正向检查只核「有 handle 必溯源」；这里堵「有产生 op 却把 handle 手术成 null」）。
+  const G_PRODUCERS = { selection: ["create_b1", "attach_a2", "mint_selection_handles", "reissue_selection_handle"], rebind: ["request_rebind"] };
+  const G_CONSUMERS = { selection: ["activate", "anchor", "void", "clear_anchor_handle"], rebind: ["rebind_session_alias", "expire_rebind_handle", "cancel_rebind"] };
+  // 触及判定复用 opTouchedIds（老形 activate/anchor 的 surviving/affected、void 的 voided_id 都算触及）
+  const touchesId = (op, id) => opTouchedIds(op).includes(id);
+  // 产生 op 必须真的为该记录产过 handle（result 里带非空 handle）；老形 1.0 op（result 无 handle）不算。
+  const prodHandleOf = (op, id) => {
+    const r = op.result ?? {};
+    switch (op.op_type) {
+      case "create_b1": return (r.created_id === id || r.affected_live_ids_after_commit?.includes(id)) ? (r.selection_handle ?? null) : null;
+      case "attach_a2": return (r.affected_id === id || r.affected_live_ids_after_commit?.includes(id)) ? (r.selection_handle ?? null) : null;
+      case "mint_selection_handles": return (r.minted?.find((m) => m.target_id === id)?.selection_handle) ?? null;
+      case "reissue_selection_handle": return r.affected_live_ids_after_commit?.includes(id) ? (r.new_handle ?? null) : null;
+      case "request_rebind": return r.affected_live_ids_after_commit?.includes(id) ? (r.rebind_handle ?? null) : null;
+      default: return null;
+    }
+  };
+  if (doc.schema_version !== "1.0") {
+    for (const [id, rec] of live) {
+      for (const kind of ["selection", "rebind"]) {
+        const field = kind === "selection" ? "selection_handle" : "rebind_handle";
+        if (rec[field] !== null && rec[field] !== undefined) continue; // 正向已核
+        const producers = Object.entries(doc.operations)
+          .filter(([, op]) => G_PRODUCERS[kind].includes(op.op_type) && touchesId(op, id) && prodHandleOf(op, id) !== null)
+          .sort((a, b) => b[1].result_revision - a[1].result_revision);
+        if (producers.length === 0) continue; // 无 handle 产生 op（1.0 旧形、seed/迁移来的 null-blocker）→ 不适用
+        const [prodId, prodOp] = producers[0];
+        const consumedByLater = Object.entries(doc.operations).some(([, op]) =>
+          G_CONSUMERS[kind].includes(op.op_type) && op.result_revision > prodOp.result_revision && touchesId(op, id));
+        if (consumedByLater) continue; // 已被合法消费/清理覆盖 → null 是清理后的合法态
+        return bad(id + "：" + field + " 的产生 op " + prodId + " 在场且未被消费，但 live handle 为空——handle 被手术清空 (G-handle)");
       }
     }
   }
@@ -2422,8 +2459,7 @@ export function createA1({ endpointId, requestKey, chatId, sessionId, now = Date
   });
 }
 
-export function createB1({ endpointId, requestKey, chatId, rootOm, lineageId, bindingTarget, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME; // 评审七 P1-3：NaN now 不裸抛
+export function createB1({ endpointId, requestKey, chatId, rootOm, lineageId, bindingTarget, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const inputs = { request_key: requestKey, chat_id: chatId, root_om: rootOm, lineage_id: lineageId, predetermined_target: bindingTarget };
   return gatedTx({
     endpointId, requestKey, env, replay: () => [{ opType: "create_b1", inputs }], _inject,
@@ -2433,13 +2469,15 @@ export function createB1({ endpointId, requestKey, chatId, rootOm, lineageId, bi
       if (targetProblem(bindingTarget)) return { ok: false, reason: "bad_target" };
       if (liveLocatorInUse(doc, rootOm)) return { ok: false, reason: "locator_exists" };
       if (Object.values(doc.records).some((r) => r.kind === "live" && r.generation_lineage_id === lineageId && r.facts.generation === "pending")) return { ok: false, reason: "lineage_pending_exists" };
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样（显式 now 仅作确定性钉值）
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
       const id = newTopicAgentId();
       // R57a §4/§6 create_b1 行：1.1-transition/1.1 下签 selection_handle（osh_）+ handle_expires_at = 锁内 now + TTL；
       // 随机 handle 只进 result、不进 fp（同 key 重放返存量）；1.0 保持旧形不签（记录无四字段）。
       const signing = is11Schema(doc);
       let handle = null, expires = null;
       if (signing) {
-        expires = handleExpiresAt57(now);
+        expires = handleExpiresAt57(nowMs);
         if (expires === null) return { ok: false, reason: "bad_time", why: "handle 到期越界" };
         handle = mintOsh();
       }
@@ -2530,21 +2568,38 @@ export function activate({ endpointId, requestKey, b1Id, a1Id, f4, authorizedBy,
   });
 }
 
-export function voidPending({ endpointId, requestKey, b1Id, reason, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME; // 评审七 P1-3：NaN now 不裸抛
-  const inputs = { request_key: requestKey, b1_id: b1Id, reason };
+export function voidPending({ endpointId, requestKey, b1Id, reason, expectedHandle = null, expectedExpiresAt = null, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
+  // R57a 返修一 P1-1（§6 void 行 / §4 到期比较）：1.1+ 账本下 fp 必含 expected_handle/expected_expires_at
+  // （expired = 当前 handle 逐字 CAS 的 stale-timer 防护；manual/superseded 双键显式 null——只对 null-handle
+  // blocker，带非 null expected → bad_input）；1.0 账本沿用旧 fp 形（兼容旧写），新写只走封闭分支。
+  // P1-5：事务时间由锁内 clock seam 读取（mutate 内），不预先求值；显式 now 仅作确定性钉值（测试/重放）。
+  const baseInputs = { request_key: requestKey, b1_id: b1Id, reason };
+  const inputsFor = (doc) => (doc !== null && doc.schema_version !== "1.0")
+    ? { ...baseInputs, expected_handle: expectedHandle ?? null, expected_expires_at: expectedExpiresAt ?? null }
+    : baseInputs;
   return gatedTx({
-    endpointId, requestKey, env, replay: () => [{ opType: "void", inputs }], _inject,
+    endpointId, requestKey, env, replay: (doc) => [{ opType: "void", inputs: inputsFor(doc) }], _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
+      const nowMs = Number.isFinite(now) ? now : clock();
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      const inputs = inputsFor(doc);
       if (!isId(b1Id)) return { ok: false, reason: "bad_id" };
       const b1 = doc.records[b1Id];
       if (!b1 || b1.kind !== "live" || b1.facts.binding !== "pending") return { ok: false, reason: "b1_not_pending" };
       if (!REASON_ENUM.includes(reason)) return { ok: false, reason: "bad_reason" };
-      // R57a §4：B1 到期走 void(reason=expired)——核 now ≥ handle_expires_at（锁内事务时间）；
-      // 无 handle 字段（1.0）或 transition null-blocker（无到期可核）不适用此核，保持既有行为。
-      if (reason === "expired" && b1.handle_expires_at != null && !(now >= Date.parse(b1.handle_expires_at))) {
-        return { ok: false, reason: "not_expired", why: "void(expired) 核 now ≥ handle_expires_at（锁内）" };
+      if (doc.schema_version !== "1.0") {
+        if (reason !== "expired" && (expectedHandle != null || expectedExpiresAt != null)) {
+          return { ok: false, reason: "bad_input", why: "manual/superseded 的 expected_handle/expected_expires_at 必须显式 null" };
+        }
+        // R57a §4：B1 到期走 void(reason=expired)——核 now ≥ handle_expires_at（锁内时间）；
+        // 无 handle 字段（1.0）或 transition null-blocker（无到期可核）不适用此核。
+        if (reason === "expired" && b1.handle_expires_at != null && !(nowMs >= Date.parse(b1.handle_expires_at))) {
+          return { ok: false, reason: "not_expired", why: "void(expired) 核 now ≥ handle_expires_at（锁内）" };
+        }
+        if (b1.selection_handle !== (expectedHandle ?? null) || b1.handle_expires_at !== (expectedExpiresAt ?? null)) {
+          return { ok: false, reason: "cas_mismatch", why: "当前 handle/expiry 与 expected 不符（防陈旧定时器清掉后换发的新 handle）" };
+        }
       }
       return { ok: true, next: stampAndBuild(doc, { opType: "void", inputs, result: { voided_id: b1Id }, mutateRecords: (n, opId) => { n.records[b1Id] = { kind: "voided_audit", topic_agent_id: b1Id, root_om: b1.aliases.root_om, voided_at: iso, reason, origin_operation_id: opId }; } }) };
     },
@@ -2555,14 +2610,15 @@ export function voidPending({ endpointId, requestKey, b1Id, reason, now = Date.n
  *  R57a（§4/§6 attach_a2 行）：1.1-transition/1.1 下 A2 签发 selection_handle + handle_expires_at（now+TTL），
  *  锚既有 live 字段 anchor_candidate（调用方传入候选 root，落盘并进 fp `expected_anchor_candidate`、
  *  result 复述）；随机 handle 只进 result、不进 fp；1.0 保持旧形不签。A2 缺候选 → 拒（不允许无候选签）。 */
-export function attach({ endpointId, requestKey, id, bindingTarget, claimKey, authorizedBy, anchorCandidate, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME; // 评审七 P1-3：NaN now 不裸抛
+export function attach({ endpointId, requestKey, id, bindingTarget, claimKey, authorizedBy, anchorCandidate, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const baseInputs = { request_key: requestKey, topic_agent_id: id, target: bindingTarget, claim_key: claimKey, root_om: null, matched_om: null };
   // attach_a3（保留 link）无新增 fp 输入（§6）；attach_a2 签发路径另带 expected_anchor_candidate。
   // 按 doc.schema 分支：同 key 的旧形重放（1.0 时代落盘的 op）fp 不变；已签发的重放要求调用方给同一候选（否则 request_conflict）。
   const a2Inputs = (doc) => (is11Schema(doc) ? { ...baseInputs, expected_anchor_candidate: anchorCandidate ?? null } : baseInputs);
   return gatedTx({
-    endpointId, requestKey, env, replay: (doc) => [{ opType: "attach_a2", inputs: a2Inputs(doc) }, { opType: "attach_a3", inputs: baseInputs }], _inject,
+    // R57a 返修一 P1-4：跨 schema 重放——重放判定同时接受「历史 1.0 形描述符」与「当前 schema 新形描述符」
+    // （1.0 完成的 attach 升级后同 key 重放 → replayed；载荷真变 → request_conflict）。首次执行仍只走新形。
+    endpointId, requestKey, env, replay: (doc) => [{ opType: "attach_a2", inputs: baseInputs }, { opType: "attach_a3", inputs: baseInputs }, { opType: "attach_a2", inputs: a2Inputs(doc) }], _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(id)) return { ok: false, reason: "bad_id" };
@@ -2574,11 +2630,13 @@ export function attach({ endpointId, requestKey, id, bindingTarget, claimKey, au
       if (typeof claimKey !== "string" || !CLAIM_KEY_SHAPE.test(claimKey) || typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
       const keepLink = fam === "A4" && rec.facts.locator_link_proof === "present";
       const opType = keepLink ? "attach_a3" : "attach_a2";
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
       let handle = null, expires = null, signing = false;
       if (!keepLink && is11Schema(doc)) {
         if (typeof anchorCandidate !== "string" || !OM_SHAPE.test(anchorCandidate)) return { ok: false, reason: "bad_input", why: "1.1+ attach_a2 需要 anchorCandidate（候选 root）" };
         signing = true;
-        expires = handleExpiresAt57(now);
+        expires = handleExpiresAt57(nowMs);
         if (expires === null) return { ok: false, reason: "bad_time", why: "handle 到期越界" };
         handle = mintOsh();
       }
@@ -2740,8 +2798,7 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
  *  否则保留原 binding（preserved）；result = §6 增量键集（selection_basis:"rebind"、tombstoned_a1_id=null——
  *  A1 归并是后续准入单的职责，本单不取）；base 路径在有 pending handle 时拒（rebind_handle_pending），
  *  不许绕过 owner-select 消费。 */
-export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME; // 评审七 P1-3：NaN now 不裸抛
+export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const consume = rebindHandle !== undefined;
   const baseInputs = { request_key: requestKey, topic_agent_id: id, old_session_id: expectedOldSessionId, new_session_id: newSessionId };
   const inputs = consume
@@ -2774,9 +2831,11 @@ export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSess
       }
       if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
       // R57a：handle 消费 CAS（逐字）+ 到期拒；base 路径在有 pending handle 时拒（不许绕过 owner-select 消费）。
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样（到期核按锁内时间）
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
       if (consume) {
         if (rec.rebind_handle !== rebindHandle || rec.rebind_expires_at !== expectedExpiresAt) return { ok: false, reason: "cas_mismatch", why: "rebind_handle/expiry 与 expected 不符" };
-        if (!(now < Date.parse(expectedExpiresAt))) return { ok: false, reason: "rebind_handle_expired", why: "orh_ 已到期：先重新 request_rebind" };
+        if (!(nowMs < Date.parse(expectedExpiresAt))) return { ok: false, reason: "rebind_handle_expired", why: "orh_ 已到期：先重新 request_rebind" };
         if (typeof rec.aliases.root_om !== "string" || !OM_SHAPE.test(rec.aliases.root_om)) return { ok: false, reason: "bad_state", why: "B3 无 root_om，无法产 owner_select link proof" };
       } else if (doc.schema_version !== "1.0" && (rec.rebind_handle !== null || rec.rebind_expires_at !== null)) {
         return { ok: false, reason: "rebind_handle_pending", why: "有待消费的 rebind_handle：须走 owner-select 消费路径（带 rebindHandle/expectedExpiresAt/selectionMessageId）" };
@@ -2924,8 +2983,7 @@ const mintOrh = () => "orh_" + crypto.randomBytes(16).toString("hex");
  *  transition null-B1（expected 双 null）可换发，strict 闸前修 blocker。随机新 osh_ 只进 result、不进 fp；同 key 重放返存量。
  *  result：B1 = {new_handle, new_expires_at, affected_live_ids_after_commit:[target_id], proof_effects:[]}；
  *  A2 另 anchor_candidate、proof_effects:[{a2_id, preserved, none}]。 */
-export function reissueSelectionHandle({ endpointId, requestKey, targetId, expectedHandle = null, expectedExpiresAt = null, expectedAnchorCandidate = null, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME;
+export function reissueSelectionHandle({ endpointId, requestKey, targetId, expectedHandle = null, expectedExpiresAt = null, expectedAnchorCandidate = null, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const inputs = { request_key: requestKey, target_id: targetId, expected_handle: expectedHandle ?? null, expected_expires_at: expectedExpiresAt ?? null };
   if (expectedAnchorCandidate !== null) inputs.expected_anchor_candidate = expectedAnchorCandidate;
   return gatedTx({
@@ -2940,6 +2998,10 @@ export function reissueSelectionHandle({ endpointId, requestKey, targetId, expec
       if (!rec || rec.kind !== "live") return { ok: false, reason: "not_live" };
       const fam = familyOf(rec.facts);
       if (fam !== "B1" && fam !== "A2") return { ok: false, reason: "not_reissuable", why: "familyOf=" + String(fam) };
+      if (fam === "A2" && expectedAnchorCandidate === null) {
+        // R57a 返修一 P1-2：A2 换发必须带候选 CAS（防改指），省略 → bad_input
+        return { ok: false, reason: "bad_input", why: "A2 换发必须带 expected_anchor_candidate（候选 CAS）" };
+      }
       if (expectedAnchorCandidate !== null) {
         if (fam !== "A2") return { ok: false, reason: "bad_input", why: "expected_anchor_candidate 只对 A2" };
         if (!OM_SHAPE.test(expectedAnchorCandidate)) return { ok: false, reason: "bad_input", why: "expected_anchor_candidate 形状不对" };
@@ -2948,7 +3010,9 @@ export function reissueSelectionHandle({ endpointId, requestKey, targetId, expec
       if (rec.selection_handle !== (expectedHandle ?? null) || rec.handle_expires_at !== (expectedExpiresAt ?? null)) {
         return { ok: false, reason: "cas_mismatch", why: "当前 handle/expiry 与 expected 不符（防陈旧 CAS 清掉后换发的新 handle）" };
       }
-      const expires = handleExpiresAt57(now);
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      const expires = handleExpiresAt57(nowMs);
       if (expires === null) return { ok: false, reason: "bad_time", why: "新 handle 到期越界" };
       const handle = mintOsh();
       const result = fam === "A2"
@@ -2965,8 +3029,7 @@ export function reissueSelectionHandle({ endpointId, requestKey, targetId, expec
  *  两字段；anchor_candidate 是独立既有字段、不在此清；清后 A2 =「无 eligible handle」合法态。
  *  result = { cleared:["selection_handle","handle_expires_at"], affected_live_ids_after_commit:[a2_id],
  *  proof_effects:[{a2_id, preserved, none}] }。 */
-export function clearAnchorHandle({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, requireExpired = false, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME;
+export function clearAnchorHandle({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, requireExpired = false, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const inputs = { request_key: requestKey, target_id: targetId, expected_handle: expectedHandle, expected_expires_at: expectedExpiresAt };
   return gatedTx({
     endpointId, requestKey, env, _inject, replay: () => [{ opType: "clear_anchor_handle", inputs }],
@@ -2983,7 +3046,9 @@ export function clearAnchorHandle({ endpointId, requestKey, targetId, expectedHa
       if (rec.selection_handle !== expectedHandle || rec.handle_expires_at !== expectedExpiresAt) {
         return { ok: false, reason: "cas_mismatch", why: "当前 handle/expiry 与 expected 不符（防陈旧定时器清掉后换发的新 handle）" };
       }
-      if (requireExpired && !(now >= Date.parse(expectedExpiresAt))) {
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      if (requireExpired && !(nowMs >= Date.parse(expectedExpiresAt))) {
         return { ok: false, reason: "not_expired", why: "到期触发核 now ≥ expected_expires_at（锁内）" };
       }
       const result = { cleared: ["selection_handle", "handle_expires_at"], affected_live_ids_after_commit: [targetId], proof_effects: [{ topic_agent_id: targetId, binding_effect: "preserved", link_effect: "none" }] };
@@ -2997,8 +3062,7 @@ export function clearAnchorHandle({ endpointId, requestKey, targetId, expectedHa
  *  签 rebind_handle（orh_）+ rebind_expires_at（now+TTL）；随机 handle 只进 result、不进 fp。
  *  result = {rebind_handle, rebind_expires_at, affected_live_ids_after_commit:[b3_id],
  *  proof_effects:[{b3_id, preserved, preserved}]}。 */
-export function requestRebind({ endpointId, requestKey, b3Id, expectedCurrentGeneration, expectedOldSessionId, now = Date.now(), env = process.env, _inject } = {}) {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME;
+export function requestRebind({ endpointId, requestKey, b3Id, expectedCurrentGeneration, expectedOldSessionId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const inputs = { request_key: requestKey, expected_b3_id: b3Id, expected_current_generation: expectedCurrentGeneration, expected_old_session_id: expectedOldSessionId, expect_no_handle: true };
   return gatedTx({
     endpointId, requestKey, env, _inject, replay: () => [{ opType: "request_rebind", inputs }],
@@ -3014,10 +3078,14 @@ export function requestRebind({ endpointId, requestKey, b3Id, expectedCurrentGen
       const fam = familyOf(rec.facts);
       if (fam === "B3'") return { ok: false, reason: "target_not_active" };
       if (fam !== "B3") return { ok: false, reason: "target_not_current", why: "familyOf=" + String(fam) + "（待 rebind 只对 B3 current）" };
+      // R57a 返修一 P2-6：值域封闭为字面量 "current"（不让任意字符串进 fingerprint）
+      if (expectedCurrentGeneration !== "current") return { ok: false, reason: "bad_input", why: "expected_current_generation 只认 \"current\"" };
       if (rec.facts.generation !== expectedCurrentGeneration) return { ok: false, reason: "cas_mismatch", why: "当前 generation 与 expected_current_generation 不符" };
       if (rec.aliases.session_id !== expectedOldSessionId) return { ok: false, reason: "cas_mismatch", why: "当前 session_id 与 expected_old_session_id 不符" };
       if (rec.rebind_handle !== null || rec.rebind_expires_at !== null) return { ok: false, reason: "cas_mismatch", why: "已有待 rebind handle（expect_no_handle CAS）" };
-      const expires = handleExpiresAt57(now);
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      const expires = handleExpiresAt57(nowMs);
       if (expires === null) return { ok: false, reason: "bad_time", why: "handle 到期越界" };
       const handle = mintOrh();
       const result = { rebind_handle: handle, rebind_expires_at: expires, affected_live_ids_after_commit: [b3Id], proof_effects: [{ topic_agent_id: b3Id, binding_effect: "preserved", link_effect: "preserved" }] };
@@ -3030,8 +3098,7 @@ export function requestRebind({ endpointId, requestKey, b3Id, expectedCurrentGen
  *  expire 核 now ≥ expected_expires_at（锁内），cancel 不核时间（P1-2）。清 rebind_handle/rebind_expires_at 两字段。
  *  result = { cleared:["rebind_handle","rebind_expires_at"], affected_live_ids_after_commit:[b3_id],
  *  proof_effects:[{b3_id, preserved, preserved}] }。 */
-const rebindClearTx = ({ opType, requireExpired, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now, env, _inject }) => {
-  const iso = isoOrNull(now); if (iso === null) return BAD_TIME;
+const rebindClearTx = ({ opType, requireExpired, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now = undefined, clock = () => Date.now(), env, _inject }) => {
   const inputs = { request_key: requestKey, target_id: targetId, expected_handle: expectedHandle, expected_expires_at: expectedExpiresAt };
   return gatedTx({
     endpointId, requestKey, env, _inject, replay: () => [{ opType, inputs }],
@@ -3048,7 +3115,9 @@ const rebindClearTx = ({ opType, requireExpired, endpointId, requestKey, targetI
       if (rec.rebind_handle !== expectedHandle || rec.rebind_expires_at !== expectedExpiresAt) {
         return { ok: false, reason: "cas_mismatch", why: "当前 rebind_handle/expiry 与 expected 不符" };
       }
-      if (requireExpired && !(now >= Date.parse(expectedExpiresAt))) {
+      const nowMs = Number.isFinite(now) ? now : clock(); // P1-5：锁内采样
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      if (requireExpired && !(nowMs >= Date.parse(expectedExpiresAt))) {
         return { ok: false, reason: "not_expired", why: "到期触发核 now ≥ expected_expires_at（锁内）" };
       }
       const result = { cleared: ["rebind_handle", "rebind_expires_at"], affected_live_ids_after_commit: [targetId], proof_effects: [{ topic_agent_id: targetId, binding_effect: "preserved", link_effect: "preserved" }] };
@@ -3057,10 +3126,10 @@ const rebindClearTx = ({ opType, requireExpired, endpointId, requestKey, targetI
   });
 };
 
-export function expireRebindHandle({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now = Date.now(), env = process.env, _inject } = {}) {
-  return rebindClearTx({ opType: "expire_rebind_handle", requireExpired: true, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now, env, _inject });
+export function expireRebindHandle({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
+  return rebindClearTx({ opType: "expire_rebind_handle", requireExpired: true, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now, clock, env, _inject });
 }
 
-export function cancelRebind({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now = Date.now(), env = process.env, _inject } = {}) {
-  return rebindClearTx({ opType: "cancel_rebind", requireExpired: false, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now, env, _inject });
+export function cancelRebind({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
+  return rebindClearTx({ opType: "cancel_rebind", requireExpired: false, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now, clock, env, _inject });
 }

@@ -108,7 +108,7 @@ import {
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
 import { FORWARD_RESULT_SCHEMA, FORWARD_STARTED_SCHEMA, forwardResultProblem as FORWARD_RESULT_PROBLEM, forwardStartedProblem as FORWARD_STARTED_PROBLEM, resultLineProblem as RESULT_LINE_PROBLEM } from "./forward-runner.mjs";
-import { readProcessStartTime } from "./process-start-time.mjs";
+import { readProcessStartTime, parseAuxvClkTck } from "./process-start-time.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
@@ -37102,26 +37102,31 @@ test("R54 返修三 P1-4：不可能组合拒——sent=true 配 reason=failed /
   assert.match(FORWARD_RESULT_PROBLEM({ ...base, is_error: true }, { now }), /is_error=true/u, "is_error=true + sent=true 拒");
 });
 
-test("R54 返修四 P1-1：读取器用固定 /bin/ps（PATH 假 ps 不执行、不影响结果）+ unavailable 严格化", () => {
-  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-pst-"));
-  const bin = path.join(local, "bin"); fs.mkdirSync(bin, { recursive: true });
+test("R54 返修四 P1-1（六轮 P2 密闭化）：读取器固定 /bin/ps——PATH 假 ps 从未执行；真 ps 可用→ok 且为真启动时刻，不可用→unavailable", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "psabs-"));
   const marker = path.join(local, "fake-ps-ran");
   const fakePs = [
     "#!/usr/bin/env node",
     "require('node:fs').writeFileSync(" + JSON.stringify(marker) + ", 'ran');",
     "process.stdout.write('Wed Jan 1 00:00:00 2020\n');",
   ].join("\n") + "\n";
-  fs.writeFileSync(path.join(bin, "ps"), fakePs, { mode: 0o700 });
+  fs.writeFileSync(path.join(local, "ps"), fakePs, { mode: 0o700 });
   const savedPath = process.env.PATH;
-  process.env.PATH = bin + path.delimiter + (savedPath ?? "");
+  process.env.PATH = local + path.delimiter + (savedPath ?? "");
   try {
+    // 六轮 P2：不硬断言 ok（沙箱禁 ps 时 /bin/ps 不可用 → unavailable）——两种终态都合法：
+    //   ok ⇒ 必是真启动时刻（不是假 ps 的 2020）；unavailable ⇒ why 必指向 ps 本身（退出码/异常）。
     const r = readProcessStartTime(process.pid, { platform: "darwin" });
+    if (r.state === "ok") {
+      assert.ok(r.startMs > Date.now() - 24 * 3600e3, "ok 时是真启动时刻（不是假 ps 的 2020）：" + JSON.stringify(r));
+    } else {
+      assert.equal(r.state, "unavailable", JSON.stringify(r));
+      assert.match(String(r.why), /ps/u, "unavailable 时 why 指向 ps：" + String(r.why));
+    }
     assert.equal(fs.existsSync(marker), false, "PATH 上的假 ps 没被执行（读取器固定 /bin/ps）");
-    assert.equal(r.state, "ok", JSON.stringify(r));
-    assert.ok(r.startMs > Date.now() - 24 * 3600e3, "startMs 是真启动时刻（不是假 ps 的 2020）：" + JSON.stringify(r));
     assert.equal(readProcessStartTime(0, { platform: "darwin" }).state, "unavailable", "pid 0 → unavailable");
     assert.equal(readProcessStartTime(process.pid, { platform: "sunos" }).state, "unavailable", "不支持平台 → unavailable");
-  } finally { process.env.PATH = savedPath; }
+  } finally { process.env.PATH = savedPath; fs.rmSync(local, { recursive: true, force: true }); }
 });
 
 // ── R54 返修五（Codex #141 五轮 2 P1 + 3 P2）──
@@ -37135,12 +37140,12 @@ test("R54 返修五 P1-1：CLK_TCK 受验读取——auxv AT_CLKTCK=250 参与�
   const auxvBuf = (pairs) => { const b = Buffer.alloc(pairs.length * 16); pairs.forEach(([t, v], i) => { b.writeBigUInt64LE(BigInt(t), i * 16); b.writeBigUInt64LE(BigInt(v), i * 16 + 8); }); return b; };
   const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
   // ① auxv 带 AT_CLKTCK=250（混入其它 entry 证明会扫描）→ 换算按 250
-  const files1 = { "/proc/self/auxv": auxvBuf([[6, 4096], [AT_CLKTCK, 250], [3, 65539]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const files1 = { "/proc/self/auxv": auxvBuf([[6, 4096], [AT_CLKTCK, 250], [3, 65539], [0, 0]]), "/proc/77/stat": stat, "/proc/stat": procStat };
   const r1 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files1 ? files1[p] : noent()), spawnSync: () => { throw new Error("auxv 命中时不该调 getconf"); } });
   assert.equal(r1.state, "ok", JSON.stringify(r1));
   assert.equal(r1.startMs, BTIME * 1000 + TICKS * (1000 / 250), "按 AT_CLKTCK=250 换算（猜 100 时此断言红）");
   // ② auxv 没有 AT_CLKTCK → /usr/bin/getconf 兜底（固定绝对路径、PATH 清空、有超时）
-  const files2 = { "/proc/self/auxv": auxvBuf([[6, 4096]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const files2 = { "/proc/self/auxv": auxvBuf([[6, 4096], [0, 0]]), "/proc/77/stat": stat, "/proc/stat": procStat };
   const calls = [];
   const r2 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files2 ? files2[p] : noent()), spawnSync: (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0, stdout: "250\n" }; } });
   assert.equal(r2.state, "ok", JSON.stringify(r2));
@@ -37198,6 +37203,96 @@ test("R54 返修五 P1-2：started 盘点后消失按 jsonl 年龄重判——<1
   const c = checkOf(rep, "inbound_forward_result");
   assert.equal(c.ok, false, "结果缺失仍在：" + JSON.stringify(c));
   assert.match(c.detail, /共 3 条：结果缺失 1、刚起还没结果 1、查不清 1/u, "接线探针（查不清 1=K9）+ 11 分钟 → 结果缺失、1 分钟 → 刚起（无条件 pending 或未接线时此断言红）：" + c.detail);
+});
+
+
+// ── R54 返修六（Codex #141 六轮 1 P1 + 1 P2）──
+
+test("R54 返修六 P1：auxv 布局不猜——arch/endianness 唯一确定，四布局（32/64 × LE/BE）AT_CLKTCK=250 各参与换算；未知 arch → unavailable", () => {
+  const BTIME = 1700000000, TICKS = 5000;
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\n";
+  const auxvBuf = (wordBytes, be, pairs) => {
+    const b = Buffer.alloc(pairs.length * wordBytes * 2);
+    pairs.forEach(([t, v], i) => {
+      const o = i * wordBytes * 2;
+      if (wordBytes === 8) { (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(t), o); (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(v), o + 8); }
+      else { (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, t, o); (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, v, o + 4); }
+    });
+    return b;
+  };
+  const AT_CLKTCK = 17;
+  const cases = [
+    ["x64", "LE", 8], ["s390x", "BE", 8], ["mips", "LE", 4], ["s390", "BE", 4],
+  ];
+  for (const [arch, endianness, wb] of cases) {
+    const be = endianness === "BE";
+    const files = { "/proc/self/auxv": auxvBuf(wb, be, [[6, 4096], [AT_CLKTCK, 250], [3, 65539], [0, 0]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+    const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+    const r = readProcessStartTime(77, { platform: "linux", arch, endianness, readFileSync: (p) => (p in files ? files[p] : noent()), spawnSync: () => { throw new Error("auxv 命中时不该调 getconf"); } });
+    assert.equal(r.state, "ok", arch + "/" + endianness + "：" + JSON.stringify(r));
+    assert.equal(r.startMs, BTIME * 1000 + TICKS * (1000 / 250), arch + "/" + endianness + " 按 AT_CLKTCK=250 换算");
+  }
+  // 未知 arch → unavailable（不猜字宽、不换布局重试）
+  const files = { "/proc/77/stat": stat, "/proc/stat": procStat };
+  const r2 = readProcessStartTime(77, { platform: "linux", arch: "riscv999", endianness: "LE", readFileSync: (p) => (p in files ? files[p] : (() => { const e = new Error("x"); e.code = "ENOENT"; throw e; })()), spawnSync: () => ({ status: 1, stdout: "" }) });
+  assert.equal(r2.state, "unavailable", JSON.stringify(r2));
+  assert.match(String(r2.why), /arch|CLK_TCK/u);
+});
+
+test("R54 返修六 P1：parseAuxvClkTck 纯函数——四布局直取 250；无终止/重复/未对齐/坏参数 → null", () => {
+  const mk = (wb, be, pairs) => {
+    const b = Buffer.alloc(pairs.length * wb * 2);
+    pairs.forEach(([t, v], i) => {
+      const o = i * wb * 2;
+      if (wb === 8) { (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(t), o); (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(v), o + 8); }
+      else { (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, t, o); (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, v, o + 4); }
+    });
+    return b;
+  };
+  const good = [[6, 4096], [17, 250], [0, 0]];
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 8, endianness: "LE" }), 250);
+  assert.equal(parseAuxvClkTck(mk(8, true, good), { wordBytes: 8, endianness: "BE" }), 250);
+  assert.equal(parseAuxvClkTck(mk(4, false, good), { wordBytes: 4, endianness: "LE" }), 250);
+  assert.equal(parseAuxvClkTck(mk(4, true, good), { wordBytes: 4, endianness: "BE" }), 250);
+  // 布局错配（64 位缓冲按 32 位读）→ null，绝不换布局猜
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 4, endianness: "LE" }), null);
+  // 结构受验
+  assert.equal(parseAuxvClkTck(mk(8, false, [[6, 4096], [17, 250]]), { wordBytes: 8, endianness: "LE" }), null, "无 AT_NULL 终止项");
+  assert.equal(parseAuxvClkTck(mk(8, false, [[17, 250], [17, 250], [0, 0]]), { wordBytes: 8, endianness: "LE" }), null, "AT_CLKTCK 两次");
+  assert.equal(parseAuxvClkTck(mk(8, false, [[17, 0], [0, 0]]), { wordBytes: 8, endianness: "LE" }), null, "值非正");
+  assert.equal(parseAuxvClkTck(Buffer.alloc(12), { wordBytes: 8, endianness: "LE" }), null, "未按 entrySize 对齐");
+  assert.equal(parseAuxvClkTck("not a buffer", { wordBytes: 8, endianness: "LE" }), null, "非 Buffer");
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 7, endianness: "LE" }), null, "wordBytes 越界");
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 8, endianness: "XX" }), null, "endianness 越界");
+});
+
+test("R54 返修六 P1：auxv 结构受验——无 AT_NULL 终止项 → unavailable；AT_CLKTCK 出现两次 → unavailable；值非正安全整数 → unavailable", () => {
+  const auxvBuf = (wordBytes, be, pairs) => {
+    const b = Buffer.alloc(pairs.length * wordBytes * 2);
+    pairs.forEach(([t, v], i) => {
+      const o = i * wordBytes * 2;
+      if (wordBytes === 8) { (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(t), o); (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(v), o + 8); }
+      else { (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, t, o); (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, v, o + 4); }
+    });
+    return b;
+  };
+  const AT_CLKTCK = 17;
+  // 无终止项：没有 AT_NULL
+  const noTerm = auxvBuf(8, false, [[6, 4096], [AT_CLKTCK, 250]]);
+  // 出现两次
+  const twice = auxvBuf(8, false, [[6, 4096], [AT_CLKTCK, 250], [AT_CLKTCK, 250], [0, 0]]);
+  // 值非正
+  const badVal = auxvBuf(8, false, [[AT_CLKTCK, 0], [0, 0]]);
+  const BTIME = 1700000000, TICKS = 5000;
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\n";
+  for (const [name, buf] of [["无终止项", noTerm], ["出现两次", twice], ["值非正", badVal]]) {
+    const files = { "/proc/self/auxv": buf, "/proc/77/stat": stat, "/proc/stat": procStat };
+    const r = readProcessStartTime(77, { platform: "linux", arch: "x64", endianness: "LE", readFileSync: (p) => (p in files ? files[p] : (() => { const e = new Error("x"); e.code = "ENOENT"; throw e; })()), spawnSync: () => ({ status: 1, stdout: "" }) });
+    assert.equal(r.state, "unavailable", name + " → unavailable：" + JSON.stringify(r));
+    assert.match(String(r.why), /CLK_TCK|auxv/u, name + " why 点名 auxv/CLK_TCK");
+  }
 });
 
 

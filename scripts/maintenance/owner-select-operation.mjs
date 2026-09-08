@@ -738,10 +738,6 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
     const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: "osm_b_strictening", now: ctx.now() });
     if (!np.ok) return { ok: false, reason: np.reason, why: np.why ?? null, phase };
     phase = "ledger_reopening";
-    if (process.env.R53_DEBUG) {
-      const cs2 = readCampaignState(env);
-      const cst2 = readJournal({ dir: ctx.dir, token }).doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
-    }
   }
 
   if (phase === "osm_direct") {

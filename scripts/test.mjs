@@ -33888,8 +33888,38 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
   }
 });
 
-function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:00.000Z", gateFile = null }) {
+function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:00.000Z", gateFile = null, campaignSha256 = null, writerSha256 = null }) {
   const dig = endpointsDigest(eps);
+  const defaultCDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [{
+      endpoint_id: "endpoint_333333333333333333333333",
+      at: "2026-09-07T10:00:00.000Z",
+      init_chain: "claude",
+      init_request_key: "req-1",
+      init_operation_token: tok
+    }],
+    members: {
+      "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 2 },
+      "endpoint_222222222222222222222222": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok
+  };
+  const defaultWDoc = {
+    schema_version: "owner-select-writer-state-1",
+    state: "partial",
+    campaign_id: cid,
+    endpoints_digest: dig,
+    revision: 1,
+    origin_operation_id: tok
+  };
+  const actualCampaignSha = campaignSha256 ?? createHash("sha256").update(JSON.stringify(defaultCDoc, null, 2) + "\n").digest("hex");
+  const actualWriterSha = writerSha256 ?? createHash("sha256").update(JSON.stringify(defaultWDoc, null, 2) + "\n").digest("hex");
   const enterSteps = [
     { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
     { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
@@ -33908,7 +33938,7 @@ function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:0
     kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at: now,
     target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
     before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
-    intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+    intended_after: { exists: true, sha256: actualCampaignSha, state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
   });
   for (const ep of eps) {
     const mintBlobPath = path.join(stagedDir, "intended", "mint-" + ep + ".json");
@@ -33931,7 +33961,7 @@ function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:0
     kind: "writer_state", id: "writer_state:" + cid + ":partial", state: "prepared", at: now,
     target: "ledger/owner-select-writer-state.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
     before: { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 },
-    intended_after: { exists: true, sha256: "2".repeat(64), state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 }
+    intended_after: { exists: true, sha256: actualWriterSha, state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 }
   });
 
   const doc = {
@@ -33960,8 +33990,32 @@ function setupMaintFixtureA({ maintDir, tok, cid, eps, now = "2026-09-07T10:00:0
   };
 }
 
-function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, now = "2026-09-07T10:00:00.000Z", gateFile = null }) {
+function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, now = "2026-09-07T10:00:00.000Z", gateFile = null, campaignSha256 = null, writerSha256 = null }) {
   const dig = endpointsDigest(eps);
+  const defaultCDocSealed = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "sealed",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      "endpoint_111111111111111111111111": { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 2 },
+      "endpoint_222222222222222222222222": { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 2,
+    origin_operation_id: "00000000-0000-4000-8000-000000000001"
+  };
+  const defaultWDocOn = {
+    schema_version: "owner-select-writer-state-1",
+    state: "on",
+    campaign_id: cid,
+    endpoints_digest: dig,
+    revision: 2,
+    origin_operation_id: "00000000-0000-4000-8000-000000000001"
+  };
+  const actualCampaignSha = campaignSha256 ?? createHash("sha256").update(JSON.stringify(defaultCDocSealed, null, 2) + "\n").digest("hex");
+  const actualWriterSha = writerSha256 ?? createHash("sha256").update(JSON.stringify(defaultWDocOn, null, 2) + "\n").digest("hex");
   const enterSteps = [
     { kind: "timer", id: "timer:claude", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
     { kind: "timer", id: "timer:codex", state: "done", at: now, target: "label", chain: null, before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: "0".repeat(64), backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } },
@@ -33980,7 +34034,7 @@ function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, n
     kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at: now,
     target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackupPath, backup_sha256: cBeforeSha, backup_bytes: 100,
     before: { exists: true, sha256: cBeforeSha, state: "open", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
-    intended_after: { exists: true, sha256: "3".repeat(64), state: "sealed", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
+    intended_after: { exists: true, sha256: actualCampaignSha, state: "sealed", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
   });
   for (const ep of eps) {
     steps.push({
@@ -34000,8 +34054,8 @@ function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, n
   }
   steps.push({
     kind: "campaign", id: "campaign:" + cid + ":complete", state: "done", at: now,
-    target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackupPath, backup_sha256: "3".repeat(64), backup_bytes: 100,
-    before: { exists: true, sha256: "3".repeat(64), state: "sealed", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
+    target: "ledger/owner-select-campaign.json", chain: null, backup: stagedBackupPath, backup_sha256: actualCampaignSha, backup_bytes: 100,
+    before: { exists: true, sha256: actualCampaignSha, state: "sealed", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
     intended_after: { exists: true, sha256: "4".repeat(64), state: "complete", campaign_id: cid, endpoints: eps, endpoints_digest: dig },
     after: { exists: true, sha256: "4".repeat(64), state: "complete", campaign_id: cid, endpoints: eps, endpoints_digest: dig }
   });
@@ -34009,7 +34063,7 @@ function setupMaintFixtureB({ maintDir, tok, cid, eps, cBeforeSha, wBeforeSha, n
     kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at: now,
     target: "ledger/owner-select-writer-state.json", chain: null, backup: stagedBackupPath, backup_sha256: wBeforeSha, backup_bytes: 100,
     before: { exists: true, sha256: wBeforeSha, state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1 },
-    intended_after: { exists: true, sha256: "5".repeat(64), state: "on", campaign_id: cid, endpoints_digest: dig, revision: 2 }
+    intended_after: { exists: true, sha256: actualWriterSha, state: "on", campaign_id: cid, endpoints_digest: dig, revision: 2 }
   });
 
   const doc = {
@@ -35329,6 +35383,7 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
   const mintBlobPath = path.join(maintDir, tok + ".staged", "intended", "mint-" + ep + ".json");
   const stepCampaignOpenId = "campaign:" + cid + ":open";
   const stepWriterPartialId = "writer_state:" + cid + ":partial";
+  const baseCampaignShaSingle = createHash("sha256").update(JSON.stringify(baseCampaignDocSingle, null, 2) + "\n").digest("hex");
   const journalDocValid = {
     schema_version: "1.4",
     operation_kind: "owner_select_migration_a",
@@ -35344,7 +35399,7 @@ test("R50 返修四 3 P1 + 3 P2：finalize 一次性不抛、维护窄事务 cap
         kind: "campaign", id: stepCampaignOpenId, state: "prepared", at: now,
         target: "ledger/owner-select-campaign.json", chain: null, backup: null, backup_sha256: null, backup_bytes: null,
         before: { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null },
-        intended_after: { exists: true, sha256: "1".repeat(64), state: "open", campaign_id: cid, endpoints: epsSingle, endpoints_digest: digSingle }
+        intended_after: { exists: true, sha256: baseCampaignShaSingle, state: "open", campaign_id: cid, endpoints: epsSingle, endpoints_digest: digSingle }
       },
       {
         kind: "schema_endpoint", id: `schema_endpoint:${ep}:transition`, state: "prepared", at: now,
@@ -35601,6 +35656,112 @@ process.stdout.write(JSON.stringify({ r1, r2 }));
   const rHolder = writeCampaignState({ env, expectedSha256: null, doc: baseCampaignDocSingle, capability: capCampaignValid });
   assert.equal(rHolder.commit, "committed", "持有租约的当前进程提交成功（结果：" + JSON.stringify(rHolder) + "）");
   assert.equal(fs.existsSync(cFileAfterSub), true, "持有者落盘成功");
+});
+
+test("R50 返修六 P1-2：prepared step 绑定实际写入字节与读回原始字节核验", () => {
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const tok = "00000000-0000-4000-8000-000000000021";
+  const cid = campaignIdFor(tok);
+  const eps = ["endpoint_111111111111111111111111"];
+  const dig = endpointsDigest(eps);
+  const now = "2026-09-07T10:00:00.000Z";
+
+  const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-p1-2-test-"));
+  const ledgerDir = path.join(tmpRoot, "ledger");
+  fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+  const maintDir = path.join(tmpRoot, "maint");
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const gateFile = path.join(tmpRoot, "maintenance.gate");
+  const env = {
+    FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
+  };
+
+  const cDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      [eps[0]]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok
+  };
+  const payload = JSON.stringify(cDoc, null, 2) + "\n";
+  const actualSha = sha256(payload);
+
+  const { capCampaignOpen: capability } = setupMaintFixtureA({ maintDir, tok, cid, eps, now, gateFile });
+
+  // 1. intended.sha256 与 payload 不等拒且盘上不变
+  const rMismatchSha = writeCampaignState({ env, expectedSha256: null, doc: cDoc, capability });
+  assert.equal(rMismatchSha.ok, false, "intended.sha256 与 payload 不等必须拒绝");
+  assert.equal(rMismatchSha.commit, "not_committed");
+  assert.equal(rMismatchSha.reason, "maintenance_capability_required");
+  assert.match(rMismatchSha.why, /sha256/u);
+  const targetFile = path.join(ledgerDir, "owner-select-campaign.json");
+  assert.equal(fs.existsSync(targetFile), false, "拒绝后盘上不变");
+
+  // 2. 篡改 members / pending_joins / origin_operation_id 但投影相同（state, campaign_id, endpoints, endpoints_digest 一致）
+  // 此时将 journal step 绑定到原 cDoc 的 actualSha
+  const jPath = path.join(maintDir, tok + ".json");
+  const jDoc = JSON.parse(fs.readFileSync(jPath, "utf-8"));
+  const step = jDoc.steps.find((s) => s.id === capability.stepId);
+  step.intended_after.sha256 = actualSha;
+  fs.writeFileSync(jPath, JSON.stringify(jDoc, null, 2) + "\n", { mode: 0o600 });
+
+  // 篡改 members
+  const cDocTamperedMembers = {
+    ...cDoc,
+    members: {
+      [eps[0]]: { schema_version: "1.0", legacy_proof_count: 99, null_b1_count: 0 }
+    }
+  };
+  const rTamperedMembers = writeCampaignState({ env, expectedSha256: null, doc: cDocTamperedMembers, capability });
+  assert.equal(rTamperedMembers.ok, false, "篡改 members 但投影相同必须拒绝");
+  assert.equal(rTamperedMembers.commit, "not_committed");
+  assert.equal(rTamperedMembers.reason, "maintenance_capability_required");
+  assert.equal(fs.existsSync(targetFile), false, "拒绝后盘上不变");
+
+  // 篡改 pending_joins
+  const cDocTamperedPending = {
+    ...cDoc,
+    pending_joins: [{
+      endpoint_id: "endpoint_222222222222222222222222",
+      at: now,
+      init_chain: "claude",
+      init_request_key: "req-tampered",
+      init_operation_token: tok
+    }]
+  };
+  const rTamperedPending = writeCampaignState({ env, expectedSha256: null, doc: cDocTamperedPending, capability });
+  assert.equal(rTamperedPending.ok, false, "篡改 pending_joins 但投影相同必须拒绝");
+  assert.equal(rTamperedPending.commit, "not_committed");
+  assert.equal(rTamperedPending.reason, "maintenance_capability_required");
+  assert.equal(fs.existsSync(targetFile), false, "拒绝后盘上不变");
+
+  // 篡改 origin_operation_id
+  const cDocTamperedOrigin = {
+    ...cDoc,
+    origin_operation_id: "00000000-0000-4000-8000-000000000099"
+  };
+  const rTamperedOrigin = writeCampaignState({ env, expectedSha256: null, doc: cDocTamperedOrigin, capability });
+  assert.equal(rTamperedOrigin.ok, false, "篡改 origin_operation_id 但投影相同必须拒绝");
+  assert.equal(rTamperedOrigin.commit, "not_committed");
+  assert.equal(rTamperedOrigin.reason, "maintenance_capability_required");
+  assert.equal(fs.existsSync(targetFile), false, "拒绝后盘上不变");
+
+  // 3. payload SHA 与 step.intended_after.sha256 一致时成功提交，且读回核原始字节
+  const rSuccess = writeCampaignState({ env, expectedSha256: null, doc: cDoc, capability });
+  assert.equal(rSuccess.ok, true, "SHA 匹配时提交成功");
+  assert.equal(rSuccess.commit, "committed");
+  assert.equal(rSuccess.sha256, actualSha);
+  assert.equal(fs.existsSync(targetFile), true, "成功落盘");
+  const rawDiskBytes = fs.readFileSync(targetFile);
+  assert.equal(sha256(rawDiskBytes), actualSha, "读回原始字节 SHA 必须严格等于 payload SHA");
 });
 
 summarySealed = true;

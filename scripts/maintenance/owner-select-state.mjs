@@ -307,7 +307,7 @@ const OSM_KIND_TO_FORWARD_PHASE = Object.freeze({
  *   - writer: state, campaign_id, endpoints_digest, revision
  * step.before.{exists, sha256} === 现场
  */
-function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256, skipLeaseCommit = false }) {
+function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256, skipLeaseCommit = false, payloadSha = null }) {
   if (!isObj(capability) || typeof capability.token !== "string" || !UUID_SHAPE.test(capability.token) || typeof capability.stepId !== "string" || capability.stepId.length === 0) {
     return { ok: false, reason: "maintenance_capability_required", why: "capability 缺失或形状无效" };
   }
@@ -407,6 +407,9 @@ function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeE
         || canonKey(ia.endpoints) !== canonKey(doc.endpoints)) {
       return { ok: false, reason: "maintenance_capability_required", why: "step intended_after 与本次 campaign doc 投影不匹配" };
     }
+    if (payloadSha !== null && (typeof ia.sha256 !== "string" || !SHA_SHAPE.test(ia.sha256) || ia.sha256 !== payloadSha)) {
+      return { ok: false, reason: "maintenance_capability_required", why: "step intended_after.sha256 (" + (ia?.sha256 ?? "null") + ") 与 payload sha256 (" + payloadSha + ") 不符" };
+    }
   } else if (targetKind === "writer_state") {
     if (step.kind !== "writer_state") {
       return { ok: false, reason: "maintenance_capability_required", why: "step kind 不是 writer_state (当前: " + step.kind + ")" };
@@ -418,6 +421,9 @@ function verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeE
         || ia.endpoints_digest !== doc.endpoints_digest
         || ia.revision !== doc.revision) {
       return { ok: false, reason: "maintenance_capability_required", why: "step intended_after 与本次 writer-state doc 投影不匹配" };
+    }
+    if (payloadSha !== null && (typeof ia.sha256 !== "string" || !SHA_SHAPE.test(ia.sha256) || ia.sha256 !== payloadSha)) {
+      return { ok: false, reason: "maintenance_capability_required", why: "step intended_after.sha256 (" + (ia?.sha256 ?? "null") + ") 与 payload sha256 (" + payloadSha + ") 不符" };
     }
   } else {
     return { ok: false, reason: "maintenance_capability_required", why: "未知 targetKind: " + targetKind };
@@ -452,6 +458,7 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
     if (byteLen > MAX_STATE_FILE_BYTES) {
       return { ok: false, commit: "not_committed", reason: "document_too_large", why: "序列化大小超过 1 MiB（" + byteLen + " 字节）" };
     }
+    const payloadSha = sha256(payload);
 
     const rootVal = validateLedgerRoot({ env, mustExistRoot: true });
     if (!rootVal.ok) {
@@ -548,7 +555,7 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
       }
 
       // 核验 maintenance capability（窄事务）
-      const capCheck = verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256: beforeSha });
+      const capCheck = verifyMaintenanceCapability({ capability, env, targetKind, doc, beforeExists, beforeSha256: beforeSha, payloadSha });
       if (!capCheck.ok) {
         return exitWithLock({ ok: false, commit: "not_committed", reason: capCheck.reason, why: capCheck.why });
       }
@@ -616,6 +623,7 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
             beforeExists,
             beforeSha256: beforeSha,
             skipLeaseCommit: true,
+            payloadSha,
           });
           if (!recheck.ok) {
             fenceCapReason = recheck.reason;
@@ -664,8 +672,8 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
       }
 
       const readBack = readVerifiedDoc({ file: targetFile, docValidator });
-      if (!readBack.ok || canonKey(readBack.doc) !== canonKey(doc)) {
-        return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: readBack.problem ?? "读回内容与写入 doc 不一致" });
+      if (!readBack.ok || canonKey(readBack.doc) !== canonKey(doc) || readBack.sha256 !== payloadSha) {
+        return exitWithLock({ ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: readBack.problem ?? "读回内容或 SHA 与写入 doc 不一致" });
       }
 
       const residue = finalizeLockOnce();

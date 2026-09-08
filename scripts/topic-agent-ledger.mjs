@@ -1642,14 +1642,16 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     if (inj.afterTmp) inj.afterTmp();
     let renameErr = null, fenceFail = null;
     const fenced = commitWhileHeld(lockDir, () => {
-      // R51 返修二 P1-1：栅栏提到两次 rename **之前**——漂移时连 .prev 都不许被覆盖。
+      // 注入钩子在栅栏**之前**（返修一原语义：「rename 前、注入钩子之后最后时刻」）——
+      // 钩子处的 journal 改动必须被栅栏看见（R51 返修二补：投影刀的测试就靠这个次序）。
+      if (inj.beforeLedgerRename) inj.beforeLedgerRename();
+      // R51 返修二 P1-1：栅栏在两次 rename **之前**——漂移时连 .prev 都不许被覆盖。
       // （旧序先 rename .prev 再栅栏：主账本不变但 .prev 已被这次失败提交覆盖，持久变更不报告。）
       if (_fence !== null) {
         const f = typeof _fence === "function" ? _fence() : _fence;
         if (f) { fenceFail = f; return; }
       }
       if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
-      if (inj.beforeLedgerRename) inj.beforeLedgerRename();
       try { fs.renameSync(ltTmp, ledgerPath); ltTmp = null; } catch (err) { renameErr = err; }
     });
     // R51 返修一：栅栏失败要有专名（不伪装成 renameErr/commit_failed）——why 带出失败分支名，reason 精确 fence_failed。

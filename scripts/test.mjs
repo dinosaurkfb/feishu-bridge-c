@@ -37119,6 +37119,85 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.ok(Buffer.compare(fs.readFileSync(path.join(dir, "ledger.json")), before) === 0, "账本字节不变");
   }));
 
+  // ── R51 返修二补（#137 二轮验收：两把逃逸刀 × 两入口 = 四条）──
+
+  test("R51 返修二补 刀1（mint 预算核）：plan.expected 与 journal intended 一致地冻错 → intended_mismatch 且未提交（账本与 .prev 不变）", () => r51WithRoot((root, dir) => {
+    r51SeedTransition(dir, { nullB1Count: 1 });
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    const plan = TAL.buildMintPlan({ doc: L0.doc, token: preTok, campaignId: campaignIdFor(preTok), endpointId: EP51, requestKey: preTok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
+    assert.equal(TAL.mintPlanProblem(plan), null, "前提：真 plan 合法");
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: "1.0", ledgerRevision: 2, transitionAfterSha: L0.sha256, tok: preTok, nullB1Count: 1 });
+    const fake = r51Sha("f");
+    // plan 与 journal **一致地**冻同一个假值：入口 plan_mismatch（plan.expected === step.intended_after）核过得去
+    const planFake = { ...structuredClone(plan), expected_ledger_sha256: fake };
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "mint").intended_after.ledger_sha256 = fake; });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const before = fs.readFileSync(path.join(dir, "ledger.json"));
+    fs.writeFileSync(path.join(dir, "ledger.json.prev"), "r51-prev-sentinel", { mode: 0o600 });
+    const r = TAL.mintSelectionHandles({ endpointId: EP51, capability: { kind: "mint_selection_handles", token: fx.tok }, plan: planFake, env });
+    assert.equal(r.ok, false, "真实预算 ≠ 一致冻错的 expected 必拦：" + JSON.stringify(r));
+    assert.equal(r.reason, "intended_mismatch", JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.equal(r.commit, "not_committed", "未提交（红：删预算核则写盘后 written_mismatch，账本已变）");
+    assert.ok(Buffer.compare(fs.readFileSync(path.join(dir, "ledger.json")), before) === 0, "主账本字节不变");
+    assert.equal(fs.readFileSync(path.join(dir, "ledger.json.prev"), "utf-8"), "r51-prev-sentinel", ".prev 字节不变");
+  }));
+
+  test("R51 返修二补 刀2（schema 栅栏投影）：beforeLedgerRename 里改 journal step 的 intended_after → fence_failed（投影漂移）且账本与 .prev 不变", () => r51WithRoot((root, dir) => {
+    const T51 = (i) => ({ runtime: "claude", project_root: "/p/r51/" + i, claude_session_id: "00000000-0000-4000-8000-" + String(i).padStart(12, "0") });
+    const r51Ok = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+    r51Seed(dir);
+    r51Ok(TAL.createB1({ endpointId: EP51, requestKey: "req_p8_b1a", chatId: "oc_r51a", rootOm: "om_r51a", lineageId: "lin-a", bindingTarget: T51(1), now: Date.now() }), "B1a");
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    const frozenSha = r51ShaOf52(TAL.serializeLedger(TAL.applySchemaUpgrade(L0.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(preTok, EP51), request_key: preTok + ":schema:" + EP51, from_schema: "1.0", to_schema: "1.1-transition" })));
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision, transitionAfterSha: frozenSha, tok: preTok });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const before = fs.readFileSync(path.join(dir, "ledger.json"));
+    fs.writeFileSync(path.join(dir, "ledger.json.prev"), "r51-prev-sentinel", { mode: 0o600 });
+    const r = TAL.schemaUpgrade({ endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: preTok + ":schema:" + EP51, fromSchema: "1.0", toSchema: "1.1-transition", env, _inject: { beforeLedgerRename: () => {
+      const jp = path.join(fx.maintDir, fx.tok + ".json");
+      const jd = JSON.parse(fs.readFileSync(jp, "utf-8"));
+      // schema.intended_after 与 mint.before 成对改（状态链合同保持连贯，journal 仍合法）：
+      // 投影核比的是整份 step 与 cap.osmStep 的规范投影 —— 链上值一致地换了也必须拒。
+      const fakeIntended = r51Sha("d"); // 64hex（SHA_SHAPE），与真预算不同值
+      jd.steps.find((s) => s.kind === "schema_endpoint").intended_after.ledger_sha256 = fakeIntended;
+      const mint = jd.steps.find((s) => s.kind === "mint");
+      mint.before.ledger_sha256 = fakeIntended;
+      mint.backup_sha256 = fakeIntended; // 备份恒需合同：backup === before
+      fs.writeFileSync(jp, JSON.stringify(jd, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(r.ok, false, "栅栏前的钩子改动必被投影核看见：" + JSON.stringify(r));
+    assert.equal(r.reason, "fence_failed", JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.match(String(r.why), /投影漂移/u, "why 含「投影漂移」：" + r.why);
+    assert.ok(Buffer.compare(fs.readFileSync(path.join(dir, "ledger.json")), before) === 0, "主账本字节不变");
+    assert.equal(fs.readFileSync(path.join(dir, "ledger.json.prev"), "utf-8"), "r51-prev-sentinel", ".prev 字节不变");
+  }));
+
+  test("R51 返修二补 刀3（mint 栅栏投影）：beforeLedgerRename 里改 mint step 的 intended_after → fence_failed（投影漂移）且账本与 .prev 不变", () => r51WithRoot((root, dir) => {
+    r51SeedTransition(dir, { nullB1Count: 1 });
+    const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+    const preTok = r51Uuid(9);
+    const plan = TAL.buildMintPlan({ doc: L0.doc, token: preTok, campaignId: campaignIdFor(preTok), endpointId: EP51, requestKey: preTok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
+    assert.equal(TAL.mintPlanProblem(plan), null);
+    const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: "1.0", ledgerRevision: 2, transitionAfterSha: L0.sha256, tok: preTok, nullB1Count: 1 });
+    fx.rewrite((d) => { d.steps.find((s) => s.kind === "mint").intended_after.ledger_sha256 = plan.expected_ledger_sha256; });
+    const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+    const before = fs.readFileSync(path.join(dir, "ledger.json"));
+    fs.writeFileSync(path.join(dir, "ledger.json.prev"), "r51-prev-sentinel", { mode: 0o600 });
+    const r = TAL.mintSelectionHandles({ endpointId: EP51, capability: { kind: "mint_selection_handles", token: fx.tok }, plan, env, _inject: { beforeLedgerRename: () => {
+      const jp = path.join(fx.maintDir, fx.tok + ".json");
+      const jd = JSON.parse(fs.readFileSync(jp, "utf-8"));
+      jd.steps.find((s) => s.kind === "mint").intended_after.ledger_sha256 = r51Sha("e"); // 64hex，与真预算不同值
+      fs.writeFileSync(jp, JSON.stringify(jd, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(r.ok, false, "栅栏前的钩子改动必被投影核看见：" + JSON.stringify(r));
+    assert.equal(r.reason, "fence_failed", JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.match(String(r.why), /投影漂移/u, "why 含「投影漂移」：" + r.why);
+    assert.ok(Buffer.compare(fs.readFileSync(path.join(dir, "ledger.json")), before) === 0, "主账本字节不变");
+    assert.equal(fs.readFileSync(path.join(dir, "ledger.json.prev"), "utf-8"), "r51-prev-sentinel", ".prev 字节不变");
+  }));
+
   test("R51 返修一补：mintSelectionHandles ledger_diverged（afterVerify 改账本至前后皆非）", () => r51WithRoot((root, dir) => {
     r51SeedTransition(dir, { nullB1Count: 1 });
     const L0 = TAL.loadLedger(dir, { endpointId: EP51 });

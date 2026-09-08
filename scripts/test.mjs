@@ -30,6 +30,7 @@ import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
 import * as RI from "./maintenance/reaffirm-intents.mjs"; // R57b：reaffirm intent store（sidecar 读写事务）
+import * as SR from "./select-resolve.mjs"; // R57c：§5 候选解析（纯函数）
 import * as SA from "./select-admission.mjs"; // R57b：/feishu-select 执行器（rfh 支）
 import * as SP from "./selection-plan.mjs"; // R57b 返修五：selection plan sidecar 叶子（写/读）
 import { executeSelectControl, selectAdmission, selectReject } from "./select-admission.mjs";
@@ -43657,6 +43658,248 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       fs.rmSync(maintDir, { recursive: true, force: true });
     }
   }));
+
+}
+
+// ─────────────────────────── R57c：owner_select 增量形 activate/anchor/rebind + §5 候选解析 ───────────────────────────
+
+{
+  const EP57C = "endpoint_" + "9".repeat(24);
+  const T0C = Date.parse("2026-09-12T09:00:00.000Z");
+  const FUTC = "2099-01-01T00:00:00.000Z";
+  const TGTC = (n) => ({ runtime: "claude", project_root: "/p/r57c", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
+  const F4C = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+  const talOkC = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+
+  const withLedgerC = (fn, { schema = "1.1-transition" } = {}) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57c-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EP57C);
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const ops = {
+        "00000000-0000-4000-8000-0000000009a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57c_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57C, chain: "claude" }), result_revision: 1, result: { revision: 1 } }
+      };
+      let revision = 1;
+      if (schema !== "1.0") {
+        revision = 2;
+        ops["00000000-0000-4000-8000-0000000009a2"] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57c_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57c_up", endpoint: EP57C, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57C, from_schema: "1.0", to_schema: "1.1-transition" } };
+      }
+      const doc = { schema_version: schema, artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57C, chain: "claude", authority_mode: "shadow", revision, operations: ops, records: {} };
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      return fn(root, dir);
+    } finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const loadOkC = (dir) => {
+    const l = TAL.loadLedger(dir, { endpointId: EP57C });
+    assert.ok(l.ok, "读回：" + JSON.stringify(l));
+    const v = TAL.validateLedger(l.doc, { endpointId: EP57C });
+    assert.equal(v.ok, true, "产物过 validateLedger：" + JSON.stringify(v.why ?? null));
+    return l.doc;
+  };
+  const b1WithHandle = (dir, rk, n, om) => talOkC(TAL.createB1({ endpointId: EP57C, requestKey: rk, chatId: "oc_r57c", rootOm: om, lineageId: "lin_c" + n, bindingTarget: TGTC(n), clock: () => T0C }), "createB1");
+  const a1Of = (dir, rk, sessionId) => talOkC(TAL.createA1({ endpointId: EP57C, requestKey: rk, chatId: "oc_r57c", sessionId, clock: () => T0C }), "createA1");
+  const a2Of = (dir, rk, n, sessionId, cand) => {
+    const a1 = a1Of(dir, rk + "_a1", sessionId);
+    talOkC(TAL.attach({ endpointId: EP57C, requestKey: rk + "_att", id: a1.result.created_id, bindingTarget: TGTC(n), claimKey: "c".repeat(64), authorizedBy: "ou_r57c", anchorCandidate: cand, clock: () => T0C }), "attach");
+    return a1.result.created_id;
+  };
+
+  // ── A. §5 候选解析（纯函数）──
+
+  test("R57c 解析：显式 osh_（activate→B1 / anchor→A2）恰一命中、basis=explicit_handle、不要求集合恰一；显式 orh_ 只盘点待 rebind B3", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57c_b1", 81, "om_c81");
+    const a2 = a2Of(dir, "r57c_a2", 82, "sess-c-82", "om_cand82");
+    // 另一个 chat 的 B1（不受验 chat，不算候选）
+    talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57c_b1x", chatId: "oc_other", rootOm: "om_c81x", lineageId: "lin_x1", bindingTarget: TGTC(83), clock: () => T0C }), "B1 other chat");
+    const d1 = loadOkC(dir);
+    let r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: b1.result.selection_handle, now: T0C });
+    assert.deepEqual({ ok: r.ok, target_id: r.target_id, family: r.family, selection_basis: r.selection_basis }, { ok: true, target_id: b1.result.created_id, family: "B1", selection_basis: "explicit_handle" }, JSON.stringify(r));
+    r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "anchor", handle: a2 ? d1.records[a2].selection_handle : null, now: T0C });
+    assert.equal(r.ok, true); assert.equal(r.family, "A2"); assert.equal(r.selection_basis, "explicit_handle");
+    // orh_：B3 无 handle 时显式 orh_ → no_candidate
+    r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "rebind", handle: "orh_" + "0".repeat(32), now: T0C });
+    assert.equal(r.ok, false); assert.equal(r.reason, "no_candidate");
+    // handle 种类错（activate 拿 orh_）→ 封闭拒
+    r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: "orh_" + "1".repeat(32), now: T0C });
+    assert.equal(r.ok, false); assert.equal(r.reason, "handle_kind_mismatch");
+  }));
+
+  test("R57c 解析：省略 handle → 集合恰一 basis=unique_candidate；多候选 → ambiguous 只回 opaque id；过期候选被过滤", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57c_b1u", 84, "om_c84");
+    const d1 = loadOkC(dir);
+    let r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    assert.equal(r.ok, true); assert.equal(r.selection_basis, "unique_candidate"); assert.equal(r.target_id, b1.result.created_id);
+    // 多候选：再建一个同 chat 的 B1
+    b1WithHandle(dir, "r57c_b1u2", 85, "om_c85");
+    const d2 = loadOkC(dir);
+    r = SR.resolveSelectionCandidate({ doc: d2, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    assert.equal(r.ok, false); assert.equal(r.reason, "ambiguous");
+    assert.deepEqual(r.candidates.length, 2, "只回计数与 opaque id");
+    for (const id of r.candidates) assert.match(id, /^ta_[0-9a-f]{32}$/u);
+    assert.equal(Object.values(r).some((v) => typeof v === "string" && v.startsWith("osh_")), false, "不回 handle 值");
+    // 过期候选被过滤：把 ep2 的 handle 到期改到过去（手术→账本读不回，改用直调 doc）
+    const doc = JSON.parse(JSON.stringify(d2));
+    doc.operations["00000000-0000-4000-8000-0000000009a3"] = { op_type: "seed", terminal_kind: "seed", request_key: "x", fingerprint: "f".repeat(64), result_revision: 3, result: { seeded_ids: [] } };
+    for (const rec of Object.values(doc.records)) {
+      if (rec.selection_handle !== null && rec.topic_agent_id !== b1.result.created_id) rec.handle_expires_at = "2026-01-01T00:00:00.000Z";
+    }
+    r = SR.resolveSelectionCandidate({ doc, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    assert.equal(r.ok, true, "过期候选被过滤后恰一：" + JSON.stringify(r));
+    // 过滤到零 → no_candidate
+    for (const rec of Object.values(doc.records)) if (rec.selection_handle !== null) rec.handle_expires_at = "2026-01-01T00:00:00.000Z";
+    r = SR.resolveSelectionCandidate({ doc, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    assert.equal(r.ok, false); assert.equal(r.reason, "no_candidate");
+  }));
+
+  // ── B. activate 增量形 ──
+
+  test("R57c activate 增量：五元入 fp、六字段 result、affected/proof_effects 逐字 §6、owner_select 双证、B1 handle 消费清空、产物过 validateLedger", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57c_act_b1", 86, "om_act86");
+    const a1 = a1Of(dir, "r57c_act_a1", "sess-c-86");
+    const sel = { selectedSessionId: "sess-c-86", selectedRootOm: "om_act86", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_msgc86", selectionBasis: "explicit_handle" };
+    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_act86"), authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "activate 增量");
+    const r = act.result;
+    assert.equal(Object.keys(r).sort().join(","), "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_historical_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id", "§6 增量键集");
+    assert.deepEqual(r.affected_live_ids_after_commit, [b1.result.created_id]);
+    assert.deepEqual(r.proof_effects, [{ topic_agent_id: b1.result.created_id, binding_effect: "produced", link_effect: "produced" }]);
+    assert.equal(r.selection_handle, b1.result.selection_handle);
+    assert.equal(r.selected_root_om, "om_act86");
+    const doc = loadOkC(dir);
+    const opId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "activate");
+    assert.equal(r.selection_operation_id, opId, "selection_operation_id = 本 op key");
+    assert.equal(opId.fingerprint ?? doc.operations[opId].fingerprint, doc.operations[opId].fingerprint);
+    assert.equal(doc.operations[opId].fingerprint, TAL.fingerprintOf("activate", { request_key: "r57c_act", b1_id: b1.result.created_id, a1_id: a1.result.created_id, matched_om: "om_act86", selected_session_id: "sess-c-86", selected_root_om: "om_act86", selection_handle: b1.result.selection_handle, selection_message_id: "om_msgc86", selection_basis: "explicit_handle" }), "五元入 fp");
+    const rec = doc.records[b1.result.created_id];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1", "owner_select binding");
+    assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1", "owner_select link");
+    assert.equal(rec.binding_proof.selection_operation_id, opId);
+    assert.equal(rec.selection_handle, null, "B1 handle 消费清空");
+    assert.equal(rec.handle_expires_at, null);
+    const tomb = doc.records[a1.result.created_id];
+    assert.equal(tomb.kind, "forwarding_tombstone");
+    assert.equal(tomb.proof_ref.kind, "owner_select_merge_v1", "归并 tombstone 用 owner_select_merge_v1");
+    assert.equal(tomb.proof_ref.selection_handle, b1.result.selection_handle);
+  }));
+
+  test("R57c activate 增量：demoted 场景 affected=[surviving,demoted] 排序、proof_effects preserved/preserved；重放幂等（fp 不含随机量）", () => withLedgerC((root, dir) => {
+    const b1a = b1WithHandle(dir, "r57c_d1", 87, "om_d87a");
+    const a1a = a1Of(dir, "r57c_d1a", "sess-c-87a");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d1act", b1Id: b1a.result.created_id, a1Id: a1a.result.created_id, f4: F4C("om_d87a"), authorizedBy: "ou_r57c", clock: () => T0C }), "首代 activate 旧形");
+    // 第二代 B1（同 lineage 新 pending）
+    const lin = loadOkC(dir).records[b1a.result.created_id].generation_lineage_id;
+    const b1b = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57c_d2", chatId: "oc_r57c", rootOm: "om_d87b", lineageId: lin, bindingTarget: TGTC(87), clock: () => T0C }), "第二代 B1（同 lineage 同 target，G6）");
+    const a1b = a1Of(dir, "r57c_d2a", "sess-c-87b");
+    const sel = { selectedSessionId: "sess-c-87b", selectedRootOm: "om_d87b", selectionHandle: b1b.result.selection_handle, selectionMessageId: "om_msgc87", selectionBasis: "unique_candidate" };
+    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d2act", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, f4: F4C("om_d87b"), authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "activate 增量 demoted");
+    const r = act.result;
+    const expectedAffected = [b1b.result.created_id, b1a.result.created_id].sort();
+    assert.deepEqual(r.affected_live_ids_after_commit, expectedAffected, "affected = [surviving, demoted] 排序");
+    assert.deepEqual(r.proof_effects, [
+      { topic_agent_id: b1a.result.created_id, binding_effect: "preserved", link_effect: "preserved" },
+      { topic_agent_id: b1b.result.created_id, binding_effect: "produced", link_effect: "produced" }
+    ].sort((x, y) => (x.topic_agent_id < y.topic_agent_id ? -1 : 1)), "demoted preserved/preserved");
+    loadOkC(dir);
+    // 重放幂等
+    const r2 = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d2act", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, f4: F4C("om_d87b"), authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "重放");
+    assert.equal(r2.idempotent, true);
+    assert.equal(r2.result.selection_handle, b1b.result.selection_handle);
+  }));
+
+  test("R57c activate 增量：CAS（selection_handle/root/session 与现场不符 → 拒）；1.0 账本传选择输入 → bad_input；无选择输入保持旧形", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57c_cas", 89, "om_cas89");
+    const a1 = a1Of(dir, "r57c_cas_a1", "sess-c-89");
+    let r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas1", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_cas89", selectionHandle: "osh_" + "0".repeat(32), selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.ok, false); assert.equal(r.reason, "cas_mismatch", "handle CAS");
+    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas2", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-OTHER", selectedRootOm: "om_cas89", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.reason, "cas_mismatch", "session CAS");
+    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas3", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_OTHER", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.reason, "cas_mismatch", "root CAS");
+    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas4", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_cas89", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "rebind", clock: () => T0C });
+    assert.equal(r.reason, "bad_input", "basis 值域封闭（activate 不认 rebind）");
+  }));
+
+  test("R57c activate：1.0 账本传选择输入 → bad_input；无选择输入旧形不变（1.0 与 1.1 都然）", () => withLedgerC((root, dir) => {
+    const b1 = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57c_10_b1", chatId: "oc_r57c", rootOm: "om_10", lineageId: "lin_10", bindingTarget: TGTC(90), clock: () => T0C }), "createB1@1.0");
+    const a1 = talOkC(TAL.createA1({ endpointId: EP57C, requestKey: "r57c_10_a1", chatId: "oc_r57c", sessionId: "sess-c-90", clock: () => T0C }), "createA1@1.0");
+    const r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_10_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_10"), authorizedBy: "ou_r57c", selectedSessionId: "sess-c-90", selectedRootOm: "om_10", selectionHandle: "osh_" + "2".repeat(32), selectionMessageId: "om_m90", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.ok, false, "1.0 不收选择增量");
+    assert.equal(r.reason, "bad_input");
+    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_10_act2", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_10"), authorizedBy: "ou_r57c", clock: () => T0C }), "1.0 旧形");
+    assert.deepEqual(Object.keys(act.result).sort(), ["demoted_historical_id", "surviving_id", "tombstoned_id"], "旧形 result");
+  }, { schema: "1.0" }));
+
+  test("R57c activate：1.1+ 无选择输入 → 旧形（合法基线支路），1.1 记录 handle 仍被消费清空", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57c_legacy", 94, "om_legacy94");
+    const a1 = a1Of(dir, "r57c_legacy_a1", "sess-c-94");
+    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_legacy_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_legacy94"), authorizedBy: "ou_r57c", clock: () => T0C }), "1.1 旧形");
+    assert.deepEqual(Object.keys(act.result).sort(), ["demoted_historical_id", "surviving_id", "tombstoned_id"], "旧形 result");
+    const doc = loadOkC(dir);
+    assert.equal(doc.records[b1.result.created_id].binding_proof.kind, "pairing", "pairing 旧证");
+    assert.equal(doc.records[b1.result.created_id].selection_handle, null, "handle 仍消费清空");
+  }));
+
+  // ── C. anchor 增量形 ──
+
+  test("R57c anchor 增量：fp 五元+三件 CAS、result 复述 expected_anchor_candidate===selected_root_om、A2 handle 消费、anchor_candidate 保留、preserved/produced", () => withLedgerC((root, dir) => {
+    const a2 = a2Of(dir, "r57c_anc", 91, "sess-c-91", "om_cand91");
+    const cur = loadOkC(dir).records[a2];
+    // 候选改指被挡：expected 三件任一不符 → cas_mismatch
+    let r = TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc1", id: a2, f4: { root_om: "om_cand91", ...F4C("om_cand91") }, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_OTHER", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.ok, false); assert.equal(r.reason, "cas_mismatch", "候选改指被 CAS 挡");
+    r = TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc2", id: a2, f4: { root_om: "om_cand91", ...F4C("om_cand91") }, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: "osh_" + "0".repeat(32), expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_cand91", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.reason, "cas_mismatch", "handle CAS");
+    const anc = talOkC(TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc3", id: a2, f4: { root_om: "om_cand91", ...F4C("om_cand91") }, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_cand91", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C }), "anchor 增量");
+    const rr = anc.result;
+    assert.equal(Object.keys(rr).sort().join(","), "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,expected_anchor_candidate,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id", "§6 anchor 增量键集");
+    assert.equal(rr.expected_anchor_candidate, "om_cand91");
+    assert.equal(rr.expected_anchor_candidate, rr.selected_root_om, "复述 === selected_root_om");
+    assert.deepEqual(rr.affected_live_ids_after_commit, [a2]);
+    assert.deepEqual(rr.proof_effects, [{ topic_agent_id: a2, binding_effect: "preserved", link_effect: "produced" }]);
+    const doc = loadOkC(dir);
+    const rec = doc.records[a2];
+    assert.equal(rec.selection_handle, null, "A2 handle 消费");
+    assert.equal(rec.handle_expires_at, null);
+    assert.equal(rec.anchor_candidate, "om_cand91", "anchor 不清 anchor_candidate");
+    assert.equal(rec.aliases.root_om, "om_cand91");
+    const opId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "anchor");
+    assert.equal(doc.operations[opId].fingerprint, TAL.fingerprintOf("anchor", { request_key: "r57c_anc3", topic_agent_id: a2, root_om: "om_cand91", matched_om: "om_cand91", selected_session_id: "sess-c-91", selected_root_om: "om_cand91", selection_handle: cur.selection_handle, selection_message_id: "om_m91", selection_basis: "explicit_handle", expected_handle: cur.selection_handle, expected_expires_at: cur.handle_expires_at, expected_anchor_candidate: "om_cand91" }), "fp = 五元 + 三件");
+  }));
+
+  // ── D. rebind_session_alias 的 A1 归并 ──
+
+  test("R57c rebind 归并：新 session 被 A1 占位 → 同笔转 tombstone、tombstoned_a1_id 非 null、G13-tomb 闭合、产物过 validateLedger；非 A1 占位仍 alias_occupied", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57c_m_b1", 92, "om_m92");
+    const a1Old = a1Of(dir, "r57c_m_a1", "sess-c-92-old");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_m_act", b1Id: b1.result.created_id, a1Id: a1Old.result.created_id, f4: F4C("om_m92"), authorizedBy: "ou_r57c", clock: () => T0C }), "activate 旧形");
+    // 新 session 上的 A1（待归并）
+    const a1New = a1Of(dir, "r57c_m_new", "sess-c-92-new");
+    const rq = talOkC(TAL.requestRebind({ endpointId: EP57C, requestKey: "r57c_m_rq", b3Id: b1.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: "sess-c-92-old", clock: () => T0C }), "requestRebind");
+    const rc = talOkC(TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-old", newSessionId: "sess-c-92-new", authorizedBy: "ou_owner57c", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_m92rc", clock: () => T0C + 1000 }), "消费+归并");
+    assert.equal(rc.result.tombstoned_a1_id, a1New.result.created_id, "tombstoned_a1_id 非空");
+    const doc = loadOkC(dir);
+    const tomb = doc.records[a1New.result.created_id];
+    assert.equal(tomb.kind, "forwarding_tombstone");
+    assert.equal(tomb.forwards_to, b1.result.created_id);
+    assert.equal(tomb.proof_ref.kind, "owner_select_merge_v1");
+    const opId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "rebind_session_alias");
+    assert.equal(tomb.proof_ref.selection_operation_id, opId);
+    assert.equal(tomb.proof_ref.selection_handle, rq.result.rebind_handle);
+    assert.equal(doc.records[b1.result.created_id].aliases.session_id, "sess-c-92-new");
+    // 非 A1 占位仍 alias_occupied：另一 B3 占用新 session
+    const b1b = b1WithHandle(dir, "r57c_m_b1b", 93, "om_m93");
+    const a1b = a1Of(dir, "r57c_m_a1b", "sess-c-93");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_m_actb", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, f4: F4C("om_m93"), authorizedBy: "ou_r57c", clock: () => T0C }), "B3 占位");
+    const rq2 = talOkC(TAL.requestRebind({ endpointId: EP57C, requestKey: "r57c_m_rq2", b3Id: b1.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: "sess-c-92-new", clock: () => T0C }), "rq2");
+    const r2 = TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc2", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-new", newSessionId: "sess-c-93", authorizedBy: "ou_owner57c", rebindHandle: rq2.result.rebind_handle, expectedExpiresAt: rq2.result.rebind_expires_at, selectionMessageId: "om_m93rc", clock: () => T0C + 1000 });
+    assert.equal(r2.ok, false);
+    assert.equal(r2.reason, "alias_occupied", "B3 占位仍拒");
+  }));
+
 
 }
 

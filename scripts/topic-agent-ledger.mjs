@@ -368,7 +368,7 @@ export function migrationInventory(doc) {
     if (rec.kind === "live") {
       if (rec.binding_proof?.kind === "pairing") legacy++;
       if (rec.locator_link_proof_ref?.kind === "f4_anchor") legacy++;
-      if (familyOf(rec.facts) === "B1" && rec.selection_handle === null) nullB1.push(id);
+      if (familyOf(rec.facts) === "B1" && (rec.selection_handle ?? null) === null) nullB1.push(id); // R53：1.0 形状字段缺位也计 null-B1
     } else if (rec.kind === "forwarding_tombstone") {
       if (rec.proof_ref?.kind === "pairing") legacy++;
     }
@@ -1722,7 +1722,7 @@ export function applySchemaUpgrade(doc, { operation_id, request_key, from_schema
     fingerprint: fingerprintOf("schema_upgrade", inputs), result_revision: next.revision,
     result: { endpoint: doc.endpoint_id, from_schema, to_schema },
   };
-  if (to_schema === "1.1") return next; // strict：四字段已存在（transition 补过），已有值不动
+  if (from_schema !== "1.0") return next; // strict（1.1-transition→1.1）：四字段已存在，已有值不动；direct（1.0→1.1）直升同样补——R53 P1-3 cherry-pick
   for (const rec of Object.values(next.records)) {
     if (rec.kind !== "live") continue;
     for (const k of ["selection_handle", "handle_expires_at", "rebind_handle", "rebind_expires_at"]) if (!(k in rec)) rec[k] = null;

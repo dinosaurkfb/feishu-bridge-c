@@ -37031,6 +37031,23 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     };
   };
 
+  test("R51 返修一 P1-3：direct（1.0→1.1）直升补显式 null + inventory 对缺位字段计 null-B1（当前真红）", () => {
+    // A1 记录账本（1.0）：direct 后 validateLedger 过（非 B1 记录的 13→17 键结构合法）
+    const a1Id = "ta_" + "7".repeat(32);
+    const a1Doc = r52Doc10(EP52A, []);
+    a1Doc.records[a1Id] = { kind: "live", topic_agent_id: a1Id, chat_id: "oc_r52", created_at: T052, updated_at: T052, origin_operation_id: "00000000-0000-4000-8000-000000000002", aliases: { session_id: "sess-a1", root_om: null }, anchor_candidate: null, binding_target: null, generation_lineage_id: null, binding_proof: null, locator_link_proof_ref: null, facts: { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" } };
+    const seedOpA1 = Object.values(a1Doc.operations).find((o) => o.op_type === "seed");
+    seedOpA1.result.seeded_ids = [a1Id];
+    const nextA1 = TAL.applySchemaUpgrade(a1Doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId("tok", EP52A), request_key: "tok", from_schema: "1.0", to_schema: "1.1" });
+    assert.equal(nextA1.schema_version, "1.1");
+    assert.equal(nextA1.records[a1Id].selection_handle, null, "direct 直升补显式 null（当前红：strict 分支跳过 1.0 记录）");
+    assert.equal(TAL.validateLedger(nextA1, { endpointId: EP52A }).ok, true, "A1 账本 direct 后 validateLedger 过（当前红：17 键缺失）");
+    // inventory：1.0 账本的缺位 selection_handle（undefined）也计 null-B1（direct 前置要拦）
+    const b1Doc = r52Doc10(EP52A, ["ta_" + "7".repeat(32)]);
+    const inv = TAL.migrationInventory(b1Doc);
+    assert.deepEqual(inv.null_b1_ids, ["ta_" + "7".repeat(32)], "1.0 缺位字段计 null-B1（当前红：undefined ≠ null 漏判）");
+  });
+
   test("R52 §一 schemaUpgrade 确定性 op key + applySchemaUpgrade 可预算（同输入同 SHA、不改 updated_at）", () => {
     const tok = r52Uuid(1);
     const id1 = TAL.ownerSelectSchemaUpgradeOpId(tok, EP52A);

@@ -398,7 +398,9 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
   `operation_kind` ∈ 三新种、phase 在 forward 段、且存在**对应的 prepared step**（`campaign:<id>:open|seal|complete` / `writer_state:<id>:partial|on`）
   其 `intended_after` 与本次写入的投影逐字相等、`before.{exists,sha256}` === 现场；缺 capability 或核不过 → `maintenance_capability_required`，
   **不导出可无 operation 直接改状态文件的通用 writer**。此外写方必先持有 `<ledger root>/owner-select-state.lock`（registry 锁协议，同一把锁盖两文件），
-  锁内 compare（现场 `{exists,sha256}`）→ 序列化并**落盘前核大小 ≤ 1 MiB** → O_EXCL 0600 临时文件 fsync → rename → fsync 目录 → 读回；
+  锁内 compare（现场 `{exists,sha256}`）→ 序列化并**落盘前核大小 ≤ 1 MiB**、**`sha256(payload)` 必 === 对应 prepared step 的 `intended_after.sha256`**（不等 → 不落盘，
+  PR #135 三轮 P1-2）→ O_EXCL 0600 临时文件 fsync → rename → fsync 目录 → 读回**原始字节**核同一 SHA；capability 的 lease 核验须在**提交栅栏内**用
+  `commitWhileHeld` 证明本进程持有真实 lease 实例并重读 active/gate/journal（三轮 P1-1，非持有进程一律拒）；
   结果联合 `{ commit:"not_committed" | "committed" | "committed_durability_uncertain"（rename 已成、目录 fsync 失败）| "lock_residue" }`，
   **finalize 一次性且不抛：rename 已落地后的任何释放/清理异常都不得折叠成 not_committed**（二轮 P1-1）；tmp 写/fsync 失败尽力清理，清不掉结构化带出 `residue`；
   写前异常一律结构化返回不裸抛；根路径经唯一 `validateLedgerRoot`（祖先 symlink 拒），文件 mode **恰 0600**、普通文件、单硬链接（读写两侧同核）。

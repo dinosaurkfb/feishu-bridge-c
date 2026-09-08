@@ -35905,6 +35905,83 @@ test("R50 返修六 P2-2：下沉 canonKey/sha256 到 canon.mjs 叶子模块消�
   }
 });
 
+test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸（rename 后篡改目标文件再读回）", () => {
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const tok = "00000000-0000-4000-8000-000000000023";
+  const cid = campaignIdFor(tok);
+  const eps = ["endpoint_111111111111111111111111"];
+  const dig = endpointsDigest(eps);
+  const now = "2026-09-07T10:00:00.000Z";
+
+  const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-r7-test-"));
+  const ledgerDir = path.join(tmpRoot, "ledger");
+  fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+  const maintDir = path.join(tmpRoot, "maint");
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const gateFile = path.join(tmpRoot, "maintenance.gate");
+  const env = {
+    FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
+  };
+
+  const cDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      [eps[0]]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok
+  };
+  const payload = JSON.stringify(cDoc, null, 2) + "\n";
+  const actualSha = sha256(payload);
+
+  const { capCampaignOpen: capability } = setupMaintFixtureA({ maintDir, tok, cid, eps, now, gateFile });
+  const jPath = path.join(maintDir, tok + ".json");
+  const jDoc = JSON.parse(fs.readFileSync(jPath, "utf-8"));
+  const step = jDoc.steps.find((s) => s.id === capability.stepId);
+  step.intended_after.sha256 = actualSha;
+  fs.writeFileSync(jPath, JSON.stringify(jDoc, null, 2) + "\n", { mode: 0o600 });
+
+  const targetFile = path.join(ledgerDir, "owner-select-campaign.json");
+
+  // Hook fs.fsyncSync：在 rename 之后、readVerifiedDoc 之前，篡改 targetFile 使其 JSON 投影相同但原始字节不同
+  const origFsync = fs.fsyncSync;
+  let tamperTargetOnDirFsync = false;
+
+  fs.fsyncSync = function(fd) {
+    if (tamperTargetOnDirFsync) {
+      try {
+        if (fs.fstatSync(fd).isDirectory()) {
+          // 此时 rename 已落地，篡改 targetFile：保留相同的结构和 schema，但改变缩进/空白使其 sha256 改变
+          const tamperedPayload = JSON.stringify(cDoc, null, 4) + "\n";
+          fs.writeFileSync(targetFile, tamperedPayload, { mode: 0o600 });
+        }
+      } catch (e) {
+        // 忽略 stat 异常
+      }
+    }
+    return origFsync.apply(this, arguments);
+  };
+
+  try {
+    tamperTargetOnDirFsync = true;
+    const res = writeCampaignState({ env, expectedSha256: null, doc: cDoc, capability });
+    assert.equal(res.ok, false, "读回原始字节 SHA 不匹配必须失败");
+    assert.equal(res.commit, "committed_durability_uncertain", "rename 落地后读回校验失败必须返回 committed_durability_uncertain");
+    assert.equal(res.reason, "readback_failed");
+    assert.match(res.why, /SHA/u);
+  } finally {
+    fs.fsyncSync = origFsync;
+    tamperTargetOnDirFsync = false;
+  }
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

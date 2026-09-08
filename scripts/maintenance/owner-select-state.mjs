@@ -7,7 +7,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonKey, sha256, ledgerRootFor, validateLedgerRoot, REQUEST_KEY_SHAPE } from "../topic-agent-ledger.mjs";
+import { canonKey, sha256 } from "./canon.mjs";
+import { ledgerRootFor, validateLedgerRoot, REQUEST_KEY_SHAPE } from "../topic-agent-ledger.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { dirFsyncIgnorable } from "./dir-fsync.mjs";

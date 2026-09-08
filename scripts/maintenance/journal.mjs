@@ -23,7 +23,7 @@ import path from "node:path";
 import { realUserHome } from "../maintenance-gate-core.mjs";
 import { readRegularFile } from "../installed-surface.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
-import { canonKey } from "../topic-agent-ledger.mjs";
+import { canonKey } from "./canon.mjs";
 import { dirFsyncIgnorable } from "./dir-fsync.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import {

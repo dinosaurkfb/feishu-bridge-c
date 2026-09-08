@@ -35873,6 +35873,38 @@ test("R50 返修六 P2-1：tmp 清理用 tmpCreated 防误删、直调 unlinkSyn
   }
 });
 
+test("R50 返修六 P2-2：下沉 canonKey/sha256 到 canon.mjs 叶子模块消除环路，颠倒 import 顺序无死锁", () => {
+  const repoRoot = path.resolve(moduleDir(import.meta.url), "..");
+  const journalPath = path.join(repoRoot, "scripts", "maintenance", "journal.mjs");
+  const derivedPath = path.join(repoRoot, "scripts", "maintenance", "owner-select-derived.mjs");
+
+  // 1. 静态断言：journal 与 owner-select-derived 绝不能依赖 topic-agent-ledger.mjs
+  const journalSrc = fs.readFileSync(journalPath, "utf-8");
+  assert.equal(/from\s+["'].*topic-agent-ledger(\.mjs)?["']/u.test(journalSrc), false, "journal.mjs 绝不能依赖 topic-agent-ledger.mjs（消环）");
+
+  const derivedSrc = fs.readFileSync(derivedPath, "utf-8");
+  assert.equal(/from\s+["'].*topic-agent-ledger(\.mjs)?["']/u.test(derivedSrc), false, "owner-select-derived.mjs 绝不能依赖 topic-agent-ledger.mjs（消环）");
+
+  // 2. 动态加载：颠倒 import 顺序也能正常加载并求值
+  const orders = [
+    // 顺序 A：传统顺序
+    `import * as T from "./scripts/topic-agent-ledger.mjs"; import * as D from "./scripts/maintenance/owner-select-derived.mjs"; import * as J from "./scripts/maintenance/journal.mjs"; if (!T.canonKey || !D.campaignIdFor || !J.readJournal) throw new Error("A failed");`,
+    // 顺序 B：完全颠倒
+    `import * as J from "./scripts/maintenance/journal.mjs"; import * as D from "./scripts/maintenance/owner-select-derived.mjs"; import * as T from "./scripts/topic-agent-ledger.mjs"; if (!T.canonKey || !D.campaignIdFor || !J.readJournal) throw new Error("B failed");`,
+    // 顺序 C：derived 先行
+    `import * as D from "./scripts/maintenance/owner-select-derived.mjs"; import * as J from "./scripts/maintenance/journal.mjs"; import * as T from "./scripts/topic-agent-ledger.mjs"; if (!T.canonKey || !D.campaignIdFor || !J.readJournal) throw new Error("C failed");`
+  ];
+
+  for (let i = 0; i < orders.length; i++) {
+    const res = spawnSync(process.execPath, ["--input-type=module", "-e", orders[i]], {
+      cwd: repoRoot,
+      encoding: "utf-8",
+      timeout: 10000
+    });
+    assert.equal(res.status, 0, `顺序 ${i} 加载失败: ${res.stderr || res.stdout}`);
+  }
+});
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

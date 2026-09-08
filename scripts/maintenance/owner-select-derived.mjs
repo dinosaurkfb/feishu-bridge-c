@@ -1,7 +1,7 @@
 /**
  * owner-select 派生函数与基本形状常量（下沉为无环小模块，消解 journal <-> owner-select-state 环路）
  */
-import { canonKey, sha256 } from "../topic-agent-ledger.mjs";
+import { canonKey, sha256 } from "./canon.mjs";
 
 export const CAMPAIGN_STATES = Object.freeze(["open", "sealed", "complete"]);
 export const WRITER_STATES = Object.freeze(["off", "partial", "on"]);

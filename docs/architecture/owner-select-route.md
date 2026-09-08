@@ -349,6 +349,7 @@ lease、install-surface 锁、active 清理语义与 `ledger_init`/`ledger_cutov
 纪律一致。**A / direct 的进门前置（九轮 P1-3）**：当前 runtime **必已受验支持** transition/strict
 schema 与 1.4 journal——即**先经普通 `maintenance_install` 装过渡版 runtime**（独立一次、需 Frank
 授权的装），再进 A/direct；未装即拒进段。崩溃恢复只从 journal 记的 step 集续跑。
+**「已受验支持」的客观判据（#138 一轮 P1-3 回带）**：`osmPrecheck` 只读核对 `~/.claude/feishu-bridge/runtime/current` 指向的**已装版本目录**——manifest 完整（`verifyRuntime` ok），且该目录内 `scripts/maintenance/journal.mjs` 导出 `OWNER_SELECT_JOURNAL_SCHEMA === "1.4"`、`scripts/topic-agent-ledger.mjs` 导出 `SCHEMA_VERSIONS` 含 `"1.1-transition"` 与 `"1.1"`（动态 import 已装目录内的模块，只读、不执行任何事务）；读不出、缺导出、值不符 → `precheck_failed: runtime_not_transition_capable`，拒进段。核的是**已装**的那份，不是仓库工作树里的这份。
 
 ### 8.2 journal 1.4 封闭数据联合（十轮 P1-2：不是流程表，是可直译 journalProblem 合同；回带 `maintenance-gate.md`）
 
@@ -362,6 +363,7 @@ P1，形状同 sidecar）且 **after 缺席**；**done** = 前者 ∪ `{after}`
 P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`before.exists===true` → backup 绝对路径
 **必落本 operation 私有目录 `<token>.staged/`** + sha/bytes、`===false` → 三字段显式 null；`schema_endpoint`/
 `mint`（账本必存在、状态对象无 `exists`）→ **备份恒需**，`backup_sha256 === before.ledger_sha256` 且落
+**备份字节的出处（#138 一轮 P1-5 回带）**：`schema_endpoint:<ep>` 的备份 = 进段时受验读取器读到的 1.0 账本**原始字节**；`mint:<ep>` 的 before 是 schema 升级**之后**的账本，它在进段时尚不存在——其备份 = `serializeLedger(applySchemaUpgrade(before1.0Doc, {operation_id, request_key, from, to}))` 的字节（确定性：与 `schema_endpoint` 的 `intended_after` 逐字节相同，也就是执行器将要写下的那份），故 `mint.backup_sha256 === mint.before.ledger_sha256 === schema_endpoint.intended_after.ledger_sha256` 按构造成立；`campaign` / `writer_state` 的备份 = 受验读取器返回的**原始字节**（读取器必须带 `raw` 与 `revision`），`before.sha256` 就算在同一份 raw 上；文件不存在（`before.exists=false`）则无备份。**禁止**用状态投影重新 JSON 化当备份。
 `<token>.staged/`；`precheck`（**只读 step**）→ **三个 backup 字段恒 null**，不因目标存在而制备份。**每 operation 的全部 step 共享同一 `campaign_id`**
 （下表交叉等式），跨 campaign / 跨 endpoint 集拼接即 problem。
 
@@ -377,6 +379,9 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 （after === intended_after 逐字段），因此 `schema_upgrade` op 的 key 不能随机：`operation_id = uuid 形式化的 sha256(canonKey({ domain:"owner_select_schema_upgrade_v1", token, endpoint }))`
 （前 32 hex 按 8-4-4-4-12 排、版本位置 4、变体位置 8——与 OP_ID_SHAPE 相容），升版不改任何记录的 `updated_at`（只补显式 null），
 于是 `applySchemaUpgrade(beforeDoc, { operation_id, request_key, from, to })` 是纯函数，编排用它算 intended_after，执行器 `schemaUpgrade` 用同一函数产 next 并读回核等。
+**request_key 派生（#138 一轮 P2 回带）**：`schema_upgrade` 的 `request_key = token + ":schema:" + endpoint_id`（与 mint 的 `request_key = token` 不同键，避免同 token 两种 op 撞 request_key 幂等）；编排与执行器同一公式，reopening 身份核验按此逐字核。
+**执行器结果的记账规则（#138 一轮 P1-7 回带）**：编排只在执行器返回 `commit === "committed_clean"` 或 `replayed` 且读回 SHA === `intended_after` 时把 step 记 done；`committed_durability_uncertain` / `committed_with_residue` **不记 done**、operation 停在当前 phase（reason `commit_unclear`，残骸路径进 why），由 `--exit` 只向前收敛时重新读盘（原始字节 + 目录 fsync）核现场：现场 === intended_after → 记 done 续跑；否则说不清 → `reopening_incomplete`。
+**撤门前的不可变事务身份核验（#138 一轮 P1-7 回带）**：reopening 对每个 ep 逐字核——当前账本 SHA === 该 ep 最后一个 step 的 `after.ledger_sha256`；`operations[plan.operation_id]` 存在且 `op_type === "mint_selection_handles"`、`fingerprint === fingerprintOf("mint_selection_handles", plan 派生 inputs)`、result 触及集 === `plan.expected_null_b1_ids`；`operations[ownerSelectSchemaUpgradeOpId(token, ep)]` 存在且 from/to 与 step 相符；campaign / writer_state 文件的 state 与 kind 的终态一致。任一不符 → `reopening_incomplete`，门不撤。
 `mint` 同理已由 plan 冻结 `operation_id`。
 **执行器与 journal step 的 CAS（PR #137 一轮回带）**：`schemaUpgrade` / `mintSelectionHandles` 在账本写锁内核 `current SHA === step.before.ledger_sha256`（不等且 ≠ intended → `before_mismatch`；
 === intended → replayed/already），读回核 `=== step.intended_after.ledger_sha256`（否则 `written_mismatch`）；intended 在进 forward 段前冻结，**绝不提交后回填**。

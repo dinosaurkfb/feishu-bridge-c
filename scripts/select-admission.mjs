@@ -5,8 +5,13 @@
 //
 // selectReject(adm, handle_kind)：给定准入状态联合（off / partial / on / unreadable）与 handle_kind，返回拒绝
 //   { reason, text } 或 null（放行）。这是"三态准入"的确定性投影，测试用假 adm 覆盖四支。
+//
+// R57b：rfh 支接真执行器（owner_select_reaffirm，§8.1 消费编排 consumeReaffirmIntent）；
+// osh/orh 支仍落 failed 终态 select_executor_absent（另单，PR #136 二轮裁定：failed 是终态，重做须发新消息）。
 
+import { REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
+import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
 
 /** 写入准入 —— 默认读真实状态（执行器未接入期准入通过也落 failed(select_executor_absent) 终态，见 executeSelectControl）。 */
 export function selectAdmission(env = process.env) {
@@ -28,24 +33,59 @@ export function selectReject(adm, handle_kind) {
   return { reason: "select_writer_state_unreadable", text: "选择功能状态读不清，未执行" };
 }
 
-/**
- * 执行选择控制命令（在控制事务锁内跑）。
- * PR #136 二轮回带（P1 / §12）：执行器未接入期间，准入通过也【落普通 failed 终态】——
- * 落 control-failed 终态 select_executor_absent（回执"已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送"），
- * 终态不重试、重放直接报 control_failed_recorded 不再调用执行器，后续真执行器接入后需发新消息。
- */
-export function executeSelectControl(intent, { selectAdmissionFn = selectAdmission } = {}) {
-  const adm = selectAdmissionFn();
-  const ej = selectReject(adm, intent?.handle_kind);
-  if (ej) return { ok: false, reason: ej.reason, text: ej.text };
-  return { ok: false, reason: "select_executor_absent", text: "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送" };
-}
-
-/** 给定拒绝 reason 反解说明文案（重放从记录恢复文案时用）。 */
+/** 拒绝 reason → 说明文案（封闭映射；重放从记录恢复文案时同一份）。 */
 export function selectRejectTextByReason(reason) {
   if (reason === "select_executor_absent") return "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送";
   if (reason === "select_writer_state_unreadable") return "选择功能状态读不清，未执行";
   if (reason === "select_off") return "选择功能未开放（迁移未开始）";
   if (reason === "select_partial_not_rfh") return "迁移期间只接受 rfh_ 重确认 handle";
+  // R57b：rfh 支的失败映射（全部封闭，不让裸 reason 漏给 owner）
+  if (reason === "reaffirm_handle_unknown") return "重确认 handle 不存在或已被消费；要重做请在终端重新签发一条";
+  if (reason === "reaffirm_intent_expired") return "重确认 handle 已过期，请在终端重新签发";
+  if (reason === "sender_mismatch") return "只有签发时登记的 owner 本人才可消费这个重确认 handle";
+  if (reason === "chat_mismatch") return "请在签发时对应的话题里发送这条选择";
+  if (reason === "family_changed") return "目标记录在签发后变动过（暂停/恢复），请重新签发重确认";
+  if (reason === "digest_cas_mismatch" || reason === "selection_mismatch") return "目标记录在签发后变动过，请重新签发重确认";
+  if (reason === "reaffirm_target_missing") return "目标记录已不在账本里，请重新签发";
+  if (reason === "reaffirm_intents_unreadable") return "重确认意图文件读不出（fail-closed），未执行；请人工检查";
+  if (reason === "reaffirm_intents_busy") return "重确认处理忙，请稍后重发一条新消息";
+  if (reason === "reaffirm_intents_unwritable") return "重确认意图写不进（fail-closed），未执行；请人工检查";
+  if (reason === "ledger_corrupt" || reason === "ledger_unreadable") return "账本读不出，未执行（fail-closed）";
+  if (reason === "schema_not_11") return "账本还没升到 1.1，不能重签";
   return "控制执行失败（" + reason + "）";
+}
+
+/** rfh 成功文案（按 result 分支如实说签了什么）。 */
+export function selectReaffirmSuccessText(result) {
+  const what = result?.new_binding_proof ? "绑定与链路证明" : "链路证明";
+  return "已按你的确认重签该目标的" + what + "（target " + String(result?.target_id ?? "?").slice(0, 40) + "）";
+}
+
+/**
+ * 执行选择控制命令（在控制事务锁内跑）。
+ * R52a（PR #136 二轮回带）：准入通过但执行器缺席 → 落普通 failed 终态 select_executor_absent（终态不重试）。
+ * R57b（§8.1/§12）：rfh 支接真执行器 —— owner_select_reaffirm 消费 reaffirm intent；入站 sender /
+ * endpoint / chat 的消费侧核验在消费编排与 ledger op 内（§8.1 五核），本入口只负责把事件事实带进去。
+ * 注入面：selectAdmissionFn / consumeReaffirm（测试密闭，不读环境变量开关）。
+ */
+export function executeSelectControl(intent, {
+  selectAdmissionFn = selectAdmission,
+  consumeReaffirm = consumeReaffirmIntent,
+  senderId = null, chatId = null, endpointId = null, messageId = null,
+  now = Date.now(), env = process.env,
+} = {}) {
+  const adm = selectAdmissionFn(env);
+  const ej = selectReject(adm, intent?.handle_kind);
+  if (ej) return { ok: false, reason: ej.reason, text: ej.text };
+  if (intent?.handle_kind !== "rfh") {
+    return { ok: false, reason: "select_executor_absent", text: "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送" };
+  }
+  if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
+    return { ok: false, reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
+  }
+  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, now, env });
+  if (!res.ok) {
+    return { ok: false, reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
+  }
+  return { ok: true, changed: res.idempotent === true ? false : true, text: selectReaffirmSuccessText(res.result) };
 }

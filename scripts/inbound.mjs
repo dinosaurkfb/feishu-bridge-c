@@ -68,7 +68,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { selectAdmission, selectRejectTextByReason, executeSelectControl } from "./select-admission.mjs";
+import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -743,7 +743,16 @@ const runControl = (replay) => {
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
-    execute: () => executeSelectControl(control, { selectAdmissionFn }),
+    execute: () => executeSelectControl(control, {
+      selectAdmissionFn,
+      // R57b §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；chat=链路模板登记群
+      // （账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；messageId=本条命令消息。
+      senderId: event.sender_id ?? null,
+      chatId: bootTpl.template?.chat_id ?? null,
+      endpointId: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
+      messageId: verdict.messageId,
+      env: process.env,
+    }),
   });
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
   const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, project_root: routed.root, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
@@ -761,10 +770,13 @@ const runSelect = (replay) => {
     finish("error", { detail: "选择命令未执行（" + tx.why + "）" + lockNote }, { reason: tx.reason });
     return;
   }
+  const rfh = control.handle_kind === "rfh";
   if (!replay && !tx.replayed) {
-    writeReceipt("select-pending-" + verdict.messageId, { status: "consumed", reason: "select_pending", ...base, claim_acquired: true });
+    // R57b：rfh 支是真消费 → 落正式 consumed 收据；osh/orh 支仍执行器缺席，收据保持 select_pending 语义。
+    writeReceipt((rfh ? "select-" : "select-pending-") + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_pending", ...base, claim_acquired: true, changed: tx.changed });
   }
-  finish("control", { text: "已收到选择，执行器尚未接入" + lockNote, taskName: config.task_display_name },
+  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "已收到选择，执行器尚未接入");
+  finish("control", { text: doneText + lockNote, taskName: config.task_display_name },
     { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
 };
 

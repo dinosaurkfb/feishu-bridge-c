@@ -375,7 +375,8 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
     return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, resumed: replay, quarantined };
   }
   const cleaned = cleanupConsumedResidue({ claimsDir, key });
-  return { ok: true, intent, changed, resumed: replay, replayed: false, residueUncleared: cleaned.uncleared, residueUnknown: cleaned.unknown, quarantined };
+  // R57b：执行器的成功文案随终态带出（select rfh 支回执用；mode 支 done.text 恒缺省，行为不变）。
+  return { ok: true, intent, changed, text: done.text ?? null, resumed: replay, replayed: false, residueUncleared: cleaned.uncleared, residueUnknown: cleaned.unknown, quarantined };
 }
 
 /**

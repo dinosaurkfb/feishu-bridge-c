@@ -37296,6 +37296,24 @@ test("R54 返修六 P1：auxv 结构受验——无 AT_NULL 终止项 → unavai
 });
 
 
+// ── R54 返修七（Codex #141 七轮 1 P1）──
+
+test("R54 返修七 P1：未知 arch / 非法 endianness 先封闭拒绝——不调 getconf、不读 auxv（注入 getconf 成功仍拒且计数为 0）", () => {
+  const BTIME = 1700000000, TICKS = 5000;
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\n";
+  const files = { "/proc/77/stat": stat, "/proc/stat": procStat };
+  const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+  for (const [tag, over] of [["未知 arch", { arch: "future64", endianness: "LE" }], ["非法 endianness", { arch: "x64", endianness: "XX" }]]) {
+    const calls = [];
+    const r = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files ? files[p] : noent()), spawnSync: (cmd, args, opts) => { calls.push([cmd, args, opts]); return { status: 0, stdout: "250\n" }; }, ...over });
+    assert.equal(r.state, "unavailable", tag + " → unavailable（改前会绕到 getconf 判 ok）：" + JSON.stringify(r));
+    assert.match(String(r.why), /arch|endianness/u, tag + " why 点名 arch/endianness");
+    assert.deepEqual(calls, [], tag + "：getconf 读取器未被调用");
+  }
+});
+
+
 summarySealed = true;
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

@@ -86,10 +86,8 @@ function readMacos(pid, { spawnSync: spawn = spawnSync } = {}) {
   return { state: "ok", startMs: t };
 }
 
-/** /proc/self/auxv 的 AT_CLKTCK（受验读取）：布局由 arch/endianness 唯一确定，解析契约见 parseAuxvClkTck。 */
-function clktckFromAuxv(readFile, { arch, endianness }) {
-  const wordBytes = ARCH_WORD_BYTES[arch];
-  if (wordBytes === undefined) return null; // 未知 arch → unavailable，不猜
+/** /proc/self/auxv 的 AT_CLKTCK（受验读取）：布局由调用方封闭校验后的 wordBytes/endianness 唯一确定，契约见 parseAuxvClkTck。 */
+function clktckFromAuxv(readFile, { wordBytes, endianness }) {
   let buf = null;
   try { buf = readFile("/proc/self/auxv"); } catch { return null; }
   return parseAuxvClkTck(buf, { wordBytes, endianness });
@@ -107,9 +105,15 @@ function clktckFromGetconf(spawn) {
 
 /** Linux：/proc/<pid>/stat 的 starttime（第 22 字段）× CLK_TCK（受验读取）+ /proc/stat 的 btime。 */
 function readLinux(pid, { readFileSync: readFile = fs.readFileSync, spawnSync: spawn = spawnSync, arch, endianness } = {}) {
+  // 七轮 P1：先封闭校验 arch/endianness——映射外 arch 或非法字节序直接 unavailable，
+  // 不读 auxv、不调 getconf（不换布局猜、也不靠兜底侧瞎蒙一个 CLK_TCK 判 ok）。
+  const wordBytes = ARCH_WORD_BYTES[arch];
+  if (wordBytes === undefined || (endianness !== "LE" && endianness !== "BE")) {
+    return { state: "unavailable", why: "unknown arch/endianness（" + String(arch) + "/" + String(endianness) + "）" };
+  }
   // 五轮 P1-1：CLK_TCK 绝不猜 100——auxv 优先、getconf 兜底，皆取不到 → unavailable（调用方记未验证）。
-  // 六轮 P1：auxv 布局由 arch/endianness 唯一确定（未知 arch → unavailable），不按长度猜、不换布局试。
-  const clktck = clktckFromAuxv(readFile, { arch, endianness }) ?? clktckFromGetconf(spawn);
+  // 六轮 P1：auxv 布局由 arch/endianness 唯一确定，不按长度猜、不换布局试。
+  const clktck = clktckFromAuxv(readFile, { wordBytes, endianness }) ?? clktckFromGetconf(spawn);
   if (!CLK_TCK_SANE(clktck)) return { state: "unavailable", why: "CLK_TCK 取不到（auxv 无 AT_CLKTCK 且 getconf 不可用）" };
   let stat;
   try {

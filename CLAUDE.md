@@ -66,7 +66,8 @@ herdr agent read <pane> --source recent-unwrapped --lines 60
   （项目级或工作线级，与出站同一条选择规则）；不许据此去动别的 binding。
 - **控制命令从飞书来的精确形状**（正文**恰为**下列之一，多一个字都不算）：
   `/feishu-bind`、`/feishu-rotate`、`/feishu-rotate cancel`、`/feishu-mode dialogue`、
-  `/feishu-mode mapping`。bind / rotate 两类按对应技能文档跑那条脚本（飞书文本不会触发斜杠命令）；
+  `/feishu-mode mapping`、`/feishu-select`、`/feishu-select <osh_|orh_|rfh_ + 32 位十六进制>`（2026-09-09 起，PR #136：路由侧确定性处置，
+  执行器未接入期一律回"未开放/未消费"的失败终态，重做须发新消息；选择的实际执行是后续单）。bind / rotate 两类按对应技能文档跑那条脚本（飞书文本不会触发斜杠命令）；
   `/feishu-mode …` 两条**不经过你** —— 入站路由器拿到 claim 后当场切换并回执（scripts/control-command.mjs）。
   `/feishu-subscribe`（正文恰为，只读查看订阅投影）从飞书开放；`/feishu-unbind`、`/feishu-pin-session` **不**从飞书开放，
   路由层会把它们当场拒掉并指路终端；订阅的**写**操作（`register-sender.mjs --apply` 等）只在终端、且要 owner 逐次授权。

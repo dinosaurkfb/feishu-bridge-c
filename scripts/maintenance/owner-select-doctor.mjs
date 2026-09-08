@@ -31,7 +31,7 @@
 import fs from "node:fs";
 
 import { isCanonicalIso } from "../canonical-time.mjs";
-import { loadByEndpoint, validateLedger, familyOf, migrationInventory, ledgerRootFor } from "../topic-agent-ledger.mjs";
+import { loadByEndpoint, validateLedger, familyOf, migrationInventory, validateLedgerRoot } from "../topic-agent-ledger.mjs";
 import { aggregateEndpointReceipts } from "./ledger-receipt.mjs";
 import { readCampaignState, readWriterState, readOwnerSelectAdmission } from "./owner-select-state.mjs";
 import { readActive, readJournal, OWNER_SELECT_OPERATION_KINDS } from "./journal.mjs";
@@ -77,8 +77,13 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
   if (agg.unreadable?.length > 0) {
     return { endpoints, chain: { ...chain, unclear: "收据 journal 读不出 " + agg.unreadable.length + " 个（如 " + agg.unreadable[0].token.slice(0, 8) + "：" + agg.unreadable[0].why + "）" }, summary, intentNote: INTENT_NOTE };
   }
-  const root = ledgerRootFor(env);
-  const rootAbsent = root === null || !fs.existsSync(root);
+  // R56 返修二 P1-1：根缺席判定复用唯一根校验器——只有 root_absent 才允许「尚未接入」（且零 initDone
+  // 收据）；no_root / root_symlink / root_not_canonical / root_unresolvable / root_perms 一律「查不清」。
+  const rootV = validateLedgerRoot({ env, mustExistRoot: true });
+  if (!rootV.ok && rootV.reason !== "root_absent") {
+    return { endpoints, chain: { ...chain, unclear: "账本根不可信（" + rootV.reason + (rootV.why ? "：" + rootV.why : "") + "）" }, summary, intentNote: INTENT_NOTE };
+  }
+  const rootAbsent = !rootV.ok && rootV.reason === "root_absent";
   // P1-4：全新机器——无任何收据且账本根缺席 → 本项不适用（尚未接入），不算红也不算查不清
   if (agg.endpoints.length === 0 && rootAbsent) {
     return { endpoints, chain: { state: "off", problems: [], unclear: null, note: null }, summary, intentNote: INTENT_NOTE, notApplicable: "尚未接入（没有任何 init 收据，账本根也未建）" };
@@ -154,7 +159,10 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
     // campaign endpoints ⊆ initDone（P1-3：conflict/in-flight endpoint 不在集内 → 这里点名）；
     // campaign state 与各 endpoint 账本 schema 相容
     if (c.exists && Array.isArray(c.endpoints)) {
-      const extras = c.endpoints.filter((ep) => !initDoneSet.has(ep));
+      // R56 返修二 P2-3：收据不可信的 endpoint 已在收据层报过一次 unclear——campaign 检查不再对它
+      // 生成「收录未 initDone」的 chain block（一次事实只报一次）。
+      const receiptUnclear = new Set(agg.endpoints.filter((e) => e.state !== "ok").map((e) => e.endpointId));
+      const extras = c.endpoints.filter((ep) => !initDoneSet.has(ep) && !receiptUnclear.has(ep));
       if (extras.length > 0) chain.problems.push("campaign 收录了未 initDone 的 endpoint：" + extras.join("、"));
       for (const ep of c.endpoints) {
         const schema = schemaByEndpoint.get(ep);

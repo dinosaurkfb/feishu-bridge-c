@@ -862,7 +862,7 @@ export function runDoctor({
   {
     const dir17 = maintenanceDir();
     if (dir17 === null) {
-      add("owner_select_reconcile", "owner_select 对账", null, "家目录查不出来，维护目录未知", null);
+      add("owner_select_reconcile", "⑰ owner_select 对账", null, "家目录查不出来，维护目录未知", null);
     } else {
       const rec = ownerSelectReconcile({ maintenanceDir: dir17, now });
       const parts = [];
@@ -886,7 +886,7 @@ export function runDoctor({
       const hasBlock = rec.summary.block > 0 || rec.chain.problems.length > 0;
       const hasUnclear = rec.summary.unclear > 0 || rec.chain.unclear !== null;
       // P2-6：项名不硬编码 ⑰——编号在 R54 ⑯（#141）合并后核对
-      add("owner_select_reconcile", "owner_select 对账", hasBlock || hasUnclear ? false : true, body, null);
+      add("owner_select_reconcile", "⑰ owner_select 对账", hasBlock || hasUnclear ? false : true, body, null);
     }
   }
 

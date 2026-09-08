@@ -38691,10 +38691,86 @@ test("R56 返修一 P2-6/P2-7：项名不硬编码 ⑰；诊断正文不输出 h
   r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
   const rep = doctorReport(m.run());
   const c = checkOf(rep, "owner_select_reconcile");
-  assert.equal(c.name, "owner_select 对账", "项名不硬编码 ⑰（编号 R54 ⑯ 合并后核对）：" + c.name);
+  assert.equal(c.name, "⑰ owner_select 对账", "编号定名（R54 ⑯ 已入 main）：" + c.name);
   assert.doesNotMatch(c.detail, /osh_[0-9a-f]{4}/u, "正文不输出 handle 前缀：" + c.detail);
   assert.match(c.detail, /G-handle|不唯一/u, "重复仍点名（脱敏后）：" + c.detail);
 });
+
+// ── R56 返修二（Codex #143 二轮 2 P1 + 3 P2）──
+
+test("R56 返修二 P1-1：账本根缺席判定复用唯一根校验器——悬空 symlink 根 / 父链 symlink / 根是文件 → 查不清，绝不「尚未接入」", () => {
+  // (a) 悬空 symlink 根：existsSync=false → 改前误判「尚未接入」
+  let m = doctorMachine();
+  fs.rmSync(m.ledgerDir, { recursive: true, force: true });
+  fs.symlinkSync(path.join(m.home, "no-such-target"), m.ledgerDir);
+  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "悬空 symlink 根 → 查不清（改前 ok:true 尚未接入）：" + c.detail);
+  assert.match(c.detail, /账本根不可信.*root_symlink/u, c.detail);
+  // (b) 父链 symlink：bridge 目录外指 → root_not_canonical
+  m = doctorMachine();
+  const bridgeDir = path.join(m.home, ".claude", "feishu-bridge");
+  const elsewhere = path.join(m.home, "elsewhere");
+  fs.mkdirSync(elsewhere, { recursive: true });
+  fs.renameSync(bridgeDir, path.join(elsewhere, "bridge"));
+  fs.symlinkSync(path.join(elsewhere, "bridge"), bridgeDir);
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "父链 symlink → 查不清：" + c.detail);
+  assert.match(c.detail, /账本根不可信.*root_not_canonical/u, c.detail);
+  // (c) 根位置是普通文件
+  m = doctorMachine();
+  fs.rmSync(m.ledgerDir, { recursive: true, force: true });
+  fs.writeFileSync(m.ledgerDir, "x", { mode: 0o600 });
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "根是文件 → 查不清：" + c.detail);
+  assert.match(c.detail, /账本根不可信/u, c.detail);
+});
+
+test("R56 返修二 P2-3：收据不可信的 endpoint 只报一次 receipt unclear——campaign 检查不再对它生成「收录未 initDone」chain block", () => {
+  const m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const { doc: cutDoc, tok: cutTokOld } = r56InitJournal(R56_EPS[0]);
+  const cutTok = r56Uuid(5);
+  const cut = JSON.parse(JSON.stringify(cutDoc).split(cutTokOld).join(cutTok));
+  cut.operation_kind = "ledger_cutover";
+  cut.phase = "ledger_cutting_over";
+  const lstep = cut.steps.find((st) => st.kind === "ledger");
+  lstep.id = "ledger:" + R56_EPS[0] + ":cutover";
+  lstep.state = "prepared";
+  lstep.before = { endpoint_id: R56_EPS[0], operation_id: cutTok, fingerprint: "b".repeat(64), authority_mode: "shadow", revision: 1, ledger_sha256: "b".repeat(64), bijection_digest: null };
+  lstep.intended_after = { endpoint_id: R56_EPS[0], operation_id: cutTok, fingerprint: "b".repeat(64), authority_mode: "authoritative", revision: 2, ledger_sha256: "c".repeat(64), bijection_digest: "c".repeat(64) };
+  lstep.after = null;
+  fs.writeFileSync(path.join(m.maintDir, cutTok + ".json"), JSON.stringify(cut, null, 2) + "\n", { mode: 0o600 });
+  const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  let rec;
+  try { rec = ownerSelectReconcile({ maintenanceDir: m.maintDir }); }
+  finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /收据 conflict/u, "该 ep 恰以 receipt unclear 报一次：" + c.detail);
+  assert.ok(rec.chain.problems.every((p) => !p.includes(R56_EPS[0])), "chain.problems 不含收据不可信的 ep（改前有「campaign 收录未 initDone」）：" + JSON.stringify(rec.chain));
+});
+
+test("R56 返修二 P2-4：编号定名「⑰ owner_select 对账」（R54 ⑯ 已入 main，不再漂移）", () => {
+  const m = doctorMachine();
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.name, "⑰ owner_select 对账", "编号定名（改前无 ⑰）：" + c.name);
+});
+
+test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂、该 endpoint 查不清", () => {
+  const m = doctorMachine();
+  r56Plant(m, { ledgerOver: r56StrictLedgerOver(), campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")) });
+  const f = path.join(m.ledgerDir, R56_EPS[0], "ledger.json");
+  fs.rmSync(f);
+  execFileSync("mkfifo", [f]);
+  const t0 = Date.now();
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.ok(Date.now() - t0 < 30000, "不挂");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清 1/u, "FIFO → 该 endpoint 查不清：" + c.detail);
+});
+
+
 
 
 

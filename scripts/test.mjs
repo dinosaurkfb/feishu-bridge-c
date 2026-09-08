@@ -36701,7 +36701,9 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     fx.lease = acquireOperationLease({ dir: fx.maintDir, token: fx.tok });
 
     // 放行冒烟：capability 全过后不再是 capability 拒（§二实现后直接执行成功，同样证明核验放行）。
-    const smoke = TAL.schemaUpgrade(args);
+    let smoke;
+    try { smoke = TAL.schemaUpgrade(args); }
+    catch (e) { console.error("R51STACK:", String(e.stack).split("\n").slice(0, 6).join(" | ")); throw e; }
     assert.ok(smoke.ok === true, "capability 全过后执行成功（证明核验放行）：" + JSON.stringify(smoke));
   }));
 
@@ -36908,6 +36910,46 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
 
   // §五 用：重置账本回 transition before 态（同 dir 重写）。
   const r51SeedTransition2 = (dir, opts) => r51SeedTransition(dir, opts);
+
+  test("R51 返修一 P1-1：提交点栅栏——rename 前删真实 lease → 必拒且账本 SHA 不变（两入口）", () => {
+    // schemaUpgrade 入口
+    {
+      r51WithRoot((root, dir) => {
+        r51Seed(dir);
+        const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+        const preTok = r51Uuid(9);
+        const frozenSha = r51ShaOf52(TAL.serializeLedger(TAL.applySchemaUpgrade(L0.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(preTok, EP51), request_key: "req_fence", from_schema: "1.0", to_schema: "1.1-transition" })));
+        const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: L0.doc.schema_version, ledgerRevision: L0.doc.revision, transitionAfterSha: frozenSha, tok: preTok });
+        const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+        const before = TAL.loadLedger(dir, { endpointId: EP51 }).sha256;
+        const r = TAL.schemaUpgrade({ endpointId: EP51, capability: { kind: "schema_upgrade", token: fx.tok }, requestKey: "req_fence", fromSchema: "1.0", toSchema: "1.1-transition", env, _inject: { beforeLedgerRename: () => { fs.rmSync(path.join(fx.maintDir, fx.tok + ".lease"), { force: true }); } } });
+        assert.equal(r.ok, false, "删 lease 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase }));
+        assert.match(r.reason, /lease_lost|commit_failed/, "拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).sha256, before, "账本 SHA 不变");
+      });
+    }
+    // mintSelectionHandles 入口
+    {
+      r51WithRoot((root, dir) => {
+        r51SeedTransition(dir, { nullB1Count: 1 });
+        const L0 = TAL.loadLedger(dir, { endpointId: EP51 });
+        const preTok = r51Uuid(9);
+        const plan = TAL.buildMintPlan({ doc: L0.doc, token: preTok, campaignId: campaignIdFor(preTok), endpointId: EP51, requestKey: preTok, now: Date.parse(T0), ttlMs: 30 * 24 * 60 * 60 * 1000 });
+        assert.equal(TAL.mintPlanProblem(plan), null);
+        const fx = r51FixtureA({ root, ledgerSha: L0.sha256, ledgerSchema: "1.0", ledgerRevision: 2, transitionAfterSha: L0.sha256, tok: preTok, nullB1Count: 1 });
+        const env = { FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_MAINTENANCE_DIR: fx.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: fx.gateFile };
+        fx.rewrite((d) => {
+          const mi = d.steps.find((s) => s.kind === "mint");
+          mi.intended_after.ledger_sha256 = plan.expected_ledger_sha256;
+        });
+        const before = TAL.loadLedger(dir, { endpointId: EP51 }).sha256;
+        const r = TAL.mintSelectionHandles({ endpointId: EP51, capability: { kind: "mint_selection_handles", token: fx.tok }, plan, env, _inject: { beforeLedgerRename: () => { fs.rmSync(path.join(fx.maintDir, fx.tok + ".lease"), { force: true }); } } });
+        assert.equal(r.ok, false, "mint 删 lease 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason }));
+        assert.match(r.reason, /lease_lost|commit_failed/, "拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(TAL.loadLedger(dir, { endpointId: EP51 }).sha256, before, "账本 SHA 不变");
+      });
+    }
+  });
 
   test("R51 §五 mintSelectionHandles：三态 CAS + plan 绑定 + 集合等式 + written_mismatch", () => r51WithRoot((root, dir) => {
     // 账本：transition（2 null-B1），mint step 锚真账本 SHA（transitionAfterSha = 现场 SHA）。

@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld } from "./registry.mjs";
+import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
@@ -1571,7 +1571,7 @@ function fsyncDir(dir) { let fd = null; try { fd = fs.openSync(dir, fs.constants
  * capability 校验通过后被调用。replay:{opType,inputs} 前置：命中即幂等（不写、返回原 result_revision）。
  * 释放失败折进四态结果（评审 P1-5），不在 finally 静默吞。
  */
-function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null, mutate, staleMs = LOCK_STALE_MS, allowAbsent = false, _inject = null }) {
+function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null, mutate, staleMs = LOCK_STALE_MS, allowAbsent = false, _inject = null, _fence = null }) {
   const inj = _inject ?? {};
   const { lock: lockDir, prev: prevPath, ledger: ledgerPath } = ledgerPaths(dir);
   const acq = gated ? acquirePublishLock : acquireLockUngated;
@@ -1643,6 +1643,11 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
     const fenced = commitWhileHeld(lockDir, () => {
       if (ptTmp) { try { fs.renameSync(ptTmp, prevPath); ptTmp = null; } catch (err) { renameErr = err; return; } }
       if (inj.beforeLedgerRename) inj.beforeLedgerRename();
+      // R51 返修一 P1-1：提交点栅栏（rename 前、注入钩子之后最后时刻）——_fence 复核 active/gate/journal/step/lease
+      if (_fence !== null) {
+        const fenceFail = typeof _fence === "function" ? _fence() : _fence;
+        if (fenceFail) { renameErr = new Error("fence:" + fenceFail); return; }
+      }
       try { fs.renameSync(ltTmp, ledgerPath); ltTmp = null; } catch (err) { renameErr = err; }
     });
     // 提交阶段取锁异常投影（评审六 P2）：lock_lost 单列；reap_residue/reap_busy/io_error 保留原 reason 与 path/error，
@@ -2209,10 +2214,16 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
   if (!d.ok) return badTx(d);
   const inputs = { request_key: requestKey, endpoint: endpointId, from_schema: fromSchema, to_schema: toSchema };
   let builtSha = null; // 写前算好的预期 SHA（serializeLedger 同源），读回核锚它
-  const res = writeLedger({
-    dir: d.dir, endpointId, gated: false, requestKey, _inject,
-    replay: () => [{ opType: "schema_upgrade", inputs }],
-    mutate: (currentDoc) => {
+  const maintDir0 = cap.maintenanceDir, opToken = capability.token;
+  // P1-1：compare → build → 账本锁 → rename 全程包进同一次真实 lease 实例的 commitWhileHeld 栅栏；
+  //   提交点（rename 前）复核 active/gate/journal/step/lease，任一漂移 → rename 不执行。
+  const leasePath0 = leasePath(maintDir0, opToken);
+  let res0Out = null;
+  const res0 = commitWhileHeld(leasePath0, () => {
+    res0Out = writeLedger({
+      dir: d.dir, endpointId, gated: false, requestKey, _inject,
+      replay: () => [{ opType: "schema_upgrade", inputs }],
+      mutate: (currentDoc) => {
       if (currentDoc === null) return { ok: false, reason: "absent" };
       // strict/direct 当场重新盘点（§8：Codex 不以现场盘点作放行依据，实现单门内当场重盘）；transition 不盘（precheck 仅 B/direct）。
       if (toSchema === "1.1") {
@@ -2233,7 +2244,24 @@ export function schemaUpgrade({ endpointId, capability, requestKey, fromSchema, 
       builtSha = sha256(serializeLedger(next));
       return { ok: true, next };
     },
+      _fence: () => {
+        const act = readActive({ dir: maintDir0 });
+        if (act.state !== "active" || act.token !== opToken) return "active 漂移";
+        const g = readGate({ file: maintenanceGatePath(env), now: Date.now() });
+        if (g.state !== "active" || g.payload?.token !== opToken) return "门漂移";
+        const j2 = readJournal({ dir: maintDir0, token: opToken });
+        if (j2.state !== "valid" || j2.doc.phase !== cap.doc.phase) return "journal 漂移";
+        const st2 = j2.doc.steps.find((s) => s.kind === "schema_endpoint" && s.id === cap.osmStep.id);
+        if (!st2 || st2.state !== "prepared") return "step 漂移";
+        const lk = readLockOwner(leasePath0);
+        if (!lk.present || !lk.owner || lk.owner.pid !== process.pid) return "lease 已非本进程";
+        return null;
+      },
+    });
   });
+  const res = res0Out;
+  if (res0.fenceFail) return { ok: false, commit: "not_committed", reason: "lease_lost", why: "提交点栅栏：" + res0.fenceFail, ...wrNote(res) };
+  if (!res0.ok) return { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" };
   if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return { ok: false, commit: res?.commit ?? "not_committed", reason: res?.reason ?? "written_refused", why: res?.why ?? null, ...wrNote(res) };
   if (res.idempotent) return { ok: true, commit: "replayed", revision: res.revision, result: res.result, ...wrNote(res) };
   const reread = loadLedger(d.dir, { endpointId });
@@ -2263,7 +2291,9 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
   }
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return badTx(d);
-  const res = writeLedger({
+  let res0Out = null;
+  const res0 = commitWhileHeld(leasePath(cap.maintenanceDir, capability.token), () => {
+    res0Out = writeLedger({
     dir: d.dir, endpointId, gated: false, requestKey: plan.request_key, _inject,
     replay: () => [{ opType: "mint_selection_handles", inputs: { request_key: plan.request_key, endpoint: plan.endpoint, expected_null_b1_ids: plan.expected_null_b1_ids } }],
     mutate: (currentDoc) => {
@@ -2280,8 +2310,25 @@ export function mintSelectionHandles({ endpointId, capability, plan, env = proce
       if (curSha === plan.expected_ledger_sha256) return { ok: false, reason: "already", why: "账本已处于 plan.expected 态" };
       return { ok: false, reason: "ledger_diverged", why: "账本既非 plan.before 也非 plan.expected 态" };
     },
-  });
-  if (res.ok && typeof res.commit === "string" && res.commit.startsWith("committed")) {
+      _fence: () => {
+        const act = readActive({ dir: cap.maintenanceDir });
+        if (act.state !== "active" || act.token !== capability.token) return "active 漂移";
+        const g = readGate({ file: maintenanceGatePath(env), now: Date.now() });
+        if (g.state !== "active" || g.payload?.token !== capability.token) return "门漂移";
+        const j2 = readJournal({ dir: cap.maintenanceDir, token: capability.token });
+        if (j2.state !== "valid" || j2.doc.phase !== cap.doc.phase) return "journal 漂移";
+        const st2 = j2.doc.steps.find((s) => s.kind === "mint" && s.id === cap.osmStep.id);
+        if (!st2 || st2.state !== "prepared") return "step 漂移";
+        const lk = readLockOwner(leasePath(cap.maintenanceDir, capability.token));
+        if (!lk.present || !lk.owner || lk.owner.pid !== process.pid) return "lease 已非本进程";
+        return null;
+      },
+    });
+    });
+    const res = res0Out;
+    if (res0.fenceFail) return { ok: false, commit: "not_committed", reason: "lease_lost", why: "提交点栅栏：" + res0.fenceFail };
+    if (!res0.ok) return { ok: false, commit: "not_committed", reason: res0.reason === "lock_lost" ? "lease_lost" : (res0.reason ?? "lease_lost"), why: res0.why ?? "本过程不再持有 operation 租约实例" };
+    if (res.ok && typeof res.commit === "string" && res.commit.startsWith("committed")) {
     if (res.idempotent) return { ok: true, commit: "already", revision: res.revision, result: res.result, ...wrNote(res) };
     const reread = loadLedger(d.dir, { endpointId });
     if (!reread.ok || reread.sha256 !== plan.expected_ledger_sha256) {

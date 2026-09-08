@@ -38612,6 +38612,94 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 返修一 (a1)：B 前置当场盘点计数非零 → precheck_failed 且留 drained", () => {
+    const fx = r52Setup({ twoEps: true }); // 默认账本含 null-B1 记录
+    try {
+      const campaignTok = r52Uuid(2);
+      const cid = campaignIdFor(campaignTok);
+      // 每 ep：1.0 账本（含 null-B1 记录）→ applySchemaUpgrade 到 1.1-transition（记录保留 → 计数非零）
+      for (const ep of fx.eps) {
+        const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(p, "utf-8"));
+        const next = TAL.applySchemaUpgrade(dd, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(campaignTok, ep), request_key: campaignTok + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1-transition" });
+        fs.writeFileSync(p, TAL.serializeLedger(next), { mode: 0o600 });
+        assert.equal(TAL.validateLedger(next, { endpointId: ep }).ok, true, ep + " transition 账本自洽（含 null-B1）");
+      }
+      const openDoc = { schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state: "open", endpoints: fx.eps, endpoints_digest: endpointsDigest(fx.eps), pending_joins: [], members: Object.fromEntries(fx.eps.map((ep) => [ep, { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 1 }])), revision: 1, origin_operation_id: campaignTok };
+      fs.writeFileSync(campaignPath(fx.env), JSON.stringify(openDoc, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify({ schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(fx.eps), revision: 1, origin_operation_id: campaignTok }, null, 2) + "\n", { mode: 0o600 });
+      const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+      assert.equal(r.ok, false, "B 计数非零必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "precheck_failed", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      assert.equal(r.phase, "drained", "留 drained（删该守卫 → 失败移 forward 相位红）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修一 (a2)：direct 前置计数非零 → precheck_failed 且留 drained", () => {
+    const fx = r52Setup({ twoEps: true }); // 默认账本含 null-B1 记录（1.0）
+    try {
+      for (const ep of fx.eps) {
+        const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(p, "utf-8"));
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: Object.values(dd.records).filter((r) => r.kind === "live").map((r) => r.topic_agent_id) };
+        fs.writeFileSync(p, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+        assert.equal(TAL.validateLedger(dd, { endpointId: ep }).ok, true, ep + " 1.0 账本自洽（含 null-B1）");
+      }
+      const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
+      assert.equal(r.ok, false, "direct 计数非零必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "precheck_failed", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      assert.equal(r.phase, "drained", "留 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修一 (a3)：B 前置 campaign 非 open（sealed）→ campaign_state_bad 且留 drained", () => {
+    const fx = r52Setup({ twoEps: true, noReceipts: true });
+    try {
+      const campaignTok = r52Uuid(2);
+      const cid = campaignIdFor(campaignTok);
+      // 账本推成 transition 且计数 0（r53SetupB 同款：清空记录）+ open campaign 改成 sealed + partial writer
+      for (const ep of fx.eps) {
+        const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(p, "utf-8"));
+        dd.schema_version = "1.1-transition"; dd.revision = 3;
+        const upOpId = "00000000-0000-4000-8000-00000000000a";
+        dd.operations[upOpId] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "seed_schema_upgrade", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "seed_schema_upgrade", endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" } };
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: [] }; dd.records = {};
+        fs.writeFileSync(p, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+        assert.equal(TAL.validateLedger(dd, { endpointId: ep }).ok, true, ep + " transition 账本自洽");
+      }
+      // campaign 已是 sealed（非 open）→ B 前置 campaign_state_bad
+      const sealedDoc = { schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state: "sealed", endpoints: fx.eps, endpoints_digest: endpointsDigest(fx.eps), pending_joins: [], members: Object.fromEntries(fx.eps.map((ep) => [ep, { schema_version: "1.1-transition", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 1, origin_operation_id: campaignTok };
+      fs.writeFileSync(campaignPath(fx.env), JSON.stringify(sealedDoc, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify({ schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(fx.eps), revision: 1, origin_operation_id: campaignTok }, null, 2) + "\n", { mode: 0o600 });
+      const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+      assert.equal(r.ok, false, "B 前置 campaign 非 open 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "campaign_state_bad", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      assert.equal(r.phase, "drained", "留 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
+    // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
+    const run = (kind, ctxFn) => {
+      const fx = ctxFn();
+      try {
+        const outBuf = [];
+        MOS.runMaintenanceOwnerSelect(["--migrate-" + (kind === "a" ? "a" : kind === "b" ? "b" : "direct"), "--apply"], { ctx: fx.ctx, out: (s) => outBuf.push(s), env: fx.env });
+        const txt = outBuf.join("\n");
+        assert.match(txt, /owner_select 迁移 (A|B|direct) 没做成/, kind + " 失败措辞（" + kind + "）：" + txt);
+        if (kind === "b") assert.match(txt, /迁移 B/, "B 用 B 措辞");
+        if (kind === "direct") assert.match(txt, /迁移 direct/, "direct 用 direct 措辞");
+      } finally { fx.cleanup(); }
+    };
+    // a：runtime 前置拒（FEISHU_BRIDGE runtime 缺席）——用 noReceipts 构造 frozen_set_empty 拒同样走失败路径
+    run("a", () => r52Setup({ twoEps: true, noReceipts: true }));
+    run("b", () => r52Setup({ twoEps: true, noReceipts: true }));
+    run("direct", () => r52Setup({ twoEps: true, noReceipts: true }));
+  });
+
   test("R53 CLI：--migrate-b/--migrate-direct 预览与全程、--status 准入投影、--exit 三 kind 分派", () => {
     const fx = r53SetupB({});
     try {

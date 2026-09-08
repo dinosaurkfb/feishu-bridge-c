@@ -126,15 +126,23 @@ export function runMaintenanceOwnerSelect(argv, { ctx = null, out = (s) => proce
   }
   const rows = releaseRows(r);
   const code = exitCodeFor(r);
+  // R53 返修一 (b)：失败/拒绝/完成/卡住的文案按 kind 分段（A/B/direct 各自措辞），不再一律「迁移 A」。
+  const KIND_LABEL = { a: "A", b: "B", direct: "direct" };
+  const DONE_BY_KIND = {
+    a: "transition + handle 已铸 + writer partial",
+    b: "transition→strict + campaign complete + writer on",
+    direct: "1.0→1.1 直升 + campaign complete + writer on",
+  };
+  const label = KIND_LABEL[kind] ?? "?" + kind;
   if (!r.ok) {
-    out("owner_select 迁移 A 没做成（" + fmtFail(r) + "）" + (r.rollback ? (r.rollback.ok ? "；已按账回退还清" : "；回退没做全（" + String(r.rollback.why ?? r.rollback.phase) + "，门与账保留，看 --status）") : "") + (rows.length ? "；且" + rows.join("；且") + "—— 只人工核对" : "") + "\n旁路指示：先看 --status。");
+    out("owner_select 迁移 " + label + " 没做成（" + fmtFail(r) + "）" + (r.rollback ? (r.rollback.ok ? "；已按账回退还清" : "；回退没做全（" + String(r.rollback.why ?? r.rollback.phase) + "，门与账保留，看 --status）") : "") + (rows.length ? "；且" + rows.join("；且") + "—— 只人工核对" : "") + "\n旁路指示：先看 --status。");
     return code;
   }
   if (r.phase === "done" && r.activeCleared === true) {
-    out("owner_select 迁移 A 完成：transition + handle 已铸 + writer partial，重开 done、active 已清" + (rows.length ? "；但" + rows.join("；且") + "—— 人工核对" : ""));
+    out("owner_select 迁移 " + label + " 完成：" + (DONE_BY_KIND[kind] ?? "") + "，重开 done、active 已清" + (rows.length ? "；但" + rows.join("；且") + "—— 人工核对" : ""));
     return code;
   }
-  out("owner_select 迁移 A 没做完：阶段 " + String(r.phase) + (r.incomplete?.length ? "\n" + r.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "") + (rows.length ? "\n且" + rows.join("\n且") : "") + "\n门与账保留（forward-only 只向前），处置后再跑 --status。");
+  out("owner_select 迁移 " + label + " 没做完：阶段 " + String(r.phase) + (r.incomplete?.length ? "\n" + r.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "") + (rows.length ? "\n且" + rows.join("\n且") : "") + "\n门与账保留（forward-only 只向前），处置后再跑 --status。");
   return code;
 }
 

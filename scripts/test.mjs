@@ -37686,11 +37686,32 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
           const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
           handlesBefore[ep] = L.ok ? Object.values(L.doc.records).filter((rec) => rec.kind === "live" && (rec.selection_handle ?? null) !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]) : [];
         }
+        // P2-6（真机安全）：子进程绝不能碰真实 launchctl——把假 launchctl 写进夹具 PATH + FEISHU_BRIDGE_LAUNCHCTL，
+        // 假脚本每次被调都落标记文件，据此断言真实 launchctl 未被调用。
+        const claudeJob = claudeDrainExpectedJobB({ home: fx.home, node: pickClaudeNodeB() });
+        const fakeLc = path.join(fx.base, "fake-launchctl.mjs");
+        fs.writeFileSync(fakeLc, [
+          "import fs from \"node:fs\";",
+          "const [cmd, label] = process.argv.slice(2);",
+          "const marker = process.env.FAKE_LAUNCHCTL_MARKER;",
+          "if (marker) fs.appendFileSync(marker, (cmd || \"\") + \" \" + (label || \"\") + \"\\n\");",
+          "if (cmd !== \"list\") process.exit(0);",
+          "if (label === " + JSON.stringify(CLAUDE_DRAIN_LAUNCH_LABEL) + ") { process.stdout.write('{ \"ProgramArguments\" = ( ' + [" + claudeJob.args.map((a) => JSON.stringify(a)).join(",") + "].map(a => \"\\\"\" + a + \"\\\"\").join(\"; \") + ' ); };'); process.exit(0); }",
+          "process.stderr.write(\"Could not find service\"); process.exit(113);",
+        ].join("\n"), { mode: 0o600 });
+        const binDir = path.join(fx.base, "bin"); fs.mkdirSync(binDir, { recursive: true, mode: 0o700 });
+        const wrapper = path.join(binDir, "launchctl");
+        fs.writeFileSync(wrapper, "#!/bin/sh\nexec " + JSON.stringify(process.execPath) + " " + JSON.stringify(fakeLc) + " \"$@\"\n", { mode: 0o755 });
+        const marker = path.join(fx.base, "launchctl-called.marker");
+        const cliEnv = { ...fx.env, FEISHU_BRIDGE_LAUNCHCTL: wrapper, FAKE_LAUNCHCTL_MARKER: marker, PATH: binDir + ":" + (fx.env.PATH ?? "") };
         // 真正以子进程跑 CLI：--exit --apply 必须路由到 osmExit（P1-1 分派），而非通用 rollback。
         let cliStdout = "", cliCode = null;
-        try { cliStdout = execFileSync(process.execPath, [path.resolve("scripts", "maintenance-gate.mjs"), "--exit", "--apply"], { encoding: "utf-8", env: fx.env, stdio: ["ignore", "pipe", "pipe"] }); cliCode = 0; }
+        try { cliStdout = execFileSync(process.execPath, [path.resolve("scripts", "maintenance-gate.mjs"), "--exit", "--apply"], { encoding: "utf-8", env: cliEnv, stdio: ["ignore", "pipe", "pipe"] }); cliCode = 0; }
         catch (e) { cliCode = e.status ?? null; cliStdout = String(e.stdout ?? "") + String(e.stderr ?? ""); }
         assert.equal(cliCode, 0, "CLI --exit --apply 退出码 0（崩溃点 " + crashAfter + "）：" + JSON.stringify({ cliCode, cliStdout: String(cliStdout).slice(0, 400) }));
+        // P2-6：假 launchctl 被调用（标记文件存在）→ 真实 launchctl 未被调；标记内容点名 list。
+        assert.equal(fs.existsSync(marker), true, "假 launchctl 被调用（" + fs.existsSync(marker) + "）：" + (fs.existsSync(marker) ? fs.readFileSync(marker, "utf-8") : ""));
+        assert.match(String(fs.readFileSync(marker, "utf-8")), /^list /u, "假 launchctl 被 list 调用：" + fs.readFileSync(marker, "utf-8"));
         // 收敛 done + active 已清（绝不回退 / 绝不留下未完成终态）。
         const afterActive = readActive({ dir: fx.dir });
         const j52 = readJournal({ dir: fx.dir, token: act52.token });
@@ -38488,6 +38509,21 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const c3 = stepCommitCheck52({ ok: true, commit: "committed_clean", lock_state: "unclear" });
     assert.equal(c3?.reason, "commit_unclear", "lock_state=unclear → commit_unclear：" + JSON.stringify(c3));
     assert.match(String(c3?.why), /lock_state/, "why 点名 lock_state");
+  });
+
+  test("R52 返修二 P2-5：stepCommitCheck 按 kind 收窄——ledger 类只认 committed_clean|replayed|already，state 类只认 committed，混用 → commit_unclear", () => {
+    // ledger 类（schema_endpoint / mint）：只认 committed_clean | replayed | already；其余（含 committed）→ commit_unclear。
+    for (const okCommit of ["committed_clean", "replayed", "already"]) {
+      assert.equal(stepCommitCheck52({ ok: true, commit: okCommit, residue: [], lockUncleared: null }, "ledger"), null, "ledger 可记：" + okCommit);
+    }
+    const ledgerBad = stepCommitCheck52({ ok: true, commit: "committed", residue: [], lockUncleared: null }, "ledger");
+    assert.equal(ledgerBad?.reason, "commit_unclear", "ledger 类 commit=committed → commit_unclear：" + JSON.stringify(ledgerBad));
+    assert.match(String(ledgerBad?.why), /kind=ledger/, "why 点名 ledger 类：" + String(ledgerBad?.why));
+    // state-file 类（campaign / writer_state）：只认 committed；其余（含 committed_clean）→ commit_unclear。
+    assert.equal(stepCommitCheck52({ ok: true, commit: "committed", residue: [], lockUncleared: null }, "state"), null, "state 可记 committed");
+    const stateBad = stepCommitCheck52({ ok: true, commit: "committed_clean", residue: [], lockUncleared: null }, "state");
+    assert.equal(stateBad?.reason, "commit_unclear", "state 类 commit=committed_clean → commit_unclear：" + JSON.stringify(stateBad));
+    assert.match(String(stateBad?.why), /kind=state/, "why 点名 state 类：" + String(stateBad?.why));
   });
 
   test("R52 返修一 补：直接调 exitMaintenance（operation.mjs）对 owner_select journal → 走 osmExit 语义，不落通用 rollback", () => {

@@ -194,7 +194,7 @@ import {
   analyzeDialogueShadowEvidence, readDialogueShadowEvidence,
   renderDialogueShadowReadinessReport, validateDialogueShadowReadinessReport,
 } from "./dialogue-shadow-readiness.mjs";
-import { createHash } from "node:crypto";
+import nodeCrypto, { createHash } from "node:crypto";
 import { CANONICAL_TIME_PATTERN, isCanonicalIso } from "./canonical-time.mjs";
 import {
   ATTESTATION_EVIDENCE_MAX_AGE_LIMIT_MS, ATTESTATION_EVIDENCE_MAX_AGE_MS,
@@ -35762,6 +35762,115 @@ test("R50 返修六 P1-2：prepared step 绑定实际写入字节与读回原始
   assert.equal(fs.existsSync(targetFile), true, "成功落盘");
   const rawDiskBytes = fs.readFileSync(targetFile);
   assert.equal(sha256(rawDiskBytes), actualSha, "读回原始字节 SHA 必须严格等于 payload SHA");
+});
+
+test("R50 返修六 P2-1：tmp 清理用 tmpCreated 防误删、直调 unlinkSync 且 EACCES 返回结构化 residue", () => {
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  const tok = "00000000-0000-4000-8000-000000000022";
+  const cid = campaignIdFor(tok);
+  const eps = ["endpoint_111111111111111111111111"];
+  const dig = endpointsDigest(eps);
+  const now = "2026-09-07T10:00:00.000Z";
+
+  const tmpRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r50-p2-1-test-"));
+  const ledgerDir = path.join(tmpRoot, "ledger");
+  fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+  const maintDir = path.join(tmpRoot, "maint");
+  fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+  const gateFile = path.join(tmpRoot, "maintenance.gate");
+  const env = {
+    FEISHU_BRIDGE_LEDGER_DIR: ledgerDir,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
+  };
+
+  const cDoc = {
+    schema_version: "owner-select-campaign-1",
+    campaign_id: cid,
+    state: "open",
+    endpoints: eps,
+    endpoints_digest: dig,
+    pending_joins: [],
+    members: {
+      [eps[0]]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 0 }
+    },
+    revision: 1,
+    origin_operation_id: tok
+  };
+  const payload = JSON.stringify(cDoc, null, 2) + "\n";
+  const actualSha = sha256(payload);
+
+  const { capCampaignOpen: capability } = setupMaintFixtureA({ maintDir, tok, cid, eps, now, gateFile });
+  const jPath = path.join(maintDir, tok + ".json");
+  const jDoc = JSON.parse(fs.readFileSync(jPath, "utf-8"));
+  const step = jDoc.steps.find((s) => s.id === capability.stepId);
+  step.intended_after.sha256 = actualSha;
+  fs.writeFileSync(jPath, JSON.stringify(jDoc, null, 2) + "\n", { mode: 0o600 });
+
+  // 1. O_EXCL 得 EEXIST 时不能删掉别人的同名文件（tmpCreated 保护）
+  const origRandomBytes = nodeCrypto.randomBytes;
+  const fixedHex = "deadbeef12345678";
+  nodeCrypto.randomBytes = function(size) {
+    if (size === 8) return Buffer.from(fixedHex, "hex");
+    return origRandomBytes.apply(this, arguments);
+  };
+  const foreignTmpPath = path.join(ledgerDir, ".owner-select-campaign.json.tmp." + process.pid + "." + fixedHex);
+  fs.writeFileSync(foreignTmpPath, "foreign-content-do-not-delete", { mode: 0o600 });
+  try {
+    const rExist = writeCampaignState({ env, expectedSha256: null, doc: cDoc, capability });
+    assert.equal(rExist.ok, false);
+    assert.equal(rExist.commit, "not_committed");
+    assert.equal(fs.existsSync(foreignTmpPath), true, "O_EXCL 遭遇 EEXIST 时绝对不可误删已存在的他人文件");
+    assert.equal(fs.readFileSync(foreignTmpPath, "utf-8"), "foreign-content-do-not-delete");
+  } finally {
+    nodeCrypto.randomBytes = origRandomBytes;
+    try { fs.unlinkSync(foreignTmpPath); } catch { /* ignore */ }
+  }
+
+  // 2. 注入 unlink EACCES → 结果带 residue
+  const origFsync = fs.fsyncSync;
+  const origUnlink = fs.unlinkSync;
+  let injectFsyncError = false;
+  let injectUnlinkEacces = false;
+
+  fs.fsyncSync = function(fd) {
+    if (injectFsyncError) {
+      const err = new Error("EIO: disk error");
+      err.code = "EIO";
+      throw err;
+    }
+    return origFsync.apply(this, arguments);
+  };
+
+  fs.unlinkSync = function(p) {
+    if (injectUnlinkEacces && String(p).includes(".tmp")) {
+      const err = new Error("EACCES: permission denied");
+      err.code = "EACCES";
+      throw err;
+    }
+    return origUnlink.apply(this, arguments);
+  };
+
+  try {
+    injectFsyncError = true;
+    injectUnlinkEacces = true;
+    const rResidue = writeCampaignState({ env, expectedSha256: null, doc: cDoc, capability });
+    assert.equal(rResidue.ok, false);
+    assert.equal(rResidue.commit, "not_committed");
+    assert.ok(rResidue.residue, "unlink EACCES 失败时必须返回结构化 residue");
+    assert.equal(rResidue.residue.reason, "tmp_unlink_failed");
+    assert.equal(rResidue.residue.why, "EACCES");
+    assert.ok(rResidue.residue.path.includes(".tmp"), "residue.path 应为临时文件路径");
+  } finally {
+    fs.fsyncSync = origFsync;
+    fs.unlinkSync = origUnlink;
+    injectFsyncError = false;
+    injectUnlinkEacces = false;
+    const orphans = fs.readdirSync(ledgerDir).filter(f => f.includes(".tmp"));
+    for (const o of orphans) {
+      try { fs.unlinkSync(path.join(ledgerDir, o)); } catch { /* ignore */ }
+    }
+  }
 });
 
 summarySealed = true;

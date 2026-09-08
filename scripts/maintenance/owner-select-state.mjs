@@ -529,6 +529,9 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
       return res;
     };
 
+    let cleanupTmp = () => {};
+    let tmpResidue = null;
+
     try {
       const targetFile = path.join(root, fileName);
       const cur = readVerifiedDoc({ file: targetFile, docValidator });
@@ -563,19 +566,24 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
       const tmpName = "." + fileName + ".tmp." + process.pid + "." + crypto.randomBytes(8).toString("hex");
       const tmpPath = path.join(root, tmpName);
       let fd = null;
-      let tmpResidue = null;
-      const cleanupTmp = () => {
+      let tmpCreated = false;
+      cleanupTmp = () => {
+        if (!tmpCreated) return;
         try {
-          if (fs.existsSync(tmpPath)) {
-            fs.unlinkSync(tmpPath);
-          }
+          fs.unlinkSync(tmpPath);
+          tmpCreated = false;
         } catch (uErr) {
+          if (uErr && uErr.code === "ENOENT") {
+            tmpCreated = false;
+            return;
+          }
           tmpResidue = { path: tmpPath, reason: "tmp_unlink_failed", why: errCode(uErr) };
         }
       };
 
       try {
         fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+        tmpCreated = true;
         fs.fchmodSync(fd, 0o600);
         const wst = fs.fstatSync(fd);
         if (!wst.isFile() || wst.nlink !== 1 || (wst.mode & 0o777) !== 0o600) {
@@ -633,6 +641,7 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
           try {
             fs.renameSync(tmpPath, targetFile);
             renameLanded = true;
+            tmpCreated = false;
           } catch (err) {
             fenceErr = err;
           }
@@ -683,6 +692,7 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
 
       return formatOutput(readBack);
     } catch (innerErr) {
+      cleanupTmp();
       const residue = finalizeLockOnce();
       if (renameLanded) {
         if (residue !== null) {
@@ -690,7 +700,9 @@ function writeStateFile({ env, expectedSha256, doc, capability, fileName, target
         }
         return { ok: false, commit: "committed_durability_uncertain", reason: "io_error", why: errCode(innerErr) };
       }
-      return exitWithLock({ ok: false, commit: "not_committed", reason: "io_error", why: errCode(innerErr) });
+      const out = { ok: false, commit: "not_committed", reason: "io_error", why: errCode(innerErr) };
+      if (tmpResidue) out.residue = tmpResidue;
+      return exitWithLock(out);
     }
   } catch (outerErr) {
     return { ok: false, commit: "not_committed", reason: "unexpected_error", why: errCode(outerErr) };

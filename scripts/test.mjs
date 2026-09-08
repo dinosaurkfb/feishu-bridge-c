@@ -38410,7 +38410,7 @@ test("R56 ⑰ block：strict 存量非零 / writer on 而 campaign 未 complete 
   let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, false, c.detail);
   assert.match(c.detail, /block 1/u, c.detail);
-  assert.match(c.detail, /双非空|strict 下存量非零|selection_handle=null/u, "strict null-B1 被 block：" + c.detail);
+  assert.match(c.detail, /strict 下存量非零/u, "专用守卫文案在（删守卫即红）：" + c.detail);
   assert.match(c.detail, /initDone 2 个：绿 1、block 1/u, "桶之和 = 总数：" + c.detail);
 
   // (b) writer on 而 campaign 非 complete（open）
@@ -38439,7 +38439,7 @@ test("R56 ⑰ block：strict 存量非零 / writer on 而 campaign 未 complete 
   }
   c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, false, c.detail);
-  assert.match(c.detail, /handle 重复|全局不唯一/u, "handle 重复被 block：" + c.detail);
+  assert.match(c.detail, /handle 重复/u, "专用守卫文案在（删守卫即红）：" + c.detail);
 
   // (e) 有 handle 无到期
   m = doctorMachine();
@@ -38453,20 +38453,22 @@ test("R56 ⑰ block：strict 存量非零 / writer on 而 campaign 未 complete 
   }
   c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, false, c.detail);
-  assert.match(c.detail, /双非空|handle_expires_at 缺席/u, "有 handle 无到期被 block：" + c.detail);
+  assert.match(c.detail, /handle_expires_at 缺席/u, "专用守卫文案在（删守卫即红）：" + c.detail);
 });
 
 test("R56 ⑰ 查不清：收据 conflict 与 writer_state 坏文件都 fail-closed 点名", () => {
   // (a) 收据矛盾（同 ep 双 init）
   let m = doctorMachine();
   r56Plant(m, { ledgerOver: r56StrictLedgerOver() });
-  const { doc: dup } = r56InitJournal(R56_EPS[0]);
+    const { doc: dup, tok: dupOrigTok } = r56InitJournal(R56_EPS[0]);
   const dupTok = r56Uuid(5);
-  fs.writeFileSync(path.join(m.maintDir, dupTok + ".json"), JSON.stringify({ ...dup, token: dupTok }, null, 2) + "\n", { mode: 0o600 });
-  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  // 文内 token 全量替换 → 合法的第二笔 init（同 ep）→ 收据 conflict（而非 journal 读不出）
+  const dupText = JSON.stringify(dup).split(dupOrigTok).join(dupTok);
+  fs.writeFileSync(path.join(m.maintDir, dupTok + ".json"), JSON.stringify(JSON.parse(dupText), null, 2) + "\n", { mode: 0o600 });
+let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, false, c.detail);
   assert.match(c.detail, /查不清/u, c.detail);
-  assert.match(c.detail, /收据 journal 读不出|收据矛盾/u, c.detail);
+  assert.match(c.detail, /收据 conflict/u, "conflict endpoint 专用文案：" + c.detail);
 
   // (b) writer_state 坏文件
   m = doctorMachine();
@@ -38493,9 +38495,22 @@ test("R56 ⑰ 过渡期：transition + null-B1 计数 opaque 报数不 block；p
   assert.match(c.detail, /状态链：partial/u, c.detail);
 });
 
-summarySealed = true;
+test("R56 ⑰ campaign complete 但 ep 账本仍 transition → 状态链 block 点名「应全 strict」", () => {
+  const m = doctorMachine();
+  const over = {};
+  for (const [i, ep] of R56_EPS.entries()) {
+    over[ep] = i === 0
+      ? { schema: "1.1", b1s: [{ id: r56Id(i), handle: "osh_" + "a".repeat(32) }] }
+      : { schema: "1.1-transition", b1s: [{ id: r56Id(i) }, { id: r56Id(i + 2) }] };
+  }
+  r56Plant(m, { ledgerOver: over, campaign: r56Campaign("complete"), writer: r56Writer("on", r56Campaign("complete")), allowInvalid: true });
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /campaign complete 但 .*（应全 strict）/u, "状态链点名 schema 相容违规：" + c.detail);
+});
 
 summarySealed = true;
+
 
 
 console.log(`\n通过 ${passed} / 失败 ${failed}\n`);

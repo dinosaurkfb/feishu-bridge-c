@@ -105,7 +105,8 @@ import {
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
-import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
+import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
+import { FORWARD_RESULT_SCHEMA } from "./forward-runner.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
@@ -36535,6 +36536,188 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     fs.fsyncSync = origFsync;
     tamperTargetOnDirFsync = false;
   }
+});
+
+// ─────────── R54：转发结果落盘 + 回执措辞 + doctor 体检（issue #140） ───────────
+
+const r54Shim = (argvLog, body) => [
+  "#!/usr/bin/env node",
+  "const fs = require('node:fs');",
+  argvLog ? "fs.appendFileSync(" + JSON.stringify(argvLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');" : null,
+  body,
+].filter(Boolean).join("\n") + "\n";
+
+const r54WaitResult = (file, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  while (!fs.existsSync(file) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf-8")) : null;
+};
+
+test("R54 转发结果落盘：三种结局投影 + claude 参数逐字 + 路由器 200ms 内返回 + jsonl/stderr 仍在（假 claude）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj);
+  const argvLog = path.join(local, "claude-argv.jsonl");
+  const deliver = (key, claudeBody, envPath = bin + path.delimiter + process.env.PATH) => {
+    fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, claudeBody), { mode: 0o700 });
+    const t0 = Date.now();
+    const run = deliverToLiveSession({
+      target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+      instruction: "帮我改一下代码", messageId: "msg_" + key, createdAtMs: Date.now(),
+      projectRoot: proj, runsDir: runs, key, env: { PATH: envPath },
+    });
+    assert.ok(Date.now() - t0 < 200, "路由器调用 200ms 内返回（实测 " + (Date.now() - t0) + "ms）");
+    assert.equal(run.resultPath, path.join(runs, key + ".forward.result.json"), "返回值带 resultPath");
+    return run;
+  };
+
+  // ① 成功：stream-json 含 result 行（is_error=false）+ 助手文本 "sent"
+  deliver("k1", [
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', model: 'fake-model', claude_code_version: '9.9.9-fake' }) + '\\n');",
+    "process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'sent' }] } }) + '\\n');",
+    "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 2, duration_ms: 1234 }) + '\\n');",
+  ].join("\n"));
+  const r1 = r54WaitResult(path.join(runs, "k1.forward.result.json"));
+  assert.ok(r1, "跑完后 result.json 落盘（runner 等 claude 退出后投影）");
+  assert.deepEqual(
+    [r1.schema, r1.key, r1.target_name, r1.is_error, r1.subtype, r1.sent, r1.num_turns, r1.duration_ms, r1.exit_code],
+    [FORWARD_RESULT_SCHEMA, "k1", "现场会话", false, "success", true, 2, 1234, 0]);
+  assert.equal(r1.reason_first_line, "sent");
+  assert.equal(r1.claude_code_version, "9.9.9-fake");
+  assert.equal(r1.model, "fake-model");
+  assert.equal(r1.claude_path, path.join(bin, "claude"), "which 到的绝对路径进 result（排障用）");
+  assert.match(r1.finished_at, /^\d{4}-\d{2}-\d{2}T/u);
+  // claude 收到的参数与原先逐字一致：-p <prompt> --output-format stream-json --verbose
+  const argv1 = JSON.parse(fs.readFileSync(argvLog, "utf-8").trim().split("\n").pop());
+  assert.equal(argv1[0], "-p");
+  assert.deepEqual(argv1.slice(2), ["--output-format", "stream-json", "--verbose"]);
+  assert.match(argv1[1], /===BEGIN===[\s\S]*===END===/u, "分隔符结构还在");
+  assert.match(argv1[1], /帮我改一下代码/u, "指令原文在 prompt 里");
+  assert.match(argv1[1], /现场会话/u, "目标会话名在 prompt 里");
+  // jsonl / stderr 仍在（runner 接管 stdio 后 stdout 照落、stderr 照开）
+  assert.ok(fs.existsSync(path.join(runs, "k1.forward.jsonl")) && fs.existsSync(path.join(runs, "k1.forward.stderr.log")));
+  assert.match(fs.readFileSync(path.join(runs, "k1.forward.jsonl"), "utf-8"), /"type":"result"/u);
+
+  // ② #140 同款失败：result 行 is_error=true，文本是那句 400（多行 → reason 取第一行）
+  deliver("k2", "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 …model not found\\n请检查 settings 里的模型配置', num_turns: 1, duration_ms: 2500 }) + '\\n');");
+  const r2 = r54WaitResult(path.join(runs, "k2.forward.result.json"));
+  assert.ok(r2);
+  assert.deepEqual([r2.is_error, r2.sent, r2.subtype, r2.exit_code, r2.num_turns, r2.duration_ms], [true, false, "error_during_execution", 0, 1, 2500]);
+  assert.equal(r2.reason_first_line, "API Error: 400 …model not found", "reason 只取第一行：" + JSON.stringify(r2.reason_first_line));
+
+  // ③ 崩溃：进程退出但不输出 result 行（半截坏行也一样）
+  deliver("k3", "require('node:fs').writeSync(1, " + JSON.stringify('{"type":"assist') + ");process.exit(3);");
+  const r3 = r54WaitResult(path.join(runs, "k3.forward.result.json"));
+  assert.ok(r3);
+  assert.deepEqual([r3.is_error, r3.subtype, r3.sent, r3.exit_code, r3.num_turns], [true, "crash", false, 3, null]);
+  assert.equal(r3.reason_first_line, "no_result_line(exit=3)");
+  assert.ok(Number.isFinite(r3.duration_ms), "崩溃按 wall clock 计时长（#140 里那 2–4 秒本身就是证据）");
+  assert.match(fs.readFileSync(path.join(runs, "k3.forward.jsonl"), "utf-8"), /"type":"assist/u, "半截行原样留在 jsonl 里");
+
+  // ④ PATH 上没有 claude：起不来也落盘，reason 点名 claude_not_found
+  const emptyBin = path.join(local, "empty"); fs.mkdirSync(emptyBin);
+  fs.rmSync(path.join(bin, "claude"), { force: true });
+  deliver("k4", "", emptyBin);
+  const r4 = r54WaitResult(path.join(runs, "k4.forward.result.json"));
+  assert.ok(r4);
+  assert.deepEqual([r4.is_error, r4.subtype, r4.claude_path, r4.sent], [true, "claude_not_found", null, false]);
+  assert.equal(r4.reason_first_line, "claude_not_found");
+  assert.equal(fs.existsSync(path.join(runs, "k4.forward.jsonl")), false, "起不来就不该有 jsonl");
+});
+
+test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执里那三个字）在 scripts/ 全仓消失（git grep 级扫描）", () => {
+  // 旧字样三个字拆开拼：这句源码自己不能让全仓扫描命中自己（test.mjs 也在 scripts/ 里）。
+  const OLD_PHRASE = "已" + "送进";
+  const hit = spawnSync("git", ["grep", "-n", OLD_PHRASE, "--", "scripts"], { encoding: "utf-8" });
+  assert.equal(hit.status, 1, "旧字样应已绝迹（exit 1 = 无命中）：" + (hit.stdout || hit.stderr));
+  assert.equal(hit.stdout, "");
+
+  // 真入口：owner 指令 + 唯一现场会话 → live_session 投递 → 受理回执按新措辞
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwdack-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: TPL.frank_sender_id, role: "owner" }] }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "fwdack", root, name: "fwdack", root_message_id: "om_fwdack", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_fwdack", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const argvLog = path.join(local, "claude-argv.jsonl");
+  // 假 claude：记 argv、不写任何 stream 输出、退出 0 → runner 落 crash 投影（存在性即证明链路通）
+  fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, ""), { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.stderr.write('fake lark-cli: refusing');", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const sessionsDir = path.join(local, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionsDir, "1.json"), JSON.stringify({ sessionId: "33333333-3333-4333-8333-333333333333", name: "live-0", pid: process.pid, kind: "interactive", cwd: root, startedAt: new Date().toISOString() }));
+  const seq = "1";
+  const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 帮我改一下代码";
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_fwdack_" + seq, sessionID: "aily_fwdack", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const p = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_fwdack", AILY_CLI_RUN_ID: "run_fwdack", FAKE_AILY_ENVELOPE: envelope } });
+  assert.equal(p.status, 0, p.stdout + p.stderr);
+  assert.match(p.stdout, /正在转发到你正开着的会话（live-0）；转发结果落在运行目录，doctor 可查/u, p.stdout);
+  assert.doesNotMatch(p.stdout, new RegExp(OLD_PHRASE, "u"), p.stdout);
+  // runner 转发的参数逐字一致；结果文件最终落盘（无 result 行 → crash 投影，存在即链路通）
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(argvLog) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  const argv = JSON.parse(fs.readFileSync(argvLog, "utf-8").trim().split("\n").pop());
+  assert.equal(argv[0], "-p");
+  assert.deepEqual(argv.slice(2), ["--output-format", "stream-json", "--verbose"]);
+  assert.match(argv[1], /SendMessage/u);
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const deadline2 = Date.now() + 5000;
+  let resultFile = null;
+  while (Date.now() < deadline2) {
+    const hits = fs.existsSync(runsDir) ? fs.readdirSync(runsDir).filter((n) => n.endsWith(".forward.result.json")) : [];
+    if (hits.length > 0) { resultFile = JSON.parse(fs.readFileSync(path.join(runsDir, hits[0]), "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  assert.ok(resultFile, "forward-runner 把结果写进运行目录");
+  assert.deepEqual([resultFile.schema, resultFile.target_name], [FORWARD_RESULT_SCHEMA, "live-0"]);
+  assert.equal(resultFile.is_error, true, "假 claude 无 result 行 → crash 投影");
+});
+
+test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn 点名，桶之和 = 总数；窗外积尘不点名", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdcheck", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdcheck", root, root_message_id: "om_root_fwdcheck", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  const writeResult = (key, doc, mtimeMs) => {
+    const f = path.join(runsDir, key + ".forward.result.json");
+    fs.writeFileSync(f, JSON.stringify(doc) + "\n");
+    if (mtimeMs !== undefined) fs.utimesSync(f, new Date(mtimeMs), new Date(mtimeMs));
+  };
+  writeResult("kg", { schema: FORWARD_RESULT_SCHEMA, key: "kg", is_error: false, sent: true, finished_at: new Date(now - 3600e3).toISOString(), reason_first_line: "sent", claude_code_version: "9.9.9" });
+  writeResult("kr", { schema: FORWARD_RESULT_SCHEMA, key: "kr", is_error: true, sent: false, finished_at: new Date(now - 120e3).toISOString(), reason_first_line: "API Error: 400 …model not found", claude_code_version: "1.2.3-old" });
+  writeResult("kold", { schema: FORWARD_RESULT_SCHEMA, key: "kold", is_error: true, sent: false, finished_at: new Date(now - 25 * 3600e3).toISOString(), reason_first_line: "很旧的失败", claude_code_version: "0.0.1" });
+  const orphan = path.join(runsDir, "ko.forward.jsonl");
+  fs.writeFileSync(orphan, "{}\n"); fs.utimesSync(orphan, new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
+  const fresh = path.join(runsDir, "kf.forward.jsonl");
+  fs.writeFileSync(fresh, "{}\n"); fs.utimesSync(fresh, new Date(now - 60e3), new Date(now - 60e3));
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.match(c.detail, /共 3 条：绿 1、红 1、结果缺失 1/u, "桶之和 = 总数（1+1+1=3）：" + c.detail);
+  assert.match(c.detail, /最近的红：\S+ —— API Error: 400/u, "红条目点名 reason_first_line：" + c.detail);
+  assert.match(c.detail, /claude_code_version 1\.2\.3-old/u, "红条目点名版本：" + c.detail);
+  assert.doesNotMatch(c.detail, /很旧的失败|0\.0\.1/u, "窗外积尘既不计数也不点名：" + c.detail);
+  assert.match(c.detail, /缺结果的 key/u, "孤儿 jsonl 记「结果缺失」：" + c.detail);
+  assert.doesNotMatch(c.detail, /kf/u, "刚起还没跑完的 jsonl 不算结果缺失：" + c.detail);
+
+  // 全绿（外加一台没转发结果的机器）：不红也不缺失 → true
+  const m2 = doctorMachine();
+  const root2 = m2.project("fwdok", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m2.writeTables({ projects: [{ id: "fwdok", root: root2, root_message_id: "om_root_fwdok", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runs2 = path.join(root2, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runs2, { recursive: true });
+  fs.writeFileSync(path.join(runs2, "kok.forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key: "kok", is_error: false, sent: true, finished_at: new Date(now - 60e3).toISOString(), reason_first_line: "sent", claude_code_version: "9.9.9" }) + "\n");
+  const c2 = checkOf(doctorReport(m2.run()), "inbound_forward_result");
+  assert.equal(c2.ok, true, c2.detail);
+  assert.match(c2.detail, /共 1 条：绿 1/u, c2.detail);
+
+  // 没有任何转发的机器：这项空转为 true，不虚报
+  const m3 = doctorMachine();
+  const root3 = m3.project("fwdnone", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m3.writeTables({ projects: [{ id: "fwdnone", root: root3, root_message_id: "om_root_fwdnone", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const c3 = checkOf(doctorReport(m3.run()), "inbound_forward_result");
+  assert.equal(c3.ok, true, c3.detail);
+  assert.match(c3.detail, /没有转发结果/u, c3.detail);
 });
 
 summarySealed = true;

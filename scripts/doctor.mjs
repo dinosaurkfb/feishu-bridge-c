@@ -721,6 +721,62 @@ export function runDoctor({
     }
   }
 
+  // ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
+  // forward-runner 落在 <root>/.runtime-data/inbound/runs/<key>.forward.result.json（issue #140）。
+  // 只读盘点近 24 小时：红（is_error 或未 sent）与结果缺失（有 jsonl 没 result —— runner 崩了或
+  // 旧版 runtime 起的）。**窗口也罩住孤儿**：更早的积尘不算当前健康度，否则一次旧故障永远红着，
+  // 这项就失去了信号。
+  {
+    const WINDOW = 24 * 3600 * 1000;
+    const ORPHAN_AFTER = 10 * 60 * 1000;
+    const buckets = { green: 0, red: 0, missing: 0, unclear: 0 };
+    const redNote = [];
+    const missingKeys = [];
+    for (const p of projects) {
+      const root = p?.root;
+      if (typeof root !== "string" || !path.isAbsolute(root)) continue; // root 不成形的项目 ⑤⑥ 已点名
+      let names;
+      try { names = fs.readdirSync(path.join(root, ".runtime-data", "inbound", "runs")); } catch { continue; } // 没有转发就没有这项条目
+      const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+      for (const n of names) {
+        if (n.endsWith(".forward.result.json")) {
+          const file = path.join(runsDir, n);
+          let doc = null;
+          let mtimeMs = 0;
+          try { doc = JSON.parse(fs.readFileSync(file, "utf-8")); mtimeMs = fs.statSync(file).mtimeMs; } catch { doc = null; }
+          const at = Date.parse(doc?.finished_at ?? "");
+          const when = Number.isFinite(at) ? at : mtimeMs;
+          if (now - when > WINDOW) continue;
+          if (!doc || doc.schema !== "forward_result_v1") { buckets.unclear += 1; continue; }
+          if (doc.is_error === true || doc.sent !== true) {
+            buckets.red += 1;
+            if (redNote.length < 3) redNote.push(String(doc.key ?? n).slice(-8) + " —— " + String(doc.reason_first_line ?? "原因不明") +
+              (doc.claude_code_version ? "（claude_code_version " + doc.claude_code_version + "）" : "（版本未知）"));
+          } else buckets.green += 1;
+        } else if (n.endsWith(".forward.jsonl")) {
+          let st;
+          try { st = fs.statSync(path.join(runsDir, n)); } catch { continue; }
+          const age = now - st.mtimeMs;
+          if (age < ORPHAN_AFTER || age > WINDOW) continue; // 刚起还没跑完的不算；超窗的积尘也不算
+          if (fs.existsSync(path.join(runsDir, n.slice(0, -".forward.jsonl".length) + ".forward.result.json"))) continue;
+          buckets.missing += 1;
+          if (missingKeys.length < 3) missingKeys.push(n.slice(0, -".forward.jsonl".length).slice(-8));
+        }
+      }
+    }
+    const scanned = buckets.green + buckets.red + buckets.missing + buckets.unclear; // 桶之和 = 总数
+    const parts = [];
+    if (buckets.green) parts.push("绿 " + buckets.green);
+    if (buckets.red) parts.push("红 " + buckets.red);
+    if (buckets.missing) parts.push("结果缺失 " + buckets.missing);
+    if (buckets.unclear) parts.push("查不清 " + buckets.unclear);
+    const body = scanned === 0 ? "近 24 小时没有转发结果（只盘 live_session 转发，没有转发就没有条目）"
+      : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
+        (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
+        (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "");
+    add("inbound_forward_result", "⑯ 入站转发结果", scanned === 0 || buckets.red + buckets.missing + buckets.unclear === 0, body, null);
+  }
+
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready
   const overall = checks.some((c) => c.ok === false) ? "blocked"
     : checks.some((c) => c.ok === null) ? "incomplete" : "ready";

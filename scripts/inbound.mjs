@@ -132,7 +132,10 @@ function ackText(kind, detail) {
   if (kind === "accepted") {
     // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。四种投递方式封闭渲染，说不清的不许冒充其中一种。
     const where = {
-      live_session: "已送进你正开着的会话（" + detail.targetName + "）",
+      // issue #140：转发是 fire-and-forget（spawn 即返回），结果要等 forward-runner 落盘才知道 ——
+      // 回执不许冒充送达（2026-09-08 三条消息拿到送达回执、转发进程秒退、消息从未到达会话）。
+      // 措辞里的旧字样已被 R54 测试用 git grep 级全仓扫描禁止 —— 注释里也不许再出现。
+      live_session: "正在转发到你正开着的会话（" + detail.targetName + "）；转发结果落在运行目录，doctor 可查",
       resume: "已续起本话题绑定的那条会话，后台执行",
       continue: "已起一轮后台执行（沿用本项目最近的对话）",
       reply_only: "已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）",

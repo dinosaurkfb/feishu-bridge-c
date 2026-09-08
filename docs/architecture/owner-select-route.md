@@ -298,6 +298,8 @@ owner_select_reaffirm}**（P1-6 补 reaffirm）、因果 revision 与直接归�
   `selection_handle` 前缀必与产生 op 相符——**activate/anchor**（attach_a3 已停产，不再列——P2-1）
   只收 `osh_`、rebind_session_alias 只收 `orh_`、owner_select_reaffirm 只收 `rfh_`；跨支即拒。
 
+**G-handle 的反向不变量（#144 一轮 P1-3 回带）**：G-handle 不只是「非空 handle 必可追溯到产生 op」；反向也成立——若记录当前的产生 op（`origin_operation_id` / `selection_operation_id` 语义）是一个**尚未被后续消费覆盖**的 handle 产生 op（`create_b1` / `attach_a2` / `mint_selection_handles` / `reissue_selection_handle` / `request_rebind`），则 live 的 handle 与到期字段必须与该 op 的 result **逐字相等且非空**；把已铸 handle 抹成 null 而保留 op 记录 = `ledger_corrupt`。新形 `create_b1` / `attach_a2` 的 result handle/expiry 不得双 null（`migrate_seed` 除外）。
+**跨 schema 重放（#144 一轮 P1-4 回带）**：同 request_key 的重放判定同时接受「合法的历史 1.0 描述符」与「当前 schema 的新描述符」；首次执行只能用当前 schema 的新形。**锁内时钟（#144 一轮 P1-5 回带）**：到期/签发/CAS 用的 now 必须在账本锁内由时钟 seam 读取，不得在取锁前预先求值。
 ## 8. 迁移状态机：两次维护 operation + 持久 campaign（P1-4/P1-5/P1-6）
 
 **过渡 schema**（合法容旧形+新形）破"旧 schema 不能存新形 / 严格不能在旧形非零时启用"的循环。

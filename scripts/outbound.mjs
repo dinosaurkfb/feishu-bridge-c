@@ -188,9 +188,10 @@ export function runRouteSha256({ bindingId, claudeSessionId, originGenerationId,
 }
 
 // runs 目录里受控的条目形状（key + 已知 sidecar；.tmp.* 是原子落盘的中间态）。
-const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|publish-claim\.json\.reaplock|stderr\.log|watch\.log|forward\.jsonl|forward\.stderr\.log|(?:published\.json|publish-failed\.json)\.tmp\.[^/]+)$/u;
+// R54 返修一 P1-1：forward.result.json / forward.started.json 是 forward-runner 的受控 sidecar。
+const RUN_ENTRY_RE = /^([0-9a-f]{64})\.(jsonl|published\.json|publish-failed\.json|publish-claim\.json|publish-claim\.json\.reaplock|stderr\.log|watch\.log|forward\.jsonl|forward\.stderr\.log|forward\.result\.json|forward\.started\.json|(?:published\.json|publish-failed\.json|forward\.result\.json|forward\.started\.json)\.tmp\.[^/]+)$/u;
 // 转发型记录（live-session 投递）允许的全部 sidecar；多一样都是冲突。
-const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "terminal"]);
+const FORWARD_KINDS = new Set(["forward.jsonl", "forward.stderr.log", "forward.result.json", "forward.started.json", "terminal"]);
 // delivery-claims 目录里受控的条目形状：claim 目录、笔记，以及 **claim.mjs 受控状态集里每一种状态**的记录
 // （rejected 也是入站写的正规记录 —— 真机上曾被硬编码的四种名字报成 unrecognized_entry）。
 // 唯一登记的遗留形状是 deliver_failed（issue #86：旧版运行时写的状态名，本仓历史里没有写方）：
@@ -410,10 +411,19 @@ export function inventoryRuns({ runsDir, claimsDir = null }) {
     // **转发型先判、且在 jsonl 判断之外**：只要有 forward 制品，就按封闭集合 {forward.jsonl, forward.stderr.log, terminal}
     // 核对完整集合 —— 主 run 的 <key>.jsonl 也算集合之外的东西（两种模式并存不可能正常产出，评审探针）。
     // 只有 stderr 没有主制品 → forward_incomplete；多出任何 kind → forward_run_conflict；恰好子集 → 正常转发型，不进 run 通道。
-    if (kinds.has("forward.jsonl") || kinds.has("forward.stderr.log")) {
-      const extra = [...kinds].filter((k) => !FORWARD_KINDS.has(k));
-      if (!kinds.has("forward.jsonl")) problems.push({ key, reason: "forward_incomplete", why: "转发型主制品缺席，只剩：" + [...kinds].join("、") });
-      else if (extra.length > 0) problems.push({ key, reason: "forward_run_conflict", why: "转发型 key 旁多出别的制品：" + extra.join("、") });
+    // R54 返修三 P1-2：按 key 聚合**所有** forward.* 制品，不以「有 jsonl 或 stderr」为进入条件——
+    // tmp 残骸 / 只有 started 没有主制品 都在这里报（结果与进行中归 ⑯，不重复报残骸）。
+    const forwardKinds = [...kinds].filter((k) => k.startsWith("forward."));
+    if (forwardKinds.length > 0) {
+      const tmps = forwardKinds.filter((k) => k.includes(".tmp."));
+      const core = forwardKinds.filter((k) => !k.includes(".tmp."));
+      if (tmps.length > 0) problems.push({ key, reason: "forward_write_residue", why: "转发 tmp 残骸：" + tmps.join("、") });
+      if (!core.includes("forward.jsonl") && !core.includes("forward.result.json")) {
+        problems.push({ key, reason: "forward_incomplete", why: "转发型主制品缺席（jsonl/result 都不在），只剩：" + core.join("、") });
+      } else {
+        const extra = [...kinds].filter((k) => !FORWARD_KINDS.has(k));
+        if (extra.length > 0) problems.push({ key, reason: "forward_run_conflict", why: "转发型 key 旁多出别的制品：" + extra.join("、") });
+      }
       continue;
     }
     if (!kinds.has("jsonl")) {

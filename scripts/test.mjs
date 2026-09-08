@@ -106,7 +106,9 @@ import {
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
-import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
+import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
+import { FORWARD_RESULT_SCHEMA, FORWARD_STARTED_SCHEMA, forwardResultProblem as FORWARD_RESULT_PROBLEM, forwardStartedProblem as FORWARD_STARTED_PROBLEM, resultLineProblem as RESULT_LINE_PROBLEM } from "./forward-runner.mjs";
+import { readProcessStartTime, parseAuxvClkTck } from "./process-start-time.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { foreignHint, projectLabel } from "./stop-note.mjs";
@@ -37525,6 +37527,779 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     assert.equal(strict.records[liveId].selection_handle, null, "strict 不改已有值");
   });
 }
+// ─────────── R54：转发结果落盘 + 回执措辞 + doctor 体检（issue #140） ───────────
+
+const r54Shim = (argvLog, body) => [
+  "#!/usr/bin/env node",
+  "const fs = require('node:fs');",
+  argvLog ? "fs.appendFileSync(" + JSON.stringify(argvLog) + ", JSON.stringify(process.argv.slice(2)) + '\\n');" : null,
+  body,
+].filter(Boolean).join("\n") + "\n";
+
+const r54WaitResult = (file, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  while (!fs.existsSync(file) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf-8")) : null;
+};
+
+const r54Key = (n) => String(n).padStart(64, "0"); // 64hex key（#141 三轮 P2-6）
+const FORWARD_SHA_SENT = crypto.createHash("sha256").update("sent").digest("hex"); // P1-4：sent=true 时 final_text_sha256 必须等于它
+
+test("R54 转发结果落盘：三种结局投影 + claude 参数逐字 + 路由器 200ms 内返回 + jsonl/stderr 仍在（假 claude）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj);
+  const argvLog = path.join(local, "claude-argv.jsonl");
+  const deliver = (key, claudeBody, envPath = bin + path.delimiter + process.env.PATH) => {
+    fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, claudeBody), { mode: 0o700 });
+    const t0 = Date.now();
+    const run = deliverToLiveSession({
+      target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+      instruction: "帮我改一下代码", messageId: "msg_" + key, createdAtMs: Date.now(),
+      projectRoot: proj, runsDir: runs, key, env: { PATH: envPath },
+    });
+    run.tReturned = Date.now() - t0; // 返回耗时只记录不再当正确性判据（P2-6：改由阻塞场景比较先后）
+    assert.equal(run.resultPath, path.join(runs, key + ".forward.result.json"), "返回值带 resultPath");
+    return run;
+  };
+
+  // ① 成功：stream-json 含 result 行（is_error=false）+ 助手文本 "sent"
+  deliver(r54Key(1), [
+    "process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', model: 'fake-model', claude_code_version: '9.9.9-fake' }) + '\\n');",
+    "process.stdout.write(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'sent' }] } }) + '\\n');",
+    "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 2, duration_ms: 1234 }) + '\\n');",
+  ].join("\n"));
+  const r1 = r54WaitResult(path.join(runs, r54Key(1) + ".forward.result.json"));
+  assert.ok(r1, "跑完后 result.json 落盘（runner 等 claude 退出后投影）");
+  assert.deepEqual(
+    [r1.schema, r1.key, r1.target_name, r1.is_error, r1.subtype, r1.sent, r1.num_turns, r1.duration_ms, r1.exit_code],
+    [FORWARD_RESULT_SCHEMA, r54Key(1), "现场会话", false, "success", true, 2, 1234, 0]);
+  assert.equal(r1.reason_first_line, "sent");
+  assert.equal(r1.claude_code_version, "9.9.9-fake");
+  assert.equal(r1.model, "fake-model");
+  assert.equal(r1.claude_path, path.join(bin, "claude"), "which 到的绝对路径进 result（排障用）");
+  assert.match(r1.finished_at, /^\d{4}-\d{2}-\d{2}T/u);
+  // claude 收到的参数与原先逐字一致：-p <prompt> --output-format stream-json --verbose
+  const argv1 = JSON.parse(fs.readFileSync(argvLog, "utf-8").trim().split("\n").pop());
+  assert.equal(argv1[0], "-p");
+  assert.deepEqual(argv1.slice(2), ["--output-format", "stream-json", "--verbose"]);
+  assert.match(argv1[1], /===BEGIN===[\s\S]*===END===/u, "分隔符结构还在");
+  assert.match(argv1[1], /帮我改一下代码/u, "指令原文在 prompt 里");
+  assert.match(argv1[1], /现场会话/u, "目标会话名在 prompt 里");
+  // jsonl / stderr 仍在（runner 接管 stdio 后 stdout 照落、stderr 照开）
+  assert.ok(fs.existsSync(path.join(runs, r54Key(1) + ".forward.jsonl")) && fs.existsSync(path.join(runs, r54Key(1) + ".forward.stderr.log")));
+  assert.match(fs.readFileSync(path.join(runs, r54Key(1) + ".forward.jsonl"), "utf-8"), /"type":"result"/u);
+
+  // ② #140 同款失败：result 行 is_error=true，文本是那句 400（多行 → reason 取第一行）
+  deliver(r54Key(2), "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 …model not found\\n请检查 settings 里的模型配置', num_turns: 1, duration_ms: 2500 }) + '\\n');");
+  const r2 = r54WaitResult(path.join(runs, r54Key(2) + ".forward.result.json"));
+  assert.ok(r2);
+  assert.deepEqual([r2.is_error, r2.sent, r2.subtype, r2.exit_code, r2.num_turns, r2.duration_ms], [true, false, "error_during_execution", 0, 1, 2500]);
+  assert.equal(r2.reason_first_line, "API Error: 400 …model not found", "reason 只取第一行：" + JSON.stringify(r2.reason_first_line));
+
+  // ③ 崩溃：进程退出但不输出 result 行（半截坏行也一样）
+  deliver(r54Key(3), "require('node:fs').writeSync(1, " + JSON.stringify('{"type":"assist') + ");process.exit(3);");
+  const r3 = r54WaitResult(path.join(runs, r54Key(3) + ".forward.result.json"));
+  assert.ok(r3);
+  assert.deepEqual([r3.is_error, r3.subtype, r3.sent, r3.exit_code, r3.num_turns], [true, "crash", false, 3, null]);
+  assert.equal(r3.reason_first_line, "no_result_line(exit=3)");
+  assert.ok(Number.isFinite(r3.duration_ms), "崩溃按 wall clock 计时长（#140 里那 2–4 秒本身就是证据）");
+  assert.match(fs.readFileSync(path.join(runs, r54Key(3) + ".forward.jsonl"), "utf-8"), /"type":"assist/u, "半截行原样留在 jsonl 里");
+
+  // ④ PATH 上没有 claude：起不来也落盘，reason 点名 claude_not_found
+  const emptyBin = path.join(local, "empty"); fs.mkdirSync(emptyBin);
+  fs.rmSync(path.join(bin, "claude"), { force: true });
+  deliver(r54Key(4), "", emptyBin);
+  const r4 = r54WaitResult(path.join(runs, r54Key(4) + ".forward.result.json"));
+  assert.ok(r4);
+  assert.deepEqual([r4.is_error, r4.subtype, r4.claude_path, r4.sent], [true, "claude_not_found", null, false]);
+  assert.equal(r4.reason_first_line, "claude_not_found");
+  assert.equal(fs.existsSync(path.join(runs, r54Key(4) + ".forward.jsonl")), false, "起不来就不该有 jsonl");
+});
+
+test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执里那三个字）在 scripts/ 全仓消失（git grep 级扫描）", () => {
+  // 旧字样三个字拆开拼：这句源码自己不能让全仓扫描命中自己（test.mjs 也在 scripts/ 里）。
+  const OLD_PHRASE = "已" + "送进";
+  const hit = spawnSync("git", ["grep", "-n", OLD_PHRASE, "--", "scripts"], { encoding: "utf-8" });
+  assert.equal(hit.status, 1, "旧字样应已绝迹（exit 1 = 无命中）：" + (hit.stdout || hit.stderr));
+  assert.equal(hit.stdout, "");
+
+  // 真入口：owner 指令 + 唯一现场会话 → live_session 投递 → 受理回执按新措辞
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwdack-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: TPL.frank_sender_id, role: "owner" }] }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "fwdack", root, name: "fwdack", root_message_id: "om_fwdack", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_fwdack", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const argvLog = path.join(local, "claude-argv.jsonl");
+  // 假 claude：记 argv、不写任何 stream 输出、退出 0 → runner 落 crash 投影（存在性即证明链路通）
+  fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, ""), { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.stderr.write('fake lark-cli: refusing');", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const sessionsDir = path.join(local, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionsDir, "1.json"), JSON.stringify({ sessionId: "33333333-3333-4333-8333-333333333333", name: "live-0", pid: process.pid, kind: "interactive", cwd: root, startedAt: new Date().toISOString() }));
+  const seq = "1";
+  const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 帮我改一下代码";
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_fwdack_" + seq, sessionID: "aily_fwdack", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const p = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_fwdack", AILY_CLI_RUN_ID: "run_fwdack", FAKE_AILY_ENVELOPE: envelope } });
+  assert.equal(p.status, 0, p.stdout + p.stderr);
+  assert.match(p.stdout, /正在转发到你正开着的会话（live-0）；转发结果落在运行目录，doctor 可查/u, p.stdout);
+  assert.doesNotMatch(p.stdout, new RegExp(OLD_PHRASE, "u"), p.stdout);
+  // runner 转发的参数逐字一致；结果文件最终落盘（无 result 行 → crash 投影，存在即链路通）
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(argvLog) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  const argv = JSON.parse(fs.readFileSync(argvLog, "utf-8").trim().split("\n").pop());
+  assert.equal(argv[0], "-p");
+  assert.deepEqual(argv.slice(2), ["--output-format", "stream-json", "--verbose"]);
+  assert.match(argv[1], /SendMessage/u);
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const deadline2 = Date.now() + 5000;
+  let resultFile = null;
+  while (Date.now() < deadline2) {
+    const hits = fs.existsSync(runsDir) ? fs.readdirSync(runsDir).filter((n) => n.endsWith(".forward.result.json")) : [];
+    if (hits.length > 0) { resultFile = JSON.parse(fs.readFileSync(path.join(runsDir, hits[0]), "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  assert.ok(resultFile, "forward-runner 把结果写进运行目录");
+  assert.deepEqual([resultFile.schema, resultFile.target_name], [FORWARD_RESULT_SCHEMA, "live-0"]);
+  assert.equal(resultFile.is_error, true, "假 claude 无 result 行 → crash 投影");
+});
+
+test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn 点名，桶之和 = 总数；窗外积尘不点名", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdcheck", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdcheck", root, root_message_id: "om_root_fwdcheck", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  // R54 返修一：result 夹具用封闭全字段（读端走 readVerifiedDoc + forwardResultProblem），0600 落盘
+  const fullResult = (key, over = {}) => ({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: new Date(now - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over });
+  const writeResult = (key, doc, mtimeMs) => {
+    const f = path.join(runsDir, key + ".forward.result.json");
+    fs.writeFileSync(f, JSON.stringify(doc) + "\n", { mode: 0o600 });
+    if (mtimeMs !== undefined) fs.utimesSync(f, new Date(mtimeMs), new Date(mtimeMs));
+  };
+  writeResult(r54Key(11), fullResult(r54Key(11)));
+  writeResult(r54Key(12), fullResult(r54Key(12), { is_error: true, sent: false, exit_code: 0, reason_first_line: "API Error: 400 …model not found", claude_code_version: "1.2.3-old", finished_at: new Date(now - 120e3).toISOString() }));
+  writeResult(r54Key(13), fullResult(r54Key(13), { is_error: true, sent: false, reason_first_line: "很旧的失败", claude_code_version: "0.0.1", finished_at: new Date(now - 25 * 3600e3).toISOString() }));
+  const orphan = path.join(runsDir, r54Key(29) + ".forward.jsonl");
+  fs.writeFileSync(orphan, "{}\n"); fs.utimesSync(orphan, new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
+  const fresh = path.join(runsDir, r54Key(28) + ".forward.jsonl");
+  fs.writeFileSync(fresh, "{}\n"); fs.utimesSync(fresh, new Date(now - 60e3), new Date(now - 60e3));
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.match(c.detail, /共 4 条：绿 1、红 1、结果缺失 1、刚起还没结果 1/u, "桶之和 = 总数（kf 1 分钟 = 刚起还没结果）：" + c.detail);
+  assert.match(c.detail, /最近的红：\S+ —— API Error: 400/u, "红条目点名 reason_first_line：" + c.detail);
+  assert.match(c.detail, /claude_code_version 1\.2\.3-old/u, "红条目点名版本：" + c.detail);
+  assert.doesNotMatch(c.detail, /很旧的失败|0\.0\.1/u, "窗外积尘既不计数也不点名：" + c.detail);
+  assert.match(c.detail, /缺结果的 key/u, "孤儿 jsonl 记「结果缺失」：" + c.detail);
+  assert.doesNotMatch(c.detail, /查不清/u, "⑯ 不为非 forward 键误报：" + c.detail);
+
+  // 全绿（外加一台没转发结果的机器）：不红也不缺失 → true
+  const m2 = doctorMachine();
+  const root2 = m2.project("fwdok", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m2.writeTables({ projects: [{ id: "fwdok", root: root2, root_message_id: "om_root_fwdok", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runs2 = path.join(root2, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runs2, { recursive: true });
+  fs.writeFileSync(path.join(runs2, r54Key(14) + ".forward.result.json"), JSON.stringify(fullResult(r54Key(14), { finished_at: new Date(now - 60e3).toISOString() })) + "\n", { mode: 0o600 });
+  const c2 = checkOf(doctorReport(m2.run()), "inbound_forward_result");
+  assert.equal(c2.ok, true, c2.detail);
+  assert.match(c2.detail, /共 1 条：绿 1/u, c2.detail);
+
+  // 没有任何转发的机器：这项空转为 true，不虚报
+  const m3 = doctorMachine();
+  const root3 = m3.project("fwdnone", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m3.writeTables({ projects: [{ id: "fwdnone", root: root3, root_message_id: "om_root_fwdnone", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const c3 = checkOf(doctorReport(m3.run()), "inbound_forward_result");
+  assert.equal(c3.ok, true, c3.detail);
+  assert.match(c3.detail, /没有转发结果/u, c3.detail);
+});
+
+// ── R54 返修一（Codex #141 一轮 5 P1 + 3 P2）──
+
+const r54FullResult = (key, over = {}) => ({
+  schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0,
+  is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234,
+  claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT,
+  finished_at: new Date(Date.now() - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over,
+});
+
+test("R54 返修一 P1-1：runs 盘点认识 forward 制品——全套制品 → inventoryRuns 零问题、doctor ⑥ 与 ⑯ 同时绿", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdset", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdset", root, root_message_id: "om_root_fwdset", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  const key = "ab".repeat(32);
+  // 全套 forward 制品（runner 实际产出的封闭集合；live_session 转发按设计没有 <key>.jsonl run 主账本）
+  fs.writeFileSync(path.join(runsDir, key + ".forward.jsonl"), "{\"type\":\"result\",\"result\":\"sent\"}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.stderr.log"), "", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key, runner_pid: process.pid, claude_pid: 4242, started_at: new Date(now - 60e3).toISOString() }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), JSON.stringify(r54FullResult(key, { finished_at: new Date(now - 30e3).toISOString() })) + "\n", { mode: 0o600 });
+  const inv = inventoryRuns({ runsDir, claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims") });
+  assert.equal(inv.problems.filter((x) => x.key === key && x.reason === "unrecognized_entry").length, 0, "新 sidecar 不再报 unrecognized_entry：" + JSON.stringify(inv.problems));
+  const report = doctorReport(m.run());
+  const c16 = checkOf(report, "inbound_forward_result");
+  assert.equal(c16.ok, true, "⑯ 绿：" + c16.detail);
+  assert.match(c16.detail, /共 1 条：绿 1/u, c16.detail);
+  const c6 = checkOf(report, "backlog_vs_publisher");
+  assert.doesNotMatch(String(c6.detail), /unrecognized_entry|说不清/u, "⑥ 不被 forward 制品打红：" + c6.detail);
+});
+
+test("R54 返修一 P1-2：forwardResultProblem 封闭校验（is_error 缺席/sent 与 exit 矛盾/多键/超长/未来时间都拦）+ doctor 坏形状记查不清并点名", () => {
+  const now = Date.now();
+  const good = r54FullResult(r54Key(25), { finished_at: new Date(now).toISOString() });
+  assert.equal(FORWARD_RESULT_PROBLEM(good, { now }), null);
+  assert.ok(FORWARD_RESULT_PROBLEM({ ...good, is_error: undefined }, { now }) !== null, "is_error 缺席按 problem（不是 false）");
+  assert.ok(FORWARD_RESULT_PROBLEM({ ...good, sent: true, exit_code: 5 }, { now }) !== null, "sent=true 但 exit_code≠0 → problem");
+  assert.ok(FORWARD_RESULT_PROBLEM({ ...good, sent: true, is_error: true }, { now }) !== null, "sent=true 但 is_error → problem");
+  assert.ok(FORWARD_RESULT_PROBLEM({ ...good, finished_at: new Date(now + 120e3).toISOString() }, { now }) !== null, "finished_at > now+60s → problem");
+  assert.ok(FORWARD_RESULT_PROBLEM({ ...good, extra: 1 }, { now }) !== null, "多键 → problem");
+  assert.ok(FORWARD_RESULT_PROBLEM({ ...good, reason_first_line: "x".repeat(201) }, { now }) !== null, "reason_first_line 超 200 → problem");
+  // doctor：坏形状 result → 查不清并点名（不是红也不是绿）
+  const m = doctorMachine();
+  const root = m.project("fwdcorrupt", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdcorrupt", root, root_message_id: "om_root_fwdcorrupt", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(path.join(runsDir, r54Key(15) + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key: r54Key(15) }) + "\n", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.match(c.detail, /查不清 1/u, "坏形状记查不清：" + c.detail);
+  assert.match(c.detail, /result 字段集不对/u, "点名 problem：" + c.detail);
+});
+
+test("R54 返修一 P1-3：⑯ 读盘纪律——symlink 不跟随（合法绿文件隔着 symlink 也算查不清）、FIFO 不挂起、坏 JSON 记查不清", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdio", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdio", root, root_message_id: "om_root_fwdio", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  // 真 result（0600）：绿
+  fs.writeFileSync(path.join(runsDir, r54Key(16) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(16), { finished_at: new Date(now - 60e3).toISOString() })) + "\n", { mode: 0o600 });
+  // symlink 指向那份合法绿文件：O_NOFOLLOW 下必须查不清（不跟随），不能隔着 symlink 被读成绿
+  fs.symlinkSync(path.join(runsDir, r54Key(16) + ".forward.result.json"), path.join(runsDir, r54Key(17) + ".forward.result.json"));
+  // FIFO：读原语 O_NONBLOCK + fstat 普通文件核 → 不挂起、记查不清
+  const fifo = path.join(runsDir, "kfifo.forward.result.json");
+  execFileSync("mkfifo", [fifo]);
+  // 坏 JSON（0600 普通文件）：记查不清
+  fs.writeFileSync(path.join(runsDir, r54Key(23) + ".forward.result.json"), "{not json", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.match(c.detail, /共 4 条：绿 1、查不清 3/u, "桶之和 = 总数，symlink/FIFO/坏 JSON 全部查不清：" + c.detail);
+  assert.match(c.detail, /不是普通文件|open 失败/u, "FIFO 被读原语点名：" + c.detail);
+  assert.match(c.detail, /JSON 解析失败/u, "坏 JSON 点名：" + c.detail);
+});
+
+test("R54 返修四 P1-2/P2-3：孤儿判定——实例核验通过 → 进行中；核不了 → 未验证（ok:null）；started 缺席 <10 分钟 → 刚起还没结果（≥10 分钟 → 结果缺失）；读取器注入密闭", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdlive", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdlive", root, root_message_id: "om_root_fwdlive", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  const ago11m = new Date(now - 11 * 60e3).toISOString();
+  const writeJsonl = (key, mtimeMs) => {
+    const f = path.join(runsDir, key + ".forward.jsonl");
+    fs.writeFileSync(f, "{}\n", { mode: 0o600 });
+    if (mtimeMs !== undefined) fs.utimesSync(f, new Date(mtimeMs), new Date(mtimeMs));
+  };
+  const writeStarted = (key, doc) => fs.writeFileSync(path.join(runsDir, key + ".forward.started.json"), JSON.stringify(doc) + "\n", { mode: 0o600 });
+  const K1 = "1".padEnd(64, "0"); const K2 = "2".padEnd(64, "0"); const K3 = "3".padEnd(64, "0"); const K4 = "4".padEnd(64, "0");
+  const deadChild = spawnSync("sleep", ["0.05"]);
+  const deadPid = deadChild.pid;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); // 等它退透
+  // k1：活 runner（本测试进程）+ started 可核（注入读取器返回与 runner_start_at 一致的启动时刻）
+  writeJsonl(K1, now - 11 * 60e3);
+  writeStarted(K1, { schema: FORWARD_STARTED_SCHEMA, key: K1, runner_pid: process.pid, claude_pid: 4242, started_at: ago11m, runner_start_at: ago11m });
+  // k2：死 runner + started（runner_start_at 也是 11 分钟前，但 pid 已死 → 核不了）
+  writeJsonl(K2, now - 11 * 60e3);
+  writeStarted(K2, { schema: FORWARD_STARTED_SCHEMA, key: K2, runner_pid: deadPid, claude_pid: 4243, started_at: ago11m, runner_start_at: ago11m });
+  // k3：无 started，11 分钟 → 结果缺失
+  writeJsonl(K3, now - 11 * 60e3);
+  // k4：无 started，1 分钟 → 刚起还没结果（pending）
+  writeJsonl(K4, now - 60e3);
+  // 读取器注入（P2-3）：活 pid → 与 runner_start_at 一致；其余 pid → unavailable。密闭，不依赖真机 ps。
+  const injected = (pid) => pid === process.pid
+    ? { state: "ok", startMs: Date.parse(ago11m) }
+    : { state: "unavailable", why: "injected" };
+  const saved = ["FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_REGISTRY"].map((k) => [k, process.env[k]]);
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = m.maintDir;
+  process.env.FEISHU_BRIDGE_REGISTRY = m.files.registry;
+  let rep;
+  try { rep = runDoctor({ home: m.home, registryFile: m.files.registry, routesFile: m.files.routes, providersFile: m.files.providers, processStartTime: injected }); }
+  finally { for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  const c = checkOf(rep, "inbound_forward_result");
+  assert.equal(c.ok, false, "结果缺失仍在（进行中/未验证不掩盖缺失）：" + JSON.stringify(c));
+  assert.match(c.detail, /共 4 条：结果缺失 1、刚起还没结果 1、进行中 1、进行中未验证 1/u, "桶之和 = 总数（恰进一桶）：" + c.detail);
+  assert.match(c.detail, /有 1 条转发进行中，尚无结果/u, "unverified 的 ok:null 措辞：" + c.detail);
+  // 只有 pending（1 分钟、无 started）的机器 → ok:null 而非 ok:true
+  const m2 = doctorMachine();
+  const root2 = m2.project("fwdpend", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m2.writeTables({ projects: [{ id: "fwdpend", root: root2, root_message_id: "om_root_fwdpend", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runs2 = path.join(root2, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runs2, { recursive: true });
+  fs.writeFileSync(path.join(runs2, "9".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runs2, "9".padEnd(64, "0") + ".forward.jsonl"), new Date(now - 60e3), new Date(now - 60e3));
+  const c2 = checkOf(doctorReport(m2.run()), "inbound_forward_result");
+  assert.equal(c2.ok, null, "仅 pending → ok:null：" + JSON.stringify(c2));
+  assert.match(c2.detail, /刚起还没结果 1/u, c2.detail);
+});
+
+test("R54 返修一 P1-5：落盘纪律——目标已是 symlink 不跟随不覆盖；8 MiB jsonl 仍 1 秒内落结果", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-fix1-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true });
+  const deliver = (key, claudeBody) => {
+    fs.writeFileSync(path.join(bin, "claude"), [
+      "#!/usr/bin/env node",
+      claudeBody,
+    ].join("\n") + "\n", { mode: 0o700 });
+    const t0 = Date.now();
+    const run = deliverToLiveSession({
+      target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+      instruction: "帮我改一下代码", messageId: "msg_" + key, createdAtMs: Date.now(),
+      projectRoot: proj, runsDir: runs, key, env: { PATH: bin + path.delimiter + process.env.PATH },
+    });
+    assert.ok(Date.now() - t0 < 200, "路由器调用 200ms 内返回");
+    return run;
+  };
+  const successShim = [
+    "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 2, duration_ms: 1234 }) + '\\n');",
+  ].join("\n");
+  // (a) 目标已是 symlink：不跟随、不覆盖，stderr.log 留诊断
+  const sentinel = path.join(local, "sentinel.json");
+  fs.writeFileSync(sentinel, "keepme", { mode: 0o600 });
+  const symTarget = path.join(runs, r54Key(17) + ".forward.result.json");
+  fs.symlinkSync(sentinel, symTarget);
+  deliver(r54Key(17), successShim);
+  let symNote = null;
+  {
+    const deadline = Date.now() + 3000;
+    const errFile = path.join(runs, r54Key(17) + ".forward.stderr.log");
+    while (Date.now() < deadline) {
+      if (fs.existsSync(errFile) && /符号链接/u.test(fs.readFileSync(errFile, "utf-8"))) { symNote = true; break; }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  assert.equal(symNote, true, "stderr.log 留诊断");
+  assert.equal(fs.lstatSync(symTarget).isSymbolicLink(), true, "symlink 原样（没被 rename 覆盖）");
+  assert.equal(fs.readFileSync(sentinel, "utf-8"), "keepme", "被指文件字节不变");
+  // (b) 8 MiB jsonl：只读尾部，1 秒内落结果
+  const t0 = Date.now();
+  deliver(r54Key(18), [
+    "for (let i = 0; i < 4; i++) process.stdout.write(\"x\".repeat(2 * 1024 * 1024) + \"\\n\");",
+    "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 2, duration_ms: 1234 }) + '\\n');",
+  ].join("\n"));
+  const deadline = Date.now() + 1000;
+  let big = null;
+  while (Date.now() < deadline) {
+    const f = path.join(runs, r54Key(18) + ".forward.result.json");
+    if (fs.existsSync(f)) { big = JSON.parse(fs.readFileSync(f, "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  assert.ok(big, "8 MiB jsonl 下 result 仍 1 秒内落盘（实测 " + (Date.now() - t0) + "ms）");
+  assert.deepEqual([big.is_error, big.sent, big.exit_code], [false, true, 0]);
+});
+
+// ── R54 返修二（Codex #141 二轮 4 P1 + 2 P2）──
+
+test("R54 返修二 P1-1：源 result 行缺 is_error → 投影 malformed_result，绝不进成功公式", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-fix2-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true });
+  fs.writeFileSync(path.join(bin, "claude"), [
+    "#!/usr/bin/env node",
+    "require('node:fs').writeSync(1, JSON.stringify({ type: 'result', result: 'sent' }) + '\\n');",
+    "process.exit(0);",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const run = deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "msg_mal", createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key: r54Key(19), env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  const deadline = Date.now() + 5000;
+  let r = null;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(run.resultPath)) { r = JSON.parse(fs.readFileSync(run.resultPath, "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  assert.ok(r, "result 落盘");
+  assert.deepEqual([r.is_error, r.sent, r.subtype, r.reason_first_line, r.exit_code], [true, false, "malformed_result", "malformed_result", 0], JSON.stringify(r));
+  assert.equal(r.num_turns, null, JSON.stringify(r));
+  // 校验器本身：缺 is_error / 坏形状逐条点名
+  assert.match(RESULT_LINE_PROBLEM({ type: "result", result: "sent" }), /is_error/u);
+  assert.match(RESULT_LINE_PROBLEM({ type: "result", is_error: false, subtype: "s", result: "sent", num_turns: 1 }), /duration_ms/u);
+  assert.equal(RESULT_LINE_PROBLEM({ type: "result", is_error: false, subtype: "s", result: "sent", num_turns: 1, duration_ms: 2 }), null);
+});
+
+test("R54 返修二 P1-2：⑯ 按 key 聚合——完整转发只计一个桶（绿 1，不再「绿 1 + 结果缺失 1」）", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdkey", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdkey", root, root_message_id: "om_root_fwdkey", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  const key = "cd".repeat(32);
+  const ago11m = new Date(now - 11 * 60e3).toISOString();
+  fs.writeFileSync(path.join(runsDir, key + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runsDir, key + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
+  fs.writeFileSync(path.join(runsDir, key + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key, runner_pid: 4242, claude_pid: 4243, started_at: ago11m }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: ago11m, claude_path: "/x" }) + "\n", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, true, c.detail);
+  assert.match(c.detail, /共 1 条：绿 1/u, "恰一个桶（红：绿 1 + 结果缺失 1）：" + c.detail);
+});
+
+test("R54 返修二 P1-3：key 与文件名绑定 + pid ≥1——错 key / runner_pid:0 / 错 key 的自称成功全部 problem，doctor 记查不清", () => {
+  const now = Date.now();
+  const good = r54FullResult(r54Key(41), { finished_at: new Date(now).toISOString() });
+  assert.match(FORWARD_RESULT_PROBLEM({ ...good, key: r54Key(40) }, { now, expectedKey: r54Key(41) }), /key 与文件名/u);
+  assert.match(FORWARD_STARTED_PROBLEM({ schema: FORWARD_STARTED_SCHEMA, key: r54Key(42), runner_pid: 0, claude_pid: 4243, started_at: new Date(now).toISOString(), runner_start_at: new Date(now).toISOString() }, { now, expectedKey: r54Key(42) }), /runner_pid/u);
+  assert.match(FORWARD_RESULT_PROBLEM({ ...good, key: r54Key(40) }, { now, expectedKey: r54Key(41) }), /key 与文件名/u);
+  // doctor：文件名 kx 的 result 内容自称 key=ky → 查不清点名
+  const m = doctorMachine();
+  const root = m.project("fwdkeybad", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdkeybad", root, root_message_id: "om_root_fwdkeybad", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(path.join(runsDir, r54Key(22) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(20), { finished_at: new Date(now).toISOString() })) + "\n", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.match(c.detail, /查不清 1/u, c.detail);
+  assert.match(c.detail, /key 与文件名/u, c.detail);
+});
+
+test("R54 返修二 P1-4：悬空 symlink 的 result → 查不清点名（不再 statSync fail-open 跳过）", () => {
+  const m = doctorMachine();
+  const root = m.project("fwddang", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwddang", root, root_message_id: "om_root_fwddang", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  fs.symlinkSync(path.join(runsDir, "nowhere.json"), path.join(runsDir, r54Key(43) + ".forward.result.json"));
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, JSON.stringify(c));
+  assert.match(c.detail, /查不清 1/u, "悬空 symlink 记查不清（红：旧版 statSync ENOENT 直接跳过）：" + c.detail);
+  assert.match(c.detail, /open 失败|ELOOP/u, "点名 I/O 原因：" + c.detail);
+});
+
+test("R54 返修二 P2-6：假 claude 阻塞 2 秒——路由器在子进程结束之前返回（不再以 200ms 为正确性判据）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-blk-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true });
+  fs.writeFileSync(path.join(bin, "claude"), [
+    "#!/usr/bin/env node",
+    "setTimeout(() => {",
+    "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 1, duration_ms: 2000 }) + '\n');",
+    "  process.exit(0);",
+    "}, 2000);",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const t0 = Date.now();
+  const run = deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "msg_blk", createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key: r54Key(21), env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  const tReturn = Date.now();
+  assert.ok(!fs.existsSync(run.resultPath), "路由器返回时子进程还没结束（结果未落盘）");
+  const deadline = tReturn + 5000; // 宽松总超时兜底（不再以 200ms 为判据）
+  let r = null;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(run.resultPath)) { r = JSON.parse(fs.readFileSync(run.resultPath, "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  assert.ok(r, "5 秒内结果落盘");
+  assert.ok(tReturn < Date.parse(r.finished_at), "返回时刻早于子进程结束（tReturn=" + new Date(tReturn).toISOString() + " finished=" + r.finished_at + "）");
+  assert.ok(tReturn - t0 < 200, "返回本身仍是毫秒级（实测 " + (tReturn - t0) + "ms）——只是不再当正确性判据");
+});
+
+test("R54 返修二 P2-5：forward tmp 残骸进受控盘点（报 forward_run_conflict 点名 tmp，不再 unrecognized_entry）", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdtmp", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdtmp", root, root_message_id: "om_root_fwdtmp", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const key = "ef".repeat(32);
+  fs.writeFileSync(path.join(runsDir, key + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json.tmp.4242"), "{}", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.started.json.tmp.4242"), "{}", { mode: 0o600 });
+  const inv = inventoryRuns({ runsDir, claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims") });
+  assert.equal(inv.problems.filter((x) => x.reason === "unrecognized_entry").length, 0, "tmp 不再是不认识的条目：" + JSON.stringify(inv.problems));
+  assert.ok(inv.problems.some((x) => x.reason === "forward_run_conflict" && /tmp/u.test(x.why)), "tmp 残骸按受控形状报出并点名：" + JSON.stringify(inv.problems));
+});
+
+// ── R54 返修三（Codex #141 三轮 4 P1）──
+
+test("R54 返修三 P1-1：源 result 行 num_turns 为负 → 投影 malformed_result，绝不进成功公式", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-fwd-f3-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true });
+  fs.writeFileSync(path.join(bin, "claude"), [
+    "#!/usr/bin/env node",
+    "require('node:fs').writeSync(1, JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: -1, duration_ms: 0 }) + '\\n');",
+    "process.exit(0);",
+  ].join("\n") + "\n", { mode: 0o700 });
+  const run = deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "msg_f3a", createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key: r54Key(31), env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  const deadline = Date.now() + 5000;
+  let r = null;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(run.resultPath)) { r = JSON.parse(fs.readFileSync(run.resultPath, "utf-8")); break; }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+  assert.ok(r, "result 落盘");
+  assert.deepEqual([r.is_error, r.sent, r.subtype, r.reason_first_line], [true, false, "malformed_result", "malformed_result"], JSON.stringify(r));
+});
+
+test("R54 返修三 P1-2：forward 制品归属封闭——孤立 tmp 报 forward_write_residue、孤立 started 报 forward_incomplete，⑯ 不计入桶", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdown", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdown", root, root_message_id: "om_root_fwdown", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const kTmp = r54Key(32); const kStarted = r54Key(33);
+  fs.writeFileSync(path.join(runsDir, kTmp + ".forward.result.json.tmp.4242"), "{}", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, kStarted + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: kStarted, runner_pid: 4242, claude_pid: 4243, started_at: new Date(Date.now() - 11 * 60e3).toISOString(), runner_start_at: new Date(Date.now() - 11 * 60e3).toISOString() }) + "\n", { mode: 0o600 });
+  const inv = inventoryRuns({ runsDir, claimsDir: path.join(root, ".runtime-data", "inbound", "delivery-claims") });
+  assert.ok(inv.problems.some((x) => x.key === kTmp && x.reason === "forward_write_residue"), "孤立 tmp → forward_write_residue：" + JSON.stringify(inv.problems));
+  assert.ok(inv.problems.some((x) => x.key === kStarted && x.reason === "forward_incomplete"), "孤立 started → forward_incomplete：" + JSON.stringify(inv.problems));
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.detail.includes("绿"), false, "⑯ 不计残骸/半制品：" + c.detail);
+});
+
+test("R54 返修三 P1-3：PID 存活不算实例证明——runner_start_at 与进程启动时刻不符 → 进行中未验证，本项 ok:null", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdpid", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdpid", root, root_message_id: "om_root_fwdpid", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const sleeper = spawn("sleep", ["30"], { stdio: "ignore", detached: true }); sleeper.unref();
+  const ago11m = new Date(Date.now() - 11 * 60e3).toISOString();
+  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), "{}\n", { mode: 0o600 });
+  fs.utimesSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.jsonl"), new Date(Date.now() - 11 * 60e3), new Date(Date.now() - 11 * 60e3));
+  // runner_pid 活着（sleeper），但 runner_start_at 自称 11 分钟前 —— 与该进程真实启动时刻差 >2s → unverified
+  fs.writeFileSync(path.join(runsDir, "1".padEnd(64, "0") + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key: "1".padEnd(64, "0"), runner_pid: sleeper.pid, claude_pid: 4243, started_at: ago11m, runner_start_at: ago11m }) + "\n", { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, null, "无法核验实例身份 → 本项 incomplete（ok:null）：" + JSON.stringify(c));
+  assert.match(c.detail, /进行中未验证 1/u, c.detail);
+  assert.match(c.detail, /尚无结果|转发进行中/u, "措辞点名进行中：" + c.detail);
+  sleeper.kill();
+});
+
+test("R54 返修三 P1-4：不可能组合拒——sent=true 配 reason=failed / 错 final_text_sha256 / is_error=true 配 sent=true 都 problem", () => {
+  const now = Date.now();
+  const base = { schema: FORWARD_RESULT_SCHEMA, key: r54Key(34), target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, finished_at: new Date(now).toISOString(), claude_path: "/x", final_text_sha256: FORWARD_SHA_SENT };
+  assert.equal(FORWARD_RESULT_PROBLEM({ ...base }, { now }), null);
+  assert.match(FORWARD_RESULT_PROBLEM({ ...base, reason_first_line: "failed" }, { now }), /sent=true/u, "sent=true + reason=failed 拒");
+  assert.match(FORWARD_RESULT_PROBLEM({ ...base, final_text_sha256: "f".repeat(64) }, { now }), /final_text_sha256/u, "sent=true + 错 SHA 拒");
+  assert.match(FORWARD_RESULT_PROBLEM({ ...base, is_error: true }, { now }), /is_error=true/u, "is_error=true + sent=true 拒");
+});
+
+test("R54 返修四 P1-1（六轮 P2 密闭化）：读取器固定 /bin/ps——PATH 假 ps 从未执行；真 ps 可用→ok 且为真启动时刻，不可用→unavailable", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "psabs-"));
+  const marker = path.join(local, "fake-ps-ran");
+  const fakePs = [
+    "#!/usr/bin/env node",
+    "require('node:fs').writeFileSync(" + JSON.stringify(marker) + ", 'ran');",
+    "process.stdout.write('Wed Jan 1 00:00:00 2020\n');",
+  ].join("\n") + "\n";
+  fs.writeFileSync(path.join(local, "ps"), fakePs, { mode: 0o700 });
+  const savedPath = process.env.PATH;
+  process.env.PATH = local + path.delimiter + (savedPath ?? "");
+  try {
+    // 六轮 P2：不硬断言 ok（沙箱禁 ps 时 /bin/ps 不可用 → unavailable）——两种终态都合法：
+    //   ok ⇒ 必是真启动时刻（不是假 ps 的 2020）；unavailable ⇒ why 必指向 ps 本身（退出码/异常）。
+    const r = readProcessStartTime(process.pid, { platform: "darwin" });
+    if (r.state === "ok") {
+      assert.ok(r.startMs > Date.now() - 24 * 3600e3, "ok 时是真启动时刻（不是假 ps 的 2020）：" + JSON.stringify(r));
+    } else {
+      assert.equal(r.state, "unavailable", JSON.stringify(r));
+      assert.match(String(r.why), /ps/u, "unavailable 时 why 指向 ps：" + String(r.why));
+    }
+    assert.equal(fs.existsSync(marker), false, "PATH 上的假 ps 没被执行（读取器固定 /bin/ps）");
+    assert.equal(readProcessStartTime(0, { platform: "darwin" }).state, "unavailable", "pid 0 → unavailable");
+    assert.equal(readProcessStartTime(process.pid, { platform: "sunos" }).state, "unavailable", "不支持平台 → unavailable");
+  } finally { process.env.PATH = savedPath; fs.rmSync(local, { recursive: true, force: true }); }
+});
+
+// ── R54 返修五（Codex #141 五轮 2 P1 + 3 P2）──
+
+test("R54 返修五 P1-1：CLK_TCK 受验读取——auxv AT_CLKTCK=250 参与换算；getconf 兜底；皆取不到 → unavailable（绝不猜 100）", () => {
+  const BTIME = 1700000000, TICKS = 5000;
+  // /proc/<pid>/stat：右括号后 fields[19] = starttime（第 22 字段）
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\nintr 0 0\n";
+  const AT_CLKTCK = 17;
+  const auxvBuf = (pairs) => { const b = Buffer.alloc(pairs.length * 16); pairs.forEach(([t, v], i) => { b.writeBigUInt64LE(BigInt(t), i * 16); b.writeBigUInt64LE(BigInt(v), i * 16 + 8); }); return b; };
+  const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+  // ① auxv 带 AT_CLKTCK=250（混入其它 entry 证明会扫描）→ 换算按 250
+  const files1 = { "/proc/self/auxv": auxvBuf([[6, 4096], [AT_CLKTCK, 250], [3, 65539], [0, 0]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const r1 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files1 ? files1[p] : noent()), spawnSync: () => { throw new Error("auxv 命中时不该调 getconf"); } });
+  assert.equal(r1.state, "ok", JSON.stringify(r1));
+  assert.equal(r1.startMs, BTIME * 1000 + TICKS * (1000 / 250), "按 AT_CLKTCK=250 换算（猜 100 时此断言红）");
+  // ② auxv 没有 AT_CLKTCK → /usr/bin/getconf 兜底（固定绝对路径、PATH 清空、有超时）
+  const files2 = { "/proc/self/auxv": auxvBuf([[6, 4096], [0, 0]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const calls = [];
+  const r2 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files2 ? files2[p] : noent()), spawnSync: (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0, stdout: "250\n" }; } });
+  assert.equal(r2.state, "ok", JSON.stringify(r2));
+  assert.equal(r2.startMs, BTIME * 1000 + TICKS * (1000 / 250), "getconf CLK_TCK=250 参与换算");
+  assert.deepEqual(calls, [{ cmd: "/usr/bin/getconf", args: ["CLK_TCK"], opts: { encoding: "utf-8", timeout: 2000, maxBuffer: 1024, env: { PATH: "" } } }], "getconf 固定绝对路径 + PATH 清空 + 超时");
+  // ③ 皆取不到 → unavailable（绝不回退 100）
+  const files3 = { "/proc/self/auxv": Buffer.alloc(0), "/proc/77/stat": stat, "/proc/stat": procStat };
+  const r3 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files3 ? files3[p] : noent()), spawnSync: () => ({ status: 1, stdout: "" }) });
+  assert.equal(r3.state, "unavailable", JSON.stringify(r3));
+  assert.match(String(r3.why), /CLK_TCK/u, "why 点名 CLK_TCK");
+  // ④ getconf 输出不是整数 → unavailable
+  const r4 = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files3 ? files3[p] : noent()), spawnSync: () => ({ status: 0, stdout: "junk\n" }) });
+  assert.equal(r4.state, "unavailable", JSON.stringify(r4));
+});
+
+test("R54 返修五 P2-3：读取器 spawnSync 注入密闭——固定绝对路径/参数被调用；成功解析、非零退出、error(超时) → unavailable", () => {
+  const calls = [];
+  const spawn = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0, stdout: "Wed Jan 01 00:00:00 2020\n" }; };
+  const r = readProcessStartTime(4242, { platform: "darwin", spawnSync: spawn });
+  assert.equal(r.state, "ok", JSON.stringify(r));
+  assert.equal(r.startMs, Date.parse("Wed Jan 01 00:00:00 2020"), "解析成功");
+  assert.equal(calls.length, 1, "恰调一次");
+  assert.equal(calls[0].cmd, "/bin/ps", "固定绝对路径");
+  assert.deepEqual(calls[0].args, ["-o", "lstart=", "-p", "4242"]);
+  assert.equal(calls[0].opts.env.PATH, "", "子进程 PATH 清空");
+  assert.ok(calls[0].opts.timeout >= 1000 && calls[0].opts.maxBuffer >= 1024, "有超时与 maxBuffer 上限");
+  assert.equal(readProcessStartTime(4242, { platform: "darwin", spawnSync: () => ({ status: 1, stdout: "" }) }).state, "unavailable", "非零退出 → unavailable");
+  assert.equal(readProcessStartTime(4242, { platform: "darwin", spawnSync: () => ({ error: new Error("timed out"), status: null }) }).state, "unavailable", "超时/error → unavailable");
+  assert.equal(readProcessStartTime(4242, { platform: "darwin", spawnSync: () => ({ status: 0, stdout: "   " }) }).state, "unavailable", "空输出 → unavailable");
+});
+
+test("R54 返修五 P1-2：started 盘点后消失按 jsonl 年龄重判——<10 分钟 → 刚起；11 分钟 → 结果缺失（不无条件 pending）", () => {
+  const m = doctorMachine();
+  const root = m.project("fwdgone", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "fwdgone", root, root_message_id: "om_root_fwdgone", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  // 两个 key：磁盘上都只有 jsonl（started 不在盘上），注入的盘点谎称 started 在场——即「盘点后、打开前被删」。
+  const K5 = "5".padEnd(64, "0"), K6 = "6".padEnd(64, "0"), K9 = "9".padEnd(64, "0");
+  for (const [k, ageMs] of [[K5, 11 * 60e3], [K6, 60e3]]) {
+    const f = path.join(runsDir, k + ".forward.jsonl");
+    fs.writeFileSync(f, "{}\n", { mode: 0o600 });
+    fs.utimesSync(f, new Date(now - ageMs), new Date(now - ageMs));
+  }
+  // 接线探针：K9 只注入 phantom result 名（盘上什么都没有）→ 只有注入真到达 ⑯ 才会记「查不清 1」；
+  // 没接线的旧代码读不到 K9，断言红（测试不会空转绿）。
+  const phantom = (dir) => fs.readdirSync(dir).concat([K5 + ".forward.started.json", K6 + ".forward.started.json", K9 + ".forward.result.json"]);
+  const saved = ["FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_REGISTRY"].map((k) => [k, process.env[k]]);
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = m.ledgerDir;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = m.maintDir;
+  process.env.FEISHU_BRIDGE_REGISTRY = m.files.registry;
+  let rep;
+  try { rep = runDoctor({ home: m.home, registryFile: m.files.registry, routesFile: m.files.routes, providersFile: m.files.providers, forwardRunsList: phantom }); }
+  finally { for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  const c = checkOf(rep, "inbound_forward_result");
+  assert.equal(c.ok, false, "结果缺失仍在：" + JSON.stringify(c));
+  assert.match(c.detail, /共 3 条：结果缺失 1、刚起还没结果 1、查不清 1/u, "接线探针（查不清 1=K9）+ 11 分钟 → 结果缺失、1 分钟 → 刚起（无条件 pending 或未接线时此断言红）：" + c.detail);
+});
+
+
+// ── R54 返修六（Codex #141 六轮 1 P1 + 1 P2）──
+
+test("R54 返修六 P1：auxv 布局不猜——arch/endianness 唯一确定，四布局（32/64 × LE/BE）AT_CLKTCK=250 各参与换算；未知 arch → unavailable", () => {
+  const BTIME = 1700000000, TICKS = 5000;
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\n";
+  const auxvBuf = (wordBytes, be, pairs) => {
+    const b = Buffer.alloc(pairs.length * wordBytes * 2);
+    pairs.forEach(([t, v], i) => {
+      const o = i * wordBytes * 2;
+      if (wordBytes === 8) { (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(t), o); (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(v), o + 8); }
+      else { (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, t, o); (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, v, o + 4); }
+    });
+    return b;
+  };
+  const AT_CLKTCK = 17;
+  const cases = [
+    ["x64", "LE", 8], ["s390x", "BE", 8], ["mips", "LE", 4], ["s390", "BE", 4],
+  ];
+  for (const [arch, endianness, wb] of cases) {
+    const be = endianness === "BE";
+    const files = { "/proc/self/auxv": auxvBuf(wb, be, [[6, 4096], [AT_CLKTCK, 250], [3, 65539], [0, 0]]), "/proc/77/stat": stat, "/proc/stat": procStat };
+    const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+    const r = readProcessStartTime(77, { platform: "linux", arch, endianness, readFileSync: (p) => (p in files ? files[p] : noent()), spawnSync: () => { throw new Error("auxv 命中时不该调 getconf"); } });
+    assert.equal(r.state, "ok", arch + "/" + endianness + "：" + JSON.stringify(r));
+    assert.equal(r.startMs, BTIME * 1000 + TICKS * (1000 / 250), arch + "/" + endianness + " 按 AT_CLKTCK=250 换算");
+  }
+  // 未知 arch → unavailable（不猜字宽、不换布局重试）
+  const files = { "/proc/77/stat": stat, "/proc/stat": procStat };
+  const r2 = readProcessStartTime(77, { platform: "linux", arch: "riscv999", endianness: "LE", readFileSync: (p) => (p in files ? files[p] : (() => { const e = new Error("x"); e.code = "ENOENT"; throw e; })()), spawnSync: () => ({ status: 1, stdout: "" }) });
+  assert.equal(r2.state, "unavailable", JSON.stringify(r2));
+  assert.match(String(r2.why), /arch|CLK_TCK/u);
+});
+
+test("R54 返修六 P1：parseAuxvClkTck 纯函数——四布局直取 250；无终止/重复/未对齐/坏参数 → null", () => {
+  const mk = (wb, be, pairs) => {
+    const b = Buffer.alloc(pairs.length * wb * 2);
+    pairs.forEach(([t, v], i) => {
+      const o = i * wb * 2;
+      if (wb === 8) { (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(t), o); (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(v), o + 8); }
+      else { (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, t, o); (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, v, o + 4); }
+    });
+    return b;
+  };
+  const good = [[6, 4096], [17, 250], [0, 0]];
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 8, endianness: "LE" }), 250);
+  assert.equal(parseAuxvClkTck(mk(8, true, good), { wordBytes: 8, endianness: "BE" }), 250);
+  assert.equal(parseAuxvClkTck(mk(4, false, good), { wordBytes: 4, endianness: "LE" }), 250);
+  assert.equal(parseAuxvClkTck(mk(4, true, good), { wordBytes: 4, endianness: "BE" }), 250);
+  // 布局错配（64 位缓冲按 32 位读）→ null，绝不换布局猜
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 4, endianness: "LE" }), null);
+  // 结构受验
+  assert.equal(parseAuxvClkTck(mk(8, false, [[6, 4096], [17, 250]]), { wordBytes: 8, endianness: "LE" }), null, "无 AT_NULL 终止项");
+  assert.equal(parseAuxvClkTck(mk(8, false, [[17, 250], [17, 250], [0, 0]]), { wordBytes: 8, endianness: "LE" }), null, "AT_CLKTCK 两次");
+  assert.equal(parseAuxvClkTck(mk(8, false, [[17, 0], [0, 0]]), { wordBytes: 8, endianness: "LE" }), null, "值非正");
+  assert.equal(parseAuxvClkTck(Buffer.alloc(12), { wordBytes: 8, endianness: "LE" }), null, "未按 entrySize 对齐");
+  assert.equal(parseAuxvClkTck("not a buffer", { wordBytes: 8, endianness: "LE" }), null, "非 Buffer");
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 7, endianness: "LE" }), null, "wordBytes 越界");
+  assert.equal(parseAuxvClkTck(mk(8, false, good), { wordBytes: 8, endianness: "XX" }), null, "endianness 越界");
+});
+
+test("R54 返修六 P1：auxv 结构受验——无 AT_NULL 终止项 → unavailable；AT_CLKTCK 出现两次 → unavailable；值非正安全整数 → unavailable", () => {
+  const auxvBuf = (wordBytes, be, pairs) => {
+    const b = Buffer.alloc(pairs.length * wordBytes * 2);
+    pairs.forEach(([t, v], i) => {
+      const o = i * wordBytes * 2;
+      if (wordBytes === 8) { (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(t), o); (be ? b.writeBigUInt64BE : b.writeBigUInt64LE).call(b, BigInt(v), o + 8); }
+      else { (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, t, o); (be ? b.writeUInt32BE : b.writeUInt32LE).call(b, v, o + 4); }
+    });
+    return b;
+  };
+  const AT_CLKTCK = 17;
+  // 无终止项：没有 AT_NULL
+  const noTerm = auxvBuf(8, false, [[6, 4096], [AT_CLKTCK, 250]]);
+  // 出现两次
+  const twice = auxvBuf(8, false, [[6, 4096], [AT_CLKTCK, 250], [AT_CLKTCK, 250], [0, 0]]);
+  // 值非正
+  const badVal = auxvBuf(8, false, [[AT_CLKTCK, 0], [0, 0]]);
+  const BTIME = 1700000000, TICKS = 5000;
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\n";
+  for (const [name, buf] of [["无终止项", noTerm], ["出现两次", twice], ["值非正", badVal]]) {
+    const files = { "/proc/self/auxv": buf, "/proc/77/stat": stat, "/proc/stat": procStat };
+    const r = readProcessStartTime(77, { platform: "linux", arch: "x64", endianness: "LE", readFileSync: (p) => (p in files ? files[p] : (() => { const e = new Error("x"); e.code = "ENOENT"; throw e; })()), spawnSync: () => ({ status: 1, stdout: "" }) });
+    assert.equal(r.state, "unavailable", name + " → unavailable：" + JSON.stringify(r));
+    assert.match(String(r.why), /CLK_TCK|auxv/u, name + " why 点名 auxv/CLK_TCK");
+  }
+});
+
+
+// ── R54 返修七（Codex #141 七轮 1 P1）──
+
+test("R54 返修七 P1：未知 arch / 非法 endianness 先封闭拒绝——不调 getconf、不读 auxv（注入 getconf 成功仍拒且计数为 0）", () => {
+  const BTIME = 1700000000, TICKS = 5000;
+  const stat = "4242 (cat) R " + Array(18).fill("0").join(" ") + " " + TICKS + " 0 0 0\n";
+  const procStat = "btime " + BTIME + "\n";
+  const files = { "/proc/77/stat": stat, "/proc/stat": procStat };
+  const noent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+  for (const [tag, over] of [["未知 arch", { arch: "future64", endianness: "LE" }], ["非法 endianness", { arch: "x64", endianness: "XX" }]]) {
+    const calls = [];
+    const r = readProcessStartTime(77, { platform: "linux", readFileSync: (p) => (p in files ? files[p] : noent()), spawnSync: (cmd, args, opts) => { calls.push([cmd, args, opts]); return { status: 0, stdout: "250\n" }; }, ...over });
+    assert.equal(r.state, "unavailable", tag + " → unavailable（改前会绕到 getconf 判 ok）：" + JSON.stringify(r));
+    assert.match(String(r.why), /arch|endianness/u, tag + " why 点名 arch/endianness");
+    assert.deepEqual(calls, [], tag + "：getconf 读取器未被调用");
+  }
+});
+
 
 summarySealed = true;
 

@@ -19,7 +19,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { moduleDir } from "./direct-run.mjs";
 import { isUnder } from "./registry.mjs";
+
+/** 转发结果由这个 runner 落盘（issue #140）：和本文件同目录，安装面拷 scripts/*.mjs 时自然带着。 */
+const FORWARD_RUNNER_SCRIPT = path.join(moduleDir(import.meta.url), "forward-runner.mjs");
 
 export const SESSIONS_DIR = path.join(os.homedir(), ".claude", "sessions");
 export const PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
@@ -281,25 +285,32 @@ export function forwardPrompt({ targetName, stamped }) {
  * 是内部协议，照着它自己拼包等于把整条链路押在一个没有版本承诺的接口上。
  *
  * 和 handOff 一样是 detached：投递方必须秒级返回，不等结果。
+ *
+ * spawn 的不再是 claude 本身，而是 forward-runner（issue #140）：原先 spawn 后 unref()
+ * 不看结果，转发进程秒退（旧版 Claude Code 不认模型报 400）时回执已经冒充送达。
+ * 现在 runner 用 process.execPath + 本目录脚本路径起（不走 PATH 上的 node），由它去起
+ * claude（解析仍走 PATH）、等退出、把结果投影成 <key>.forward.result.json 落盘。
+ * 返回值多带 resultPath，回执措辞随之改老实（inbound.mjs）。
  */
-export function deliverToLiveSession({ target, instruction, messageId, createdAtMs, projectRoot, runsDir, key }) {
+export function deliverToLiveSession({ target, instruction, messageId, createdAtMs, projectRoot, runsDir, key, env: extraEnv }) {
   fs.mkdirSync(runsDir, { recursive: true });
   const logPath = path.join(runsDir, key + ".forward.jsonl");
   const errPath = path.join(runsDir, key + ".forward.stderr.log");
+  const resultPath = path.join(runsDir, key + ".forward.result.json");
 
   const prompt = forwardPrompt({
     targetName: target.name,
     stamped: stampInstruction({ instruction, messageId, createdAtMs }),
   });
 
-  const out = fs.openSync(logPath, "a");
-  const err = fs.openSync(errPath, "a");
+  // runner 的 env 默认原样继承（claude 由 runner 用 ROLE_ENV=forwarder 起）；env 参数是测试
+  // 注入假 claude 的隔离点，生产路径不传。
   const child = spawn(
-    "claude",
-    ["-p", prompt, "--output-format", "stream-json", "--verbose"],
+    process.execPath,
+    [FORWARD_RUNNER_SCRIPT, JSON.stringify({ key, runsDir, projectRoot, targetName: target.name, prompt })],
     {
-      cwd: projectRoot, detached: true, stdio: ["ignore", out, err],
-      env: { ...process.env, [ROLE_ENV]: "forwarder" },
+      cwd: projectRoot, detached: true, stdio: "ignore",
+      env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
     },
   );
   child.unref();
@@ -308,6 +319,7 @@ export function deliverToLiveSession({ target, instruction, messageId, createdAt
     mode: "live_session",
     pid: child.pid,
     logPath,
+    resultPath,
     targetSessionId: target.sessionId,
     targetName: target.name,
     startedAt: new Date().toISOString(),

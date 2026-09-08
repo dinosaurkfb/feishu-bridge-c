@@ -58,6 +58,9 @@ import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
+import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
+import { readProcessStartTime } from "./process-start-time.mjs";
+import { forwardResultProblem, forwardStartedProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
@@ -113,6 +116,11 @@ export function runDoctor({
   launchctl = undefined,
   // **默认不执行状态入口脚本**：它们是外部代码，可能写盘 —— 只有显式要求才跑，副作用属于登记入口自己的信任边界。
   probeProviders = false,
+  // R54 返修四 P2-3：进程启动时刻读取器可注入（测试密闭，不依赖真机 ps）；默认 = 可信读取器。
+  processStartTime = (pid) => readProcessStartTime(pid),
+  // R54 返修五 P1-2：⑯ runs 盘点可注入（测试密闭——「盘点后、打开前消失」无法在同步进程里确定性复现）；
+  // 生产恒 null → fs.readdirSync。注入函数接收 runsDir，返回名字数组。
+  forwardRunsList = null,
 } = {}) {
   const ctx = machineContext({ home });
   registryFile = registryFile ?? ctx.registryFile;
@@ -719,6 +727,134 @@ export function runDoctor({
         : "说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；");
       add("topic_agent_staging", "⑮ topic-agent staging", problems.length === 0, body, null);
     }
+  }
+
+  // ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
+  // forward-runner 落在 <root>/.runtime-data/inbound/runs/<key>.forward.*（issue #140）。
+  // 读盘纪律（#141 二轮 P1-4）：一律先走 readVerifiedDoc（fd 绑定，O_NOFOLLOW|O_NONBLOCK），只把
+  // ENOENT 折成缺席；EIO/悬空 symlink/FIFO/并发变化 → 查不清并点名；不做受验读取前的 statSync fail-open。
+  // 按 key 聚合（#141 二轮 P1-2）：runs 目录先聚成 {key: {jsonl, stderr, started, result}} 快照，
+  // 每个 key 恰进一个终态桶（绿/红/进行中/结果缺失/查不清）；有 result 的 key 不再走孤儿判断。
+  // key 绑定（#141 二轮 P1-3）：doctor 从文件名解析 key 传入校验器，doc.key 与文件名不符 → 查不清。
+  // 24h 窗口罩住一切：更早的积尘不算当前健康度，否则一次旧故障永远红着，这项就失去了信号。
+  {
+    const WINDOW = 24 * 3600 * 1000;
+    const ORPHAN_AFTER = 10 * 60 * 1000;
+    const RESULT_CAP = 64 * 1024;
+    const SUFFIXES = [[".forward.result.json", "result"], [".forward.started.json", "started"], [".forward.stderr.log", "stderr"], [".forward.jsonl", "jsonl"]];
+    const buckets = { green: 0, red: 0, missing: 0, pending: 0, inflight: 0, inflightUnverified: 0, unclear: 0 };
+    const redNote = [];
+    const missingKeys = [];
+    const unclearNote = [];
+    // fd 绑定 stat（O_NOFOLLOW|O_NONBLOCK，不读内容）：jsonl 的年龄来源；悬空 symlink/FIFO/并发变化 → problem，不 fail-open
+    const fdStat = (file) => {
+      let fd = null;
+      try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+        const st = fs.fstatSync(fd);
+        if (!st.isFile() || st.nlink !== 1) return { problem: "不是普通文件或硬链接数不为 1" };
+        return { ok: true, mtimeMs: st.mtimeMs };
+      } catch (err) {
+        if (err?.code === "ENOENT") return { absent: true };
+        return { problem: "open/fstat 失败: " + String(err?.code ?? err?.message ?? err) };
+      }
+      finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+    };
+    for (const p of projects) {
+      const root = p?.root;
+      if (typeof root !== "string" || !path.isAbsolute(root)) continue; // root 不成形的项目 ⑤⑥ 已点名
+      const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+      let names;
+      try { names = typeof forwardRunsList === "function" ? forwardRunsList(runsDir) : fs.readdirSync(runsDir); }
+      catch (err) {
+        if (err?.code === "ENOENT") continue; // 没有转发就没有这项条目
+        buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(path.basename(String(root)) + "（runs 读不出：" + String(err?.code ?? err?.message ?? err) + "）");
+        continue;
+      }
+      // P1-2：先按 key 聚合成快照，再逐 key 判桶；key 形状不符（非 64hex）→ 查不清（P2-6）
+      const byKey = new Map();
+      for (const n of names) {
+        for (const [suffix, kind] of SUFFIXES) {
+          if (!n.endsWith(suffix)) continue;
+          const key = n.slice(0, -suffix.length);
+          if (!byKey.has(key)) byKey.set(key, {});
+          byKey.get(key)[kind] = n;
+          break;
+        }
+      }
+      // R54 返修五 P2-5：走 PATH 的旧 etimeSecs() 已删——启动时刻一律走受验读取器（process-start-time.mjs）。
+      for (const [key, parts] of byKey) {
+        const unclear = (why) => { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：" + why); };
+        if (!FORWARD_KEY_RE.test(key)) { unclear("key 形状不对（须 64 位十六进制）"); continue; }
+        if (parts.result !== undefined) {
+          // 有 result：唯一终态来源，不再走孤儿判断
+          const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key }), maxBytes: RESULT_CAP });
+          if (v.ok !== true) { if (v.absent) unclear("result 读不出（并发变化）"); else unclear(String(v.problem ?? "读不出")); continue; }
+          const at = Date.parse(v.doc.finished_at ?? "");
+          if (now - (Number.isFinite(at) ? at : (v.mtimeMs ?? 0)) > WINDOW) continue; // 窗外积尘
+          if (v.doc.is_error === true || v.doc.sent !== true) {
+            buckets.red += 1;
+            if (redNote.length < 3) redNote.push(key.slice(-8) + " —— " + String(v.doc.reason_first_line ?? "原因不明") + (v.doc.claude_code_version ? "（claude_code_version " + v.doc.claude_code_version + "）" : "（版本未知）"));
+          } else buckets.green += 1;
+          continue;
+        }
+        // 无 result：孤儿判定（jsonl 是年龄与存亡的依据；缺席的 key 没有可判的制品，跳过）
+        if (parts.jsonl === undefined) continue;
+        const vj = fdStat(path.join(runsDir, parts.jsonl)); // jsonl 只取同 fd fstat 时间，不整读内容（可达数 MiB）
+        if (vj.ok !== true) {
+          if (vj.absent) { buckets.unclear += 1; if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：jsonl 在盘点后消失（并发变化）"); }
+          else unclear(String(vj.problem ?? "jsonl 读不出")); // EIO / 悬空 symlink / FIFO / 并发变化：不 fail-open
+          continue;
+        }
+        const age = now - (vj.mtimeMs ?? 0);
+        if (age > WINDOW) continue; // 超窗积尘不算
+        // R54 返修四 P1-2：一律先读 started.json 并做实例核验——10 分钟宽限只延迟「结果缺失」，
+        // 不绕过实例核验。started 缺席才看 age：<10 分钟 → pending（ok:null），≥10 分钟 → 结果缺失。
+        if (parts.started === undefined) {
+          if (age < ORPHAN_AFTER) { buckets.pending += 1; continue; } // 刚起还没结果
+          buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
+          continue;
+        }
+        const sv = readVerifiedDoc({ file: path.join(runsDir, parts.started), docValidator: (doc) => forwardStartedProblem(doc, { now, expectedKey: key }), maxBytes: 16 * 1024 });
+        if (sv.ok !== true) {
+          // R54 返修五 P1-2：started 盘点后消失——按 jsonl 年龄重判（宽限内=刚起，超窗=结果缺失），
+          // 不无条件 pending（否则 11 分钟旧 jsonl 被谎报成「刚起还没结果」）。
+          if (sv.absent) {
+            if (age < ORPHAN_AFTER) { buckets.pending += 1; continue; }
+            buckets.missing += 1; if (missingKeys.length < 3) missingKeys.push(key.slice(-8));
+            continue;
+          }
+          unclear("started " + String(sv.problem ?? "读不出")); continue;
+        }
+        // 实例核验：PID 存活不算证明——runner_start_at 与可信读取器的进程启动时刻一致（±2s）才算进行中
+        const ps = processStartTime(sv.doc.runner_pid);
+        const startMs = Date.parse(sv.doc.runner_start_at ?? "");
+        if (ps.state === "ok" && Number.isFinite(startMs) && Math.abs(ps.startMs - startMs) <= 2000) { buckets.inflight += 1; continue; }
+        buckets.inflightUnverified += 1; continue;
+      }
+    }
+    const scanned = buckets.green + buckets.red + buckets.missing + buckets.pending + buckets.inflight + buckets.inflightUnverified + buckets.unclear; // 桶之和 = 总数
+    const parts = [];
+    if (buckets.green) parts.push("绿 " + buckets.green);
+    if (buckets.red) parts.push("红 " + buckets.red);
+    if (buckets.missing) parts.push("结果缺失 " + buckets.missing);
+    if (buckets.pending) parts.push("刚起还没结果 " + buckets.pending);
+    if (buckets.inflight) parts.push("进行中 " + buckets.inflight);
+    if (buckets.inflightUnverified) parts.push("进行中未验证 " + buckets.inflightUnverified);
+    if (buckets.unclear) parts.push("查不清 " + buckets.unclear);
+    const body = scanned === 0 ? "近 24 小时没有转发结果（只盘 live_session 转发，没有转发就没有条目）"
+      : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
+        (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
+        (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "") +
+        (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "") +
+        (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "");
+    // R54 返修三 P1-3：有无法核验实例身份的进行中转发 → 本项 incomplete（ok:null），不判绿也不判红
+    // R54 返修四 P1-2：无法核验实例身份 / 刚起还没结果 → 本项 incomplete（ok:null）
+    const ok17 = scanned === 0 ? true
+      : buckets.red + buckets.missing + buckets.unclear > 0 ? false
+      : buckets.inflightUnverified + buckets.pending > 0 ? null
+      : true;
+    add("inbound_forward_result", "⑯ 入站转发结果", ok17, body, null);
   }
 
   // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready

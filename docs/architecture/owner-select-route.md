@@ -90,6 +90,7 @@ chat_id、同 endpoint、handle 与候选一一映射且 eligible、owner 先验
 `expected_handle` + `expected_expires_at`（expected-value CAS，防陈旧定时器清掉后换发的新 handle）。
 **具体 TTL 数值必须在实现单开工前拍定为单一常量**（不可"字段已进 schema、有效期由各调用方自定"，
 P2-2/P2-3）。
+**TTL 拍定（2026-09-09，R57a/R57b 开工前）**：`selection_handle` 与 `rebind_handle` 一律用账本模块唯一常量 `OWNER_SELECT_HANDLE_TTL_MS`（30 天，R51 已落地）；reaffirm intent 的 `expires_at = issued_at + OWNER_SELECT_REAFFIRM_TTL_MS`（7 天，新常量，同模块）。不再有第三个 TTL。
 
 **其余**：128-bit CSPRNG；endpoint 级作用域；**不进** pending-claims bearer 库；owner 先验先于
 解析、不豁免任何闸；`selection_message_id` 在 fingerprint 内保重放幂等；**随机 handle 不进

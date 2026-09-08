@@ -37736,7 +37736,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         const tok = r52Uuid(6);
         const ep = fx.eps[0];
         const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
-        const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.token = r52Uuid(7); });
+        const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.token = r52Uuid(7); p.campaign_id = campaignIdFor(p.token); });
         const shaBefore = r52ShaOf(fs.readFileSync(preset.planFile));
         const dfx = r52DrainedFixture({ fx, tok });
         const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });

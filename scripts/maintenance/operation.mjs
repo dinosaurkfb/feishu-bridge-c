@@ -28,6 +28,7 @@ import {
   FORWARD_ONLY_PHASES, INCOMPLETE_PHASES, TERMINAL_PHASES, acquireOperationLease, addNote, addStepPrepared, clearActive, createOperation, inspectMaintenanceDir, leaseHolder, maintenanceDir,
   markStepDone, readActive, readJournal, releaseOperationLease, setPhase, verifyBackup, writeBackup, writeDurable,
 } from "./journal.mjs";
+import { osmExit } from "./owner-select-operation.mjs";
 import { buildStubVersion, isStubTarget, readStubManifest, removeStubVersion, stubDirName, stubRelTarget } from "./stub.mjs";
 import { defaultPs, waitForQuiet } from "./inventory.mjs";
 import { bootoutTimer, bootstrapTimer, guiDomain, timerPhase } from "./timers.mjs";
@@ -411,6 +412,8 @@ export function exitMaintenance(ctx, { apply = false, env = process.env, surface
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
   // 账本 operation 走专用只向前分派（评审 F2）：ledger_initializing / ledger_cutting_over / ledger_reopening 不被这里误判成 rollback
   if (j.doc.operation_kind === "ledger_init" || j.doc.operation_kind === "ledger_cutover") return ledgerExit(ctx, { apply, env, surface });
+  // R53：owner_select 三 kind 的 --exit 不许落通用 rollback（journal 合同不匹配），走 osmExit（重开/只向前/清 active）。
+  if (["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"].includes(j.doc.operation_kind)) return osmExit(ctx, { apply, env, surface });
   const phase = j.doc.phase;
   const action = TERMINAL_PHASES.includes(phase) ? "clear_active" : phase === "rollback_incomplete" || phase === "rollback_reopening" ? "rollback_forward" : phase === "reopening" || phase === "reopening_incomplete" ? "reopen_forward" : "rollback";
   if (!apply) { const holder = leaseHolder({ dir: ctx.dir, token }); return { ok: true, dryRun: true, token, phase, action, executor: holder.present && holder.alive ? holder.pid : null }; }

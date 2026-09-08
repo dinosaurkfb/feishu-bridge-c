@@ -38089,7 +38089,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         assert.ok(crashed, "campaign 写后崩");
         releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") });
         fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
-        // 第二步：恢复 forward，注入目录 fsync 失败 → 恢复窗口的 recoveryBarrier 拒 → campaign 不记 done。
+        // 第二步：恢复 forward，注入目录 fsync 失败 → 恢复窗口的 sealAndVerifyStep 拒 → campaign 不记 done。
         fx.ctx.afterWrite = null;
         const r2 = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
         assert.ok(r2.ok === false && r2.reason === "recovery_seal_failed", "目录 fsync 失败 → recovery_seal_failed：" + JSON.stringify({ reason: r2.reason, why: r2.why, phase: r2.phase }));

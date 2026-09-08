@@ -182,29 +182,12 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
   return { ok: true };
 }
 
-/** 返修三：B/direct 恢复窗 re-seal 专用包装（与 A 的 recoveryBarrier 同工艺；allowed 白名单 = ledger 根两个状态文件）。 */
-function barrierCampaign(env, intended, dir, inject) {
-  return recoveryBarrier({ dir, allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json", inject, verify: () => {
-    const a = readCampaignState(env);
-    const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id
-      && JSON.stringify(a.endpoints) === JSON.stringify(intended.endpoints) && a.endpoints_digest === intended.endpoints_digest;
-    return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
-  } });
-}
-function barrierWriter(env, intended, dir, inject) {
-  return recoveryBarrier({ dir, allowed: (n) => n === "owner-select-campaign.json" || n === "owner-select-writer-state.json", inject, verify: () => {
-    const a = readWriterState(env);
-    const ok = a.exists && a.sha256 === intended.sha256 && a.state === intended.state && a.campaign_id === intended.campaign_id && a.endpoints_digest === intended.endpoints_digest;
-    return ok ? { ok: true } : { ok: false, why: a.state === "unreadable" ? a.problem : "重读投影 ≠ intended" };
-  } });
-}
-function barrierLedger(ep, dir, intended, inject) {
-  return recoveryBarrier({ dir, inject, verify: () => {
-    const a = loadLedger(dir, { endpointId: ep });
-    const ok = a.ok && a.sha256 === intended.ledger_sha256 && a.doc.schema_version === intended.schema_version && a.doc.revision === intended.revision;
-    return ok ? { ok: true } : { ok: false, why: "重读投影 ≠ intended（sha/schema/revision）" };
-  } });
-}
+/** 受验投影构造器：读回目标现场，返回 { ok, projection }（供 sealAndVerifyStep 逐字段比对 intended）。 */
+const campaignProj = (env) => { const a = readCampaignState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints: a.endpoints, endpoints_digest: a.endpoints_digest } }; };
+const writerProj = (env) => { const a = readWriterState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints_digest: a.endpoints_digest, revision: a.revision } }; };
+const ledgerProj = (ep, dir) => { const a = loadLedger(dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { schema_version: a.doc.schema_version, revision: a.doc.revision, ledger_sha256: a.sha256 } : {} }; };
+const CAMPAIGN_ALLOWED = (n) => ENDPOINT_SHAPE.test(n) || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json";
+const LEDGER_ALLOWED = (n) => n === "ledger.json" || n === "ledger.json.prev";
 
 /** P1-3（返修二 P1-1）：核**两条链**的已装 runtime 是否支持过渡（§8 进门前置）。
  *  目标从**受验 journal** 的 `current:<chain>.before` 取（绝不读桩 manifest 的 original_current——
@@ -670,13 +653,10 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 返修三 测试注入点：写后读回前
-          const after = readCampaignState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "sealed") return { ok: false, reason: "written_mismatch", why: "seal 写后读回 ≠ intended_after", phase };
-        } else {
-          // 返修三：恢复窗（现场 === intended）先 fsync+受验重读+无残骸才记 done。
-          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        // 返修三：B/direct 首次 clean 提交与恢复支统一 sealAndVerifyStep。
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -702,16 +682,14 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const d = resolveEndpointDir(ep, { env });
         if (!d.ok) return { ok: false, reason: d.reason, why: ep, phase };
         const L = loadLedger(d.dir, { endpointId: ep });
-        if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1") {
-          // 现场已 after → 补 done。返修三：先 barrier 才记 done。
-          const rb = barrierLedger(ep, d.dir, st.intended_after, _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
-        } else {
+        const atIntended = L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1";
+        if (!atIntended) {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.1-transition", toSchema: "1.1", env, _inject });
           const sc = stepCommitCheck(r, "ledger");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
-          if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 执行器读回 SHA ≠ 进段预算", phase };
         }
+        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: LEDGER_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -737,12 +715,9 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          const after = readCampaignState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "complete") return { ok: false, reason: "written_mismatch", why: "complete 写后读回 ≠ intended_after", phase };
-        } else {
-          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -766,12 +741,11 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          const adm = readOwnerSelectAdmission(env);
-          if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
-        } else {
-          const rb = barrierWriter(env, intended, path.dirname(writerStatePath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const adm = readOwnerSelectAdmission(env);
+        if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -801,12 +775,9 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           copyBackup(path.join(ctx.dir, token + ".staged", "backup-campaign.json"), serializeLedger(rebuild.doc)); // seal/complete 步备份合同
-          const after = readCampaignState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "open") return { ok: false, reason: "written_mismatch", why: "open 写后读回 ≠ intended_after", phase };
-        } else {
-          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -831,16 +802,14 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
       if (st.state !== "done") {
         const d = resolveEndpointDir(ep, { env });
         const L = loadLedger(d.dir, { endpointId: ep });
-        if (L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1") {
-          // 已 after。返修三：先 barrier 才记 done。
-          const rb = barrierLedger(ep, d.dir, st.intended_after, _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
-        } else {
+        const atIntended = L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1";
+        if (!atIntended) {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1", env, _inject });
           const sc = stepCommitCheck(r, "ledger");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
-          if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 读回 ≠ 预算", phase };
         }
+        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: LEDGER_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -864,12 +833,9 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          const after = readCampaignState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "sealed") return { ok: false, reason: "written_mismatch", why: "seal 写后读回 ≠ intended_after", phase };
-        } else {
-          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -894,12 +860,9 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          const after = readCampaignState(env);
-          if (after.sha256 !== intended.sha256 || after.state !== "complete") return { ok: false, reason: "written_mismatch", why: "complete 写后读回 ≠ intended_after", phase };
-        } else {
-          const rb = barrierCampaign(env, intended, path.dirname(campaignPath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -922,12 +885,11 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          const adm = readOwnerSelectAdmission(env);
-          if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
-        } else {
-          const rb = barrierWriter(env, intended, path.dirname(writerStatePath(env)), _inject);
-          if (!rb.ok) return { ok: false, reason: "recovery_seal_failed", why: rb.why, phase };
         }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const adm = readOwnerSelectAdmission(env);
+        if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);

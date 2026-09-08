@@ -24,6 +24,8 @@ import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 import { JOURNAL_SCHEMA, OPERATION_KINDS, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
+import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
+export { canonKey, sha256 };
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -49,8 +51,8 @@ const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const AILY_SESSION_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;    // aliases.session_id（Aily 会话 locator）
 const CODEX_ID_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;        // codex task/thread
 const LINEAGE_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;
-export { LINEAGE_SHAPE }; // 只读导出（policy-store 派生 policy_subject_id 复用同一判据，#R33 P2-1）
 const REQUEST_KEY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,256}$/u; // 外部请求身份（控制 claim key / message id），进指纹（评审四 P1-2）
+export { LINEAGE_SHAPE, REQUEST_KEY_SHAPE }; // 只读导出（policy-store / owner-select-state 复用，#R33 P2-1, R50 P1-3）
 const AUTHORIZED_BY_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u; // 授权者 sender id（有界、无控制字符，评审六 P2）
 const REASON_ENUM = ["expired", "superseded", "manual"];
 const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
@@ -94,20 +96,14 @@ const OP_EFFECT_PROOF_KINDS = Object.freeze({
   retarget: { produced_binding: ["retarget"] }
 });
 
-const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const isId = (v) => typeof v === "string" && ID_SHAPE.test(v);
 const isOperationId = (v) => typeof v === "string" && OP_ID_SHAPE.test(v);
 export const newTopicAgentId = () => "ta_" + crypto.randomBytes(16).toString("hex");
-export const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 // 时间守卫（评审七 P1-3 / 八 P2）：用 isCanonicalMs 核**本仓规范时间范围**（挡 toISOString 会抛的越界，
 // 也挡 now=2.6e14 这种不抛但产六位年份的非规范 ISO）→ 非规范一律 null，事务入口收成 bad_time，绝不进到取锁/写盘。
 const isoOrNull = (now) => isCanonicalMs(now) ? canonicalIso(now) : null;
 const BAD_TIME = { ok: false, commit: "not_committed", reason: "bad_time" };
-
-/** 规范化（键排序递归）后 JSON —— 用于目标/证明的稳定比较（评审 G6/G7：不能用键序敏感的 JSON.stringify）。 */
-const stable = (v) => Array.isArray(v) ? v.map(stable) : (isObj(v) ? Object.keys(v).sort().reduce((o, k) => { o[k] = stable(v[k]); return o; }, {}) : v);
-export const canonKey = (v) => JSON.stringify(stable(v));
 
 /* ─────────────────────────── 路径（受验派生，评审 P1-7） ─────────────────────────── */
 

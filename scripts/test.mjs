@@ -36962,7 +36962,6 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   });
 
   test("R51 §五 mintSelectionHandles：三态 CAS + plan 绑定 + 集合等式 + written_mismatch", () => r51WithRoot((root, dir) => {
-    try {
     // 账本：transition（2 null-B1），mint step 锚真账本 SHA（transitionAfterSha = 现场 SHA）。
     r51SeedTransition(dir);
     const L0 = TAL.loadLedger(dir, { endpointId: EP51 });

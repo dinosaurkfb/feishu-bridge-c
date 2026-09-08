@@ -39003,11 +39003,12 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
   test("R57a 清理：B1 到期走 void(reason=expired) 核 now≥handle_expires_at；未到期拒；strict 下 void 后不留 null-handle B1", () => withLedger57((dir) => {
     const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "r57_v_b1", chatId: "oc_r57", rootOm: "om_v57", lineageId: "lin_v", bindingTarget: TGT57(18), now: T0 }), "createB1");
-    const early = TAL.voidPending({ endpointId: EP57, requestKey: "r57_v_1", b1Id: b1.result.created_id, reason: "expired", now: T0 + 1000 });
+    const early = TAL.voidPending({ endpointId: EP57, requestKey: "r57_v_1", b1Id: b1.result.created_id, reason: "expired", expectedHandle: b1.result.selection_handle, expectedExpiresAt: b1.result.handle_expires_at, now: T0 + 1000 });
     assert.equal(early.ok, false, "未到期拒");
     assert.equal(early.reason, "not_expired");
     const expiryMs = Date.parse(b1.result.handle_expires_at);
-    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "r57_v_2", b1Id: b1.result.created_id, reason: "expired", now: expiryMs + 1 }), "到期 void");
+    // 返修一 P1-1：void(expired) 必带 expected_handle/expected_expires_at（stale-timer CAS）
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "r57_v_2", b1Id: b1.result.created_id, reason: "expired", expectedHandle: b1.result.selection_handle, expectedExpiresAt: b1.result.handle_expires_at, now: expiryMs + 1 }), "到期 void");
     const doc = loadOk57(dir);
     assert.equal(doc.records[b1.result.created_id].kind, "voided_audit", "B1 → voided_audit");
     assert.ok(!Object.values(doc.records).some((r) => r.kind === "live" && TAL.familyOf(r.facts) === "B1" && r.selection_handle === null), "strict/到期后不留 null-handle live B1");
@@ -39162,6 +39163,122 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(v2.ok, false, "半有半无②拒");
     assert.match(String(v2.why), /rebind handle 与 expiry 必须同时有或同时无/u);
   });
+  // ── R57a 返修一（Codex #144 一轮 5 P1 + 1 P2）──
+
+  test("R57a 返修一 P1-1：void(expired) 带 stale-timer CAS——1.1+ fp 必含 expected_handle/expiry 双键且逐字 CAS；manual/superseded 双键显式 null；manual 带非 null expected → bad_input", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "r57f_b1", chatId: "oc_r57", rootOm: "om_f1", lineageId: "lin_f1", bindingTarget: TGT57(61), now: T0 }), "createB1");
+    const doc0 = loadOk57(dir);
+    const rec0 = doc0.records[b1.result.created_id];
+    // 手动 void：不带 expected（null）+ 记录有 handle → CAS mismatch
+    let r = TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v1", b1Id: b1.result.created_id, reason: "manual", now: T0 + 1000 });
+    assert.equal(r.ok, false, "manual 但当前 handle 非空且 expected 缺省 → CAS 拒（P1-1 契约：manual 只对 null-handle blocker）");
+    assert.equal(r.reason, "cas_mismatch");
+    // manual 显式带非 null expected → bad_input（manual/superseded 的双键必须显式 null）
+    r = TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v2", b1Id: b1.result.created_id, reason: "manual", expectedHandle: rec0.selection_handle, expectedExpiresAt: rec0.handle_expires_at, now: T0 + 1000 });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "bad_input", "manual 带非 null expected → bad_input");
+    // expired：expected 与当前不符 → cas_mismatch 且账本不变
+    r = TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v3", b1Id: b1.result.created_id, reason: "expired", expectedHandle: "osh_" + "0".repeat(32), expectedExpiresAt: rec0.handle_expires_at, now: Date.parse(rec0.handle_expires_at) + 1 });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "cas_mismatch", "expected_handle 与当前不符");
+    const revBefore = loadOk57(dir).revision;
+    // expired：expected 逐字相符 → 过了到期 → 提交；fp 含双键
+    r = talOk(TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v4", b1Id: b1.result.created_id, reason: "expired", expectedHandle: rec0.selection_handle, expectedExpiresAt: rec0.handle_expires_at, now: Date.parse(rec0.handle_expires_at) + 1 }), "expired void with CAS");
+    const doc1 = loadOk57(dir);
+    assert.equal(doc1.records[b1.result.created_id].kind, "voided_audit");
+    const op = Object.values(doc1.operations).find((o) => o.op_type === "void");
+    assert.equal(op.fingerprint, TAL.fingerprintOf("void", { request_key: "r57f_v4", b1_id: b1.result.created_id, reason: "expired", expected_handle: rec0.selection_handle, expected_expires_at: rec0.handle_expires_at }), "fp 必含 expected 双键");
+    assert.equal(doc1.revision, revBefore + 1);
+    assert.equal(r.revision, doc1.revision);
+  }, { schema: "1.1" }));
+
+  test("R57a 返修一 P1-2：A2 换发强制候选 CAS——不传 expected_anchor_candidate → bad_input（现在 ok:true 必红）；B1 携带候选 → bad_input", () => withLedger57((dir) => {
+    const a1 = talOk(TAL.createA1({ endpointId: EP57, requestKey: "r57f_a1", chatId: "oc_r57", sessionId: "sess-f-a2", now: T0 }), "createA1");
+    talOk(TAL.attach({ endpointId: EP57, requestKey: "r57f_att", id: a1.result.created_id, bindingTarget: TGT57(62), claimKey: CLAIM57("a"), authorizedBy: "ou_r57", anchorCandidate: "om_fcand", now: T0 }), "attach");
+    const cur = loadOk57(dir).records[a1.result.created_id];
+    const r = TAL.reissueSelectionHandle({ endpointId: EP57, requestKey: "r57f_re1", targetId: a1.result.created_id, expectedHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, now: T0 + 1000 });
+    assert.equal(r.ok, false, "A2 换发不带候选必须拒（改前 ok:true）");
+    assert.equal(r.reason, "bad_input", "省略候选 → bad_input");
+    // B1 + 候选 → bad_input（已有守卫，回归钉住）
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "r57f_b1b", chatId: "oc_r57", rootOm: "om_fb1", lineageId: "lin_fb1", bindingTarget: TGT57(63), now: T0 }), "createB1");
+    const rb = TAL.reissueSelectionHandle({ endpointId: EP57, requestKey: "r57f_re2", targetId: b1.result.created_id, expectedHandle: b1.result.selection_handle, expectedExpiresAt: b1.result.handle_expires_at, expectedAnchorCandidate: "om_fcand", now: T0 + 1000 });
+    assert.equal(rb.reason, "bad_input", "B1 不认候选字段");
+  }));
+
+  test("R57a 返修一 P1-3：G-handle 反向不变量——已铸 handle 被手术成 null 而产生 op 未被消费 → ledger_corrupt；RESULT_SHAPE 新形 attach_a2 不再容双 null", () => {
+    const id = "ta_" + "b".repeat(32);
+    const b1Op = "00000000-0000-4000-8000-0000000003a1";
+    const ISO = "2026-09-10T08:00:00.000Z";
+    const H = "osh_" + "c".repeat(32);
+    const mkDoc = (recordHandle) => ({ schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 3, operations: {
+      "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "fx_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      "00000000-0000-4000-8000-0000000001a2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "fx_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "fx_up", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
+      [b1Op]: { op_type: "create_b1", terminal_kind: "create_b1", request_key: "fx_b1", fingerprint: TAL.fingerprintOf("create_b1", { request_key: "fx_b1", chat_id: "oc_r57", root_om: "om_fx", lineage_id: "lin_fx", predetermined_target: TGT57(64) }), result_revision: 3, result: { created_id: id, selection_handle: H, handle_expires_at: ISO, affected_live_ids_after_commit: [id], proof_effects: [] } }
+    }, records: { [id]: { kind: "live", topic_agent_id: id, chat_id: "oc_r57", aliases: { session_id: null, root_om: "om_fx" }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, binding_target: TGT57(64), binding_proof: null, locator_link_proof_ref: null, generation_lineage_id: "lin_fx", anchor_candidate: null, selection_handle: recordHandle, handle_expires_at: recordHandle === null ? null : ISO, rebind_handle: null, rebind_expires_at: null, origin_operation_id: b1Op, created_at: ISO, updated_at: ISO } } });
+    const ok = TAL.validateLedger(mkDoc(H), { endpointId: EP57 });
+    assert.equal(ok.ok, true, "handle 与产生 op 逐字一致 → 合法：" + JSON.stringify(ok));
+    // 手术刀：handle 被清成 null，产生 op 还在且未被消费 → 必 corrupt
+    const v = TAL.validateLedger(mkDoc(null), { endpointId: EP57 });
+    assert.equal(v.ok, false, "手术清 null → ledger_corrupt");
+    assert.match(String(v.why), /G-handle/u);
+    // 同理 rebind：request_rebind 产生 op 在、rebind_handle 被手术成 null → corrupt
+    const b3 = "ta_" + "d".repeat(32);
+    const rbOp = "00000000-0000-4000-8000-0000000003a2";
+    const doc2 = mkDoc(H);
+    doc2.records[b3] = { kind: "live", topic_agent_id: b3, chat_id: "oc_r57", aliases: { session_id: "sess-fx", root_om: "om_fx2" }, facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, binding_target: TGT57(65), binding_proof: { kind: "pairing", authorized_by: "ou_r57", authorized_at: ISO, matched_om: "om_fx2", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: ISO, matched_om: "om_fx2", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, generation_lineage_id: "lin_fx2", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: rbOp, created_at: ISO, updated_at: ISO };
+    // 干净手术：双字段都清 null（半有半无会先被 G11′ 拦下，测不到反向不变量）
+    doc2.revision = 4;
+    doc2.operations[rbOp] = { op_type: "request_rebind", terminal_kind: "request_rebind", request_key: "fx_rb", fingerprint: TAL.fingerprintOf("request_rebind", { request_key: "fx_rb", expected_b3_id: b3, expected_current_generation: "current", expected_old_session_id: "sess-fx", expect_no_handle: true }), result_revision: 4, result: { rebind_handle: "orh_" + "d".repeat(32), rebind_expires_at: ISO, affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "preserved", link_effect: "preserved" }] } };
+    const v2 = TAL.validateLedger(doc2, { endpointId: EP57 });
+    assert.equal(v2.ok, false, "rebind_handle 手术清 null 而产生 op 在 → corrupt");
+    assert.match(String(v2.why), /G-handle/u);
+  });
+
+  test("R57a 返修一 P1-4：attach_a2 跨 schema 重放——1.0 attach → 升级 transition → 同 request_key 重放 → replayed（载荷真变 → conflict）", () => withLedger57((dir) => {
+    const a1 = talOk(TAL.createA1({ endpointId: EP57, requestKey: "r57f_xa1", chatId: "oc_r57", sessionId: "sess-f-x", now: T0 }), "createA1");
+    const att = talOk(TAL.attach({ endpointId: EP57, requestKey: "r57f_xatt", id: a1.result.created_id, bindingTarget: TGT57(66), claimKey: CLAIM57("b"), authorizedBy: "ou_r57", now: T0 }), "attach@1.0");
+    assert.equal(att.result.terminal_family, "A2");
+    // 升级到 1.1-transition（手工补一笔 schema_upgrade op，复用 R57b 同款手法）
+    const f = path.join(dir, "ledger.json");
+    const up = JSON.parse(fs.readFileSync(f, "utf-8"));
+    up.revision += 1;
+    up.schema_version = "1.1-transition";
+    const upOp = "00000000-0000-4000-8000-0000000004a1";
+    up.operations[upOp] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57f_xup", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57f_xup", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: up.revision, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } };
+    for (const r of Object.values(up.records)) { r.selection_handle = null; r.handle_expires_at = null; r.rebind_handle = null; r.rebind_expires_at = null; }
+    fs.writeFileSync(f, JSON.stringify(up, null, 2) + "\n", { mode: 0o600 });
+    assert.equal(TAL.validateLedger(up, { endpointId: EP57 }).ok, true, "升级后账本自洽");
+    // 同请求重放（同 key 同载荷）→ replayed 返存量，而不是 request_conflict
+    const r2 = talOk(TAL.attach({ endpointId: EP57, requestKey: "r57f_xatt", id: a1.result.created_id, bindingTarget: TGT57(66), claimKey: CLAIM57("b"), authorizedBy: "ou_r57", now: T0 }), "重放@1.1");
+    assert.equal(r2.idempotent, true, "跨 schema 重放 → replayed");
+    assert.deepEqual(Object.keys(r2.result).sort(), ["affected_id", "terminal_family"], "返存量旧形 result");
+    // 载荷真变 → request_conflict
+    const r3 = TAL.attach({ endpointId: EP57, requestKey: "r57f_xatt", id: a1.result.created_id, bindingTarget: TGT57(67), claimKey: CLAIM57("b"), authorizedBy: "ou_r57", now: T0 });
+    assert.equal(r3.ok, false);
+    assert.equal(r3.reason, "request_conflict", "载荷真变 → conflict");
+  }, { schema: "1.0" }));
+
+  test("R57a 返修一 P1-5：到期核用的 now 由锁内 clock seam 读取——注入「取锁后跨过到期」的时钟 → rebind 消费按锁内时间拒", () => withLedger57((dir) => {
+    const { b1Id, sessionId } = seedB357(dir, "r57f_ck", 68, "sess-f-ck");
+    // 时钟 seam：request_rebind 在 T1 签发（expiry = T1+30d）；消费时钟在 T2 > expiry。
+    const T1 = Date.parse("2098-12-31T00:00:00.000Z");
+    const T2 = Date.parse("2099-06-01T00:00:00.000Z");
+    const rq = talOk(TAL.requestRebind({ endpointId: EP57, requestKey: "r57f_ck0", b3Id: b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: sessionId, clock: () => T1 }), "requestRebind@clock");
+    assert.equal(rq.result.rebind_expires_at, "2099-01-30T00:00:00.000Z", "签发到期来自 clock seam（T1+TTL）");
+    // 旧实现（entry 采样默认 Date.now()）会按真实时间放行 → 本断言红；新实现按锁内 T2 → 拒
+    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f_ck1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_fck", clock: () => T2 });
+    assert.equal(r.ok, false, "锁内时钟已跨过到期 → 拒");
+    assert.equal(r.reason, "rebind_handle_expired");
+  }));
+
+  test("R57a 返修一 P2-6：requestRebind 的 expected_current_generation 封闭为字面量 current（其它 → bad_input，不进 fingerprint）", () => withLedger57((dir) => {
+    const { b1Id, sessionId } = seedB357(dir, "r57f_g", 69, "sess-f-g");
+    const r = TAL.requestRebind({ endpointId: EP57, requestKey: "r57f_g1", b3Id: b1Id, expectedCurrentGeneration: "historical", expectedOldSessionId: sessionId, now: T0 });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "bad_input", "值域封闭 → bad_input（改前 cas_mismatch）");
+  }));
+
+
 }
 
 summarySealed = true;

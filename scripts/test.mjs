@@ -37973,6 +37973,57 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R52 返修二 P1-3：campaign/writer 备份用读取器 raw——绝不重读路径；读取器返回 raw 后路径被改成别的内容 → 备份仍等于 raw", () => {
+    const fx = r52Setup({ twoEps: false, crashAfter: 1 }); // 进段后即崩（备份已写盘，staged 未被清理）
+    try {
+      const tok = r52Uuid(5);
+      const cid = campaignIdFor(tok);
+      const eps = [...fx.eps].sort();
+      const dig = endpointsDigest(eps);
+      const members = {};
+      for (const ep of eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const inv = TAL.migrationInventory(L.doc);
+        members[ep] = { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
+      }
+      // campaign 用 state=complete（journal 的 campaign open step 只认 before.state ∈ {absent,complete}）；
+      // writer 用 state=off（writer_state partial step 只认 before.state ∈ {off,on}）。
+      const campaignDoc = { schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state: "complete", endpoints: eps, endpoints_digest: dig, pending_joins: [], members: Object.fromEntries(eps.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 5, origin_operation_id: tok };
+      const writerDoc = { schema_version: WRITER_STATE_SCHEMA, state: "on", campaign_id: cid, endpoints_digest: dig, revision: 4, origin_operation_id: tok };
+      fs.mkdirSync(path.dirname(campaignPath(fx.env)), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(campaignPath(fx.env), JSON.stringify(campaignDoc, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+      const cs0 = readCampaignState(fx.env);
+      const ws0 = readWriterState(fx.env);
+      assert.ok(cs0.exists && Buffer.isBuffer(cs0.raw) && ws0.exists && Buffer.isBuffer(ws0.raw), "夹具 campaign/writer 在读且带 raw");
+      const cp = campaignPath(fx.env), wp = writerStatePath(fx.env);
+      const origCampaign = fs.readFileSync(cp), origWriter = fs.readFileSync(wp);
+      const dfx = r52DrainedFixture({ fx, tok });
+      // 读取器返回 raw 后，把 campaign/writer 路径的“重读”结果换成别的内容（模拟现场被换成 FIFO/改内容）。
+      // 编排必须用 cs.raw/ws.raw（同一受验 fd 字节），绝不走 fs.readFileSync 二读。
+      const realReadFile = fs.readFileSync;
+      fs.readFileSync = function (p, ...rest) {
+        if (typeof p === "string" && (p === cp || p === wp)) return Buffer.from("changed-after-read:" + p);
+        return realReadFile.call(fs, p, ...rest);
+      };
+      let crashed = false, r = null;
+      try {
+        r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+      } catch (err) {
+        crashed = err?.simulatedCrash === true;
+      } finally {
+        fs.readFileSync = realReadFile;
+      }
+      // 新版：备份在进段后写盘（old 二读拿“改后内容”→ campaign_backup_raw_mismatch 提前拒，进不到进段）。
+      assert.ok(crashed === true, "备份在进段后写盘（旧实现二读改内容 → campaign_backup_raw_mismatch 拒）：" + JSON.stringify(r));
+      // 备份文件字节 === 读取器 raw（原始字节），而不是“改后内容”。
+      const camBak = path.join(fx.dir, tok + ".staged", "backup-campaign.json");
+      const wrBak = path.join(fx.dir, tok + ".staged", "backup-writer-state.json");
+      assert.deepEqual(fs.readFileSync(camBak), origCampaign, "campaign 备份字节 === 读取器 raw（非改后内容）");
+      assert.deepEqual(fs.readFileSync(wrBak), origWriter, "writer-state 备份字节 === 读取器 raw（非改后内容）");
+    } finally { fx.cleanup(); }
+  });
+
   test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
     // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
     {

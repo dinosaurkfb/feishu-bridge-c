@@ -28,7 +28,7 @@ import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, 
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
 import { applyMintPlan, applySchemaUpgrade, buildMintPlan, fingerprintOf, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, OWNER_SELECT_HANDLE_TTL_MS, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
-import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
+import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writeWriterState } from "./owner-select-state.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
@@ -338,17 +338,18 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
   let campaignBackup = { backup: null, backup_sha256: null, backup_bytes: null };
   let writerBackup = { backup: null, backup_sha256: null, backup_bytes: null };
   if (cs.exists) {
-    // P1-5：campaign 备份 = 读取器 raw 原始字节（读回核 sha === 读取器 sha），不得从状态投影重新 JSON 化。
-    const rawBytes = fs.readFileSync(campaignPath(env));
-    if (shaHex(rawBytes) !== cs.sha256) return { ok: false, reason: "campaign_backup_raw_mismatch", why: "campaign 备份 raw sha ≠ 读取器 sha", rollbackSafe: false };
+    // P1-3（返修二）：campaign 备份 = 读取器 raw（cs.raw 同一受验 fd 字节），绝不重读路径——
+    // 读取器返回 raw 后若现场被换成 FIFO/改内容，备份仍等于 raw。
+    const rawBytes = cs.raw;
+    if (!Buffer.isBuffer(rawBytes) || shaHex(rawBytes) !== cs.sha256) return { ok: false, reason: "campaign_backup_raw_mismatch", why: "campaign 备份 raw sha ≠ 读取器 sha", rollbackSafe: false };
     const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), rawBytes);
     if (!cb.ok) return { ok: false, reason: cb.reason, why: "campaign 备份：" + (cb.why ?? "") };
     campaignBackup = { backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: cb.sha256, backup_bytes: cb.bytes };
   }
   if (ws.exists) {
-    // P1-5：writer_state 备份 = 读取器 raw 原始字节（读回核 sha === 读取器 sha），不得从状态投影重新 JSON 化。
-    const rawBytes = fs.readFileSync(writerStatePath(env));
-    if (shaHex(rawBytes) !== ws.sha256) return { ok: false, reason: "writer_backup_raw_mismatch", why: "writer-state 备份 raw sha ≠ 读取器 sha", rollbackSafe: false };
+    // P1-3（返修二）：writer_state 备份 = 读取器 raw（ws.raw 同一受验 fd 字节），绝不重读路径。
+    const rawBytes = ws.raw;
+    if (!Buffer.isBuffer(rawBytes) || shaHex(rawBytes) !== ws.sha256) return { ok: false, reason: "writer_backup_raw_mismatch", why: "writer-state 备份 raw sha ≠ 读取器 sha", rollbackSafe: false };
     const wb = copyBackup(path.join(stagedDir, "backup-writer-state.json"), rawBytes);
     if (!wb.ok) return { ok: false, reason: wb.reason, why: "writer-state 备份：" + (wb.why ?? "") };
     writerBackup = { backup: path.join(stagedDir, "backup-writer-state.json"), backup_sha256: wb.sha256, backup_bytes: wb.bytes };

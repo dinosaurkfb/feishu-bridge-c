@@ -27,7 +27,7 @@ import { chainFacts } from "./precheck.mjs";
 import { acquireOperationLease, addNote, clearActive, markStepDone, readActive, readJournal, releaseOperationLease, setPhase, updateJournal, verifyBackup } from "./journal.mjs";
 import { readGate } from "../maintenance-gate-core.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { applyMintPlan, applySchemaUpgrade, buildMintPlan, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
+import { applyMintPlan, applySchemaUpgrade, buildMintPlan, fingerprintOf, loadLedger, migrationInventory, mintPlanProblem, mintSelectionHandles, ownerSelectSchemaUpgradeOpId, resolveEndpointDir, schemaUpgrade, serializeLedger } from "../topic-agent-ledger.mjs";
 import { CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA, campaignIdFor, campaignPath, endpointsDigest, readCampaignState, readOwnerSelectAdmission, readWriterState, writeCampaignState, writerStatePath, writeWriterState } from "./owner-select-state.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs";
 
@@ -371,6 +371,18 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
 
   if (phase === "osm_a_upgrading") {
     const cid = campaignIdFor(token);
+    // P1-7 (a) 精确口径（#137 放行）：每 step 通用「可记 done」= ok === true ∧ commit∈{committed_clean,replayed,already}
+    //   ∧ residue 为空 ∧ lockUncleared === null ∧ lock_state !== 'unclear'（state-writer 的 clean 值为 committed，归并进来）
+    //   ∧ 受验现场逐字段 === journal step.intended_after（调用方随后做读回核）；任一 → commit_unclear 停当前 phase。
+    const cleanCommit = (c) => ["committed", "committed_clean", "replayed", "already"].includes(c);
+    const stepCommitCheck = (result) => {
+      if (!result?.ok) return { reason: result?.reason ?? "step_failed", why: result?.why ?? null };
+      if (!cleanCommit(result.commit)) return { reason: "commit_unclear", why: "commit=" + String(result.commit ?? "?") };
+      if (result.residue != null && result.residue.length > 0) return { reason: "commit_unclear", why: "residue 非空" };
+      if (result.lockUncleared != null) return { reason: "commit_unclear", why: "lockUncleared 非 null" };
+      if (result.lock_state === "unclear") return { reason: "commit_unclear", why: "lock_state=unclear" };
+      return null;
+    };
     const stepDone = (id, after) => { const m = markStepDone({ dir: ctx.dir, token, lease, id, after, now: ctx.now() }); if (!m.ok) return m; return null; };
 
     // a. campaign open：现场已 === intended（崩溃窗口）→ 补 done；否则 CAS 写 → markStepDone(after=写后读回投影 === intended)
@@ -387,8 +399,8 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!rebuild.ok) return { ok: false, reason: "campaign_member_unreadable", why: rebuild.why, phase };
           if (shaHex(serializeLedger(rebuild.doc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "预算漂移：进段 " + intended.sha256.slice(0, 12) + " 重算 " + shaHex(serializeLedger(rebuild.doc)).slice(0, 12), phase };
           const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: rebuild.doc, capability: { token, stepId: st.id } });
-          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
-          if (w.commit !== "committed") return { ok: false, reason: "commit_residue", phase, commit: w.commit, why: w.why ?? null };
+          const sc = stepCommitCheck(w);
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：写后读回前（返修一 ③）
           const after = readCampaignState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "open") return { ok: false, reason: "written_mismatch", why: "campaign 写后读回 ≠ intended_after", phase };
@@ -410,7 +422,8 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           // 现场已 after（崩溃窗口）→ 补 done
         } else {
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1-transition", env, _inject });
-          if (!r.ok) return { ok: false, reason: r.reason, why: r.why ?? null, phase, commit: r.commit ?? "not_committed" };
+          const sc = stepCommitCheck(r);
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
           if (r.sha256 !== st.intended_after.ledger_sha256) return { ok: false, reason: "written_mismatch", why: ep + " 执行器读回 SHA ≠ 进段预算", phase };
         }
         const m = stepDone(st.id, st.intended_after);
@@ -432,8 +445,8 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const pp = mintPlanProblem(plan);
         if (pp !== null) return { ok: false, reason: "mint_plan_corrupt", why: ep + "：" + pp, phase };
         const r = mintSelectionHandles({ endpointId: ep, capability: { kind: "mint_selection_handles", token }, plan, env, _inject });
-        if (!r.ok) return { ok: false, reason: r.reason, why: r.why ?? null, phase, commit: r.commit ?? "not_committed" };
-        if (r.commit !== "committed_clean" && r.commit !== "already") return { ok: false, reason: "commit_residue", phase, commit: r.commit, why: r.why ?? null };
+        const sc = stepCommitCheck(r);
+        if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -452,8 +465,8 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const rebuild = buildOsmWriterDoc({ token, cid, digest: intended.endpoints_digest, expectedRevision: intended.revision });
           if (shaHex(serializeLedger(rebuild)) !== intended.sha256) return { ok: false, reason: "writer_budget_drift", why: "partial 写入前状态与进段预算不一致（说不清）", phase };
           const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
-          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
-          if (w.commit !== "committed") return { ok: false, reason: "commit_residue", phase, commit: w.commit, why: w.why ?? null };
+          const sc = stepCommitCheck(w);
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           const after = readWriterState(env);
           if (after.sha256 !== intended.sha256 || after.state !== "partial") return { ok: false, reason: "written_mismatch", why: "writer-state 写后读回 ≠ intended_after", phase };
         }
@@ -529,15 +542,25 @@ export function osmReopening(ctx, token, lease, env = process.env) {
     if (!L.ok) { incomplete.push({ id: se.id, why: "账本缺失/不可读：" + (L.why ?? L.reason) }); continue; }
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const op = L.doc.operations[opId] ?? null;
+    const mi = doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
+    // P1-7 (b)：撤门前逐 ep 核——当前账本 SHA === 最后（mint）step.after、schema op 的 from/to（在 op.result）、mint op 的 fingerprint/result。
+    if (mi && L.sha256 !== mi.after.ledger_sha256) incomplete.push({ id: mi.id, why: "当前账本 SHA ≠ 最后（mint）step.after（" + String(L.sha256).slice(0, 12) + " ≠ " + mi.after.ledger_sha256.slice(0, 12) + "）" });
     if (!op) incomplete.push({ id: se.id, why: "账本内不含本 operation 的 schema_upgrade op（" + opId.slice(0, 8) + "）" });
     else if (op.request_key !== token + ":schema:" + ep) incomplete.push({ id: se.id, why: "schema_upgrade 的 request_key 非本 operation 派生键" });
+    else if (op.result?.from_schema !== "1.0" || op.result?.to_schema !== se.after.schema_version) incomplete.push({ id: se.id, why: "schema_upgrade 的 from/to 与 step.after 不符（" + String(op.result?.from_schema) + "→" + String(op.result?.to_schema) + "）" });
     else if (op.result_revision < se.intended_after.revision) incomplete.push({ id: se.id, why: "schema_upgrade 的 result_revision（" + op.result_revision + "）早于 journal 意图（" + se.intended_after.revision + "）" });
     else if (L.doc.revision < op.result_revision) incomplete.push({ id: se.id, why: "账本当前 revision 早于本事务" });
-    const mi = doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
     const mop = mi ? Object.values(L.doc.operations).find((o) => o.op_type === "mint_selection_handles" && o.request_key === token) : null;
     if (mi) {
       if (!mop) incomplete.push({ id: mi.id, why: "账本内不含本 operation 的 mint_selection_handles op" });
+      else if (mop.request_key !== token) incomplete.push({ id: mi.id, why: "mint op 的 request_key 非本 operation token" });
       else if (mop.result_revision < mi.intended_after.revision) incomplete.push({ id: mi.id, why: "mint 的 result_revision（" + mop.result_revision + "）早于 journal 意图（" + mi.intended_after.revision + "）" });
+      else {
+        // fingerprint 核：由 op.result.minted 的 target_id 集重算 fingerprint（与 result_revision 处 op 的 result 锚同源）。
+        const targets = Array.isArray(mop.result?.minted) ? mop.result.minted.map((m) => m.target_id) : null;
+        const expectedFp = targets ? fingerprintOf("mint_selection_handles", { request_key: mop.request_key, endpoint: ep, expected_null_b1_ids: targets }) : null;
+        if (mop.fingerprint !== expectedFp) incomplete.push({ id: mi.id, why: "mint op 的 fingerprint 与 result.minted 集不符（被篡改？）" });
+      }
     }
   }
   {

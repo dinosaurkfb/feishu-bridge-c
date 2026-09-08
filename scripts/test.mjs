@@ -37986,10 +37986,10 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
         fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
         const tok = readActive({ dir: fx.dir }).token;
-        // 恢复 osmForward：c 步 mint 写注入 failDirFsync → durability_uncertain → commit_residue 停门
+        // 恢复 osmForward：c 步 mint 写注入 failDirFsync → durability_uncertain → P1-7(a) commit_unclear 停门（不记 done）
         const r = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
         assert.equal(r.ok, false, "mint 停门");
-        assert.equal(r.reason, "commit_residue", "commit_residue：" + JSON.stringify({ reason: r.reason, commit: r.commit }));
+        assert.equal(r.reason, "commit_unclear", "commit_unclear（durability_uncertain 不记 done）：" + JSON.stringify({ reason: r.reason, commit: r.commit }));
         assert.equal(r.phase, "osm_a_upgrading", "phase 仍 osm_a_upgrading");
         const jj = readJournal({ dir: fx.dir, token: tok });
         const mintStep = jj.doc.steps.find((s) => s.kind === "mint");
@@ -38214,6 +38214,30 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       fs.writeFileSync(pA, JSON.stringify(dA2, null, 2) + "\n", { mode: 0o600 });
       const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
       assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "修复后续跑 done：" + JSON.stringify({ reason: ex2.reason, incomplete: ex2.incomplete }));
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P1-7：篡改 mint op fingerprint → 重开前身份核验失败 → reopening_incomplete，不撤门", () => {
+    const fx = r52Setup({ crashAfter: 14 });
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "d 步后崩溃");
+      const tok = readActive({ dir: fx.dir }).token;
+      const epA = fx.eps[0];
+      const pA = path.join(fx.ledgerRoot, epA, "ledger.json");
+      const dA = JSON.parse(fs.readFileSync(pA, "utf-8"));
+      const mintOp = Object.values(dA.operations).find((o) => o.op_type === "mint_selection_handles");
+      mintOp.fingerprint = "f".repeat(64); // 篡改 fingerprint ≠ result.minted 集重算
+      fs.writeFileSync(pA, JSON.stringify(dA, null, 2) + "\n", { mode: 0o600 });
+      releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.equal(ex.ok, false, "指纹篡改拒：" + JSON.stringify({ reason: ex.reason, phase: ex.phase }));
+      assert.equal(ex.phase, "reopening_incomplete", "reopening_incomplete：" + JSON.stringify({ phase: ex.phase, incomplete: ex.incomplete }));
+      assert.ok(ex.incomplete.some((i) => /fingerprint/.test(String(i.why))), "指纹不符被点名：" + JSON.stringify(ex.incomplete));
+      assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留门不撤");
+      assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "active", "门保留");
     } finally { fx.cleanup(); }
   });
 

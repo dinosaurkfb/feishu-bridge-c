@@ -1,13 +1,16 @@
 // scripts/select-admission.mjs
-// R52a：/feishu-select 的写入准入 —— **可注入**；默认实现固定返回 { state: "off" }（R50 合并前一律 fail-closed）。
-// R50 合并（owner-select-state.mjs 进 main）后由 Frank 一行换成 readOwnerSelectAdmission。本模块**不 import 任何不在 main 的模块**。
+// R52a：/feishu-select 的写入准入 —— **可注入**；默认实现接真实状态（R55，issue：准入默认实现接线）：
+// readOwnerSelectAdmission（owner-select-state.mjs）按 ledger 根下 campaign / writer_state 投影
+// off / partial / on / unreadable —— 缺席 = off，任何读不出/不自洽 = unreadable，两处 fail-closed 方向不变。
 //
 // selectReject(adm, handle_kind)：给定准入状态联合（off / partial / on / unreadable）与 handle_kind，返回拒绝
 //   { reason, text } 或 null（放行）。这是"三态准入"的确定性投影，测试用假 adm 覆盖四支。
 
-/** 写入准入 —— 默认 fail-closed（off）；测试只通过依赖注入（参数/工厂）覆盖，生产不可达；R50 合并后由 Frank 接入真读取器。 */
-export function selectAdmission() {
-  return { state: "off" };
+import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
+
+/** 写入准入 —— 默认读真实状态（执行器未接入期准入通过也落 failed(select_executor_absent) 终态，见 executeSelectControl）。 */
+export function selectAdmission(env = process.env) {
+  return readOwnerSelectAdmission(env);
 }
 
 /** 三态准入的确定性投影：返回 { reason, text }（拒绝）或 null（放行）。准入联合以外的任何状态（缺席/未知/非对象）一律投影为 unreadable → 拒。 */

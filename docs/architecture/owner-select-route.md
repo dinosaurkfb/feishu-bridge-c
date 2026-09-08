@@ -386,6 +386,7 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 **执行器与 journal step 的 CAS（PR #137 一轮回带）**：`schemaUpgrade` / `mintSelectionHandles` 在账本写锁内核 `current SHA === step.before.ledger_sha256`（不等且 ≠ intended → `before_mismatch`；
 === intended → replayed/already），读回核 `=== step.intended_after.ledger_sha256`（否则 `written_mismatch`）；intended 在进 forward 段前冻结，**绝不提交后回填**。
 compare→build→账本锁→rename 全程处于**同一真实 lease 实例**的 `commitWhileHeld` 栅栏内，提交点复核 active/gate/journal/step。
+**栅栏的位置与内容（#137 二轮 P1-1/建议 回带）**：提交点复核必须在 `.prev` 与 ledger **两次 rename 之前**执行（漂移时 `.prev` 也不得被覆盖）；复核重读的 prepared step 与 capability 捕获的 step 比较**完整规范投影**（canonKey 逐字等），不只核 id 与 state。**预算先于落盘（#137 二轮 P1-2）**：执行器在写 tmp 之前核 `sha256(payload) === step.intended_after.ledger_sha256`（mint 同时核 `=== plan.expected_ledger_sha256`），不等 → `intended_mismatch` 且不提交；`written_mismatch` 只指写后读回异常。外层 lease 栅栏的 `reapUncleared` 残骸必须投进结果（commit 降为 `committed_with_residue`），编排不得据此记 done。
 **mint plan 身份与有效期**：TTL 唯一常量 `OWNER_SELECT_HANDLE_TTL_MS`（账本模块单一出处，编排 import），`mintPlanProblem` 核 `handle_expires_at === frozen_at + TTL`、
 `campaign_id === campaignIdFor(token)`、`minted[*].selection_handle` 全局唯一，且 `applyMintPlan` 产物过 `validateLedger` 才可落 staging。
 

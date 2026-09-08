@@ -292,7 +292,8 @@ export function wirePromoteBinding({
       if (!en(sessionId)) return [{ op: "rebind_session_alias", ok: false, reason: "bad_external_id", why: "sessionId 必填（新 Aily 会话 locator）" }];
       const k = rk("rebind_session_alias", claimKey, b1Id);
       if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
-      return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldSessionId: target.aliases.session_id, newSessionId: sessionId, authorizedBy, now, env }))];
+      // R57a 返修二 P1-2：handle 事务不传数值 now——到期/TTL 由锁内 clock() 读取
+      return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldSessionId: target.aliases.session_id, newSessionId: sessionId, authorizedBy, env }))];
     }
     if (target.facts.binding !== "pending") return [{ op: "promote", ok: false, reason: "target_not_pending_or_active", why: "target.facts.binding=" + String(target.facts.binding) }];
     // W1 引用码认领（B1 仍 pending）→ create_a1 → activate。P1-2 收尾：**只消费**认领校验处受验的
@@ -322,7 +323,8 @@ export function wireAttach({ endpointId, env = process.env, legacy, claimKey, id
     if (!en(claimKey) || !en(id)) return [{ op: "attach", ok: false, reason: "bad_external_id", why: "claimKey/id 必填 1..256 字符串" }];
     const k = rk("attach", claimKey, id);
     if (!k.ok) return [{ op: "attach", ...k }];
-    return [capture("attach", attach({ endpointId, requestKey: k.request_key, id, bindingTarget, claimKey, authorizedBy, now, env }))];
+    // R57a 返修二 P1-2：attach 不传数值 now（handle TTL 走锁内 clock()）
+    return [capture("attach", attach({ endpointId, requestKey: k.request_key, id, bindingTarget, claimKey, authorizedBy, env }))];
   } });
 }
 
@@ -345,7 +347,8 @@ function rotateCompositeSubmit({ endpointId, env, legacyRes, rotationOpId, linea
     const resolved = resolveLiveId({ endpointId, locator: supersededOm, env });
     if (resolved.ok) {
       const kv = rk("void", rotationOpId, resolved.id);
-      ops.push(kv.ok ? capture("void", voidPending({ endpointId, requestKey: kv.request_key, b1Id: resolved.id, reason: "expired", now, env })) : { op: "void", ...kv });
+      // R57a 返修二 P1-2：void 不传数值 now（到期核走锁内 clock()）
+      ops.push(kv.ok ? capture("void", voidPending({ endpointId, requestKey: kv.request_key, b1Id: resolved.id, reason: "expired", env })) : { op: "void", ...kv });
     } else {
       // 旧 B1 在 shadow 缺席（legacy-only / 已作废 / 读不出）→ void fail-closed 投影，但不阻断 create_b1。
       ops.push({ op: "void", ok: false, reason: resolved.reason, why: resolved.why ?? null });
@@ -353,7 +356,8 @@ function rotateCompositeSubmit({ endpointId, env, legacyRes, rotationOpId, linea
   }
   const k = rk("create_b1", rotationOpId, lineageId);
   if (!k.ok) { ops.push({ op: "create_b1", ...k }); return ops; }
-  ops.push(capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, now, env })));
+  // R57a 返修二 P1-2：create_b1 不传数值 now（handle TTL 由锁内 clock() 读取）
+  ops.push(capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env })));
   return ops;
 }
 
@@ -382,7 +386,8 @@ export function wireRotateRecovery({ endpointId, env = process.env, rotationOpId
     if (!legacyRes || legacyRes.ok !== true) return [{ op: "create_b1", ok: false, reason: "legacy_verify_failed", why: legacyRes?.why ?? "补 create_b1 前 legacy 现场复核未通过" }];
     const k = rk("create_b1", rotationOpId, lineageId);
     if (!k.ok) return [{ op: "create_b1", ...k }];
-    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm, lineageId, bindingTarget, now, env }))];
+    // R57a 返修二 P1-2：不传数值 now（TTL 走锁内 clock()）
+    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm, lineageId, bindingTarget, env }))];
   } });
 }
 
@@ -399,7 +404,8 @@ export function wireVoid({ endpointId, env = process.env, legacy, rotationOpId, 
     const id = resolved.id;
     const k = rk("void", rotationOpId, id);
     if (!k.ok) return [{ op: "void", ...k }];
-    return [capture("void", voidPending({ endpointId, requestKey: k.request_key, b1Id: id, reason, now, env }))];
+    // R57a 返修二 P1-2：void 不传数值 now（到期核走锁内 clock()）
+    return [capture("void", voidPending({ endpointId, requestKey: k.request_key, b1Id: id, reason, env }))];
   } });
 }
 
@@ -458,6 +464,7 @@ export function wireBind({ endpointId, env = process.env, legacy, externalReques
     if (!en(om)) return [{ op: "create_b1", ok: false, reason: "bad_external_id", why: "legacy 未返回受验 root_message_id" }];
     const k = rk("create_b1", "bind:" + externalRequestId, lineageId);
     if (!k.ok) return [{ op: "create_b1", ...k }];
-    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, now, env }))];
+    // R57a 返修二 P1-2：create_b1 不传数值 now（TTL 走锁内 clock()）
+    return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env }))];
   } });
 }

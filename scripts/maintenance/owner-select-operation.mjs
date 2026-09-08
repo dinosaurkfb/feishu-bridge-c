@@ -15,9 +15,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { acquireInstallSurfaceLock } from "../install-surface-lock.mjs";
-import { switchCurrentTarget } from "../runtime-install.mjs";
+import { runtimeRoot, switchCurrentTarget, verifyRuntime } from "../runtime-install.mjs";
+import { moduleDir } from "../direct-run.mjs";
 import { readStagedVerified, removeStagedPlan } from "../m1b/staged-plan.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
@@ -78,6 +80,43 @@ function copyBackup(dest, bytes) {
   return { ok: true, sha256: shaHex(bytes), bytes: bytes.length };
 }
 
+/** P1-3：核当前 runtime（env.HOME 下 claude 链 current）已装版本模块是否支持过渡（§8 进门前置）。
+ *  current 缺席 / manifest 不完整（verifyRuntime 非 ok）→ 拒；否则子进程探针 import 已装目录内
+ *  journal.mjs / topic-agent-ledger.mjs，值不符 / 非零退出 / 超时 / 输出非合法 JSON → 一律 fail-closed。
+ *  返回 { ok:true } 或 { ok:false, why }（why 为 stderr 前 200 字或判定原因）。 */
+function runtimeTransitionCapable(env) {
+  const home = env.HOME;
+  const root = runtimeRoot(home, "claude");
+  const rt = verifyRuntime({ home });
+  // 维护期 current 是桩（versions/maintenance-<token>）：要核的是装维护前那份 runtime（桩 manifest 的 original_current）。
+  let linkTarget;
+  if (rt.reason === "maintenance") {
+    linkTarget = rt.maintenance?.original_current ?? null;
+    if (typeof linkTarget !== "string" || linkTarget.length === 0) return { ok: false, why: "maintenance 但 original_current 缺失" };
+  } else if (!rt.ok) {
+    return { ok: false, why: rt.reason };
+  } else {
+    linkTarget = rt.linkTarget;
+  }
+  const versionDir = path.join(root, linkTarget);
+  const probePath = path.join(moduleDir(import.meta.url), "runtime-capability-probe.mjs");
+  let raw = null;
+  try {
+    raw = execFileSync(process.execPath, [probePath, versionDir], { encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024, env: { ...process.env, HOME: home } });
+  } catch (e) {
+    return { ok: false, why: String(e.stderr ?? e.message).slice(0, 200) };
+  }
+  const line = String(raw ?? "").trim().split("\n").filter(Boolean);
+  if (line.length < 1) return { ok: false, why: "探针无输出" };
+  let rv = null;
+  try { rv = JSON.parse(line[line.length - 1]); } catch { return { ok: false, why: "探针输出非合法 JSON" }; }
+  if (rv?.ok !== true) return { ok: false, why: "探针 ok=false" };
+  if (rv.journal_schema !== "1.4") return { ok: false, why: "journal_schema=" + String(rv.journal_schema) };
+  const sv = rv.ledger_schema_versions;
+  if (!Array.isArray(sv) || !sv.includes("1.1-transition") || !sv.includes("1.1")) return { ok: false, why: "账本 schema_versions 缺 1.1-transition/1.1" };
+  return { ok: true };
+}
+
 /** 删本 operation 的 staged mint plan（§二.7：回退先删 plan，删不掉 → rollback_incomplete；目录缺席幂等）。 */
 export function removeMintPlans(ctx, token) {
   const dir = path.join(ctx.dir, token + ".staged", "intended");
@@ -102,6 +141,11 @@ function osmExitAction(phase) {
 
 /** ── drained 只读前置（§二.2；失败留在 drained，rollbackSafe）── */
 function osmPrecheck(ctx, { token, env }) {
+  // P1-3：过渡 runtime 前置 —— 当前 runtime 必已受验支持 transition/strict 与 1.4 journal（§8 进门前置）。
+  // current 缺席 / manifest 不完整 → verifyRuntime 报非 ok；否则用子进程探针 import 已装目录内的
+  // journal.mjs / topic-agent-ledger.mjs，值不符 / 非零退出 / 超时 / 输出非合法 JSON → 一律 fail-closed。
+  const rtProbe = runtimeTransitionCapable(env);
+  if (!rtProbe.ok) return { ok: false, reason: "precheck_failed", why: "runtime_not_transition_capable" + (rtProbe.why ? "：" + rtProbe.why : "") };
   // 冻结集 = 全部有效初始化收据（initDone）的 endpoint，有序去重非空（§8：open 的初始集来源）。
   // P1-2：改用唯一聚合 aggregateEndpointReceipts——任一收据 conflict / in-flight / duplicate / unreadable
   //   → 整体 precheck_failed（why 点名 ep），绝不拿剩余子集迁移（自建 aggregateInitDone 会静默跳过矛盾收据）。

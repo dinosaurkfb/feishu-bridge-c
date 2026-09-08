@@ -62,7 +62,8 @@ const MATCHED_FIELDS = ["chat_id", "sender", "body", "thread_root"];
 const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
 
 // R48：owner_select 账本地基 schema 与 handle 前缀形状
-const SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
+// P1-3：导出 SCHEMA_VERSIONS——过渡 runtime 前置要核已装 runtime 的账本模块认 1.1-transition/1.1。
+export const SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
 const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;
 const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
 const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;

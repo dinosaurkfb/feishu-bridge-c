@@ -37819,6 +37819,60 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R52 返修一 P1-3：过渡 runtime 前置——假 runtime 旧/新版模块→拒/放行、current 缺席→拒、探针挂死→超时拒", () => {
+    const rtRoot = (home) => runtimeRoot(home, "claude");
+    const buildFakeRuntime = (home, { journalBody, ledgerBody }) => {
+      const root = rtRoot(home);
+      const files = [
+        { path: "scripts/maintenance/journal.mjs", sha256: r52ShaOf(Buffer.from(journalBody)) },
+        { path: "scripts/topic-agent-ledger.mjs", sha256: r52ShaOf(Buffer.from(ledgerBody)) },
+      ];
+      const version = crypto.createHash("sha256").update(files.map((f) => f.path + ":" + f.sha256).join("\n")).digest("hex").slice(0, 16);
+      const vdir = path.join(root, "versions", version);
+      fs.mkdirSync(path.join(vdir, "scripts", "maintenance"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(vdir, "scripts", "maintenance", "journal.mjs"), journalBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "scripts", "topic-agent-ledger.mjs"), ledgerBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "INSTALLED.json"), JSON.stringify({ version, files, source_commit: null }, null, 2) + "\n", { mode: 0o600 });
+      fs.rmSync(path.join(root, "current"), { force: true });
+      fs.symlinkSync("versions/" + version, path.join(root, "current"));
+      return version;
+    };
+    const runForward = (fx) => {
+      const tok = r52Uuid(5);
+      const dfx = r52DrainedFixture({ fx, tok });
+      return osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+    };
+    const NEW_J = "export const OWNER_SELECT_JOURNAL_SCHEMA = \"1.4\";";
+    const NEW_L = "export const SCHEMA_VERSIONS = [\"1.0\",\"1.1-transition\",\"1.1\"];";
+    // 新版模块 → 放行（预检不再以 runtime_not_transition_capable 拒）
+    {
+      const fx = r52Setup({});
+      try {
+        buildFakeRuntime(fx.home, { journalBody: NEW_J, ledgerBody: NEW_L });
+        const r = runForward(fx);
+        assert.ok(r.reason !== "precheck_failed" || !String(r.why).includes("runtime_not_transition_capable"), "新版放行（非 runtime_not_transition_capable）：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+      } finally { fx.cleanup(); }
+    }
+    // 旧版模块（无导出）→ 拒
+    {
+      const fx = r52Setup({});
+      try { buildFakeRuntime(fx.home, { journalBody: "export const X = 1;", ledgerBody: "export const Y = 2;" }); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "旧版拒（缺导出）：" + JSON.stringify({ reason: r.reason, why: r.why })); assert.match(String(r.why), /runtime_not_transition_capable/); }
+      finally { fx.cleanup(); }
+    }
+    // current 缺席 → 拒
+    {
+      const fx = r52Setup({});
+      try { fs.rmSync(path.join(rtRoot(fx.home), "current"), { force: true }); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "current 缺席拒"); assert.match(String(r.why), /runtime_not_transition_capable/); }
+      finally { fx.cleanup(); }
+    }
+    // 探针挂死（假模块顶层死循环）→ 超时拒
+    {
+      const fx = r52Setup({});
+      try { buildFakeRuntime(fx.home, { journalBody: "while (true) {}", ledgerBody: NEW_L }); const t0 = Date.now(); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "探针挂死超时拒"); assert.match(String(r.why), /runtime_not_transition_capable/); }
+      finally { fx.cleanup(); }
+    }
+  });
+
   test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
     // ── 1. mint 段 commit_residue：failDirFsync → committed_durability_uncertain → 停门、step 不记 done ──
     {

@@ -39135,6 +39135,33 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(v.ok, false, "有 handle 无候选 → 拒");
     assert.match(String(v.why), /A2 有 handle 必须有 anchor_candidate/u, "G11′ A2 联合");
   });
+
+  test("R57a 校验器 G11′：rebind_handle 与 rebind_expires_at 半有半无 → ledger_corrupt（两个方向各一；删守卫必转红）", () => {
+    const id = "ta_" + "d".repeat(32);
+    const seedOp = "00000000-0000-4000-8000-0000000000d1";
+    const rbOp = "00000000-0000-4000-8000-0000000000d2";
+    const ISO0 = "2026-09-10T08:00:00.000Z";
+    const H = "orh_" + "e".repeat(32), EXP = "2026-10-10T08:00:00.000Z";
+    const baseOps = {
+      "00000000-0000-4000-8000-0000000000a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57_g11_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      "00000000-0000-4000-8000-0000000000b1": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57_g11_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57_g11_up", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
+      [seedOp]: { op_type: "seed", terminal_kind: "seed", request_key: "r57_g11_seed", fingerprint: TAL.fingerprintOf("seed", { request_key: "r57_g11_seed", candidates: [id] }), result_revision: 3, result: { seeded_ids: [id] } }
+    };
+    const b3Record = (over = {}) => ({ kind: "live", topic_agent_id: id, chat_id: "oc_r57", aliases: { session_id: "sess-r57-p", root_om: "om_rb57" }, facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, binding_target: TGT57(41), binding_proof: { kind: "pairing", authorized_by: "ou_r57", authorized_at: ISO0, matched_om: "om_rb57", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: ISO0, matched_om: "om_rb57", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, generation_lineage_id: "lin_rb57", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: seedOp, created_at: ISO0, updated_at: ISO0, ...over });
+    const docOf = (records, ops = baseOps, revision = 3) => ({ schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision, operations: ops, records });
+    // 阳性对照：双字段齐 + request_rebind 产生 op（result 逐字一致）→ validateLedger 通过（刀不是因别的原因红）
+    const fullOps = { ...baseOps, [rbOp]: { op_type: "request_rebind", terminal_kind: "request_rebind", request_key: "r57_g11_rq", fingerprint: TAL.fingerprintOf("request_rebind", { request_key: "r57_g11_rq", expected_b3_id: id, expected_current_generation: "current", expected_old_session_id: "sess-r57-p", expect_no_handle: true }), result_revision: 4, result: { rebind_handle: H, rebind_expires_at: EXP, affected_live_ids_after_commit: [id], proof_effects: [{ topic_agent_id: id, binding_effect: "preserved", link_effect: "preserved" }] } } };
+    const okDoc = docOf({ [id]: b3Record({ rebind_handle: H, rebind_expires_at: EXP, origin_operation_id: rbOp }) }, fullOps, 4);
+    assert.equal(TAL.validateLedger(okDoc, { endpointId: EP57 }).ok, true, "双字段齐 + 产生 op → 合法");
+    // 刀①：有 rebind_handle、无 rebind_expires_at → 拒且点名 G11′ 半有半无
+    const v1 = TAL.validateLedger(docOf({ [id]: b3Record({ rebind_handle: H }) }), { endpointId: EP57 });
+    assert.equal(v1.ok, false, "半有半无①拒");
+    assert.match(String(v1.why), /rebind handle 与 expiry 必须同时有或同时无/u);
+    // 刀②：有 rebind_expires_at、无 rebind_handle → 拒且点名 G11′ 半有半无
+    const v2 = TAL.validateLedger(docOf({ [id]: b3Record({ rebind_expires_at: EXP }) }), { endpointId: EP57 });
+    assert.equal(v2.ok, false, "半有半无②拒");
+    assert.match(String(v2.why), /rebind handle 与 expiry 必须同时有或同时无/u);
+  });
 }
 
 summarySealed = true;

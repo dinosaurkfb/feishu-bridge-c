@@ -48,6 +48,19 @@ const releaseSurface = (surface) => {
 };
 const note = (ctx, token, lease, t) => addNote({ dir: ctx.dir, token, lease, note: t, now: ctx.now() });
 
+/** P1-7 (a) 精确口径（#137 放行）：每 step 通用「可记 done」——ok ∧ commit∈{committed,committed_clean,replayed,already}
+ *   ∧ residue 空 ∧ lockUncleared==null ∧ lock_state!=='unclear'（state-writer 的 clean 值为 committed，归并进来）。
+ *   返回 null（可记）或 { reason:'commit_unclear'|'step_failed', why }。 */
+const stepCleanCommit = (c) => ["committed", "committed_clean", "replayed", "already"].includes(c);
+export function stepCommitCheck(result) {
+  if (!result?.ok) return { reason: result?.reason ?? "step_failed", why: result?.why ?? null };
+  if (!stepCleanCommit(result.commit)) return { reason: "commit_unclear", why: "commit=" + String(result.commit ?? "?") };
+  if (result.residue != null && result.residue.length > 0) return { reason: "commit_unclear", why: "residue 非空" };
+  if (result.lockUncleared != null) return { reason: "commit_unclear", why: "lockUncleared 非 null" };
+  if (result.lock_state === "unclear") return { reason: "commit_unclear", why: "lock_state=unclear" };
+  return null;
+}
+
 /** mint plan 的落盘字节（编排私有：与重演算消费的 JSON.parse 往返一致即可，账本序列化走 serializeLedger）。 */
 export const mintPlanBytes = (plan) => Buffer.from(JSON.stringify(plan, null, 2) + "\n", "utf-8");
 
@@ -370,18 +383,6 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
 
   if (phase === "osm_a_upgrading") {
     const cid = campaignIdFor(token);
-    // P1-7 (a) 精确口径（#137 放行）：每 step 通用「可记 done」= ok === true ∧ commit∈{committed_clean,replayed,already}
-    //   ∧ residue 为空 ∧ lockUncleared === null ∧ lock_state !== 'unclear'（state-writer 的 clean 值为 committed，归并进来）
-    //   ∧ 受验现场逐字段 === journal step.intended_after（调用方随后做读回核）；任一 → commit_unclear 停当前 phase。
-    const cleanCommit = (c) => ["committed", "committed_clean", "replayed", "already"].includes(c);
-    const stepCommitCheck = (result) => {
-      if (!result?.ok) return { reason: result?.reason ?? "step_failed", why: result?.why ?? null };
-      if (!cleanCommit(result.commit)) return { reason: "commit_unclear", why: "commit=" + String(result.commit ?? "?") };
-      if (result.residue != null && result.residue.length > 0) return { reason: "commit_unclear", why: "residue 非空" };
-      if (result.lockUncleared != null) return { reason: "commit_unclear", why: "lockUncleared 非 null" };
-      if (result.lock_state === "unclear") return { reason: "commit_unclear", why: "lock_state=unclear" };
-      return null;
-    };
     const stepDone = (id, after) => { const m = markStepDone({ dir: ctx.dir, token, lease, id, after, now: ctx.now() }); if (!m.ok) return m; return null; };
 
     // a. campaign open：现场已 === intended（崩溃窗口）→ 补 done；否则 CAS 写 → markStepDone(after=写后读回投影 === intended)

@@ -229,7 +229,7 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
-import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52 } from "./maintenance/owner-select-operation.mjs";
+import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52, stepCommitCheck as stepCommitCheck52 } from "./maintenance/owner-select-operation.mjs";
 import * as MOS from "./maintenance-owner-select.mjs";
 import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
 import { installSurfaceLockPath } from "./install-surface-lock.mjs";
@@ -38256,6 +38256,52 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       // 渲染含查不清文案
       const txt = MOS.renderOwnerSelectStatus(st);
       assert.match(txt, /查不清/, "渲染含查不清：" + txt);
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 补：campaign × writer 跨文件联合不自洽（writer partial 但 campaign 缺席）→ osmPrecheck 回 campaign_writer_inconsistent", () => {
+    const fx = r52Setup({});
+    try {
+      const tok = r52Uuid(5);
+      const cid = campaignIdFor(tok);
+      const eps = [...fx.eps].sort();
+      // campaign 缺席（不写 campaign 文件）+ writer partial（同 cid）→ 跨文件不自洽。
+      const writerDoc = { schema_version: "owner-select-writer-state-1", state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(eps), revision: 1, origin_operation_id: tok };
+      fs.mkdirSync(path.dirname(writerStatePath(fx.env)), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+      const dfx = r52DrainedFixture({ fx, tok });
+      const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+      assert.ok(r.ok === false, "跨文件不自洽必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+      assert.equal(r.reason, "campaign_writer_inconsistent", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      const j52 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j52.doc.phase, "drained", "未进段，仍 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 补：stepCommitCheck 纯函数——residue/lockUncleared/lock_state 任一 → commit_unclear", () => {
+    assert.equal(stepCommitCheck52({ ok: true, commit: "committed_clean" }), null, "纯净 committed_clean → 可记");
+    const c1 = stepCommitCheck52({ ok: true, commit: "committed_clean", residue: ["x"] });
+    assert.equal(c1?.reason, "commit_unclear", "residue 非空 → commit_unclear：" + JSON.stringify(c1));
+    assert.match(String(c1?.why), /residue/, "why 点名 residue：" + String(c1?.why));
+    const c2 = stepCommitCheck52({ ok: true, commit: "committed_clean", lockUncleared: { reason: "x" } });
+    assert.equal(c2?.reason, "commit_unclear", "lockUncleared 非 null → commit_unclear：" + JSON.stringify(c2));
+    assert.match(String(c2?.why), /lockUncleared/, "why 点名 lockUncleared");
+    const c3 = stepCommitCheck52({ ok: true, commit: "committed_clean", lock_state: "unclear" });
+    assert.equal(c3?.reason, "commit_unclear", "lock_state=unclear → commit_unclear：" + JSON.stringify(c3));
+    assert.match(String(c3?.why), /lock_state/, "why 点名 lock_state");
+  });
+
+  test("R52 返修一 补：直接调 exitMaintenance（operation.mjs）对 owner_select journal → 走 osmExit 语义，不落通用 rollback", () => {
+    const fx = r52Setup({ crashAfter: 8 }); // 进段后（osm_a_upgrading）崩溃
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      // 直接调 exitMaintenance（不经 maintenance-gate.mjs）——对 owner_select journal 应路由到 osmExit。
+      const r = exitMaintenance(fx.ctx, { apply: false });
+      assert.ok(r.ok === true && r.dryRun === true, "dry-run 返回：" + JSON.stringify({ ok: r.ok, reason: r.reason, action: r.action, phase: r.phase }));
+      assert.notEqual(r.action, "rollback", "owner_select 不落通用 rollback：action=" + String(r.action));
+      assert.ok(r.phase === "osm_a_upgrading" || r.phase === "ledger_reopening", "osmExit 只向前阶段语义：phase=" + String(r.phase));
     } finally { fx.cleanup(); }
   });
 

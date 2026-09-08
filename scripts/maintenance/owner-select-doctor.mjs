@@ -3,116 +3,55 @@
  * **纯函数 + 只读盘**：不修、不写飞书、不给修复建议；判据只读既有制品（账本、收据、campaign、
  * writer_state、journal 1.4、active），读不出/说不清一律 fail-closed 记「查不清」并点名。
  *
- * 对每个 initDone 的 endpoint（收据聚合复用 aggregateEndpointReceipts）：
- *   1. 账本一致性：loadLedger 受验读取，validateLedger 不过 → block；live 记录按 §7.2 核
- *      locator_link_proof_ref.kind 相容与 binding_proof.kind === "owner_select_v1" 的 §3.1 六字段；
- *      来源 op 带 proof_effects 时按 G13′ 判产证/保留。
- *   2. 存量计数：migrationInventory —— strict（1.1）下任一非 0 → block；transition/1.0 只报
- *      opaque 计数（不点名 id / handle 值）。
- *   3. handle 卫生：三 handle 与合法族一一映射（osh_→B1/A2、orh_→B3、rfh_ 在 sidecar 不入账本）、
- *      到期字段与存废一致、endpoint 内全局唯一；strict 不得有 null-handle B1。
- *      intent store 尚未实现（§4 ③）——本项注明「intent 未纳入」，不猜。
+ * R56 返修一（Codex #143 一轮）：
+ *   - P1-1：删除裸路径读账本与第二套守卫校验器——一律先 `loadByEndpoint`（fd 绑定、O_NOFOLLOW、
+ *     单硬链接、0600、大小上限）受验读取 + 整账本 `validateLedger`，doctor 专属判据只跑在受验 doc 上；
+ *     细粒度文案来自唯一校验器的结构化 why。账本读不出（FIFO/symlink/坏 JSON/权限）→ 该 endpoint
+ *     「查不清」，不抛不挂、不误 block。
+ *   - P1-2：handle 到期卫生——`now >= handle_expires_at / rebind_expires_at`（边界含等号）仍存活
+ *     → block「handle 已过期未清理」（validateLedger 不核时间，这是 doctor 专属判据）。
+ *   - P1-3：只把 `state === "ok" && initDone === true` 的 endpoint 视为 initDone；收据 conflict /
+ *     in-flight 只进「查不清」一次，不进 initDone 集、不参与 campaign 成员关系，total 不重复。
+ *   - P1-4：零收据 + 账本根缺席 → 本项不适用（ok:true，文案「尚未接入」）；有收据但根缺席 →
+ *     fail-closed 查不清。
+ *   - P2-5：「迁移进行中」只认 journal 1.4 且 operation_kind ∈ owner_select 迁移集；普通
+ *     install/gate 的 active 不冒充迁移。
+ *   - P2-7：诊断正文不输出 handle 前缀，只记 opaque id 与计数（redactHandle）。
+ *
+ * 对每个 initDone 的 endpoint：
+ *   1. 账本一致性：validateLedger 不过 → block（结构化 why，脱敏后展示）。
+ *   2. 存量计数：migrationInventory —— strict（1.1）下任一非 0 → block（strict 合法性由
+ *      validateLedger 收口，这里只对受验 doc 报 opaque 计数）；transition/1.0 只报计数。
+ *   3. handle 卫生：到期字段与存废一致、endpoint 内全局唯一（validateLedger 已核形状/族/G-handle，
+ *      到期是本项专属）；intent store（§4 ③）不在本项对账范围，注明不猜。
  *   4. 迁移状态链：campaign × writer_state 直读 + readOwnerSelectAdmission 联合互证；
- *      campaign endpoints ⊆ initDone；campaign state 与各 endpoint 账本 schema 相容；
- *      journal 1.4 进行中的迁移只报「迁移进行中（phase）」不判 block（那归 ⑩/维护门）。
+ *      campaign endpoints ⊆ initDone；campaign state 与各 endpoint 账本 schema 相容。
  */
 
 import fs from "node:fs";
-import path from "node:path";
 
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { loadByEndpoint, validateLedger, familyOf, migrationInventory, ledgerRootFor } from "../topic-agent-ledger.mjs";
 import { aggregateEndpointReceipts } from "./ledger-receipt.mjs";
 import { readCampaignState, readWriterState, readOwnerSelectAdmission } from "./owner-select-state.mjs";
-import { readActive, readJournal } from "./journal.mjs";
+import { readActive, readJournal, OWNER_SELECT_OPERATION_KINDS } from "./journal.mjs";
 
-const OSH_RE = /^osh_[0-9a-f]{32}$/u;
-const ORH_RE = /^orh_[0-9a-f]{32}$/u;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
-const OWNER_SELECT_BINDING_KEYS = "authorized_at,authorized_by,kind,selected_root_om,selected_session_id,selection_handle,selection_operation_id";
-const OWNER_SELECT_LINK_KEYS = "authorized_at,authorized_by,by_identity,kind,selected_root_om,selected_session_id,selection_handle,selection_operation_id";
-// §7.2 G13′ preserved：link 的来源必须是产证 op（activate/anchor/rebind_session_alias/reaffirm）
-const PRODUCER_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);
+const HANDLE_RE = /(?:osh|orh|rfh)_[0-9a-f]{32}/gu;
 
-const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+/** P2-7：诊断正文不输出 handle 前缀——handle 值一律脱敏成 [handle]，只留 opaque id 与计数。 */
+const redactHandle = (t) => String(t).replace(HANDLE_RE, "[handle]");
 
-/** 裸读账本（非受验 JSON 读）：第一层专用守卫跑在它上面（#137 四轮验收：纵深保留、守卫可测）。读不出 → null。 */
-function readRawLedger(ep, env) {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(ledgerRootFor(env), ep, "ledger.json"), "utf-8"));
-  } catch { return null; }
-}
-
-/** 单条 live 记录的账本一致性 + handle 卫生检查。返回问题短句数组（空 = 干净）。 */
-function checkLiveRecord(doc, rec, schema) {
-  const problems = [];
+/** 单条 live 记录的 handle 到期卫生（P1-2，doctor 专属：validateLedger 不核时间）。 */
+function checkHandleExpiry(rec, now, problems) {
   const fam = familyOf(rec.facts);
-
-  // ── handle 卫生（§4：两枚稳态字段 + 族闭合）── 字段缺席按 null 处理（旧形账本可能不带这些键）
-  if ((rec.selection_handle ?? null) !== null) {
-    if (typeof rec.selection_handle !== "string" || !OSH_RE.test(rec.selection_handle)) problems.push("selection_handle 不是 osh_+32hex 形状");
-    if (!isCanonicalIso(rec.handle_expires_at)) problems.push("有 selection_handle 但 handle_expires_at 缺席/不是规范化 ISO");
-    if (fam !== "B1" && fam !== "A2") problems.push("selection_handle 出现在 " + fam + " 族（合法族只有 B1/A2）");
-  } else if ((rec.handle_expires_at ?? null) !== null) {
-    problems.push("无 selection_handle 但 handle_expires_at 非 null");
-  }
-  if ((rec.rebind_handle ?? null) !== null) {
-    if (typeof rec.rebind_handle !== "string" || !ORH_RE.test(rec.rebind_handle)) problems.push("rebind_handle 不是 orh_+32hex 形状");
-    if (!isCanonicalIso(rec.rebind_expires_at)) problems.push("有 rebind_handle 但 rebind_expires_at 缺席/不是规范化 ISO");
-    if (fam !== "B3") problems.push("rebind_handle 出现在 " + fam + " 族（合法族只有待 rebind 的 B3）");
-  } else if ((rec.rebind_expires_at ?? null) !== null) {
-    problems.push("无 rebind_handle 但 rebind_expires_at 非 null");
-  }
-  if (schema === "1.1" && fam === "B1" && (rec.selection_handle ?? null) === null) {
-    problems.push("strict 下存在 selection_handle=null 的 B1（违族闭合）");
-  }
-
-  // ── locator_link_proof 相容（§7.2 G13′/§3.2）──
-  if (rec.facts?.locator_link_proof === "present") {
-    const link = rec.locator_link_proof_ref;
-    if (!isObj(link) || typeof link.kind !== "string") {
-      problems.push("link proof 标记 present 但 locator_link_proof_ref 缺席/形状不对");
-    } else if (rec.binding_proof?.kind === "owner_select_v1" && link.kind !== "owner_selected_route_v1") {
-      problems.push("binding=owner_select_v1 但 link kind=" + link.kind + "（应为 owner_selected_route_v1）");
+  for (const [hField, eField] of [["selection_handle", "handle_expires_at"], ["rebind_handle", "rebind_expires_at"]]) {
+    if ((rec[hField] ?? null) === null) continue;
+    if (!isCanonicalIso(rec[eField])) continue; // 形状问题归唯一校验器
+    if (now >= Date.parse(rec[eField])) {
+      problems.push(fam + " " + rec.topic_agent_id.slice(0, 12) + "：handle 已过期未清理（" + eField + " ≤ now）");
     }
   }
-
-  // ── binding_proof.kind === "owner_select_v1"：§3.1 六字段 + G11′ 等式 + 与 link 的 §3.2 等式 ──
-  if (rec.binding_proof?.kind === "owner_select_v1") {
-    const bp = rec.binding_proof;
-    if (Object.keys(bp).sort().join(",") !== OWNER_SELECT_BINDING_KEYS) {
-      problems.push("owner_select_v1 binding_proof 字段集不对（§3.1 七键）");
-    } else {
-      if (bp.selected_session_id !== rec.aliases.session_id) problems.push("selected_session_id ≠ aliases.session_id（G11′）");
-      if (bp.selected_root_om !== rec.aliases.root_om) problems.push("selected_root_om ≠ aliases.root_om（G11′）");
-      if (typeof bp.selection_handle !== "string" || !OSH_RE.test(bp.selection_handle)) problems.push("binding_proof.selection_handle 不是 osh_ 形状");
-      if (typeof bp.selection_operation_id !== "string" || !UUID_RE.test(bp.selection_operation_id)) problems.push("selection_operation_id 不是合法 op id");
-      if (!isCanonicalIso(bp.authorized_at)) problems.push("authorized_at 不是规范化 ISO");
-    }
-    const link = rec.locator_link_proof_ref;
-    if (isObj(link) && link.kind === "owner_selected_route_v1") {
-      if (Object.keys(link).sort().join(",") !== OWNER_SELECT_LINK_KEYS) problems.push("owner_selected_route_v1 link 字段集不对（§3.2 八键）");
-      else if (link.selected_session_id !== bp.selected_session_id || link.selected_root_om !== bp.selected_root_om ||
-        link.selection_handle !== bp.selection_handle || link.selection_operation_id !== bp.selection_operation_id) {
-        problems.push("link 与 binding 的六字段不等（§3.2：仅 binding=owner_select_v1 时等式成立）");
-      }
-    }
-    // G13′-produced：本记录的 proof_effects 项判产证 → selection_operation_id 必须 === origin
-    const op = doc.operations[rec.origin_operation_id];
-    const eff = Array.isArray(op?.result?.proof_effects)
-      ? op.result.proof_effects.find((x) => isObj(x) && x.topic_agent_id === rec.topic_agent_id) : null;
-    if (eff && eff.link_effect === "produced" && isObj(link) && link.selection_operation_id !== rec.origin_operation_id) {
-      problems.push("来源 op 判 link=produced 但 selection_operation_id ≠ origin_operation_id（G13′-A）");
-    }
-  } else if (rec.facts?.locator_link_proof === "present" && isObj(rec.locator_link_proof_ref) && rec.locator_link_proof_ref.kind === "owner_selected_route_v1") {
-    // G13′-B：binding 非 owner_select_v1 时 link 独立经自身来源 op 校验（preserved 语义）——
-    // selection_operation_id 必须指向存在的产证 op。
-    const src = doc.operations[rec.locator_link_proof_ref.selection_operation_id];
-    if (!src || !PRODUCER_OPS.includes(src.op_type)) {
-      problems.push("link=owner_selected_route_v1 但 selection_operation_id 不指向产证 op（G13′-B）");
-    }
-  }
-  return problems;
 }
 
 /**
@@ -121,6 +60,7 @@ function checkLiveRecord(doc, rec, schema) {
  *   endpoints: [{ endpointId, status: "ok"|"block"|"unclear", problems: [...], counts: {...}|null }],
  *   chain: { state: "off"|"partial"|"on"|null, problems: [...], unclear: string|null, note: string|null },
  *   intentNote: "intent 未纳入（§4 ③ intent store 尚未实现）",
+ *   notApplicable: string|null,   // P1-4：零收据 + 根缺席 → 「尚未接入」
  *   summary: { total, green, block, unclear },
  * }
  */
@@ -134,81 +74,51 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
 
   // ── 收据聚合：任一收据说不清 → 整项查不清点名，不猜 ──
   const agg = aggregateEndpointReceipts({ dir: maintenanceDir });
-  // R56 补（#137 四轮验收刀1）：journal 读不出才整项查不清；conflict（重复/矛盾）由后面的
-  // 逐 endpoint 循环记「查不清」并带「收据 conflict」文案，其余 endpoint 照常对账。
   if (agg.unreadable?.length > 0) {
     return { endpoints, chain: { ...chain, unclear: "收据 journal 读不出 " + agg.unreadable.length + " 个（如 " + agg.unreadable[0].token.slice(0, 8) + "：" + agg.unreadable[0].why + "）" }, summary, intentNote: INTENT_NOTE };
   }
-  const initDone = agg.endpoints.filter((e) => e.initDone === true);
+  const root = ledgerRootFor(env);
+  const rootAbsent = root === null || !fs.existsSync(root);
+  // P1-4：全新机器——无任何收据且账本根缺席 → 本项不适用（尚未接入），不算红也不算查不清
+  if (agg.endpoints.length === 0 && rootAbsent) {
+    return { endpoints, chain: { state: "off", problems: [], unclear: null, note: null }, summary, intentNote: INTENT_NOTE, notApplicable: "尚未接入（没有任何 init 收据，账本根也未建）" };
+  }
+  // P1-3：只认 state === "ok" && initDone === true；conflict / in-flight 只进「查不清」一次，
+  // 不进 initDone 集、不参与 campaign 成员关系（下面 extras 检查自然点名）。
+  const initDone = agg.endpoints.filter((e) => e.state === "ok" && e.initDone === true);
   const initDoneSet = new Set(initDone.map((e) => e.endpointId));
 
-  // ── 逐 endpoint：账本一致性 + 存量计数 + handle 卫生 ──
+  // ── 逐 endpoint：受验读取 → validateLedger → doctor 专属判据（计数 / 到期卫生）──
   const schemaByEndpoint = new Map();
   for (const ep of initDone) {
     const entry = { endpointId: ep.endpointId, status: "ok", problems: [], counts: null };
-    // 第一层：裸读账本上的专用守卫（具体文案 —— 删守卫 = 文案消失 = 测试转红；纵深在第二层兜底）
-    const rawDoc = readRawLedger(ep.endpointId, env);
-    if (rawDoc !== null) {
-      for (const rec of Object.values(rawDoc.records ?? {})) {
-        if (rec?.kind !== "live") continue;
-        for (const p of checkLiveRecord(rawDoc, rec, rawDoc.schema_version)) {
-          entry.problems.push(rec.topic_agent_id.slice(0, 12) + "：" + p);
-        }
-      }
-      const seenHandles = new Map();
-      for (const rec of Object.values(rawDoc.records ?? {})) {
-        if (rec?.kind !== "live") continue;
-        for (const h of [rec.selection_handle ?? null, rec.rebind_handle ?? null]) {
-          if (h === null) continue;
-          if (seenHandles.has(h)) entry.problems.push("handle 重复（endpoint 内须全局唯一）：" + h.slice(0, 12) + "（" + seenHandles.get(h).slice(0, 12) + " 与 " + rec.topic_agent_id.slice(0, 12) + "）");
-          else seenHandles.set(h, rec.topic_agent_id);
-        }
-      }
-      const inv = migrationInventory(rawDoc);
-      entry.counts = { schema_version: rawDoc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
-      if (rawDoc.schema_version === "1.1" && (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0)) {
-        entry.problems.push("strict 下存量非零：legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count);
-      }
-    }
     const L = loadByEndpoint(ep.endpointId, { env });
     if (!L.ok) {
-      entry.status = "block";
-      entry.problems.push(L.granular === "absent" ? "有 init 收据但账本缺席" : "账本受验读取不过（" + (L.why ?? L.reason ?? "说不清") + "）");
-      endpoints.push(entry);
-      summary.total += 1; summary.block += 1;
-      continue;
-    }
-    const doc = L.doc;
-    const v = validateLedger(doc, { endpointId: ep.endpointId });
-    if (!v.ok) {
-      entry.status = "block";
-      entry.problems.push("validateLedger 不过：" + (v.why ?? "说不清"));
-      endpoints.push(entry);
-      summary.total += 1; summary.block += 1;
-      continue;
-    }
-    schemaByEndpoint.set(ep.endpointId, doc.schema_version);
-    // endpoint 内 handle 全局唯一（#141/§7.2 G-handle；intent store 未实现，跨文件唯一后续并入）
-    const seenHandles = new Map();
-    for (const rec of Object.values(doc.records)) {
-      if (rec?.kind !== "live") continue;
-      for (const h of [rec.selection_handle ?? null, rec.rebind_handle ?? null]) {
-        if (h === null) continue;
-        if (seenHandles.has(h)) {
-          entry.problems.push("handle 重复（endpoint 内须全局唯一）：" + h.slice(0, 12) + "（" + seenHandles.get(h).slice(0, 12) + " 与 " + rec.topic_agent_id.slice(0, 12) + "）");
-        } else seenHandles.set(h, rec.topic_agent_id);
+      if (L.granular === "unreadable" || (L.granular === "absent" && rootAbsent)) {
+        // P1-1/P1-4：读不出（symlink/FIFO/坏 JSON/权限）或根整体缺席但有收据 → fail-closed 查不清
+        entry.status = "unclear";
+        entry.problems.push(L.granular === "absent"
+          ? "有 init 收据但账本根缺席（fail-closed）"
+          : "账本受验读取不过（" + (L.why ?? "说不清") + "）—— fail-closed");
+      } else {
+        // 账本损坏（validateLedger 不过）→ block，细粒度文案来自唯一校验器（脱敏后展示）
+        entry.status = "block";
+        entry.problems.push(L.granular === "absent" ? "有 init 收据但账本缺席" : "validateLedger 不过：" + (L.why ?? L.reason ?? "说不清"));
       }
+      endpoints.push(entry);
+      summary.total += 1;
+      summary[entry.status === "unclear" ? "unclear" : "block"] += 1;
+      continue;
     }
-    for (const rec of Object.values(doc.records)) {
-      if (rec?.kind !== "live") continue;
-      for (const p of checkLiveRecord(doc, rec, doc.schema_version)) entry.problems.push(rec.topic_agent_id.slice(0, 12) + "：" + p);
-    }
-    // ── 存量计数（§9：严格后恒 0 非 0 block；过渡/1.0 报 opaque 计数）──
+    const doc = L.doc; // loadByEndpoint 已内嵌整账本 validateLedger——到这里 doc 必受验
+    schemaByEndpoint.set(ep.endpointId, doc.schema_version);
+    // ── 存量计数（§9：报 opaque 计数；strict 合法性由 validateLedger 收口，这里不再第二套）──
     const inv = migrationInventory(doc);
     entry.counts = { schema_version: doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
-    if (doc.schema_version === "1.1" && (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0)) {
-      entry.status = "block";
-      entry.problems.push("strict 下存量非零：legacy_proof_count=" + inv.legacy_proof_count + " null_b1_count=" + inv.null_b1_count);
+    // ── handle 到期卫生（P1-2，doctor 专属：validateLedger 不核时间；边界含等号）──
+    for (const rec of Object.values(doc.records)) {
+      if (rec?.kind !== "live") continue;
+      checkHandleExpiry(rec, now, entry.problems);
     }
     entry.status = entry.problems.length > 0 ? "block" : "ok";
     endpoints.push(entry);
@@ -241,7 +151,8 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
       chain.state = c.exists ? c.state : "off";
       chain.problems.push("campaign/writer_state 组合说不清（writer " + (w.exists ? w.state : "缺席") + "，campaign " + (c.exists ? c.state : "缺席") + "）");
     }
-    // campaign endpoints ⊆ initDone；campaign state 与各 endpoint 账本 schema 相容
+    // campaign endpoints ⊆ initDone（P1-3：conflict/in-flight endpoint 不在集内 → 这里点名）；
+    // campaign state 与各 endpoint 账本 schema 相容
     if (c.exists && Array.isArray(c.endpoints)) {
       const extras = c.endpoints.filter((ep) => !initDoneSet.has(ep));
       if (extras.length > 0) chain.problems.push("campaign 收录了未 initDone 的 endpoint：" + extras.join("、"));
@@ -261,21 +172,26 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
     }
   }
 
-  // ── journal 1.4 进行中的迁移：只报不判（归 ⑩/维护门）──
+  // ── journal 迁移进行中（P2-5）：只认 journal 1.4 且 owner_select 迁移 kinds——
+  //    普通 install/gate 的 active 不冒充迁移（不产生 note，也不产生状态链 block；那归 ⑩/维护门）。
+  //    readJournal 内嵌 journalProblem（phase×kind×step 合法性）→ j.state === "valid" 即合法中间态。
   const act = readActive({ dir: maintenanceDir });
   if (act.state === "active") {
     const j = readJournal({ dir: maintenanceDir, token: act.token });
-    const phase = j.state === "valid" ? j.doc.phase : "phase 说不清";
-    chain.note = "迁移进行中（" + phase + "，operation " + act.token.slice(0, 8) + "）—— 进行中由 ⑩/维护门负责，本项不判 block";
+    if (j.state === "valid" && j.doc.schema_version === "1.4" && OWNER_SELECT_OPERATION_KINDS.includes(j.doc.operation_kind)) {
+      chain.note = "迁移进行中（" + j.doc.operation_kind + "：" + j.doc.phase + "，operation " + act.token.slice(0, 8) + "）—— 进行中由 ⑩/维护门负责，本项不判 block";
+    }
   }
 
-  // 查不清的 endpoint（收据层面的矛盾已由 agg.ok 兜底；此处兜逐 endpoint 的不确定）
+  // 查不清的 endpoint（收据层面的矛盾：conflict / in-flight——恰进这一桶，P1-3）
   for (const ep of agg.endpoints) {
     if (ep.state === "conflict" || ep.state === "duplicate_or_conflict") {
       endpoints.push({ endpointId: ep.endpointId, status: "unclear", problems: ["收据 conflict：" + (agg.why ?? "说不清")], counts: null });
       summary.total += 1; summary.unclear += 1;
     }
   }
+  // P2-7：诊断正文不输出 handle 前缀——出口统一脱敏（opaque id 与计数保留）
+  for (const e of endpoints) e.problems = e.problems.map(redactHandle);
   return { endpoints, chain, summary, intentNote: INTENT_NOTE };
 }
 

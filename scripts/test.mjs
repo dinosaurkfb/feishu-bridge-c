@@ -102,7 +102,7 @@ import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
-  applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
+  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
@@ -37723,10 +37723,10 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       done({ kind: "gate", id: "gate", target: "gate", before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null } }),
     ];
   };
-  const r52DrainedFixture = ({ fx, tok }) => {
+  const r52DrainedFixture = ({ fx, tok, curOverride = null }) => {
     const cid = campaignIdFor(tok);
     const rd = (p) => { try { return fs.readlinkSync(p); } catch { return "versions/0123456789abcdef"; } };
-    const cur = {
+    const cur = curOverride ?? {
       claude: rd(path.join(fx.home, ".claude", "feishu-bridge", "runtime", "current")),
       codex: rd(path.join(fx.base, "codex-home", "feishu-bridge", "runtime", "current")),
     };
@@ -37873,6 +37873,73 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       const fx = r52Setup({});
       try { buildFakeRuntime(fx.home, { journalBody: "while (true) {}", ledgerBody: NEW_L }); const t0 = Date.now(); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "探针挂死超时拒"); assert.match(String(r.why), /runtime_not_transition_capable/); }
       finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修二 P1-1：探针目标信受验 journal 不信桩内自由字段——两链各核 versions/<16hex>+manifest+probe；桩 original_current 逃逸→不随、claude 达标 codex 旧→拒", () => {
+    const NEW_J = "export const OWNER_SELECT_JOURNAL_SCHEMA = \"1.4\";";
+    const NEW_L = "export const SCHEMA_VERSIONS = [\"1.0\",\"1.1-transition\",\"1.1\"];";
+    const OLD_J = "export const X = 1;";
+    const OLD_L = "export const Y = 2;";
+    const chainRootOf = (fx, chain) => chain === "claude" ? runtimeRoot(fx.home, "claude") : codexRuntimeRoot(fx.env.CODEX_HOME);
+    // 建一条链的假 runtime：写 versions/<hex> + INSTALLED.json + 切 current 到它，返回版本 hex（供 journal before 指向）。
+    const buildRt = (fx, chain, { journalBody, ledgerBody }) => {
+      const root = chainRootOf(fx, chain);
+      const files = [
+        { path: "scripts/maintenance/journal.mjs", sha256: r52ShaOf(Buffer.from(journalBody)) },
+        { path: "scripts/topic-agent-ledger.mjs", sha256: r52ShaOf(Buffer.from(ledgerBody)) },
+      ];
+      const version = crypto.createHash("sha256").update(files.map((f) => f.path + ":" + f.sha256).join("\n")).digest("hex").slice(0, 16);
+      const vdir = path.join(root, "versions", version);
+      fs.rmSync(vdir, { recursive: true, force: true });
+      fs.mkdirSync(path.join(vdir, "scripts", "maintenance"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(vdir, "scripts", "maintenance", "journal.mjs"), journalBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "scripts", "topic-agent-ledger.mjs"), ledgerBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "INSTALLED.json"), JSON.stringify({ version, files, source_commit: null }, null, 2) + "\n", { mode: 0o600 });
+      fs.rmSync(path.join(root, "current"), { force: true });
+      fs.symlinkSync("versions/" + version, path.join(root, "current"));
+      return version;
+    };
+    // 反例一：桩 original_current 逃逸 → 不信；journal before 指向旧版 → 拒（旧实现曾跟随逃逸到假新版放行）。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const oldClaude = buildRt(fx, "claude", { journalBody: OLD_J, ledgerBody: OLD_L });   // 受验 journal before → 旧版
+        const newCodex = buildRt(fx, "codex", { journalBody: NEW_J, ledgerBody: NEW_L });     // codex 达标（本就不该放行，因 claude 旧）
+        const dfx = r52DrainedFixture({ fx, tok, curOverride: { claude: "versions/" + oldClaude, codex: "versions/" + newCodex } });
+        // claude current 换成维护桩（记在 journal 里：current:claude.after = versions/maintenance-<tok>），
+        // 桩 manifest 的 original_current 是逃逸路径；逃逸处放新版模块（旧实现会跟随）。
+        const claudeRoot = runtimeRoot(fx.home, "claude");
+        const stubDir = path.join(claudeRoot, "versions", "maintenance-" + tok);
+        fs.mkdirSync(stubDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(stubDir, "MAINTENANCE.json"), JSON.stringify({ schema_version: "1.0", token: tok, at: T052, reason: "r52 escape", original_current: "../../../escape-runtime", entries: [] }, null, 2) + "\n", { mode: 0o600 });
+        fs.rmSync(path.join(claudeRoot, "current"), { force: true });
+        fs.symlinkSync("versions/maintenance-" + tok, path.join(claudeRoot, "current"));
+        // 逃逸位置（root/../../../escape-runtime）放新版模块：旧实现 path.join(root, original_current) 会跟到这里并通过。
+        const esc = path.join(claudeRoot, "../../../escape-runtime");
+        fs.mkdirSync(path.join(esc, "scripts", "maintenance"), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(esc, "scripts", "maintenance", "journal.mjs"), NEW_J, { mode: 0o600 });
+        fs.writeFileSync(path.join(esc, "scripts", "topic-agent-ledger.mjs"), NEW_L, { mode: 0o600 });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "桩 original_current 逃逸必拒（旧实现曾跟随逃逸放行并做完迁移）：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "precheck_failed", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.match(String(r.why), /runtime_not_transition_capable/, "why 点名 runtime_not_transition_capable：" + r.why);
+      } finally { fx.cleanup(); }
+    }
+    // 反例二：claude 达标（新版）、codex 旧版 → 拒（旧实现只查 claude 会放行）。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        buildRt(fx, "claude", { journalBody: NEW_J, ledgerBody: NEW_L });
+        buildRt(fx, "codex", { journalBody: OLD_J, ledgerBody: OLD_L });
+        const dfx = r52DrainedFixture({ fx, tok });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "claude 达标 codex 旧版必拒（旧实现只查 claude 会放行）：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "precheck_failed", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.match(String(r.why), /runtime_not_transition_capable/, "why 点名 runtime_not_transition_capable：" + r.why);
+      } finally { fx.cleanup(); }
     }
   });
 

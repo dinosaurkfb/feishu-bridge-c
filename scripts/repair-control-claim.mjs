@@ -18,7 +18,7 @@ import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext } from "./select-admission.mjs";
 import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE } from "./topic-agent-ledger.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
-import { acquireOrderLock } from "./m1a/dual-write.mjs";
+import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
 import { readSelectionPlan, recoverSelectionPlanTmp } from "./selection-plan.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
@@ -96,7 +96,7 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
   if (kind === "select") {
     if (typeof onSelect === "function") return onSelect(target, ctx);
     const claim = ctx?.claim;
-    const vCtx = verifySelectionContext(claim);
+    const vCtx = verifySelectionContext(claim, { handleRequired: claim?.selection_context?.kind === "rfh" });
     if (!vCtx.ok) return { ok: false, reason: vCtx.reason, why: vCtx.why };
     const sc = vCtx.context;
     if (ctx?.uncleanRecord || claim?.state === "control-committed-unclean") {
@@ -132,9 +132,29 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
  * 重读账本核已提交 → 只做清理/释放收尾 → 转 consumed；核不出 → 保持并点名。
  */
 export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRecord, env = process.env, _inject = undefined } = {}) {
-  const vCtx = verifySelectionContext(claim);
+  // R57d 返修一 B 段 P1-7：kind 判别 —— rfh 走 intent 清理收尾；osh/orh 走「按 selection plan 核账本提交」收尾
+  //   （目标已消费，不重执行；核得出提交 → 转 consumed 交事务层闭合，核不出 → 保持并点名）。
+  const vCtx = verifySelectionContext(claim, { handleRequired: claim?.selection_context?.kind === "rfh" });
   if (!vCtx.ok) return { ok: false, reason: vCtx.reason, why: vCtx.why };
   const sc = vCtx.context;
+  if (sc.kind !== "rfh") {
+    const d0 = resolveEndpointDir(sc.endpoint, { env });
+    if (!d0.ok) return { ok: false, reason: "endpoint_dir_unresolvable", why: d0.why };
+    const L0 = loadLedger(d0.dir, { endpointId: sc.endpoint });
+    if (!L0.ok) return { ok: false, reason: "ledger_unreadable", why: L0.why ?? L0.reason };
+    const plan = claim?.selection_plan;
+    if (!plan || typeof plan !== "object" || typeof plan.target_id !== "string" || typeof plan.action !== "string") {
+      return { ok: false, reason: "selection_plan_missing", why: "claim 里没有可复核的 selection plan（旧形 unclean），保持 control-committed-unclean" };
+    }
+    const opType = plan.action === "rebind" ? "rebind_session_alias" : plan.action;
+    const wantKey = requestKeyFor({ opType, externalRequestId: sc.message, entityId: plan.target_id });
+    if (!wantKey.ok) return { ok: false, reason: "select_plan_invalid", why: wantKey.why ?? "request key 派生失败" };
+    const op = Object.values(L0.doc.operations).find((o) => o.op_type === opType && o.request_key === wantKey.request_key);
+    if (!op || !op.result || typeof op.result_revision !== "number") {
+      return { ok: false, reason: "ledger_commit_unverifiable", why: "账本中核不出 " + opType + "（" + plan.target_id + "）的提交记录，保持 control-committed-unclean" };
+    }
+    return { ok: true, changed: true };
+  }
 
   // R57b 返修三 P1-4a：repair 同样走 outer → intent 锁序（同 P1-2 签发/消费纪律）。
   //   顶层取 instance-bound outer（m1a-order lock），内层持 outer 的受验 capability。

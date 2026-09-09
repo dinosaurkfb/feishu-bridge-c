@@ -374,6 +374,12 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
   if (consumed.status === "valid") return { ok: true, intent, changed: consumed.record.changed, resumed: false, replayed: true, residueUncleared: [], residueUnknown: null, quarantined };
   if (consumed.status === "mismatch") return { ok: false, reason: "consumed_intent_mismatch", why: consumed.why };
   if (failed.status === "valid") return { ok: false, reason: "control_failed_recorded", why: failed.record.error, replayed: true };
+  // R57d 返修一 B 段 P1-7：unclean 不是终态也不是普通 failed —— 运输层重放按记录重出「已写入但收口不干净」，
+  //   **不重执行**（osh/orh 的目标已消费，重执行只会 no_candidate）；只向前收敛走维护入口 resumeControlClaim。
+  const uncleanPrior = readControlCommittedUncleanRecord({ claimsDir, key });
+  if (uncleanPrior.status === "valid") {
+    return { ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why: uncleanPrior.record.why ?? uncleanPrior.record.error ?? "committed_unclean", replayed: true, quarantined };
+  }
   if (failed.status === "unreadable") {
     const name = key + ".failed.quarantined." + process.pid + "." + Date.now();
     try { fs.renameSync(path.join(claimsDir, key + ".failed.json"), path.join(claimsDir, name)); }

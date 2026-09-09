@@ -45902,7 +45902,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" },
       selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" }),
     };
-    fs.mkdirSync(path.join(root, "claims"), { recursive: true });
+    fs.mkdirSync(path.join(root, "claims", "0".repeat(64) + ".claim"), { recursive: true });
     const txCtx = { claimsDir: path.join(root, "claims"), key: "0".repeat(64), claim };
     // ① 旧形 claim（无 selection_context）→ fail-closed 点名
     const r1 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx: { claimsDir: txCtx.claimsDir, key: txCtx.key, claim: { control: claim.control } } }));
@@ -45915,12 +45915,72 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     // ③ 正常：铸 capability → 复合成功；capability 不持久化（claims 目录 grep 不到）
     const r3 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx }));
     assert.equal(r3.ok, true, "③ 成功：" + JSON.stringify(r3));
-    fs.writeFileSync(path.join(txCtx.claimsDir, txCtx.key + ".claim.json"), JSON.stringify({ ...claim, selection_plan: { action: "activate", target_id: ids.b1Id, selection_basis: "explicit_handle", handle: ids.b1Handle, cas: {} } }));
     let leaked = false;
-    for (const n of fs.readdirSync(txCtx.claimsDir)) {
-      if (fs.readFileSync(path.join(txCtx.claimsDir, n), "utf-8").includes("owner_select_control_v1")) leaked = true;
-    }
+    const walkClaims = (d) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) walkClaims(full);
+        else if (fs.readFileSync(full, "utf-8").includes("owner_select_control_v1")) leaked = true;
+      }
+    };
+    walkClaims(txCtx.claimsDir);
     assert.equal(leaked, false, "capability 不持久化");
+  }));
+
+  test("R57d 返修一 B 段 P1-7：注入 committed_durability_uncertain → control-committed-unclean（非终态非普通 failed）；同 digest 重放只向前收敛转 consumed；repair 收尾核账本后转 consumed", () => withLedgerD((root, dir, ids) => {
+    fs.mkdirSync(path.join(root, "claims"), { recursive: true });
+    const claimsDir = path.join(root, "claims");
+    const msgId = "om_unclean1"; const ltk = "ltk_unclean"; const key = claimKey(msgId, ltk);
+    const selCtx = { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: msgId, sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const acquired = acquireClaim({ claimsDir, messageId: msgId, logicalTaskKey: ltk, meta: {
+      control: { control: "select", handle: ids.b1Handle, handle_kind: "osh" },
+      selection_context: selCtx, selection_context_digest_v1: digest,
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0",
+      origin_channel_generation_id: "gen_unclean",
+    } });
+    assert.equal(acquired.ok, true, "claim 取得：" + JSON.stringify(acquired));
+    const runTx = (inject) => runControlTransaction({ claimsDir, key, intent: { control: "select", handle: ids.b1Handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ messageId: "om_unclean1", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: inject })) });
+    // ① 注入目录 fsync 失败 → 账本已提交但收口不干净 → control-committed-unclean（不是 consumed、不是普通 failed）
+    const tx1 = runTx({ failDirFsync: true });
+    assert.equal(tx1.ok, false, "① 拒：" + JSON.stringify(tx1).slice(0, 300));
+    assert.equal(tx1.status, "control-committed-unclean", "① status：" + tx1.status);
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".control-committed-unclean.json")), true, "① unclean 记录落盘");
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".consumed.json")), false, "① 未落 consumed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".failed.json")), false, "① 未落普通 failed");
+    // ② 同 digest 重放 → 按记录重出「已写入但收口不干净」（不重执行——osh/orh 目标已消费）；转 consumed 只走 repair 收尾
+    const tx2 = runTx(null);
+    assert.equal(tx2.ok, false, "② 重放仍报 unclean：" + JSON.stringify(tx2).slice(0, 300));
+    assert.equal(tx2.status, "control-committed-unclean", "② status：" + tx2.status);
+    assert.equal(tx2.replayed, true, "② 重放投影（不重执行）");
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".consumed.json")), false, "② 未落 consumed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".control-committed-unclean.json")), true, "② unclean 记录仍在");
+    // ③ repair 收尾：unclean 态 + 账本核得出提交 → 只做收尾转 consumed（repairControlCommittedUnclean 的 osh/orh 支）
+    fs.rmSync(path.join(claimsDir, key + ".consumed.json"), { force: true });
+    // ③ 用第二个候选（① 已消费 B1）：新 B1 + 新 A1（旧 A1 已是 tombstone，locator 让位）
+    const b2 = TAL.createB1({ endpointId: EP57D, requestKey: "r57d_b3", chatId: CHAT_D, rootOm: "om_b3root", lineageId: "lin_d3", bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000d4" }, clock: () => T0D });
+    assert.ok(b2.ok, "新 B1：" + JSON.stringify(b2));
+    const a1b = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_a1c", chatId: CHAT_D, sessionId: SESSION_D + "-2", clock: () => T0D });
+    assert.ok(a1b.ok, "新 A1：" + JSON.stringify(a1b));
+    const msgId2 = "om_unclean2"; const key2 = claimKey(msgId2, ltk);
+    const selCtx2 = { ...selCtx, message: msgId2, session: SESSION_D + "-2", handle: b2.result.selection_handle };
+    const digest2 = SA.selectionContextDigestV1(selCtx2);
+    const acquired2 = acquireClaim({ claimsDir, messageId: msgId2, logicalTaskKey: ltk, meta: {
+      control: { control: "select", handle: b2.result.selection_handle, handle_kind: "osh" },
+      selection_context: selCtx2, selection_context_digest_v1: digest2,
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0",
+      origin_channel_generation_id: "gen_unclean",
+    } });
+    assert.equal(acquired2.ok, true, "claim2 取得：" + JSON.stringify(acquired2));
+    const tx3 = runControlTransaction({ claimsDir, key: key2, intent: { control: "select", handle: b2.result.selection_handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest2,
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ messageId: "om_unclean2", eventSessionId: SESSION_D + "-2", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: { failDirFsync: true } })) });
+    assert.equal(tx3.status, "control-committed-unclean", "③ 前置 unclean：" + JSON.stringify(tx3).slice(0, 200));
+    // 目标已激活（B3），再跑会 no_candidate —— repair 的 osh/orh 收尾只核账本不重执行
+    const repaired = resumeControlClaim({ claimsDir, key: key2, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
+    assert.equal(repaired.ok, true, "③ repair 收尾成功：" + JSON.stringify(repaired).slice(0, 300));
+    assert.equal(fs.existsSync(path.join(claimsDir, key2 + ".consumed.json")), true, "③ 转 consumed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key2 + ".control-committed-unclean.json")), false, "③ unclean 已清");
   }));
 
   test("R57d 返修二 P1-6：A1 复核在 legacy 之前（preflight）——缺席 → no_a1 且 legacy 调用数为 0（Codex #147 二轮）", () => withLedgerD((root, dir, ids) => {
@@ -46199,9 +46259,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision, rev1, "重放不重执行");
       // B 段 P1-3：执行前持久化的 immutable selection plan 写进 claim 记录（省略/续做可复现的封闭形状）
       const claimsDirEntry = path.join(root, ".runtime-data", "inbound", "delivery-claims");
-      const claimFiles = fs.readdirSync(claimsDirEntry).filter((n) => n.endsWith(".claim.json"));
-      assert.equal(claimFiles.length, 1, "claim 记录恰一份：" + claimFiles.join(","));
-      const claimRec = JSON.parse(fs.readFileSync(path.join(claimsDirEntry, claimFiles[0]), "utf-8"));
+      const claimDirs = fs.readdirSync(claimsDirEntry, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.endsWith(".claim"));
+      assert.equal(claimDirs.length, 1, "claim 目录恰一份：" + claimDirs.map((d) => d.name).join(","));
+      const claimRec = JSON.parse(fs.readFileSync(path.join(claimsDirEntry, claimDirs[0].name, "claim.json"), "utf-8"));
       const plan = claimRec.selection_plan;
       assert.ok(plan, "claim 里有 selection_plan");
       assert.deepEqual(Object.keys(plan).sort(), ["action", "cas", "handle", "selection_basis", "target_id"], "plan 封闭键集：" + JSON.stringify(Object.keys(plan)));

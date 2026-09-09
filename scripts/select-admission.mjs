@@ -17,7 +17,8 @@ import { createHash } from "node:crypto";
 import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
-import { recordClaimState } from "./claim.mjs";
+import fs from "node:fs";
+import path from "node:path";
 import { canonKey } from "./maintenance/canon.mjs";
 import { resolveSelectionCandidate } from "./select-resolve.mjs";
 import { wireSelectActivate, wireSelectAnchor, wireSelectRebind } from "./m1a/wiring.mjs";
@@ -222,22 +223,37 @@ const stableStringify = (v) => JSON.stringify(v, (_k, x) => (x !== null && typeo
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
 function wiredOutcome(w, action) {
-  if (!w || typeof w !== "object") return { ok: false, reason: "select_op_failed", text: selectRejectTextByReason("select_op_failed") };
+  if (!w || typeof w !== "object") return { ok: false, status: "failed", reason: "select_op_failed", text: selectRejectTextByReason("select_op_failed") };
   if (w.ok !== true) {
     const reason = w.reason ?? "select_op_failed";
-    return { ok: false, reason, text: selectRejectTextByReason(reason) + (w.why ? "（" + w.why + "）" : "") };
+    return { ok: false, status: "failed", reason, text: selectRejectTextByReason(reason) + (w.why ? "（" + w.why + "）" : "") };
   }
   if (w.legacy && w.legacy.ok === false) {
     const why = String(w.legacy.why ?? w.legacy.reason ?? "");
-    return { ok: false, reason: "select_legacy_failed", text: selectRejectTextByReason("select_legacy_failed") + (why ? "（" + why + "）" : "") };
+    return { ok: false, status: "failed", reason: "select_legacy_failed", text: selectRejectTextByReason("select_legacy_failed") + (why ? "（" + why + "）" : "") };
   }
   const step = Array.isArray(w.shadow) ? w.shadow[0] : null;
-  if (!step) return { ok: false, reason: "select_ledger_skipped", text: selectRejectTextByReason("select_ledger_skipped") };
-  if (step.ok !== true) {
-    const reason = step.reason ?? "select_op_failed";
-    return { ok: false, reason, text: selectRejectTextByReason(reason) + (step.why ? "（" + step.why + "）" : "") };
+  // R57d 返修一 B 段 P1-7：三份结果分类（账本提交 / claim 清理 / 锁释放）——与 rfh 共用叶子
+  //   classifySelectOutcome（select-outcome.mjs，无反向依赖）与同一 control-committed-unclean 可恢复态。
+  const ledger = step
+    ? { ok: step.ok === true, commit: step.committed ?? null, residue: step.residue ?? null, lockUncleared: step.lockUncleared ?? null, reason: step.reason ?? null, why: step.why ?? null }
+    : { ok: false, reason: "select_ledger_skipped" };
+  const rel = w.release;
+  const outer = rel == null ? "released"
+    : (rel.ok === true && !rel.absent && !rel.reapUncleared ? "released" : (rel.reapUncleared ? "residue" : "unclear"));
+  const outcome = classifySelectOutcome({ ledger, intentCleanup: "cleared", locks: { outer, intent: "released" } });
+  if (outcome.status === "consumed") {
+    return { ok: true, status: "consumed", changed: step.idempotent !== true, action, text: selectExecutorSuccessText(action) };
   }
-  return { ok: true, changed: step.idempotent !== true, action, text: selectExecutorSuccessText(action) };
+  if (outcome.status === "control-committed-unclean") {
+    return {
+      ok: false, status: "control-committed-unclean", reason: "control_committed_unclean",
+      text: "已写入但收口不干净（" + String(outcome.why ?? "账本已写入但未收净") + "）",
+      ledger: outcome.ledger, intent_cleanup: outcome.intent_cleanup, locks: outcome.locks, why: outcome.why,
+    };
+  }
+  const reason = outcome.reason ?? step?.reason ?? "select_op_failed";
+  return { ok: false, status: "failed", reason, text: selectRejectTextByReason(reason) + (step?.why ? "（" + step.why + "）" : "") };
 }
 
 /**
@@ -386,8 +402,12 @@ export function executeSelectControl(intent, {
         return { ok: false, status: "failed", reason: "select_plan_conflict", text: selectRejectTextByReason("select_plan_conflict") };
       }
     } else {
+      // 写进 readClaimState 读的那份 claim 记录（<key>.claim/claim.json）——repair 的重读才拿得到 plan
       try {
-        recordClaimState({ claimsDir: txCtx.claimsDir, key: txCtx.key, state: "claim", detail: { ...txCtx.claim, selection_plan: plan } });
+        const file = path.join(txCtx.claimsDir, txCtx.key + ".claim", "claim.json");
+        const tmp = file + ".tmp." + process.pid;
+        fs.writeFileSync(tmp, JSON.stringify({ ...txCtx.claim, selection_plan: plan }, null, 2) + "\n", { mode: 0o600 });
+        fs.renameSync(tmp, file);
       } catch {
         return { ok: false, status: "failed", reason: "select_plan_unwritten", text: selectRejectTextByReason("select_plan_unwritten") };
       }
@@ -410,12 +430,12 @@ export function executeSelectControl(intent, {
   if (action === "activate") {
     // R57d 返修一 P1-5（§12 ⑤）：root = 命中 B1 的 aliases.root_om（selected_root_om 与之 CAS）；
     //   session = 受验入站事件 session。不收 transport 根（eventRootOm 已删，不声称验过 thread_root）。
-    w = wireSelectActivate({ endpointId, env, legacy, capability, messageId, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
+    w = wireSelectActivate({ endpointId, env, legacy, capability, messageId, _inject, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
   } else if (action === "anchor") {
     // P1-5：root = A2 的 anchor_candidate；session = 事件 session（不再自填目标旧 session——那会让 CAS 变得恒真）
-    w = wireSelectAnchor({ endpointId, env, capability, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
+    w = wireSelectAnchor({ endpointId, env, capability, messageId, _inject, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
-    w = wireSelectRebind({ endpointId, env, legacy, capability, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
+    w = wireSelectRebind({ endpointId, env, legacy, capability, messageId, _inject, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
   return wiredOutcome(w, action);
 }

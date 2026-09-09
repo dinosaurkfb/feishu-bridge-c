@@ -520,7 +520,7 @@ const selectCapFail = (v) => ({ ok: false, commit: "not_committed", reason: v.re
 /** wireSelectActivate —— owner_select activate（B1+A1 归并）的双写分派。
  * A1 复核在 preflight（outer 锁内、legacy 提交之前，R57d 返修二 P1-6）：缺 → no_a1 整笔拒，
  * 不再出现「legacy 已提交、shadow no_a1」的半笔。 */
-export function wireSelectActivate({ endpointId, env = process.env, legacy = null, capability, messageId, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
+export function wireSelectActivate({ endpointId, env = process.env, legacy = null, capability, messageId, _inject = undefined, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
   const vcap = verifySelectCapability(capability, { endpoint: endpointId, message: messageId, sender: authorizedBy, handle: selectionHandle, handleKind: "osh" });
   if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
@@ -536,7 +536,7 @@ export function wireSelectActivate({ endpointId, env = process.env, legacy = nul
   const submit = (_legacyRes, pf) => {
     const k = rk("activate", messageId, b1Id);
     if (!k.ok) return [{ op: "activate", ...k }];
-    return [capture("activate", activate({ endpointId, requestKey: k.request_key, b1Id, a1Id: pf.a1Id, authorizedBy, selectedSessionId: eventSessionId, selectedRootOm, selectionHandle, selectionMessageId: messageId, selectionBasis, clock, env }))];
+    return [capture("activate", activate({ endpointId, requestKey: k.request_key, b1Id, a1Id: pf.a1Id, authorizedBy, selectedSessionId: eventSessionId, selectedRootOm, selectionHandle, selectionMessageId: messageId, selectionBasis, clock, env, _inject }))];
   };
   if (mode.mode === "authoritative") {
     const pf = preflight();
@@ -549,7 +549,7 @@ export function wireSelectActivate({ endpointId, env = process.env, legacy = nul
 
 /** wireSelectAnchor —— owner_select anchor（A2 → A3 补链路证明）的双写分派。
  * legacy 恒为显式 no-op：anchor 没有 legacy mapping 权威事实可更新，不伪造 mapping 写；outer 排序照走。 */
-export function wireSelectAnchor({ endpointId, env = process.env, capability, messageId, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionBasis, clock = () => Date.now() }) {
+export function wireSelectAnchor({ endpointId, env = process.env, capability, messageId, _inject = undefined, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionBasis, clock = () => Date.now() }) {
   const vcap = verifySelectCapability(capability, { endpoint: endpointId, message: messageId, sender: authorizedBy, handle: selectionHandle, handleKind: "osh" });
   if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
@@ -557,14 +557,14 @@ export function wireSelectAnchor({ endpointId, env = process.env, capability, me
   const submit = () => {
     const k = rk("anchor", messageId, id);
     if (!k.ok) return [{ op: "anchor", ...k }];
-    return [capture("anchor", anchor({ endpointId, requestKey: k.request_key, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionMessageId: messageId, selectionBasis, clock, env }))];
+    return [capture("anchor", anchor({ endpointId, requestKey: k.request_key, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionMessageId: messageId, selectionBasis, clock, env, _inject }))];
   };
   if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
   return runWired({ endpointId, env, legacy: () => ({ ok: true, noop: true, why: "anchor 无 legacy mapping 权威事实（§12 ①：显式 no-op，不伪造 mapping 写）" }), submit });
 }
 
 /** wireSelectRebind —— owner_select rebind_session_alias（B3 换绑事件会话）的双写分派。 */
-export function wireSelectRebind({ endpointId, env = process.env, legacy = null, capability, messageId, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
+export function wireSelectRebind({ endpointId, env = process.env, legacy = null, capability, messageId, _inject = undefined, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
   const vcap = verifySelectCapability(capability, { endpoint: endpointId, message: messageId, sender: authorizedBy, handle: rebindHandle, handleKind: "orh" });
   if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
@@ -572,7 +572,7 @@ export function wireSelectRebind({ endpointId, env = process.env, legacy = null,
   const submit = () => {
     const k = rk("rebind_session_alias", messageId, id);
     if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
-    return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId: messageId, clock, env }))];
+    return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId: messageId, clock, env, _inject }))];
   };
   if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
   if (typeof legacy !== "function") return selectLegacyMissing();

@@ -40637,6 +40637,46 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(r.idem, true, "idempotent:true");
   });
 
+  test("R57a 返修五 K1：replayDescriptorsAcrossUpgrade 单钉——二选一、绝不两者同给（改回两者同给应转红）", () => {
+    const mkDoc = (schema, upgrades = []) => { const ops = {}; for (const u of upgrades) ops[u.rev] = { op_type: "schema_upgrade", result_revision: u.rev, result: { from_schema: u.from, to_schema: u.to } }; return { schema_version: schema, operations: ops }; };
+    const L = [{ opType: "void", inputs: { a: 1 } }];
+    const C = [{ opType: "void", inputs: { b: 2 } }, { opType: "attach_a3", inputs: { c: 3 } }];
+    const doc10 = mkDoc("1.0");
+    const doc11 = mkDoc("1.1", [{ rev: 3, from: "1.0", to: "1.1-transition" }, { rev: 4, from: "1.1-transition", to: "1.1" }]); // 边界=3
+    const doc11tr = mkDoc("1.1-transition"); // 零升级历史，边界=0
+    const assertExactly = (res, which) => {
+      assert.equal(res.length, which === "legacy" ? L.length : C.length, "长度 == " + which + ".length（绝不混含）");
+      assert.deepEqual(res, which === "legacy" ? L : C, "恰 " + which);
+    };
+    assertExactly(TAL.replayDescriptorsAcrossUpgrade({ doc: doc10, prior: { result_revision: 5 }, legacy: L, current: C }), "legacy");
+    assertExactly(TAL.replayDescriptorsAcrossUpgrade({ doc: doc11, prior: { result_revision: 2 }, legacy: L, current: C }), "legacy");
+    assertExactly(TAL.replayDescriptorsAcrossUpgrade({ doc: doc11, prior: { result_revision: 3 }, legacy: L, current: C }), "current");
+    assertExactly(TAL.replayDescriptorsAcrossUpgrade({ doc: doc11tr, prior: { result_revision: 5 }, legacy: L, current: C }), "current");
+  });
+
+  test("R57a 返修五 K3：validateLedger 钉「新形落边界前」——构造边界在 rev N、把 rev < N 的 void 指纹改成新形（含 expected 双键）→ ok:false 点名（去掉该条应转红）", () => {
+    const initOp = "00000000-0000-4000-8000-000000000001";
+    const up1 = "00000000-0000-4000-8000-000000000002";
+    const up2 = "00000000-0000-4000-8000-000000000003";
+    const voidOp = "00000000-0000-4000-8000-000000000004";
+    const ops = {
+      [initOp]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57k3_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      // 升级边界 = 首笔 from_schema==="1.0" 的 schema_upgrade（rev3）。rev2 的 void 落在边界前。
+      [up1]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57k3_up1", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57k3_up1", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
+      [up2]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57k3_up2", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57k3_up2", endpoint: EP57, from_schema: "1.1-transition", to_schema: "1.1" }), result_revision: 4, result: { endpoint: EP57, from_schema: "1.1-transition", to_schema: "1.1" } },
+    };
+    // 边界前（rev2）void：把指纹改成**新形**（含 expected_handle/expected_expires_at 双键）→ 应拒。
+    const newShapeFp = TAL.fingerprintOf("void", { request_key: "r57k3_v", b1_id: "ta_" + "3".repeat(32), reason: "manual", expected_handle: null, expected_expires_at: null });
+    const vid = "ta_" + "3".repeat(32);
+    ops[voidOp] = { op_type: "void", terminal_kind: "void", request_key: "r57k3_v", fingerprint: newShapeFp, result_revision: 2, result: { voided_id: vid } };
+    // legacyFpFor 需从记录取 reason：补一笔 voided_audit 记录（rev2 边界前，void 指纹被改成新形）。
+    const records = { [vid]: { kind: "voided_audit", topic_agent_id: vid, root_om: "om_k3", voided_at: "2026-01-01T00:00:00.000Z", reason: "manual", origin_operation_id: voidOp } };
+    const doc = { schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 4, operations: ops, records };
+    const v = TAL.validateLedger(doc, { endpointId: EP57 });
+    assert.equal(v.ok, false, "新形落边界前必拒");
+    assert.match(String(v.why), /跨 schema 指纹形不符（新形落边界前）/, "why 点名新形落边界前：" + v.why);
+  });
+
 
 }
 

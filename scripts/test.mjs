@@ -45894,8 +45894,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].facts.binding, "pending", "handle 未被消费");
   }));
 
-  test("R57d 返修一 P1-8：歧义回执上限 5——6 个候选只列标签序前 5 + 提示还有 N 个；≤5 全列", () => withLedgerD((root, dir, ids) => {
-    // 追加 5 个可锚 A2（各自独立 A1 前身 + 独立 anchor_candidate；夹具原有 1 个 → 省略分支歧义集合 = 6）
+  test("R57d 返修一 P1-8 + 返修二 P1-8：歧义回执上限 5 + 三族候选汇总并集——7 个候选只列标签序前 5 + 提示还有 2 个；≤5 全列", () => withLedgerD((root, dir, ids) => {
+    // 追加 5 个可锚 A2（各自独立 A1 前身 + 独立 anchor_candidate；夹具原有 1 个 → anchor 族 6）
     for (let i = 0; i < 5; i += 1) {
       const a1 = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_p" + i, chatId: CHAT_D, sessionId: SESSION_D + "-p" + i, clock: () => T0D });
       assert.ok(a1.ok, "A1 前身：" + JSON.stringify(a1));
@@ -45905,10 +45905,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
     assert.equal(r.ok, false);
     assert.equal(r.reason, "ambiguous_selection");
-    assert.match(r.text, /6 个候选/u, "计数：" + r.text);
+    // 返修二 P1-8：activate 族（B1，可归并 A1 在事件会话上）+ anchor 族 6 = 并集 7——某族 ok 不再被另一族 ambiguous 遮住
+    assert.match(r.text, /7 个候选/u, "计数：" + r.text);
     const handles = r.text.match(/osh_[0-9a-f]{32}/gu) ?? [];
     assert.equal(handles.length, 5, "只列 5 个 handle：" + r.text);
-    assert.match(r.text, /还有 1 个/u, "超限提示：" + r.text);
+    assert.match(r.text, /还有 2 个/u, "超限提示：" + r.text);
     assert.doesNotMatch(r.text, /ta_|oc_|om_/u, "不含记录 id / locator / 会话 id / chat_id");
   }));
 

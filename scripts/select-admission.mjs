@@ -319,12 +319,18 @@ export function executeSelectControl(intent, {
       ["anchor", resolveSelectionCandidate({ doc, endpointId, chatId, action: "anchor", handle: null, now: nowMs })],
       ["rebind", resolveSelectionCandidate({ doc, endpointId, chatId, action: "rebind", handle: null, now: nowMs })],
     ];
-    const hits = tries.filter(([, r]) => r.ok);
-    const ambs = tries.filter(([, r]) => r.reason === "ambiguous");
-    if (hits.length === 1 && ambs.length === 0) { res = hits[0][1]; action = hits[0][0]; }
-    else if (ambs.length > 0) res = ambs[0][1];
-    else if (hits.length > 1) res = { ok: false, reason: "ambiguous", candidates: hits.flatMap(([, r]) => [r.target_id]) };
-    else res = { ok: false, reason: "no_candidate" };
+    // R57d 返修二 P1-8：三族 eligible 候选**汇总并集**（去重、排序）再判唯一/歧义——
+    //   某族 ambiguous 不再遮住其它族（族间记录不重叠，B1/A2/B3 互斥；去重为防御）。
+    const families = tries.filter(([, r]) => r.ok || r.reason === "ambiguous");
+    const unionIds = [...new Set(families.flatMap(([, r]) => (r.ok ? [r.target_id] : (r.candidates ?? []))))].sort();
+    if (unionIds.length === 1) {
+      const [act, r] = families.find(([, r]) => r.ok);
+      res = r; action = act;
+    } else if (unionIds.length > 1) {
+      res = { ok: false, reason: "ambiguous", candidates: unionIds };
+    } else {
+      res = { ok: false, reason: "no_candidate" };
+    }
   }
   if (!res.ok) {
     if (res.reason === "ambiguous") {

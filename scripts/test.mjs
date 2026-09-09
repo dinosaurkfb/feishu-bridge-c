@@ -40792,6 +40792,31 @@ test("R58 返修一 P1-2：forward_failed 封闭校验器五处共用——伪�
   assert.equal(d3.count, 1, "合法记录进入发布 dry-run：" + JSON.stringify(d3));
 });
 
+test("R58 返修一 P1-3：原子 no-replace 发布——既存半截/不合法 → residue 点名不覆盖；崩溃在 link 前 → 无最终文件、tmp 被清；同内容重放 → duplicate、内容不等 → conflict", () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58p13-"));
+  const key = r54Key(40);
+  const file = path.join(dir, key + R58_RECEIPT_SUFFIX);
+  // ① 预置内容为 "{" 的同名文件 → append → residue（不是 duplicate、不覆盖）
+  fs.writeFileSync(file, "{");
+  const r1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1" });
+  assert.deepEqual([r1.ok, r1.reason], [false, "residue"], JSON.stringify(r1));
+  assert.equal(fs.readFileSync(file, "utf-8"), "{", "半截文件不被覆盖");
+  // ② 崩溃在 link 前（beforeLink 抛错）→ 无最终文件、tmp 被清
+  fs.rmSync(file, { force: true });
+  const r2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1", _inject: { beforeLink: () => { throw new Error("crash before link"); } } });
+  assert.equal(r2.ok, false, JSON.stringify(r2));
+  assert.equal(fs.existsSync(file), false, "link 前崩溃 → 无最终文件");
+  assert.equal(fs.readdirSync(dir).filter((n) => n.includes(".tmp.")).length, 0, "tmp 被清");
+  // ③ 正常写成功 → 读回过校验器；同内容重放 → duplicate
+  const r3 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1" });
+  assert.equal(r3.ok, true, JSON.stringify(r3));
+  const r4 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1" });
+  assert.deepEqual([r4.ok, r4.reason], [false, "duplicate"], "同内容重放 → duplicate");
+  // ④ 既存内容不等（不同 category）→ conflict
+  const r5 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "unknown", messageId: "om_m1", targetGenerationId: "gen-1" });
+  assert.deepEqual([r5.ok, r5.reason], [false, "conflict"], "内容不等 → conflict");
+});
+
 test("R58 doctor ⑯：失败但回执缺失 → 子计数点名 key；回执在项目级 / 会话级 outbox → 不点名；桶之和不变", () => {
   const m = doctorMachine();
   const root = m.project("r58doc", { expiresAt: "2099-01-01T00:00:00.000Z" });

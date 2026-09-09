@@ -19,6 +19,7 @@ import { generationTargetState, usableGeneration } from "./topic-generation.mjs"
 import { isCanonicalIso } from "./canonical-time.mjs";
 // registry 不反向依赖 outbox —— 没有环。
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { canonKey } from "./maintenance/canon.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 
 /**
@@ -183,6 +184,20 @@ export function forwardFailureReceiptProblem(record, { expectedKey = null } = {}
   return null;
 }
 
+/** 受验读回（P1-3/doctor 共用）：读 <key>.forward-failed.outbox.json 并过 forwardFailureReceiptProblem。 */
+export function readForwardFailureReceipt({ outboxDir, forwardKey }) {
+  const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
+  let raw;
+  try { raw = fs.readFileSync(file); }
+  catch (err) { if (err?.code === "ENOENT") return { absent: true }; return { ok: false, why: "读不出: " + String(err?.code ?? err?.message ?? err), badPath: file }; }
+  let rec;
+  try { rec = JSON.parse(raw.toString("utf-8")); }
+  catch { return { ok: false, why: "半截/坏 JSON", badPath: file }; }
+  const p = forwardFailureReceiptProblem(rec, { expectedKey: forwardKey });
+  if (p !== null) return { ok: false, why: "不合法: " + p, badPath: file };
+  return { ok: true, record: rec, file };
+}
+
 /** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
 export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
 
@@ -199,7 +214,7 @@ export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
  */
 export function appendForwardFailureReceipt({
   outboxDir, forwardKey, category, messageId, targetGenerationId,
-  source = "forward-runner",
+  source = "forward-runner", _inject = null,
 }) {
   if (typeof outboxDir !== "string" || outboxDir.length === 0) return { ok: false, reason: "outbox_dir_missing" };
   if (typeof forwardKey !== "string" || !/^[0-9a-f]{64}$/u.test(forwardKey)) return { ok: false, reason: "key_shape" };
@@ -235,15 +250,51 @@ export function appendForwardFailureReceipt({
   if (ip !== null) return { ok: false, reason: "receipt_invalid", why: ip };
   fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
   const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
+  // P1-3 原子 no-replace 发布（与 selection-plan.mjs 同纪律）：写 tmp → fsync → linkSync(tmp, final) → unlink tmp →
+  // fsync 目录 → 受验读回。EEXIST：既存完整合法且 canonKey 逐字等 → duplicate；内容不等 → conflict；不合法/半截 → residue（不覆盖）。
+  const bytes = Buffer.from(JSON.stringify(record, null, 2) + "\n", "utf-8");
+  const tmp = path.join(outboxDir, "." + forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX + ".tmp." + process.pid + "." + randomUUID());
+  const errCode = (e) => String(e?.code ?? e?.message ?? e);
   let fd = null;
+  let linked = false;
+  const cleanupTmp = () => { try { fs.unlinkSync(tmp); } catch (err) { if (err?.code !== "ENOENT") throw err; } };
   try {
-    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-    fs.writeFileSync(fd, JSON.stringify(record, null, 2) + "\n");
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    let off = 0; while (off < bytes.length) { const n = fs.writeSync(fd, bytes, off, bytes.length - off); if (n <= 0) break; off += n; }
     fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = null;
+    if (typeof _inject?.beforeLink === "function") _inject.beforeLink();
+    try { fs.linkSync(tmp, file); }
+    catch (err) {
+      if (err?.code === "EEXIST") {
+        try { cleanupTmp(); } catch (e2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(e2) }; }
+        const existing = readForwardFailureReceipt({ outboxDir, forwardKey });
+        // duplicate：既存完整合法且**内容**与本次逐字等（born-eligible 的 created_at/publish_eligible_at 每次重放都变，
+        //  不参与同内容判定——重放输给 EEXIST 应视为 duplicate 而非 conflict）。
+        if (existing.ok && existing.record && canonKey({ ...existing.record, created_at: null, publish_eligible_at: null }) === canonKey({ ...record, created_at: null, publish_eligible_at: null })) return { ok: false, reason: "duplicate", file };
+        if (existing.ok && existing.record) return { ok: false, reason: "conflict", why: "既存回执与本次期望记录不等（不覆盖）", file };
+        return { ok: false, reason: "residue", residue: existing.badPath ?? file, why: "既存回执不合法/半截（不覆盖）" };
+      }
+      throw err;
+    }
+    linked = true;
+    try { cleanupTmp(); } catch (err2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(err2) }; }
   } catch (err) {
-    if (err?.code === "EEXIST") return { ok: false, reason: "duplicate", file };
-    return { ok: false, reason: "io_error", error: String(err?.code ?? err?.message ?? err), file };
-  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+    if (fd !== null) { try { fs.closeSync(fd); fd = null; } catch {} }
+    if (!linked) { try { cleanupTmp(); } catch (e2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(e2) }; } return { ok: false, reason: "receipt_write_failed", why: errCode(err) }; }
+    return { ok: false, reason: "commit_uncertain", why: "link 后收口失败: " + errCode(err) };
+  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch {} } }
+  // 发布后目录 fsync
+  try {
+    let dfd = null;
+    try { dfd = fs.openSync(outboxDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
+    finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch {} } }
+  } catch (err) {
+    return { ok: false, reason: "dir_fsync_failed", why: "目录 fsync 失败: " + errCode(err), commit: "committed_durability_uncertain" };
+  }
+  // 受验读回
+  const rb = readForwardFailureReceipt({ outboxDir, forwardKey });
+  if (!rb.ok) return { ok: false, reason: "readback_failed", why: "受验读回未通过: " + rb.why, commit: "committed_durability_uncertain" };
   return { ok: true, id: record.id, file };
 }
 

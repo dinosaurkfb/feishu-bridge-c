@@ -510,6 +510,7 @@
       "markSent",
       "outboxMutationBlocker",
       "pauseKindOf",
+      "readForwardFailureReceipt",
       "readOutboxSnapshot",
       "recordPublishFailure",
       "retryProtection",

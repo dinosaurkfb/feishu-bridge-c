@@ -39311,17 +39311,70 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const T1 = Date.parse("2098-12-31T00:00:00.000Z");
     let clockCalls = 0;
     const lockClock = () => { clockCalls += 1; return T1 + 40 * 86400e3; }; // 锁内时钟比事件戳晚 40 天
-    // 事件戳 now=T1，锁内 clock=+40d → TTL 按 clock 生成（改前按 now：clock 调用 0 次）
-    const rq = talOk(TAL.requestRebind({ endpointId: EP57, requestKey: "r57f2_ck0", b3Id: b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: sessionId, clock: () => T1, clock: lockClock }), "requestRebind");
-    assert.ok(clockCalls > 0, "clock seam 被调用（改前 0 次）");
+    // 事件戳 now=T1，锁内 clock=+40d → 事件戳写 now，TTL 按 clock 生成（改前 clock 键重复/无 now：事件戳与 TTL 都错）
+    const rq = talOk(TAL.requestRebind({ endpointId: EP57, requestKey: "r57f2_ck0", b3Id: b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: sessionId, now: T1, clock: lockClock }), "requestRebind");
+    assert.ok(clockCalls > 0, "clock seam 被调用");
     const expMs = T1 + 40 * 86400e3 + 30 * 86400e3;
     assert.equal(rq.result.rebind_expires_at, new Date(expMs).toISOString(), "TTL 按 clock()（按 now 生成时此断言红）");
     assert.equal(rq.result.affected_live_ids_after_commit.length, 1);
-    // 消费：事件戳 now=T1+1s（远未到期）+ 锁内 clock 跨过到期 → 按锁内时间拒
-    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f2-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", clock: () => T1 + 1000, clock: () => Date.parse(rq.result.rebind_expires_at) + 1 });
+    // 事件时间必须写 now（T1），不是 clock()：读回记录 updated_at === iso(T1)
+    const Lq = TAL.loadLedger(dir, { endpointId: EP57 });
+    assert.equal(Lq.ok, true, "读回账本");
+    assert.equal(Lq.doc.records[b1Id].updated_at, new Date(T1).toISOString(), "事件戳写 now=T1（写 clock() 时此断言红）");
+    // 消费：事件戳 now=T1+1s（远未到期）+ 锁内 clock 跨过到期 → 按锁内时间拒；反面：now 已到期、clock 未到期 → 判未到期
+    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f2-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", now: T1 + 1000, clock: () => Date.parse(rq.result.rebind_expires_at) + 1 });
     assert.equal(r.ok, false, "到期按锁内 clock()（按事件戳 now 放行时此断言红）");
     assert.equal(r.reason, "rebind_handle_expired");
+    // 反面（判未到期）：now 已到期（T1+100d）、clock 未到期（锁内 T1+1s）→ expiry 判未到期 → 重绑成功
+    const r2 = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck2", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f2-ck2b", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", now: T1 + 100 * 86400e3, clock: () => T1 + 1000 });
+    assert.equal(r2.ok, true, "now 已到期但 clock 未到期 → expiry 判未到期、重绑成功（按 now 判到期时此断言红）");
+    assert.notEqual(r2.reason, "rebind_handle_expired", "不是 expired（clock 未到期）");
   }));
+
+  test("R57a 返修四 P1：跨 schema 重放描述符按升级边界二选一 + validateLedger 钉指纹形——边界后旧形 void 拒、同 key 用旧形 inputs 重放 request_conflict、边界前旧形重放 idempotent", () => withLedger57((dir) => {
+    // 1.1 账本（边界=rev2）：init(1)+up(2,1.0→transition)+up(3,transition→1.1)。边界后走正常 1.1 形 void（rev4）。
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "p1_b1", chatId: "oc_p1", rootOm: "om_p1", lineageId: "lin_p1", bindingTarget: TGT57(51), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id, handle = b1.result.selection_handle, expiry = b1.result.handle_expires_at;
+    const expiryMs = Date.parse(expiry);
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "p1_void", b1Id, reason: "expired", expectedHandle: handle, expectedExpiresAt: expiry, clock: () => expiryMs + 1 }), "边界后 1.1 形 void");
+    let doc = loadOk57(dir);
+    assert.equal(TAL.validateLedger(doc, { endpointId: EP57 }).ok, true, "边界后新形 void 合法");
+    // ① 同 request_key 用“旧形 inputs”（无 expected_handle/expires）重放 → 必须是 request_conflict（不是 idempotent）。
+    const rep = TAL.voidPending({ endpointId: EP57, requestKey: "p1_void", b1Id, reason: "expired", clock: () => expiryMs + 1 });
+    assert.equal(rep.ok, false, "旧形同 key 重放必拒");
+    assert.equal(rep.reason, "request_conflict", "旧形 inputs 重放 → request_conflict（不是 idempotent）");
+    // ② 手工把一笔“旧形指纹”void 塞进 rev+1（边界后）→ validateLedger 必须 ok:false 点名“跨 schema 指纹形不符”。
+    doc = loadOk57(dir);
+    const voided = doc.records[b1Id];
+    const tamperKey = "p1_tamper";
+    const legacyFp = TAL.fingerprintOf("void", { request_key: tamperKey, b1_id: b1Id, reason: voided.reason });
+    const tamperOpId = "00000000-0000-4000-8000-00000000000e";
+    doc.operations[tamperOpId] = { op_type: "void", terminal_kind: "void", request_key: tamperKey, fingerprint: legacyFp, result_revision: doc.revision + 1, result: { voided_id: b1Id } };
+    doc.revision += 1;
+    const vv = TAL.validateLedger(doc, { endpointId: EP57 });
+    assert.equal(vv.ok, false, "边界后旧形指纹 void 必拒");
+    assert.match(String(vv.why), /跨 schema 指纹形不符/, "why 点名跨 schema 指纹形不符：" + vv.why);
+  }, { schema: "1.1" }));
+
+  test("R57a 返修四 P1：边界前的历史 1.0 void 用旧形 inputs 重放 → 仍 idempotent（升级后落 1.1，边界前 legacy 描述符命中）", () => {
+    // 1.0 建账 → 旧形 void（无 expected 双键）→ 升级到 1.1（边界 rev3）→ 旧形 inputs 同 key 重放 → idempotent。
+    const r = withLedger57((dir) => {
+      const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "p1b_b1", chatId: "oc_p1b", rootOm: "om_p1b", lineageId: "lin_p1b", bindingTarget: TGT57(52), clock: () => T0 }), "createB1");
+      const b1Id = b1.result.created_id;
+      talOk(TAL.voidPending({ endpointId: EP57, requestKey: "p1b_void", b1Id, reason: "manual", clock: () => T0 }), "1.0 旧形 void");
+      // 升级 1.0 → 1.1-transition → 1.1（边界 = 第一笔 1.0→transition）。
+      let d = TAL.loadLedger(dir, { endpointId: EP57 }).doc;
+      d = TAL.applySchemaUpgrade(d, { operation_id: "00000000-0000-4000-8000-00000000000f", request_key: "p1b_up1", from_schema: "1.0", to_schema: "1.1-transition" });
+      d = TAL.applySchemaUpgrade(d, { operation_id: "00000000-0000-4000-8000-000000000010", request_key: "p1b_up2", from_schema: "1.1-transition", to_schema: "1.1" });
+      fs.writeFileSync(path.join(dir, "ledger.json"), TAL.serializeLedger(d) + "\n", { mode: 0o600 });
+      // 旧形 inputs 同 key 重放 → 应命中 legacy 描述符 → idempotent。
+      const rep = TAL.voidPending({ endpointId: EP57, requestKey: "p1b_void", b1Id, reason: "manual", clock: () => T0 });
+      return { ok: rep.ok, commit: rep.commit, idem: rep.idempotent, reason: rep.reason };
+    }, { schema: "1.0" });
+    assert.equal(r.ok, true, "边界前旧形重放 idempotent：" + JSON.stringify(r));
+    assert.equal(r.commit, "committed_clean", "idempotent 返回 committed_clean");
+    assert.equal(r.idem, true, "idempotent:true");
+  });
 
 
 }

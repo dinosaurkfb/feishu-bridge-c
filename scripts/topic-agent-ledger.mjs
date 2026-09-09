@@ -844,7 +844,22 @@ const RESULT_SHAPE = Object.freeze({
     && VALID_UPGRADE_EDGES.includes(r.from_schema + "->" + r.to_schema),
 });
 
-function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBoundaryRevision = 0 } = {}) {
+/** R57a 返修四 P1：由 op 的 result + 关联 record 重算**旧形（1.0）**指纹；重建不出来返回 null（fail-open 跳过）。 */
+function legacyFpFor(op, records) {
+  if (op.op_type === "void") {
+    const r = records[op.result?.voided_id];
+    if (!r || typeof r.reason !== "string") return null;
+    return fingerprintOf("void", { request_key: op.request_key, b1_id: op.result.voided_id, reason: r.reason });
+  }
+  if (op.op_type === "attach_a2") {
+    const r = records[op.result?.affected_id];
+    if (!r?.binding_target || !r?.binding_proof || typeof r.binding_proof.claim_key !== "string") return null;
+    return fingerprintOf("attach_a2", { request_key: op.request_key, topic_agent_id: op.result.affected_id, target: r.binding_target, claim_key: r.binding_proof.claim_key, root_om: null, matched_om: null });
+  }
+  return null;
+}
+
+function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBoundaryRevision = 0, records = {} } = {}) {
   if (!isObj(op) || keysOf(op) !== "fingerprint,op_type,request_key,result,result_revision,terminal_kind") return "operation 字段集不对";
   if (typeof op.request_key !== "string" || !REQUEST_KEY_SHAPE.test(op.request_key)) return "request_key 形状不对";
   if (!OP_TYPES.includes(op.op_type)) return "op_type 越界";
@@ -859,6 +874,14 @@ function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBound
     if (schemaVersion === "1.0" && op.op_type === "schema_upgrade") return "schema_upgrade 禁现于 1.0 账本";
     if (op.op_type !== "schema_upgrade" && NEW_OP_TYPES.includes(op.op_type)) return op.op_type + " 禁现于 1.0 或升级边界之前";
     if ("affected_live_ids_after_commit" in op.result) return op.op_type + " 增量 result 禁现于 1.0 或升级边界之前";
+  }
+  // R57a 返修四 P1：跨 schema 指纹形钉边界——void/attach_a2 的指纹必须与边界位置形状一致（旧形落边界后 / 新形落边界前 → 拒）。
+  if (op.op_type === "void" || op.op_type === "attach_a2") {
+    const legacyFp = legacyFpFor(op, records);
+    if (legacyFp !== null) {
+      if (isBeforeUpgrade && op.fingerprint !== legacyFp) return op.op_type + " 跨 schema 指纹形不符（新形落边界前）";
+      if (!isBeforeUpgrade && op.fingerprint === legacyFp) return op.op_type + " 跨 schema 指纹形不符（旧形落边界后）";
+    }
   }
 
   if ((op.op_type === "activate" || op.op_type === "anchor") && op.result.selection_handle && !op.result.selection_handle.startsWith("osh_")) {
@@ -950,6 +973,25 @@ function opConsistentWithRecord(op, id, rec) {
 
 /* ─────────────────────────── 整账本校验（G1–G15） ─────────────────────────── */
 
+/** 升级边界 revision（单一出处）：按 result_revision 排序后**首笔** from_schema==="1.0" 的 schema_upgrade 的
+ *  result_revision；无则 0。其余跨 schema 重放判别 / 指纹形校验都以此为准。 */
+export function upgradeBoundaryRevisionOf(doc) {
+  const upgradeOps = Object.values(doc?.operations ?? {})
+    .filter((op) => isObj(op) && op.op_type === "schema_upgrade")
+    .sort((a, b) => a.result_revision - b.result_revision);
+  const firstLeave10 = upgradeOps.find((u) => u.result?.from_schema === "1.0");
+  return firstLeave10 ? firstLeave10.result_revision : 0;
+}
+
+/** 跨 schema 重放描述符二选一（R57a 返修四 P1）：按 prior（同 request_key 已在账本的 op）位置相对升级边界决定
+ *  只返回 legacy（doc 是 1.0，或 prior 在边界前）或只返回 current（边界后；或零升级历史账本，边界=0）。
+ *  任何情况不返回两者。`legacy`/`current` 都是描述符数组。 */
+export function replayDescriptorsAcrossUpgrade({ doc, prior, legacy, current }) {
+  const boundary = upgradeBoundaryRevisionOf(doc);
+  const legacySide = doc.schema_version === "1.0" || (boundary > 0 && prior && prior.result_revision < boundary);
+  return legacySide ? legacy : current;
+}
+
 export function validateLedger(doc, { endpointId } = {}) {
   const bad = (why) => ({ ok: false, reason: "ledger_corrupt", why });
   if (!isObj(doc)) return bad("账本不是对象");
@@ -988,14 +1030,13 @@ export function validateLedger(doc, { endpointId } = {}) {
   }
   // 升级边界 = 首次离开 1.0 的那笔 schema_upgrade（按 result_revision 排序后第一笔 from_schema==="1.0"）；
   // 之后的 op 才允许新形/增量 result —— 合法历史 1.0→transition→mint→1.1 里夹在两笔升级间的 op 也要放行。
-  const firstLeave10 = upgradeOps.find((u) => u.result?.from_schema === "1.0");
-  const upgradeBoundaryRevision = firstLeave10 ? firstLeave10.result_revision : 0;
+  const upgradeBoundaryRevision = upgradeBoundaryRevisionOf(doc);
 
   let initCount = 0;
   const revSeen = new Set(), fpSeen = new Set(), rkSeen = new Set();
   for (const [opId, op] of Object.entries(doc.operations)) {
     if (!isOperationId(opId)) return bad("operation key 形状不对：" + opId);
-    const p = operationProblem(op, doc.revision, { schemaVersion: doc.schema_version, upgradeBoundaryRevision });
+    const p = operationProblem(op, doc.revision, { schemaVersion: doc.schema_version, upgradeBoundaryRevision, records: doc.records });
     if (p !== null) return bad("operation " + opId + "：" + p);
     if (op.result?.selection_operation_id && op.result.selection_operation_id !== opId) {
       return bad("operation " + opId + " 的 selection_operation_id 必须等于本 operation key");
@@ -1654,7 +1695,7 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
       if (typeof requestKey === "string") {
         const prior = Object.values(currentDoc.operations).find((op) => op.request_key === requestKey);
         if (prior) {
-          const descs = typeof replay === "function" ? replay(currentDoc) : [];
+          const descs = typeof replay === "function" ? replay(currentDoc, prior) : [];
           const match = descs.some((d) => d.opType === prior.op_type && fingerprintOf(d.opType, d.inputs) === prior.fingerprint);
           if (match) return finalize({ ok: true, commit: "committed_clean", revision: prior.result_revision, result: prior.result, idempotent: true });
           return finalize({ ok: false, commit: "not_committed", reason: "request_conflict", why: "同 request_key 换了载荷" });
@@ -2578,10 +2619,9 @@ export function voidPending({ endpointId, requestKey, b1Id, reason, expectedHand
   const inputsFor = (doc) => (doc !== null && doc.schema_version !== "1.0")
     ? { ...baseInputs, expected_handle: expectedHandle ?? null, expected_expires_at: expectedExpiresAt ?? null }
     : baseInputs;
-  // R57a 返修二 P1-1：跨 schema 重放——重放判定同时接受「受升级边界约束的历史 1.0 描述符」
-  // 与「当前 1.1+ 新描述符（含 expected 双键）」；首次执行仍只用当前 schema 新形（inputsFor）。
+  // R57a 返修二 P1-1：跨 schema 重放——按 prior 相对升级边界二选一（不两者同给）；首次执行仍只用当前 schema 新形（inputsFor）。
   return gatedTx({
-    endpointId, requestKey, env, replay: (doc) => [{ opType: "void", inputs: baseInputs }, { opType: "void", inputs: inputsFor(doc) }], _inject,
+    endpointId, requestKey, env, replay: (doc, prior) => replayDescriptorsAcrossUpgrade({ doc, prior, legacy: [{ opType: "void", inputs: baseInputs }], current: [{ opType: "void", inputs: inputsFor(doc) }] }), _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
       const nowMs = Number.isFinite(now) ? now : clock();
@@ -2619,9 +2659,8 @@ export function attach({ endpointId, requestKey, id, bindingTarget, claimKey, au
   // 按 doc.schema 分支：同 key 的旧形重放（1.0 时代落盘的 op）fp 不变；已签发的重放要求调用方给同一候选（否则 request_conflict）。
   const a2Inputs = (doc) => (is11Schema(doc) ? { ...baseInputs, expected_anchor_candidate: anchorCandidate ?? null } : baseInputs);
   return gatedTx({
-    // R57a 返修一 P1-4：跨 schema 重放——重放判定同时接受「历史 1.0 形描述符」与「当前 schema 新形描述符」
-    // （1.0 完成的 attach 升级后同 key 重放 → replayed；载荷真变 → request_conflict）。首次执行仍只走新形。
-    endpointId, requestKey, env, replay: (doc) => [{ opType: "attach_a2", inputs: baseInputs }, { opType: "attach_a3", inputs: baseInputs }, { opType: "attach_a2", inputs: a2Inputs(doc) }], _inject,
+    // R57a 返修一 P1-4：跨 schema 重放——按 prior 相对升级边界二选一（attach_a3 历史描述符归 legacy 侧，不旁路）。
+    endpointId, requestKey, env, replay: (doc, prior) => replayDescriptorsAcrossUpgrade({ doc, prior, legacy: [{ opType: "attach_a2", inputs: baseInputs }, { opType: "attach_a3", inputs: baseInputs }], current: [{ opType: "attach_a2", inputs: a2Inputs(doc) }] }), _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(id)) return { ok: false, reason: "bad_id" };

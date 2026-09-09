@@ -38671,7 +38671,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
         const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
         assert.equal(r.ok, false);
-        assert.equal(r.reason, "writer_state_partial", "writer partial 拒：" + r.reason);
+        assert.equal(r.reason, "writer_state_not_off", "writer partial 拒（P1-3 改：不是 off 一律拒）：" + r.reason);
       } finally { fx.cleanup(); }
     }
   });
@@ -38773,6 +38773,44 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       assert.equal(r.ok, false, "B 前置 campaign 非 open 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
       assert.equal(r.reason, "campaign_state_bad", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
       assert.equal(r.phase, "drained", "留 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修五 P1-3 ①：B 前置核完整 partial 联合——writer partial 的 endpoints_digest 与 campaign 不符 → 拒（改前只核 campaign_id，不自洽 partial 被静默改写成 on）", () => {
+    const fx = r53SetupB({});
+    try {
+      const wp = writerStatePath(fx.env);
+      const wdoc = JSON.parse(fs.readFileSync(wp, "utf-8"));
+      wdoc.endpoints_digest = "f".repeat(64); // 破坏 digest（与 campaign 不符）
+      fs.writeFileSync(wp, JSON.stringify(wdoc, null, 2) + "\n", { mode: 0o600 });
+      const r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env });
+      assert.equal(r.ok, false, "不自洽 partial 必拒：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "writer_state_foreign", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      assert.equal(r.phase, "drained", "留 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修五 P1-3 ②：direct 前置要求 writer 精确 off——既有 writer on → 拒于 precheck、无 staged 残留（改前放行 on → 进段后 journal before=on 拒、留在 drained 不回退）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      // direct 账本：1.0 且两计数 0
+      for (const ep of fx.eps) {
+        const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+        dd.records = {};
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: [] };
+        fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+      }
+      // writer 既有 on
+      const cid = campaignIdFor(r52Uuid(2));
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify({ schema_version: WRITER_STATE_SCHEMA, state: "on", campaign_id: cid, endpoints_digest: endpointsDigest(fx.eps), revision: 1, origin_operation_id: r52Uuid(2) }, null, 2) + "\n", { mode: 0o600 });
+      const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
+      assert.equal(r.ok, false, "direct 既有 on 必拒：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "writer_state_not_off", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      assert.equal(r.phase, "drained", "留 drained（不回退）");
+      const tok = readActive({ dir: fx.dir }).token;
+      assert.equal(fs.existsSync(path.join(fx.dir, tok + ".staged")), false, "无 staged 残留");
     } finally { fx.cleanup(); }
   });
 

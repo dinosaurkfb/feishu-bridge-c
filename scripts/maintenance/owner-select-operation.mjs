@@ -939,6 +939,12 @@ function osmPrecheckB(ctx, { env, j }) {
   if (ws.state === "unreadable") return { ok: false, reason: "writer_state_unreadable", why: ws.problem };
   if (!ws.exists || ws.state !== "partial") return { ok: false, reason: "writer_state_not_partial", why: "B 前置要求 writer partial（现 " + (ws.exists ? ws.state : "off") + "）" };
   if (ws.campaign_id !== cs.campaign_id) return { ok: false, reason: "writer_state_foreign", why: "writer partial 属别的 campaign：" + ws.campaign_id };
+  // R53 返修五 P1-3（#138 五轮）：B 前置核**完整** partial 联合——不只 campaign_id，还核 endpoints_digest 跨文件一致，
+  //   且 readOwnerSelectAdmission 投影必须为同 campaign 的 partial（post_js：不自洽 partial 会被静默改写成 on）。
+  if (ws.endpoints_digest !== cs.endpoints_digest) return { ok: false, reason: "writer_state_foreign", why: "writer partial endpoints_digest 与 campaign 不一致" };
+  const adm = readOwnerSelectAdmission(env);
+  if (adm.state === "unreadable") return { ok: false, reason: "admission_unreadable", why: adm.problem };
+  if (adm.state !== "partial" || adm.campaign_id !== ws.campaign_id) return { ok: false, reason: "admission_not_partial", why: "admission 非 partial 或属别的 campaign（现 " + adm.state + "）" };
   const frozen = [...(cs.endpoints ?? [])].sort();
   if (frozen.length === 0) return { ok: false, reason: "frozen_set_empty", why: "campaign endpoints 为空" };
   for (const ep of frozen) {
@@ -978,7 +984,9 @@ function osmPrecheckDirect(ctx, { env, j }) {
   if (cs.exists && cs.state !== "complete") return { ok: false, reason: "campaign_state_bad", why: "campaign state=" + cs.state + "（direct 要求 absent 或 complete）" };
   const ws = readWriterState(env);
   if (ws.state === "unreadable") return { ok: false, reason: "writer_state_unreadable", why: ws.problem };
-  if (ws.exists && ws.state === "partial") return { ok: false, reason: "writer_state_partial", why: "writer partial（A 进行中？）—— direct 的 on before=off" };
+  // R53 返修五 P1-3：direct 前置要求 writer **精确为 off**（缺席或 off）；既有 partial 或 on 一律拒，否则进段后
+  //   journal 的 writer_state:on before=on（非 partial/off）shape 拒、operation 留在 drained 不回退（staged 已备好）。
+  if (ws.exists && ws.state !== "off") return { ok: false, reason: "writer_state_not_off", why: "writer state=" + ws.state + "（direct 要求 off，即 absent 或 off，在准备任何制品前）" };
   return { ok: true, frozen };
 }
 

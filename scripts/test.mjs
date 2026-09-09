@@ -43962,7 +43962,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(r.reason, "handle_expired");
   }));
 
-  test("R57c 返修一 T4：带 owner_select 输入的调用不被 1.0 旧操作重放吞——旧 key 加选择五元 → request_conflict（activate + anchor 各测）", () => withLedgerC((root, dir) => {
+  test("R57c 返修一 T4：带 owner_select 输入的调用不被 1.0 旧操作重放吞——旧 key 加选择五元 → request_conflict、1.1 同 key 同载荷 → idempotent（activate + anchor 各测）", () => withLedgerC((root, dir) => {
     const b1 = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57cf_t4b1", chatId: "oc_r57c", rootOm: "om_t4", lineageId: "lin_t4", bindingTarget: TGTC(100), clock: () => T0C }), "createB1@1.0");
     const a1 = talOkC(TAL.createA1({ endpointId: EP57C, requestKey: "r57cf_t4a1", chatId: "oc_r57c", sessionId: "sess-cf-t4", clock: () => T0C }), "createA1@1.0");
     // 1.0 旧形 activate（无选择输入）
@@ -43971,6 +43971,24 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const r = TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t4k", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-t4", selectedRootOm: "om_t4", selectionHandle: "osh_" + "3".repeat(32), selectionMessageId: "om_t4m", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.ok, false);
     assert.equal(r.reason, "request_conflict", "旧 key 加选择五元 → request_conflict（改前 idempotent:true）");
+    // anchor 同构反例（1.0）：旧形 anchor 后同 key 加选择输入 → request_conflict
+    const a2 = a2Of(dir, "r57cf_t4a2", 104, "sess-cf-t4a2", "om_t4cand");
+    const f4a = { root_om: "om_t4new", matched_om: "om_t4new", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" };
+    talOkC(TAL.anchor({ endpointId: EP57C, requestKey: "r57cf_t4ka", id: a2, f4: f4a, authorizedBy: "ou_r57c", clock: () => T0C }), "anchor 旧形@1.0");
+    const ra = TAL.anchor({ endpointId: EP57C, requestKey: "r57cf_t4ka", id: a2, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-t4a2", selectedRootOm: "om_t4new", selectionHandle: "osh_" + "4".repeat(32), expectedExpiresAt: "2099-01-01T00:00:00.000Z", expectedAnchorCandidate: "om_t4cand", selectionMessageId: "om_t4am", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(ra.ok, false);
+    assert.equal(ra.reason, "request_conflict", "anchor 旧 key 加选择输入 → request_conflict");
+    // 1.1 同 key 同载荷 → idempotent（重放返原 result/revision，不落第二笔）
+    withLedgerC((root11, dir11) => {
+      const a2b = a2Of(dir11, "r57cf_t4a2b", 105, "sess-cf-t4a2b", "om_t4candb");
+      const cur = loadOkC(dir11).records[a2b];
+      const args = { endpointId: EP57C, requestKey: "r57cf_t4kb", id: a2b, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-t4a2b", selectedRootOm: "om_t4candb", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: cur.anchor_candidate, selectionMessageId: "om_t4bm", selectionBasis: "explicit_handle", clock: () => T0C };
+      const r1 = talOkC(TAL.anchor(args), "1.1 owner形 anchor");
+      const r2 = TAL.anchor(args);
+      assert.ok(r2.ok && r2.idempotent === true, "anchor 同 key 同载荷 → idempotent：" + JSON.stringify(r2));
+      assert.equal(r2.revision, r1.revision, "重放返原 revision");
+      assert.deepEqual(r2.result, r1.result, "重放返原 result");
+    });
   }, { schema: "1.0" }));
 
   test("R57c 返修一 T5：tombstoned_a1_id 反向不变量——删 tombstone / 替换为 live / 改 forwards_to → ledger_corrupt", () => withLedgerC((root, dir) => {
@@ -44003,6 +44021,75 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     d = mutate((x) => { if (x.records[tombId]?.kind === "forwarding_tombstone") x.records[tombId].forwards_to = "ta_" + "f".repeat(32); });
     v = TAL.validateLedger(d, { endpointId: EP57C });
     assert.equal(v.ok, false, "改 forwards_to → corrupt");
+  }));
+
+  test("R57c 返修二 P1-1：activate.tombstoned_id 反向不变量（增量形+基线形，与 rebind 同口径）——删 tombstone / 换 live / 改 forwards_to / 篡 proof_ref → ledger_corrupt", () => withLedgerC((root, dir) => {
+    // ── 增量形（owner_select）：proof_ref.kind=owner_select_merge_v1，selected_* 与 op 一致 ──
+    const b1 = b1WithHandle(dir, "r57d_p1b", 110, "om_p1");
+    const a1 = a1Of(dir, "r57d_p1a", "sess-p1");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57d_p1act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-p1", selectedRootOm: "om_p1", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_p1m", selectionBasis: "explicit_handle", clock: () => T0C }), "owner_select activate");
+    const actOp = Object.values(loadOkC(dir).operations).find((o) => o.op_type === "activate");
+    const tid = actOp.result.tombstoned_id;
+    assert.ok(tid, "增量形 result 点名 tombstoned_id");
+    const fLedger = path.join(dir, "ledger.json");
+    const pristine = JSON.parse(fs.readFileSync(fLedger, "utf-8"));
+    // 每支手术都从同一干净快照出发，互不叠觰
+    const mutate = (fn) => {
+      const d = structuredClone(pristine);
+      fn(d);
+      fs.writeFileSync(fLedger, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+      return d;
+    };
+    const actOpId = Object.keys(pristine.operations).find((k) => pristine.operations[k].op_type === "activate");
+    let d = mutate((x) => { delete x.records[tid]; });
+    let v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "增量形 删 tombstone → corrupt");
+    assert.match(String(v.why ?? ""), /反向|tombstoned_id/u);
+    d = mutate((x) => { x.records[tid] = { kind: "live", topic_agent_id: tid, chat_id: "oc_r57c", aliases: { session_id: "sess-p1", root_om: null }, facts: { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, generation_lineage_id: null, anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: null, created_at: actOp.result.authorized_at, updated_at: actOp.result.authorized_at }; });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "增量形 换成 live → corrupt");
+    d = mutate((x) => { x.records[tid].forwards_to = "ta_" + "e".repeat(32); });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "增量形 改 forwards_to → corrupt");
+    d = mutate((x) => { x.records[tid].proof_ref.selection_handle = "osh_" + "d".repeat(32); });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "增量形 篡 proof_ref.selection_handle → corrupt");
+    fs.writeFileSync(fLedger, JSON.stringify(pristine, null, 2) + "\n", { mode: 0o600 }); // 还原干净账本，后续可写
+    // ── 基线形（pairing）：proof_ref.kind=pairing，om 与同笔 surviving binding_proof 一致 ──
+    const b2 = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57d_p1b2", chatId: "oc_p1x", rootOm: "om_p1x", lineageId: "lin_p1x", bindingTarget: TGTC(111), clock: () => T0C }), "createB1 基线");
+    const a2x = talOkC(TAL.createA1({ endpointId: EP57C, requestKey: "r57d_p1a2", chatId: "oc_p1x", sessionId: "sess-p1x", clock: () => T0C }), "createA1 基线");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57d_p1act2", b1Id: b2.result.created_id, a1Id: a2x.result.created_id, f4: F4C("om_p1x"), authorizedBy: "ou_r57c", clock: () => T0C }), "基线 activate");
+    const docB = loadOkC(dir);
+    const actOpB = Object.values(docB.operations).find((o) => o.op_type === "activate" && o.result.tombstoned_id !== tid);
+    const tidB = actOpB.result.tombstoned_id;
+    assert.ok(tidB, "基线形 result 点名 tombstoned_id");
+    const pristineB = structuredClone(docB);
+    const mutateB = (fn) => {
+      const d = structuredClone(pristineB);
+      fn(d);
+      fs.writeFileSync(fLedger, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+      return d;
+    };
+    d = mutateB((x) => { delete x.records[tidB]; });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "基线形 删 tombstone → corrupt");
+    assert.match(String(v.why ?? ""), /反向|tombstoned_id/u);
+    d = mutateB((x) => { x.records[tidB].proof_ref.om = "om_其他"; });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "基线形 篡 proof_ref.om → corrupt");
+  }));
+
+  test("R57c 返修二 P1-1：reaffirm remap 重闭包后 activate/rebind 反向核不误报——重指 origin 的 tombstone 由 G13-tomb reaffirm 分支闭环", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57d_p1r", 112, "om_p1r");
+    const a1 = a1Of(dir, "r57d_p1ra", "sess-p1r");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57d_p1ract", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-p1r", selectedRootOm: "om_p1r", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_p1rm", selectionBasis: "explicit_handle", clock: () => T0C }), "owner_select activate");
+    const intent = talOkC(RI.issueReaffirmIntent({ endpointId: EP57C, targetId: b1.result.created_id, authorizedOwner: "ou_owner57c", chatId: "oc_r57c", clock: () => T0C + 10 }), "issue intent");
+    talOkC(RI.consumeReaffirmIntent({ endpointId: EP57C, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57c", chatId: "oc_r57c", selectionMessageId: "om_p1rr", clock: () => T0C + 20 }), "consume intent");
+    const doc = loadOkC(dir); // loadOkC 内含 validateLedger：remap 后反向核不误报
+    const tomb = Object.values(doc.records).find((r) => r.kind === "forwarding_tombstone");
+    const reOp = Object.values(doc.operations).find((o) => o.op_type === "owner_select_reaffirm");
+    assert.equal(tomb.origin_operation_id, Object.keys(doc.operations).find((k) => doc.operations[k] === reOp), "tombstone origin 已改指 reaffirm op");
+    assert.deepEqual(reOp.result.tombstone_remap.map((m) => m.old_tomb_id), [tomb.topic_agent_id], "remap 点名该 tombstone");
   }));
 
   test("R57c 返修一 T6：resolveSelectionCandidate handle 先 typeof 再正则——Symbol / 数字 / 对象 → handle_kind_mismatch 不裸抛", () => {

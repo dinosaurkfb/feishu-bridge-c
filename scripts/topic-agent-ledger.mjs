@@ -1558,19 +1558,44 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
 
-  // R57c 返修一 T5：tombstoned_a1_id 反向不变量——op result 点名的 A1 tombstone 必须实际存在且逐字一致
-  for (const [opId, op] of Object.entries(doc.operations)) {
-    if (op.op_type !== "rebind_session_alias" || op.result?.tombstoned_a1_id == null) continue;
-    const tid = op.result.tombstoned_a1_id;
+  // R57c 返修二 P1-1：op→record 反向不变量（原 T5 口径推广到 activate）——result 点名的 tombstone id
+  //  必须实际存在且与同笔落盘逐字一致：kind=forwarding_tombstone、origin_operation_id=本 op、
+  //  forwards_to=同笔存活 id、proof_ref 与 op 逐字（增量形 owner_select_merge_v1：selected_* 与 result 一致；
+  //  基线形 pairing：om 与同笔 surviving binding_proof 一致）。唯一例外：后续 reaffirm remap 合法重闭包
+  //  （origin 已改指 reaffirm op，remap↔记录一致由 G13-tomb reaffirm 分支核）。
+  const tombstoneBackstop = (opId, op, tid, forwardsTo, proofKind, result) => {
     const t = doc.records[tid];
-    if (!t) return bad("op " + opId + "：tombstoned_a1_id " + tid + " 无对应记录 (G13-tomb-rebind)");
-    if (t.kind !== "forwarding_tombstone") return bad("op " + opId + "：tombstoned_a1_id " + tid + " 不是 forwarding_tombstone（被替换为 " + t.kind + "）(G13-tomb-rebind)");
-    if (t.forwards_to !== op.result.affected_id) return bad(tid + "：forwards_to ≠ rebind affected_id (G13-tomb-rebind)");
-    if (t.origin_operation_id !== opId) return bad(tid + "：origin_operation_id ≠ 本 rebind op (G13-tomb-rebind)");
-    const pr = t.proof_ref;
-    if (!pr || pr.kind !== "owner_select_merge_v1") return bad(tid + "：proof_ref 不是 owner_select_merge_v1 (G13-tomb-rebind)");
-    if (pr.selected_root_om !== op.result.selected_root_om || pr.selection_handle !== op.result.selection_handle || pr.selection_operation_id !== opId) {
-      return bad(tid + "：proof_ref 与 op result 不一致 (G13-tomb-rebind)");
+    if (!t) return bad("op " + opId + "：result 点名的 tombstone " + tid + " 无对应记录 (G13-tomb-反向)");
+    if (t.kind !== "forwarding_tombstone") return bad("op " + opId + "：" + tid + " 不是 forwarding_tombstone（被替换为 " + t.kind + "）(G13-tomb-反向)");
+    if (t.forwards_to !== forwardsTo) return bad(tid + "：forwards_to ≠ 本 op 存活 id (G13-tomb-反向)");
+    if (t.origin_operation_id === opId) {
+      const pr = t.proof_ref;
+      if (!pr || pr.kind !== proofKind) return bad(tid + "：proof_ref.kind ≠ " + proofKind + " (G13-tomb-反向)");
+      if (proofKind === "owner_select_merge_v1") {
+        if (pr.selected_root_om !== result.selected_root_om || pr.selection_handle !== result.selection_handle || pr.selection_operation_id !== opId) {
+          return bad(tid + "：proof_ref 与 op result 不一致 (G13-tomb-反向)");
+        }
+      } else if (fingerprintOf("activate", { request_key: op.request_key, b1_id: forwardsTo, a1_id: tid, matched_om: pr.om }) !== op.fingerprint) {
+        // 基线形 result 无 om，而 surviving 的 binding_proof 会被后续 retarget 合法重签——锚本 op 指纹（基线 inputs 形自建块起未变）。
+        return bad(tid + "：proof_ref.om 与本 op 指纹不符 (G13-tomb-反向)");
+      }
+      return null;
+    }
+    const reOp = doc.operations[t.origin_operation_id];
+    const remapped = reOp?.op_type === "owner_select_reaffirm" && Array.isArray(reOp.result?.tombstone_remap)
+      && reOp.result.tombstone_remap.some((m) => m.old_tomb_id === tid);
+    if (!remapped) return bad(tid + "：origin_operation_id ≠ 本 op 且无后续 reaffirm remap 闭环 (G13-tomb-反向)");
+    return null;
+  };
+  for (const [opId, op] of Object.entries(doc.operations)) {
+    const r = op.result;
+    if (!r) continue;
+    if (op.op_type === "activate" && r.tombstoned_id != null) {
+      const e = tombstoneBackstop(opId, op, r.tombstoned_id, r.surviving_id, r.proof_effects != null ? "owner_select_merge_v1" : "pairing", r);
+      if (e) return e;
+    } else if (op.op_type === "rebind_session_alias" && r.tombstoned_a1_id != null) {
+      const e = tombstoneBackstop(opId, op, r.tombstoned_a1_id, r.affected_id, "owner_select_merge_v1", r);
+      if (e) return e;
     }
   }
 
@@ -3013,8 +3038,8 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
  *  R57a（§6 rebind 行）owner-select 消费路径：传 rebindHandle + expectedExpiresAt + selectionMessageId 时，
  *  CAS 另核记录的 rebind_handle/rebind_expires_at 逐字相等 + **到期拒**（now ≥ expiry → rebind_handle_expired），
  *  消费后清两字段、link 一律重签 owner_selected_route_v1、原 binding=owner_select_v1 时六字段同步重签（produced），
- *  否则保留原 binding（preserved）；result = §6 增量键集（selection_basis:"rebind"、tombstoned_a1_id=null——
- *  A1 归并是后续准入单的职责，本单不取）；base 路径在有 pending handle 时拒（rebind_handle_pending），
+ *  否则保留原 binding（preserved）；result = §6 增量键集（selection_basis:"rebind"；同笔归并新 session 上的
+ *  A1 时 result.tombstoned_a1_id 点名该 tombstone，无归并则 null）；base 路径在有 pending handle 时拒（rebind_handle_pending），
  *  不许绕过 owner-select 消费。 */
 export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const consume = rebindHandle !== undefined;

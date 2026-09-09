@@ -45912,6 +45912,31 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.doesNotMatch(r.text, /ta_|oc_|om_/u, "不含记录 id / locator / 会话 id / chat_id");
   }));
 
+  test("R57d 返修一 P2：endpoint 形状守卫 + granular 封闭分派——坏形状不进账本读；absent→no_candidate、corrupt→ledger_corrupt、unreadable→ledger_unreadable", () => withLedgerD((root, dir, ids) => {
+    // ① endpoint 守卫：非 string / 空串 / 形状不符 → select_endpoint_unknown（原实现只挡 null，其余泄进账本读）
+    for (const bad of [null, undefined, 123, "", "endpoint_short", "endpoint_" + "g".repeat(24)]) {
+      const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: bad }));
+      assert.equal(r.ok, false, String(bad));
+      assert.equal(r.reason, "select_endpoint_unknown", String(bad) + " → " + r.reason);
+    }
+    // ② granular=absent（该 endpoint 无账本目录）→ no_candidate（不是 fail-closed）
+    const epAbsent = "endpoint_" + "0".repeat(24);
+    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: epAbsent }));
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "no_candidate", "absent → no_candidate：" + r.reason);
+    // ③ granular=corrupt（可解析但校验不过）→ ledger_corrupt
+    const epBad = "endpoint_" + "1".repeat(24);
+    fs.mkdirSync(path.join(root, epBad), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(root, epBad, "ledger.json"), "{\"x\":1}", { mode: 0o600 });
+    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: epBad }));
+    assert.equal(r.reason, "ledger_corrupt", "corrupt → ledger_corrupt：" + r.reason);
+    // ④ granular=unreadable（ledger.json 是目录 → EISDIR）→ ledger_unreadable
+    const epDir2 = "endpoint_" + "2".repeat(24);
+    fs.mkdirSync(path.join(root, epDir2, "ledger.json"), { recursive: true, mode: 0o700 });
+    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: epDir2 }));
+    assert.equal(r.reason, "ledger_unreadable", "unreadable → ledger_unreadable：" + r.reason);
+  }));
+
   test("R57d 返修一 P1-5：root/session 来源——root=命中记录现场（B1.root_om / A2.anchor_candidate）、session=受验事件 session；不再收 transport 根", () => withLedgerD((root, dir, ids) => {
     // ① 显式 osh 命中 B1：事件根不再传（eventRootOm 已删），B1 的根（om_b1root）≠ 旧 mapping 根（ROOT_D）→ 仍成功，
     //    账本 selected_root_om === 该 B1 的根（反例：非当前 mapping 根的 B1 也能被选中）

@@ -288,16 +288,17 @@ export function executeSelectControl(intent, {
   if (kind === "orh" && (typeof handle !== "string" || !REBIND_HANDLE_SHAPE.test(handle))) {
     return { ok: false, reason: "no_candidate", text: selectRejectTextByReason("no_candidate") };
   }
-  if (endpointId === null) return { ok: false, reason: "select_endpoint_unknown", text: selectRejectTextByReason("select_endpoint_unknown") };
+  // R57d 返修一 P2：endpoint 守卫——只认受验形状（非字符串/空串/形状不符一律 select_endpoint_unknown，不进账本读）。
+  if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) {
+    return { ok: false, reason: "select_endpoint_unknown", text: selectRejectTextByReason("select_endpoint_unknown") };
+  }
   const L = loadByEndpoint(endpointId, { env });
   if (!L.ok) {
-    // absent = 该 endpoint 还没有账本（准入 on 但从未建账/无候选）→ no_candidate，不是 fail-closed；
-    // unreadable / corrupt（FIFO/symlink/坏 JSON/校验不过）才是 fail-closed 账本读不出。
-    if (L.granular !== "absent" && L.granular !== "corrupt" || L.granular === "corrupt") {
-      const reason = L.granular === "corrupt" ? "ledger_corrupt" : "ledger_unreadable";
-      return { ok: false, reason, text: selectRejectTextByReason(reason) };
-    }
-    return { ok: false, reason: "no_candidate", text: selectRejectTextByReason("no_candidate") };
+    // R57d 返修一 P2：granular 直接、封闭的 reason 分派——
+    //   absent = 该 endpoint 还没有账本（准入 on 但从未建账/无候选）→ no_candidate，不是 fail-closed；
+    //   corrupt（坏 JSON/校验不过）→ ledger_corrupt；unreadable 及其它说不清的 granular → fail-closed ledger_unreadable。
+    const reason = L.granular === "absent" ? "no_candidate" : L.granular === "corrupt" ? "ledger_corrupt" : "ledger_unreadable";
+    return { ok: false, reason, text: selectRejectTextByReason(reason) };
   }
   const doc = L.doc;
 

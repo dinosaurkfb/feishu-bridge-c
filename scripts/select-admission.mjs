@@ -205,9 +205,6 @@ export function selectAmbiguityReceipt(doc, candidateIds) {
   return ["选择不唯一（" + rows.length + " 个候选），请带对应 handle 重新发送 /feishu-select：", ...lines, ...tail].join("\n");
 }
 
-/** owner-select f4（无 token 三项 + absent）：owner-select 的配对证据是 owner 授权本身，不声称 token 核验。 */
-const ownerSelectF4 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" });
-
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
 function wiredOutcome(w, action) {
@@ -234,10 +231,12 @@ function wiredOutcome(w, action) {
  * R52a（PR #136）：准入不过 → failed 终态；R57b：rfh 支接 owner_select_reaffirm；
  * R57d：osh / orh / 省略 支接真执行器——§8.1 消费侧核验（chat 过滤在解析器、endpoint 由受验
  * 账本自证、sender 的 owner 闸由入站路由 R3/R4 先行）+ §6 增量形输入：
- *   选择五元 = { selected_session_id: 事件会话, selected_root_om: 事件根 om, selection_handle:
- *   命中 handle, selection_message_id: 事件 message id, selection_basis: 解析结果 }；
+ *   选择五元 = { selected_session_id: 受验事件 session, selected_root_om: 命中记录现场
+ *   （B1.root_om / A2.anchor_candidate，P1-5），selection_handle: 命中 handle,
+ *   selection_message_id: 事件 message id, selection_basis: 解析结果 }；
  *   anchor 另带 expected 三件（取自命中记录）；rebind 带 expected_expires_at；
- *   request_key = "sel:" + message id（同 message 重放 → ledger 幂等 + 事务层判已完成）。
+ *   request_key 由 m1a/wiring.mjs 按 §5.1 通式从事件 message id + 目标 id 逐 op 派生
+ *   （同 message 重放 → ledger 幂等 + 事务层判已完成）。
  * select_executor_absent 路径已删除（执行器全量接入）。注入面：selectAdmissionFn / consumeReaffirm。
  */
 export function executeSelectControl(intent, {

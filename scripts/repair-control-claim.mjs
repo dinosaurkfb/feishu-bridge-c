@@ -96,7 +96,7 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
   if (kind === "select") {
     if (typeof onSelect === "function") return onSelect(target, ctx);
     const claim = ctx?.claim;
-    const vCtx = verifySelectionContext(claim, { handleRequired: claim?.selection_context?.kind === "rfh" });
+    const vCtx = verifySelectionContext(claim);
     if (!vCtx.ok) return { ok: false, reason: vCtx.reason, why: vCtx.why };
     const sc = vCtx.context;
     if (ctx?.uncleanRecord || claim?.state === "control-committed-unclean") {
@@ -134,7 +134,7 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
 export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRecord, env = process.env, _inject = undefined } = {}) {
   // R57d 返修一 B 段 P1-7：kind 判别 —— rfh 走 intent 清理收尾；osh/orh 走「按 selection plan 核账本提交」收尾
   //   （目标已消费，不重执行；核得出提交 → 转 consumed 交事务层闭合，核不出 → 保持并点名）。
-  const vCtx = verifySelectionContext(claim, { handleRequired: claim?.selection_context?.kind === "rfh" });
+  const vCtx = verifySelectionContext(claim);
   if (!vCtx.ok) return { ok: false, reason: vCtx.reason, why: vCtx.why };
   const sc = vCtx.context;
   if (sc.kind !== "rfh") {

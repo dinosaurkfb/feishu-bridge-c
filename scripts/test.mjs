@@ -45983,6 +45983,26 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(fs.existsSync(path.join(claimsDir, key2 + ".control-committed-unclean.json")), false, "③ unclean 已清");
   }));
 
+  test("R57d 返修三 P1-3：claim 判别联合由 claim.control 决定——省略 claim 合法；rfh claim 被篡改成 osh/null context → 拒；显式 context 与 control 逐字不等 → 拒", () => {
+    // 省略 claim（control.handle_kind/handle 双 null，context 同）→ 合法
+    const omitted = { control: { control: "select", handle: null, handle_kind: null }, selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: null, kind: null }, selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: null, kind: null }) };
+    assert.equal(SA.verifySelectionContext(omitted).ok, true, "省略 claim 合法：" + JSON.stringify(SA.verifySelectionContext(omitted)));
+    // 显式 osh claim：context 逐字等于 control → 合法
+    const explicit = { control: { control: "select", handle: "osh_" + "a".repeat(32), handle_kind: "osh" }, selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: "osh_" + "a".repeat(32), kind: "osh" }, selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: "osh_" + "a".repeat(32), kind: "osh" }) };
+    assert.equal(SA.verifySelectionContext(explicit).ok, true);
+    // rfh claim 被篡改持久 context（kind:"osh" / handle null，digest 自洽）→ 拒（旧码 handleRequired:false 会放行）
+    const tampered = { control: { control: "select", handle: "rfh_" + "b".repeat(32), handle_kind: "rfh" }, selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: null, kind: "osh" }, selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: null, kind: "osh" }) };
+    const vt = SA.verifySelectionContext(tampered);
+    assert.equal(vt.ok, false, "rfh→osh/null 篡改拒：" + JSON.stringify(vt));
+    // 显式 claim 的 context.handle ≠ control.handle（逐字）→ 拒
+    const mismatch = { ...explicit, selection_context: { ...explicit.selection_context, handle: "osh_" + "f".repeat(32) }, selection_context_digest_v1: SA.selectionContextDigestV1({ ...explicit.selection_context, handle: "osh_" + "f".repeat(32) }) };
+    const vm = SA.verifySelectionContext(mismatch);
+    assert.equal(vm.ok, false, "handle 逐字不等拒：" + JSON.stringify(vm));
+    // 篡改 control 把 rfh 改成省略（handle/kind 双 null）→ context 非全 null → 拒
+    const fakeOmit = { control: { control: "select", handle: null, handle_kind: null }, selection_context: explicit.selection_context, selection_context_digest_v1: SA.selectionContextDigestV1(explicit.selection_context) };
+    assert.equal(SA.verifySelectionContext(fakeOmit).ok, false, "假省略拒");
+  });
+
   test("R57d 返修二 P1-6：A1 复核在 legacy 之前（preflight）——缺席 → no_a1 且 legacy 调用数为 0（Codex #147 二轮）", () => withLedgerD((root, dir, ids) => {
     let calls = 0;
     const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, capability: mkCap({ message: "om_w5", handle: ids.b1Handle }), messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });

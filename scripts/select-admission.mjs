@@ -65,9 +65,11 @@ const SELECTION_KIND_SHAPE = /^(osh|orh|rfh)$/u;
 const HANDLE_SHAPE_BY_KIND = Object.freeze({ osh: SELECTION_HANDLE_SHAPE, orh: REBIND_HANDLE_SHAPE, rfh: REAFFIRM_HANDLE_SHAPE });
 
 /** 校验 claim 里的 selection_context 与 digest，fail-closed 点名缺项/形状不对（P1-5：封闭精确键集 + 各字段形状，session 必填）。
- *  R57d 返修一 B 段：handleRequired 形参 —— osh/orh 省略 handle 的 claim 中 handle 为 null 合法（digest 覆盖 null，
- *  键集仍含 handle 键）；handle 非空时仍按 kind 形状核。rfh 默认严格（handle 必须在场且形状相符）。 */
-export function verifySelectionContext(claim, { handleRequired = true } = {}) {
+ *  R57d 返修三 P1-3：claim 的判别联合由 **claim.control** 决定（不给调用方布尔开关）——
+ *    省略（control.handle_kind / handle 同 null）→ context 的 kind / handle 必须同为 null（digest 覆盖 null，键集仍封闭）；
+ *    显式 osh / orh / rfh → context 的 kind / handle 必在场、前缀形状相符、且逐字等于 control；
+ *    rfh 永远不走省略支。 */
+export function verifySelectionContext(claim) {
   if (!claim || typeof claim !== "object") {
     return { ok: false, reason: "selection_context_missing", why: "claim 为空或不是对象" };
   }
@@ -89,11 +91,18 @@ export function verifySelectionContext(claim, { handleRequired = true } = {}) {
   if (typeof ctx.session !== "string" || !AILY_SESSION_SHAPE.test(ctx.session)) missing.push("session");
   if (typeof ctx.message !== "string" || !OM_SHAPE.test(ctx.message)) missing.push("message");
   if (typeof ctx.sender !== "string" || !AUTHORIZED_BY_SHAPE.test(ctx.sender)) missing.push("sender");
-  if (typeof ctx.kind !== "string" || !SELECTION_KIND_SHAPE.test(ctx.kind)) missing.push("kind");
-  const handleShape = typeof ctx.kind === "string" ? HANDLE_SHAPE_BY_KIND[ctx.kind] : null;
-  const handleOk = typeof ctx.handle === "string" && !!handleShape && handleShape.test(ctx.handle);
-  // R57d 返修一 B 段：handleRequired=false（osh/orh 省略 handle）时 handle 为 null 合法；非空仍按 kind 形状核
-  if (!handleOk && !(handleRequired === false && ctx.handle === null)) missing.push("handle");
+  // R57d 返修三 P1-3：判别联合由 claim.control 决定——省略 / 显式两支，rfh 永不走省略支
+  const ctrlKind = typeof claim?.control?.handle_kind === "string" ? claim.control.handle_kind : null;
+  const ctrlHandle = typeof claim?.control?.handle === "string" ? claim.control.handle : null;
+  if (ctrlKind === null) {
+    // 省略支：context 的 kind / handle 必须同为 null（键集封闭不变，digest 覆盖 null）
+    if (ctx.kind !== null || ctx.handle !== null) missing.push("kind/handle（省略支须同 null）");
+  } else {
+    // 显式支：kind / handle 必在场、前缀形状相符、且逐字等于 control
+    if (ctx.kind !== ctrlKind) missing.push("kind（须逐字等于 control）");
+    const handleShape = HANDLE_SHAPE_BY_KIND[ctrlKind] ?? null;
+    if (typeof ctx.handle !== "string" || !(handleShape && handleShape.test(ctx.handle)) || ctx.handle !== ctrlHandle) missing.push("handle（须逐字等于 control）");
+  }
   if (missing.length > 0) {
     return { ok: false, reason: "selection_context_incomplete", why: "selection_context 缺/形状不对：" + missing.join(", ") };
   }
@@ -374,7 +383,7 @@ export function executeSelectControl(intent, {
   // R57d 返修一 B 段 P1-2：capability 由本次 R3 owner 放行后铸成、绑定本次选择上下文、不持久化。
   //   先核 claim 的 selection_context（旧形 claim → 点名拒；osh/orh 省略 handle 合法）与 sender 归属（非 owner → 拒）。
   if (txCtx && txCtx.claim) {
-    const vCtx = verifySelectionContext(txCtx.claim, { handleRequired: false });
+    const vCtx = verifySelectionContext(txCtx.claim);
     if (!vCtx.ok) return { ok: false, status: "failed", reason: vCtx.reason, text: selectRejectTextByReason(vCtx.reason) };
     if (vCtx.context.sender !== null && vCtx.context.sender !== senderId) {
       return { ok: false, status: "failed", reason: "select_sender_mismatch", text: selectRejectTextByReason("select_sender_mismatch") };

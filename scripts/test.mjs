@@ -45816,12 +45816,14 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   };
   const ctxD = (over = {}) => ({ selectAdmissionFn: () => ({ state: "on" }), senderId: "ou_owner57d", chatId: CHAT_D, endpointId: EP57D, messageId: "om_msgd1", eventSessionId: SESSION_D, env: process.env, ...over });
   const mappingStub = (calls) => (ctx) => { calls.push(ctx); return { ok: true, legacyCommitted: true }; };
+  // B 段 P1-2：wiring 层直调测试用的受验 capability 铸造（执行器内铸同一形状）
+  const mkCap = (over = {}) => Object.freeze({ kind: "owner_select_control_v1", endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_cap", sender: "ou_owner57d", handle: null, handleKind: "osh", ...over });
 
   test("R57d 返修一 P1-1（wiring 层）：wireSelect* 按 authority_mode 分派——shadow 复合双写（outer 锁 + legacy 回调；anchor 为显式 no-op）、busy 整笔拒不直写、authoritative ledger-only 不碰 legacy", () => withLedgerD((root, dir, ids) => {
     const recAt = () => TAL.loadLedger(dir, { endpointId: EP57D }).doc.records;
     // ① shadow + 已启用：activate → legacy 回调被调 → 账本 op 落账；outer 锁被持有且释放
     let calls = 0;
-    const wA = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, messageId: "om_w1", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    const wA = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, capability: mkCap({ message: "om_w1", handle: ids.b1Handle }), messageId: "om_w1", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.ok(wA.ok, "① activate 复合成功：" + JSON.stringify(wA));
     assert.equal(calls, 1, "① shadow：legacy 回调被调");
     assert.equal(wA.legacy.legacyCommitted, true, "① legacy 提交投影");
@@ -45834,7 +45836,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.ok(acq.ok, "② 测试持锁");
     const revBefore = TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision;
     let busyCalls = 0;
-    const wB = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { busyCalls += 1; return { ok: true }; }, messageId: "om_w2", b1Id: ids.a2Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: ROOT_D, selectionHandle: ids.a2Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    const wB = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { busyCalls += 1; return { ok: true }; }, capability: mkCap({ message: "om_w2", handle: ids.a2Handle }), messageId: "om_w2", b1Id: ids.a2Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: ROOT_D, selectionHandle: ids.a2Handle, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.equal(wB.ok, false, "② busy → 整笔拒");
     assert.equal(wB.reason, "binding_busy", "② reason：" + JSON.stringify(wB));
     assert.equal(busyCalls, 0, "② busy 时 legacy 未跑");
@@ -45842,7 +45844,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.ok(acq.release().ok, "② 释放");
     // ③ anchor：没有 legacy mapping 权威事实 → legacy 显式 no-op 记录，但仍走 outer 排序 + ledger
     const a2rec = recAt()[ids.a2Id];
-    const wC = WIRE.wireSelectAnchor({ endpointId: EP57D, env: process.env, messageId: "om_w3", id: ids.a2Id, authorizedBy: "ou_owner57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionBasis: "explicit_handle", clock: () => T0D });
+    const wC = WIRE.wireSelectAnchor({ endpointId: EP57D, env: process.env, capability: mkCap({ message: "om_w3", handle: ids.a2Handle }), messageId: "om_w3", id: ids.a2Id, authorizedBy: "ou_owner57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.ok(wC.ok, "③ anchor 复合成功：" + JSON.stringify(wC));
     assert.equal(wC.legacy.noop, true, "③ anchor legacy 显式 no-op（不伪造 mapping 写）");
     assert.ok(wC.shadow[0].ok, "③ ledger op 成功：" + JSON.stringify(wC.shadow[0]));
@@ -45858,7 +45860,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const b2 = TAL.createB1({ endpointId: EP57D, requestKey: "r57d_b2", chatId: CHAT_D, rootOm: "om_b2root", lineageId: "lin_d2", bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000d3" }, clock: () => T0D });
     assert.ok(b2.ok, "④ 新 B1：" + JSON.stringify(b2));
     let authCalls = 0;
-    const wD = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { authCalls += 1; return { ok: true }; }, messageId: "om_w4", b1Id: b2.result.created_id, chatId: CHAT_D, eventSessionId: SESSION_D + "-x", authorizedBy: "ou_owner57d", selectedRootOm: "om_b2root", selectionHandle: b2.result.selection_handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    const wD = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { authCalls += 1; return { ok: true }; }, capability: mkCap({ message: "om_w4", handle: b2.result.selection_handle, session: SESSION_D + "-x" }), messageId: "om_w4", b1Id: b2.result.created_id, chatId: CHAT_D, eventSessionId: SESSION_D + "-x", authorizedBy: "ou_owner57d", selectedRootOm: "om_b2root", selectionHandle: b2.result.selection_handle, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.ok(wD.ok, "④ authoritative ledger-only 成功：" + JSON.stringify(wD));
     assert.equal(wD.ledgerOnly, true, "④ ledgerOnly 投影");
     assert.equal(authCalls, 0, "④ authoritative：不碰 legacy");
@@ -45867,9 +45869,63 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(wD.release, null, "④ 无 outer 锁");
   }));
 
+  test("R57d 返修一 B 段 P1-2（wiring 层）：wireSelect* 只认绑定本次选择上下文的 capability——缺/裸 sender/通用 full/上下文不符 → 拒且 legacy 不跑", () => withLedgerD((root, dir, ids) => {
+    const base = { endpointId: EP57D, env: process.env, messageId: "om_cap1", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D };
+    const cap = (over = {}) => Object.freeze({ kind: "owner_select_control_v1", endpoint: EP57D, message: "om_cap1", sender: "ou_owner57d", handle: ids.b1Handle, handleKind: "osh", ...over });
+    let calls = 0;
+    const legacy = () => { calls += 1; return { ok: true, legacyCommitted: true }; };
+    // ① 缺 capability → 拒（不收裸上下文参数）
+    const w1 = WIRE.wireSelectActivate({ ...base, legacy });
+    assert.equal(w1.ok, false, "① 缺 capability 拒：" + JSON.stringify(w1));
+    assert.equal(w1.reason, "select_capability_required", "① " + w1.reason);
+    // ② 裸 sender 字符串 / 通用 full 对象 → 形状拒
+    const w2 = WIRE.wireSelectActivate({ ...base, legacy, capability: "ou_owner57d" });
+    assert.equal(w2.reason, "select_capability_required", "② 裸 sender：" + w2.reason);
+    const w3 = WIRE.wireSelectActivate({ ...base, legacy, capability: { full: true } });
+    assert.equal(w3.reason, "select_capability_required", "② 通用 full：" + w3.reason);
+    // ③ 上下文不符（sender / handle / endpoint 任一）→ 拒
+    for (const over of [{ sender: "ou_other" }, { handle: "osh_" + "0".repeat(32) }, { endpoint: "endpoint_" + "9".repeat(24) }]) {
+      const w = WIRE.wireSelectActivate({ ...base, legacy, capability: cap(over) });
+      assert.equal(w.ok, false, "③ 不符拒：" + JSON.stringify(over));
+      assert.equal(w.reason, "select_capability_invalid", "③ " + JSON.stringify(over) + " → " + w.reason);
+    }
+    assert.equal(calls, 0, "全部拒绝路径 legacy 都没跑");
+    // ④ 正确 capability → 复合成功
+    const w4 = WIRE.wireSelectActivate({ ...base, legacy, capability: cap() });
+    assert.ok(w4.ok, "④ 正确 capability 成功：" + JSON.stringify(w4));
+    assert.equal(calls, 1, "④ legacy 跑了一次");
+  }));
+
+  test("R57d 返修一 B 段 P1-2（执行器层）：R3 放行后铸 capability（不持久化）；旧形 claim 点名拒；非 owner sender 拒", () => withLedgerD((root, dir, ids) => {
+    const claim = {
+      control: { control: "select", handle: ids.b1Handle, handle_kind: "osh" },
+      selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" },
+      selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" }),
+    };
+    fs.mkdirSync(path.join(root, "claims"), { recursive: true });
+    const txCtx = { claimsDir: path.join(root, "claims"), key: "0".repeat(64), claim };
+    // ① 旧形 claim（无 selection_context）→ fail-closed 点名
+    const r1 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx: { claimsDir: txCtx.claimsDir, key: txCtx.key, claim: { control: claim.control } } }));
+    assert.equal(r1.ok, false, "① 旧形 claim 拒：" + JSON.stringify(r1));
+    assert.equal(r1.reason, "selection_context_missing", "① " + r1.reason);
+    // ② 非 owner：执行 sender ≠ claim 登记的 owner → 拒
+    const r2 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx, senderId: "ou_other" }));
+    assert.equal(r2.ok, false, "② 非 owner 拒：" + JSON.stringify(r2));
+    assert.equal(r2.reason, "select_sender_mismatch", "② " + r2.reason);
+    // ③ 正常：铸 capability → 复合成功；capability 不持久化（claims 目录 grep 不到）
+    const r3 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx }));
+    assert.equal(r3.ok, true, "③ 成功：" + JSON.stringify(r3));
+    fs.writeFileSync(path.join(txCtx.claimsDir, txCtx.key + ".claim.json"), JSON.stringify({ ...claim, selection_plan: { action: "activate", target_id: ids.b1Id, selection_basis: "explicit_handle", handle: ids.b1Handle, cas: {} } }));
+    let leaked = false;
+    for (const n of fs.readdirSync(txCtx.claimsDir)) {
+      if (fs.readFileSync(path.join(txCtx.claimsDir, n), "utf-8").includes("owner_select_control_v1")) leaked = true;
+    }
+    assert.equal(leaked, false, "capability 不持久化");
+  }));
+
   test("R57d 返修二 P1-6：A1 复核在 legacy 之前（preflight）——缺席 → no_a1 且 legacy 调用数为 0（Codex #147 二轮）", () => withLedgerD((root, dir, ids) => {
     let calls = 0;
-    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, capability: mkCap({ message: "om_w5", handle: ids.b1Handle }), messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.equal(w.ok, false, "preflight 拒 → 整笔拒：" + JSON.stringify(w));
     assert.equal(w.reason, "no_a1", "reason：" + w.reason);
     assert.equal(calls, 0, "legacy 调用数为 0（A1 复核在 legacy 之前，不再出现 legacy 已提交、shadow no_a1）");

@@ -63,8 +63,10 @@ const SELECTION_KIND_SHAPE = /^(osh|orh|rfh)$/u;
 /** kind → handle 形状（封闭映射；kind 与 handle 前缀不一致 → 拒）。 */
 const HANDLE_SHAPE_BY_KIND = Object.freeze({ osh: SELECTION_HANDLE_SHAPE, orh: REBIND_HANDLE_SHAPE, rfh: REAFFIRM_HANDLE_SHAPE });
 
-/** 校验 claim 里的 selection_context 与 digest，fail-closed 点名缺项/形状不对（P1-5：封闭精确键集 + 各字段形状，session 必填）。 */
-export function verifySelectionContext(claim) {
+/** 校验 claim 里的 selection_context 与 digest，fail-closed 点名缺项/形状不对（P1-5：封闭精确键集 + 各字段形状，session 必填）。
+ *  R57d 返修一 B 段：handleRequired 形参 —— osh/orh 省略 handle 的 claim 中 handle 为 null 合法（digest 覆盖 null，
+ *  键集仍含 handle 键）；handle 非空时仍按 kind 形状核。rfh 默认严格（handle 必须在场且形状相符）。 */
+export function verifySelectionContext(claim, { handleRequired = true } = {}) {
   if (!claim || typeof claim !== "object") {
     return { ok: false, reason: "selection_context_missing", why: "claim 为空或不是对象" };
   }
@@ -88,7 +90,9 @@ export function verifySelectionContext(claim) {
   if (typeof ctx.sender !== "string" || !AUTHORIZED_BY_SHAPE.test(ctx.sender)) missing.push("sender");
   if (typeof ctx.kind !== "string" || !SELECTION_KIND_SHAPE.test(ctx.kind)) missing.push("kind");
   const handleShape = typeof ctx.kind === "string" ? HANDLE_SHAPE_BY_KIND[ctx.kind] : null;
-  if (typeof ctx.handle !== "string" || !(handleShape && handleShape.test(ctx.handle))) missing.push("handle");
+  const handleOk = typeof ctx.handle === "string" && !!handleShape && handleShape.test(ctx.handle);
+  // R57d 返修一 B 段：handleRequired=false（osh/orh 省略 handle）时 handle 为 null 合法；非空仍按 kind 形状核
+  if (!handleOk && !(handleRequired === false && ctx.handle === null)) missing.push("handle");
   if (missing.length > 0) {
     return { ok: false, reason: "selection_context_incomplete", why: "selection_context 缺/形状不对：" + missing.join(", ") };
   }
@@ -152,6 +156,9 @@ export function selectRejectTextByReason(reason) {
   if (reason === "select_context_conflict") return "这条选择与当时的事件上下文不一致（同一条消息被重放到不同会话/发送者），未执行";
   if (reason === "select_plan_conflict") return "选择计划与 claim 里持久化的不一致（现场已变动），未执行";
   if (reason === "select_plan_unwritten") return "选择计划落盘失败，未执行（fail-closed）";
+  if (reason === "select_capability_required") return "缺少本次选择的受验授权（capability），未执行";
+  if (reason === "select_capability_invalid") return "授权与本次选择上下文不符，未执行";
+  if (reason === "select_sender_mismatch") return "只有这条选择 claim 里登记的 owner 本人才可执行";
   if (reason === "ledger_corrupt" || reason === "ledger_unreadable") return "账本读不出，未执行（fail-closed）";
   if (reason === "schema_not_11") return "账本还没升到 1.1，不能重签";
   return "控制执行失败（" + reason + "）";
@@ -347,7 +354,18 @@ export function executeSelectControl(intent, {
     }
     return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }
-const target = doc.records[res.target_id];
+  const target = doc.records[res.target_id];
+  // R57d 返修一 B 段 P1-2：capability 由本次 R3 owner 放行后铸成、绑定本次选择上下文、不持久化。
+  //   先核 claim 的 selection_context（旧形 claim → 点名拒；osh/orh 省略 handle 合法）与 sender 归属（非 owner → 拒）。
+  if (txCtx && txCtx.claim) {
+    const vCtx = verifySelectionContext(txCtx.claim, { handleRequired: false });
+    if (!vCtx.ok) return { ok: false, status: "failed", reason: vCtx.reason, text: selectRejectTextByReason(vCtx.reason) };
+    if (vCtx.context.sender !== null && vCtx.context.sender !== senderId) {
+      return { ok: false, status: "failed", reason: "select_sender_mismatch", text: selectRejectTextByReason("select_sender_mismatch") };
+    }
+  }
+  const actualHandle = handle ?? (action === "rebind" ? target.rebind_handle : target.selection_handle) ?? null;
+  const capability = Object.freeze({ kind: "owner_select_control_v1", endpoint: endpointId, chat: chatId, session: eventSessionId, message: messageId, sender: senderId, handle: actualHandle, handleKind: action === "rebind" ? "orh" : "osh" });
   // R57d 返修一 B 段 P1-3：执行前把解析后的 immutable selection plan 持久化进 claim —— 否则省略 handle 的
   //   重放/续做无法复现同一目标。plan 已在（重放/续做）→ 逐字比对，不一致 → select_plan_conflict。
   if (txCtx && txCtx.claimsDir && txCtx.key && txCtx.claim) {
@@ -355,9 +373,9 @@ const target = doc.records[res.target_id];
       action,
       target_id: res.target_id,
       selection_basis: res.selection_basis,
-      handle: handle ?? (action === "rebind" ? target.rebind_handle : target.selection_handle) ?? null,
+      handle: actualHandle,
       cas: action === "activate"
-        ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.aliases?.root_om ?? null, selection_handle: (handle ?? target.selection_handle) ?? null }
+        ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.aliases?.root_om ?? null, selection_handle: actualHandle }
         : action === "anchor"
           ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.anchor_candidate ?? null, expected_handle: (handle ?? target.selection_handle) ?? null, expected_expires_at: target.handle_expires_at ?? null, expected_anchor_candidate: target.anchor_candidate ?? null }
           : { new_session_id: eventSessionId ?? null, expected_old_session_id: target.aliases?.session_id ?? null, rebind_handle: (handle ?? target.rebind_handle) ?? null, expected_expires_at: target.rebind_expires_at ?? null },
@@ -392,12 +410,12 @@ const target = doc.records[res.target_id];
   if (action === "activate") {
     // R57d 返修一 P1-5（§12 ⑤）：root = 命中 B1 的 aliases.root_om（selected_root_om 与之 CAS）；
     //   session = 受验入站事件 session。不收 transport 根（eventRootOm 已删，不声称验过 thread_root）。
-    w = wireSelectActivate({ endpointId, env, legacy, messageId, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
+    w = wireSelectActivate({ endpointId, env, legacy, capability, messageId, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
   } else if (action === "anchor") {
     // P1-5：root = A2 的 anchor_candidate；session = 事件 session（不再自填目标旧 session——那会让 CAS 变得恒真）
-    w = wireSelectAnchor({ endpointId, env, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
+    w = wireSelectAnchor({ endpointId, env, capability, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
-    w = wireSelectRebind({ endpointId, env, legacy, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
+    w = wireSelectRebind({ endpointId, env, legacy, capability, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
   return wiredOutcome(w, action);
 }

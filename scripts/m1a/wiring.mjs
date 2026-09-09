@@ -500,10 +500,29 @@ function selectLedgerOnly(step) {
 /** shadow 支的前置拒（activate / rebind 必须带 legacy 提交回调；缺席 → 不做无 legacy 的半笔双写）。 */
 const selectLegacyMissing = () => ({ ok: false, commit: "not_committed", reason: "select_legacy_required", why: "shadow 期该动作必须带 legacy 提交回调（更新 mapping）；缺席 → 拒", legacy: null, shadow: null, release: null });
 
+/** R57d 返修一 B 段 P1-2：受验 owner capability 的封闭校验（写层的内层闸）。
+ * 只认 kind=owner_select_control_v1、绑定本次选择上下文的 capability —— 不认通用 full、不收裸 sender；
+ * 任一字段与本次执行不符 → select_capability_invalid。 */
+function verifySelectCapability(capability, want) {
+  if (!capability || typeof capability !== "object" || Array.isArray(capability) || capability.kind !== "owner_select_control_v1") {
+    return { ok: false, reason: "select_capability_required", why: "缺绑定本次选择上下文的受验 owner capability（不认通用 full、不收裸 sender）" };
+  }
+  const mismatch = [];
+  for (const [k, v] of Object.entries(want)) {
+    if ((capability[k] ?? null) !== (v ?? null)) mismatch.push(k);
+  }
+  if (mismatch.length > 0) return { ok: false, reason: "select_capability_invalid", why: "capability 与本次选择上下文不一致（" + mismatch.join(",") + "）" };
+  return { ok: true };
+}
+
+const selectCapFail = (v) => ({ ok: false, commit: "not_committed", reason: v.reason, why: v.why, legacy: null, shadow: null, release: null });
+
 /** wireSelectActivate —— owner_select activate（B1+A1 归并）的双写分派。
  * A1 复核在 preflight（outer 锁内、legacy 提交之前，R57d 返修二 P1-6）：缺 → no_a1 整笔拒，
  * 不再出现「legacy 已提交、shadow no_a1」的半笔。 */
-export function wireSelectActivate({ endpointId, env = process.env, legacy = null, messageId, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
+export function wireSelectActivate({ endpointId, env = process.env, legacy = null, capability, messageId, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
+  const vcap = verifySelectCapability(capability, { endpoint: endpointId, message: messageId, sender: authorizedBy, handle: selectionHandle, handleKind: "osh" });
+  if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
   if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
   // preflight 在 outer 锁内、legacy 之前跑（runWired 的 preflight 槽位）：复核事件会话/chat 上仍存在可归并 A1（§12 ⑥）。
@@ -530,7 +549,9 @@ export function wireSelectActivate({ endpointId, env = process.env, legacy = nul
 
 /** wireSelectAnchor —— owner_select anchor（A2 → A3 补链路证明）的双写分派。
  * legacy 恒为显式 no-op：anchor 没有 legacy mapping 权威事实可更新，不伪造 mapping 写；outer 排序照走。 */
-export function wireSelectAnchor({ endpointId, env = process.env, messageId, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionBasis, clock = () => Date.now() }) {
+export function wireSelectAnchor({ endpointId, env = process.env, capability, messageId, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionBasis, clock = () => Date.now() }) {
+  const vcap = verifySelectCapability(capability, { endpoint: endpointId, message: messageId, sender: authorizedBy, handle: selectionHandle, handleKind: "osh" });
+  if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
   if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
   const submit = () => {
@@ -543,7 +564,9 @@ export function wireSelectAnchor({ endpointId, env = process.env, messageId, id,
 }
 
 /** wireSelectRebind —— owner_select rebind_session_alias（B3 换绑事件会话）的双写分派。 */
-export function wireSelectRebind({ endpointId, env = process.env, legacy = null, messageId, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
+export function wireSelectRebind({ endpointId, env = process.env, legacy = null, capability, messageId, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
+  const vcap = verifySelectCapability(capability, { endpoint: endpointId, message: messageId, sender: authorizedBy, handle: rebindHandle, handleKind: "orh" });
+  if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
   if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
   const submit = () => {

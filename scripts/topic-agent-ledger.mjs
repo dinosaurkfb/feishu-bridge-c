@@ -729,7 +729,11 @@ const RESULT_SHAPE = Object.freeze({
       && canonKey(r.affected_live_ids_after_commit) === canonKey(expectedAffected)
       && canonKey(r.proof_effects) === canonKey(expectedPes);
   },
-  void: (r) => keysOf(r) === "voided_id" && isId(r.voided_id),
+  void: (r) => (keysOf(r) === "voided_id" && isId(r.voided_id))
+    || (keysOf(r) === "expected_expires_at,expected_handle,voided_id"
+        && isId(r.voided_id) && (r.expected_handle === null || SELECTION_HANDLE_SHAPE.test(r.expected_handle))
+        && (r.expected_expires_at === null || isCanonicalIso(r.expected_expires_at))
+        && (r.expected_handle === null) === (r.expected_expires_at === null)),
   attach_a2: (r) => (keysOf(r) === "affected_id,terminal_family" && isId(r.affected_id) && r.terminal_family === "A2")
     || (keysOf(r) === "affected_id,affected_live_ids_after_commit,anchor_candidate,handle_expires_at,proof_effects,selection_handle,terminal_family"
         && isId(r.affected_id) && r.terminal_family === "A2"
@@ -844,19 +848,30 @@ const RESULT_SHAPE = Object.freeze({
     && VALID_UPGRADE_EDGES.includes(r.from_schema + "->" + r.to_schema),
 });
 
-/** R57a 返修四 P1：由 op 的 result + 关联 record 重算**旧形（1.0）**指纹；重建不出来返回 null（fail-open 跳过）。 */
-function legacyFpFor(op, records) {
-  if (op.op_type === "void") {
-    const r = records[op.result?.voided_id];
-    if (!r || typeof r.reason !== "string") return null;
-    return fingerprintOf("void", { request_key: op.request_key, b1_id: op.result.voided_id, reason: r.reason });
-  }
-  if (op.op_type === "attach_a2") {
-    const r = records[op.result?.affected_id];
-    if (!r?.binding_target || !r?.binding_proof || typeof r.binding_proof.claim_key !== "string") return null;
-    return fingerprintOf("attach_a2", { request_key: op.request_key, topic_agent_id: op.result.affected_id, target: r.binding_target, claim_key: r.binding_proof.claim_key, root_om: null, matched_om: null });
-  }
-  return null;
+// R57a 返修六 P1-1（#144 四轮 P1-1 回带）：跨 schema 判形按**不可变 result 键集**（旧形/新形各一套），
+//   不靠从当前 live 记录回推历史指纹（binding_target/claim_key 会被后续 retarget 改掉 → 回推会 fail-open）。
+const CROSS_SCHEMA_OLD_KEYS = Object.freeze({
+  void: "voided_id",
+  attach_a2: "affected_id,terminal_family",
+  attach_a3: "affected_id,terminal_family",
+});
+const CROSS_SCHEMA_NEW_KEYS = Object.freeze({
+  void: "expected_expires_at,expected_handle,voided_id",
+  attach_a2: "affected_id,affected_live_ids_after_commit,anchor_candidate,handle_expires_at,proof_effects,selection_handle,terminal_family",
+  attach_a3: "affected_id,affected_live_ids_after_commit,proof_effects,terminal_family",
+});
+
+/** R57a 返修六 P1-1：void 的指纹重核——reason 只从**不可变**的 voided_audit 记录取（非 live 记录，
+ *  不会被后续 retarget 改掉）；expected 双键从 result 取。重建不出来（voided_audit 记录缺失/畸形）→ 返回 null，
+ *  上层**fail-closed 拒**（不是跳过——旧 legacyFpFor 返回 null 恰好是 fail-open）。 */
+function voidFingerprintFor(op, records) {
+  const rec = records[op.result?.voided_id];
+  if (!rec || typeof rec.reason !== "string") return null;
+  const base = { request_key: op.request_key, b1_id: op.result.voided_id, reason: rec.reason };
+  const isNewForm = keysOf(op.result) === CROSS_SCHEMA_NEW_KEYS.void;
+  return isNewForm
+    ? fingerprintOf("void", { ...base, expected_handle: op.result.expected_handle, expected_expires_at: op.result.expected_expires_at })
+    : fingerprintOf("void", base);
 }
 
 function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBoundaryRevision = 0, records = {} } = {}) {
@@ -875,13 +890,22 @@ function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBound
     if (op.op_type !== "schema_upgrade" && NEW_OP_TYPES.includes(op.op_type)) return op.op_type + " 禁现于 1.0 或升级边界之前";
     if ("affected_live_ids_after_commit" in op.result) return op.op_type + " 增量 result 禁现于 1.0 或升级边界之前";
   }
-  // R57a 返修四 P1：跨 schema 指纹形钉边界——void/attach_a2 的指纹必须与边界位置形状一致（旧形落边界后 / 新形落边界前 → 拒）。
-  if (op.op_type === "void" || op.op_type === "attach_a2") {
-    const legacyFp = legacyFpFor(op, records);
-    if (legacyFp !== null) {
-      if (isBeforeUpgrade && op.fingerprint !== legacyFp) return op.op_type + " 跨 schema 指纹形不符（新形落边界前）";
-      if (!isBeforeUpgrade && op.fingerprint === legacyFp) return op.op_type + " 跨 schema 指纹形不符（旧形落边界后）";
+  // R57a 返修六 P1-1（#144 四轮 P1-1 回带）：跨 schema 判形按不可变 result 键集（旧形/新形各一套），
+  //   不靠从 live 记录回推历史指纹（binding_target/claim_key 会被后续 retarget 改掉 → fail-open）。
+  if (op.op_type === "void" || op.op_type === "attach_a2" || op.op_type === "attach_a3") {
+    const keySet = keysOf(op.result);
+    if (isBeforeUpgrade) {
+      if (keySet !== CROSS_SCHEMA_OLD_KEYS[op.op_type]) return op.op_type + " 跨 schema 结果形不符（新形落边界前）";
+    } else {
+      if (keySet !== CROSS_SCHEMA_NEW_KEYS[op.op_type]) return op.op_type + " 跨 schema 结果形不符（旧形落边界后）";
     }
+  }
+  // 指纹只在 result 携带全部指纹输入时重核（仅 void：reason 从不可变 voided_audit 记录取，expected 双键在 result）；
+  //   重建不出来 → fail-closed 拒（不是跳过）。attach_a2/attach_a3 的指纹输入（target/claim_key）不入 result，无可靠来源 → 只判键集。
+  if (op.op_type === "void") {
+    const wantFp = voidFingerprintFor(op, records);
+    if (wantFp === null) return "void 重建不了指纹输入（voided_audit 记录缺失/畸形）——跨 schema 指纹形不符";
+    if (op.fingerprint !== wantFp) return "void 指纹与 result 携带的指纹输入不符";
   }
 
   if ((op.op_type === "activate" || op.op_type === "anchor") && op.result.selection_handle && !op.result.selection_handle.startsWith("osh_")) {
@@ -2649,7 +2673,12 @@ export function voidPending({ endpointId, requestKey, b1Id, reason, expectedHand
           return { ok: false, reason: "cas_mismatch", why: "当前 handle/expiry 与 expected 不符（防陈旧定时器清掉后换发的新 handle）" };
         }
       }
-      return { ok: true, next: stampAndBuild(doc, { opType: "void", inputs, result: { voided_id: b1Id }, mutateRecords: (n, opId) => { n.records[b1Id] = { kind: "voided_audit", topic_agent_id: b1Id, root_om: b1.aliases.root_om, voided_at: iso, reason, origin_operation_id: opId }; } }) };
+      // R57a 返修六 P1-1：1.1+ 新形 result 把 expected 双键固化进 result（指纹输入，null 也显式写），
+      //   供 validateLedger 判形/重核，不靠从 live 记录回推；1.0 保持旧形 {voided_id}。
+      const result = doc.schema_version !== "1.0"
+        ? { voided_id: b1Id, expected_handle: expectedHandle ?? null, expected_expires_at: expectedExpiresAt ?? null }
+        : { voided_id: b1Id };
+      return { ok: true, next: stampAndBuild(doc, { opType: "void", inputs, result, mutateRecords: (n, opId) => { n.records[b1Id] = { kind: "voided_audit", topic_agent_id: b1Id, root_om: b1.aliases.root_om, voided_at: iso, reason, origin_operation_id: opId }; } }) };
     },
   });
 }

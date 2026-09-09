@@ -40614,7 +40614,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     doc.revision += 1;
     const vv = TAL.validateLedger(doc, { endpointId: EP57 });
     assert.equal(vv.ok, false, "边界后旧形指纹 void 必拒");
-    assert.match(String(vv.why), /跨 schema 指纹形不符/, "why 点名跨 schema 指纹形不符：" + vv.why);
+    assert.match(String(vv.why), /跨 schema 结果形不符/, "why 点名跨 schema 结果形不符：" + vv.why);
   }, { schema: "1.1" }));
 
   test("R57a 返修四 P1：边界前的历史 1.0 void 用旧形 inputs 重放 → 仍 idempotent（升级后落 1.1，边界前 legacy 描述符命中）", () => {
@@ -40674,7 +40674,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const doc = { schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 4, operations: ops, records };
     const v = TAL.validateLedger(doc, { endpointId: EP57 });
     assert.equal(v.ok, false, "新形落边界前必拒");
-    assert.match(String(v.why), /跨 schema 指纹形不符（新形落边界前）/, "why 点名新形落边界前：" + v.why);
+    assert.match(String(v.why), /指纹与 result 携带的指纹输入不符/, "why 点名指纹不符：" + v.why);
   });
 
   test("R57a 返修六 P1-3：null-handle B1 无证 void(reason=expired) 拒——1.1+ 且 expired 必带 expected_handle + expected_expires_at，缺一 → bad_input", () => withLedger57((dir) => {
@@ -40693,8 +40693,126 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(r3.ok, true, "带齐两键 → 合法");
   }, { schema: "1.1" }));
 
+  // ── R57a 返修六 P1-1/P1-2（Codex #144 四轮 P1-1 回带 + P1-2 钉）：跨 schema 判形——不可变 result 键集，不靠回推 ──
+
+  test("R57a 返修六 P1-1 ①：attach_a2 伪装旧形——边界后 attach_a2 用旧形（affected_id,terminal_family）result + 指纹按旧 target 取 → validateLedger 拒（改前 ok：legacyFpFor 按被 retarget 改过的 record 回推 fp 与 op.fingerprint 不等 → 放行；改后按键集拒）", () => {
+    // 1.1-transition 账本：边界 rev2。attach_a2 在 rev4（边界后），旧形 result + 指纹按 TGT(3)。
+    //   记录 binding_target 已被 retarget 改成 TGT(4)——旧代码 legacyFpFor 从记录回推 fp(TGT4) ≠ op.fingerprint(fp_TGT3) → 旧代码放行（fail-open）；
+    //   新代码按不可变 result 键集判形：边界后必须新形，旧形 → 拒「旧形落边界后」。
+    const a2Id = "ta_" + "b".repeat(32), a1Id = "ta_" + "a".repeat(32);
+    const initOp = "00000000-0000-4000-8000-000000000001", upOp = "00000000-0000-4000-8000-000000000002", a1Op = "00000000-0000-4000-8000-000000000003", a2Op = "00000000-0000-4000-8000-000000000004";
+    const ops = {
+      [initOp]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      [upOp]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r_up", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
+      [a1Op]: { op_type: "create_a1", terminal_kind: "create_a1", request_key: "r_a1", fingerprint: TAL.fingerprintOf("create_a1", { request_key: "r_a1", topic_agent_id: a1Id }), result_revision: 3, result: { created_id: a1Id } },
+      [a2Op]: { op_type: "attach_a2", terminal_kind: "attach_a2", request_key: "r_att", fingerprint: TAL.fingerprintOf("attach_a2", { request_key: "r_att", topic_agent_id: a2Id, target: TGT57(3), claim_key: CLAIM57("c"), root_om: null, matched_om: null }), result_revision: 4, result: { affected_id: a2Id, terminal_family: "A2" } },
+    };
+    const recA2 = { kind: "live", topic_agent_id: a2Id, chat_id: "oc_r", aliases: { session_id: null, root_om: null }, facts: { binding: "active", session: "absent", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: TGT57(4), binding_proof: { kind: "attach", authorized_by: "ou_a", authorized_at: "2026-09-10T08:00:00.000Z", claim_key: CLAIM57("c") }, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: a2Op, created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z", selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null };
+    const recA1 = { kind: "live", topic_agent_id: a1Id, chat_id: "oc_r", aliases: { session_id: null, root_om: null }, facts: { generation: "n/a", binding: "pending", anchor: "absent", locator_link_proof: "absent" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, origin_operation_id: a1Op, created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z" };
+    const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 4, operations: ops, records: { [a1Id]: recA1, [a2Id]: recA2 } };
+    const v = TAL.validateLedger(doc, { endpointId: EP57 });
+    assert.equal(v.ok, false, "边界后 attach_a2 旧形必拒");
+    assert.match(String(v.why), /attach_a2 跨 schema 结果形不符（旧形落边界后）/, "why 点名旧形落边界后：" + v.why);
+  });
+
+  test("R57a 返修六 P1-1 ②：void 键集判形——边界后缺 expected 双键 / 边界前带 expected 双键 均拒", () => withLedger57((dir) => {
+    // 1.1 账本（边界 rev2）：真实 createB1 + voidPending(expired) 落新形 void（含 expected 双键）。
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "p11_b1", chatId: "oc_p11", rootOm: "om_p11", lineageId: "lin_p11", bindingTarget: TGT57(41), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id, handle = b1.result.selection_handle, expiry = b1.result.handle_expires_at;
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "p11_v", b1Id, reason: "expired", expectedHandle: handle, expectedExpiresAt: expiry, clock: () => Date.parse(expiry) + 1 }), "void");
+    let doc = loadOk57(dir);
+    // ① 边界后旧形 result（缺 expected 双键）→ 拒「旧形落边界后」。
+    const voidKey = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "void");
+    const d1 = structuredClone(doc);
+    d1.operations[voidKey].result = { voided_id: b1Id };
+    const v1 = TAL.validateLedger(d1, { endpointId: EP57 });
+    assert.equal(v1.ok, false, "边界后 void 缺 expected 双键必拒");
+    assert.match(String(v1.why), /void 跨 schema 结果形不符（旧形落边界后）/, "why 点名旧形落边界后：" + v1.why);
+  }, { schema: "1.1" }));
+
+  test("R57a 返修六 P1-1 ②b：边界前一笔 void 带 expected 双键 → 拒「新形落边界前」", () => {
+    // 1.1 账本：边界 rev3（首笔 from_schema==1.0 的 schema_upgrade）。void 在 rev2（边界前），result 带 expected 双键。
+    const initOp = "00000000-0000-4000-8000-000000000001", up1 = "00000000-0000-4000-8000-000000000002", up2 = "00000000-0000-4000-8000-000000000003", voidOp = "00000000-0000-4000-8000-000000000004";
+    const vid = "ta_" + "3".repeat(32);
+    const ops = {
+      [initOp]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      [up1]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r_u1", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r_u1", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
+      [up2]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r_u2", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r_u2", endpoint: EP57, from_schema: "1.1-transition", to_schema: "1.1" }), result_revision: 4, result: { endpoint: EP57, from_schema: "1.1-transition", to_schema: "1.1" } },
+      [voidOp]: { op_type: "void", terminal_kind: "void", request_key: "r_v", fingerprint: TAL.fingerprintOf("void", { request_key: "r_v", b1_id: vid, reason: "manual", expected_handle: null, expected_expires_at: null }), result_revision: 2, result: { voided_id: vid, expected_handle: null, expected_expires_at: null } },
+    };
+    const records = { [vid]: { kind: "voided_audit", topic_agent_id: vid, root_om: "om_v", voided_at: "2026-01-01T00:00:00.000Z", reason: "manual", origin_operation_id: voidOp } };
+    const doc = { schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 4, operations: ops, records };
+    const v = TAL.validateLedger(doc, { endpointId: EP57 });
+    assert.equal(v.ok, false, "边界前 void 带 expected 双键必拒");
+    assert.match(String(v.why), /void 跨 schema 结果形不符（新形落边界前）/, "why 点名新形落边界前：" + v.why);
+  });
+
+  test("R57a 返修六 P1-1 ③：void 新形 result 携带的输入重算指纹 ≠ op.fingerprint → 拒（删 legacyFpFor 后改走此项）", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "p13_b1", chatId: "oc_p13", rootOm: "om_p13", lineageId: "lin_p13", bindingTarget: TGT57(45), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id, handle = b1.result.selection_handle, expiry = b1.result.handle_expires_at;
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "p13_v", b1Id, reason: "expired", expectedHandle: handle, expectedExpiresAt: expiry, clock: () => Date.parse(expiry) + 1 }), "void");
+    let doc = loadOk57(dir);
+    // 篡改：把 void 的指纹换成按「错误 expected_handle」重算的值 → result 携带的输入（现 handle）重算不符 → 拒。
+    const voidKey = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "void");
+    const badFp = TAL.fingerprintOf("void", { request_key: "p13_v", b1_id: b1Id, reason: "expired", expected_handle: "osh_" + "9".repeat(32), expected_expires_at: expiry });
+    const d1 = structuredClone(doc);
+    d1.operations[voidKey].fingerprint = badFp;
+    const v = TAL.validateLedger(d1, { endpointId: EP57 });
+    assert.equal(v.ok, false, "新形 void 指纹与 result 携带输入不符必拒");
+    assert.match(String(v.why), /void 指纹与 result 携带的指纹输入不符/, "why 点名指纹不符：" + v.why);
+  }, { schema: "1.1" }));
+
+  test("R57a 返修六 P1-1 ④：void 重建不了指纹输入 → fail-closed 拒（不是跳过）——voided_audit 记录缺失", () => {
+    // 边界后 void，result 新形，但 voided_audit 记录被删 → 重建不了 reason → 必须拒（旧 legacyFpFor 返回 null 即跳过 = fail-open）。
+    const initOp = "00000000-0000-4000-8000-000000000001", up1 = "00000000-0000-4000-8000-000000000002", voidOp = "00000000-0000-4000-8000-000000000003";
+    const vid = "ta_" + "4".repeat(32);
+    const handle = "osh_" + "5".repeat(32);
+    const ops = {
+      [initOp]: { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      [up1]: { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r_u1", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r_u1", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
+      [voidOp]: { op_type: "void", terminal_kind: "void", request_key: "r_v", fingerprint: TAL.fingerprintOf("void", { request_key: "r_v", b1_id: vid, reason: "expired", expected_handle: handle, expected_expires_at: "2026-11-01T00:00:00.000Z" }), result_revision: 3, result: { voided_id: vid, expected_handle: handle, expected_expires_at: "2026-11-01T00:00:00.000Z" } },
+    };
+    const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 3, operations: ops, records: {} }; // 无 voided_audit 记录
+    const v = TAL.validateLedger(doc, { endpointId: EP57 });
+    assert.equal(v.ok, false, "void 重建不了必拒（fail-closed）");
+    assert.match(String(v.why), /重建不了指纹输入/, "why 点名重建不了（不是跳过）：" + v.why);
+  });
+
+  test("R57a 返修六 P1-2 ①：真实 attach() A4→A3——边界后同 key 同载荷第二次 idempotent:true（改前 request_conflict）+ result 含 affected_live_ids_after_commit + proof_effects", () => withLedger57((dir) => {
+    // A2(签 handle) → anchor(A3) → unbind(A4，link 保留) → attach 再入 A4→A3（attach_a3 继承）
+    const a1 = talOk(TAL.createA1({ endpointId: EP57, requestKey: "p12_a1", chatId: "oc_p12", sessionId: "sess-p12", now: T0 }), "createA1");
+    const id = a1.result.created_id;
+    talOk(TAL.attach({ endpointId: EP57, requestKey: "p12_att", id, bindingTarget: TGT57(6), claimKey: CLAIM57("e"), authorizedBy: "ou_p12", anchorCandidate: "om_p12", clock: () => T0 }), "attach→A2");
+    talOk(TAL.anchor({ endpointId: EP57, requestKey: "p12_anc", id, f4: { root_om: "om_p12", ...F457("om_p12") }, now: T0 }), "anchor→A3");
+    talOk(TAL.unbind({ endpointId: EP57, requestKey: "p12_unb", id, now: T0 }), "unbind→A4");
+    const att2 = talOk(TAL.attach({ endpointId: EP57, requestKey: "p12_att2", id, bindingTarget: TGT57(6), claimKey: CLAIM57("e"), authorizedBy: "ou_p12", anchorCandidate: "om_p12", clock: () => T0 }), "attach→A4→A3");
+    assert.equal(att2.result.terminal_family, "A3", "keepLink 继承 → attach_a3");
+    assert.deepEqual(Object.keys(att2.result).sort(), ["affected_id", "affected_live_ids_after_commit", "proof_effects", "terminal_family"], "边界后 attach_a3 用 §6 新形键集");
+    assert.deepEqual(att2.result.affected_live_ids_after_commit, [id]);
+    assert.deepEqual(att2.result.proof_effects, [{ topic_agent_id: id, binding_effect: "produced", link_effect: "preserved" }], "§6 attach_a3 行逐字");
+    // 同 key 同载荷第二次 → idempotent:true（改前 request_conflict）。
+    const att3 = talOk(TAL.attach({ endpointId: EP57, requestKey: "p12_att2", id, bindingTarget: TGT57(6), claimKey: CLAIM57("e"), authorizedBy: "ou_p12", anchorCandidate: "om_p12", clock: () => T0 }), "同 key 重放");
+    assert.equal(att3.idempotent, true, "A4→A3 同 key 同载荷第二次 idempotent:true");
+  }, { schema: "1.1-transition" }));
+
+  test("R57a 返修六 P1-2 ②：边界后 attach_a3 的 result 缺 affected_live_ids_after_commit + proof_effects → validateLedger 拒", () => withLedger57((dir) => {
+    const a1 = talOk(TAL.createA1({ endpointId: EP57, requestKey: "p14_a1", chatId: "oc_p14", sessionId: "sess-p14", now: T0 }), "createA1");
+    const id = a1.result.created_id;
+    talOk(TAL.attach({ endpointId: EP57, requestKey: "p14_att", id, bindingTarget: TGT57(7), claimKey: CLAIM57("f"), authorizedBy: "ou_p14", anchorCandidate: "om_p14", clock: () => T0 }), "attach→A2");
+    talOk(TAL.anchor({ endpointId: EP57, requestKey: "p14_anc", id, f4: { root_om: "om_p14", ...F457("om_p14") }, now: T0 }), "anchor→A3");
+    talOk(TAL.unbind({ endpointId: EP57, requestKey: "p14_unb", id, now: T0 }), "unbind→A4");
+    talOk(TAL.attach({ endpointId: EP57, requestKey: "p14_att2", id, bindingTarget: TGT57(7), claimKey: CLAIM57("f"), authorizedBy: "ou_p14", anchorCandidate: "om_p14", clock: () => T0 }), "attach→A4→A3");
+    let doc = loadOk57(dir);
+    const a3Key = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "attach_a3");
+    const d1 = structuredClone(doc);
+    d1.operations[a3Key].result = { affected_id: id, terminal_family: "A3" }; // 旧形：缺 affected_live_ids + proof_effects
+    const v = TAL.validateLedger(d1, { endpointId: EP57 });
+    assert.equal(v.ok, false, "边界后 attach_a3 缺新形键必拒");
+    assert.match(String(v.why), /attach_a3 跨 schema 结果形不符/, "why 点名 attach_a3 键集不符：" + v.why);
+  }, { schema: "1.1-transition" }));
 
 }
+
 
 summarySealed = true;
 

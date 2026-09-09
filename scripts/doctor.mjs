@@ -36,7 +36,7 @@ import path from "node:path";
 import { displaySafe } from "./display-safe.mjs";
 import { inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
-import { auditOutbox } from "./outbox.mjs";
+import { auditOutbox, FORWARD_FAILURE_RECEIPT_SUFFIX } from "./outbox.mjs";
 import { inspectRunChannel, outboxDirOf } from "./drain-outbox.mjs";
 import { inventoryRuns } from "./outbound.mjs";
 import { loadRegistryStrict, registryPath } from "./registry.mjs";
@@ -747,6 +747,32 @@ export function runDoctor({
     const redNote = [];
     const missingKeys = [];
     const unclearNote = [];
+    const noReceiptKeys = [];
+    let noReceipt = 0;
+    // R58：失败回执核对（issue #140 后半）。回执文件名 = <key>.forward-failed.outbox.json，
+    // 写在哪个 outbox 目录取决于投递时的绑定（项目级 outbox / 会话级 outbox-<sid>），
+    // doctor 不重算 —— 把项目 outbound 下所有 outbox 目录扫一遍，找得到就算有了。
+    // 判据与 outbox.mjs 的 FORWARD_FAILURE_RECEIPT_SUFFIX 同源（直接引，不抄字符串）。
+    const receiptKeysOf = (rootDir) => {
+      const found = { ok: true, keys: new Set(), why: null };
+      let entries;
+      try { entries = fs.readdirSync(path.join(rootDir, ".runtime-data", "outbound")); }
+      catch (err) {
+        // ENOENT = 从未有过 outbox：回执必然缺席，照实点名
+        if (err?.code !== "ENOENT") { found.ok = false; found.why = String(err?.code ?? err?.message ?? err); }
+        return found;
+      }
+      for (const d of entries) {
+        if (d !== "outbox" && !d.startsWith("outbox-")) continue;
+        let names;
+        try { names = fs.readdirSync(path.join(rootDir, ".runtime-data", "outbound", d)); }
+        catch { continue; } // 单个目录读不出：不算有，也不算证据充分的缺席
+        for (const n of names) {
+          if (n.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX)) found.keys.add(n.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length));
+        }
+      }
+      return found;
+    };
     // fd 绑定 stat（O_NOFOLLOW|O_NONBLOCK，不读内容）：jsonl 的年龄来源；悬空 symlink/FIFO/并发变化 → problem，不 fail-open
     const fdStat = (file) => {
       let fd = null;
@@ -765,6 +791,7 @@ export function runDoctor({
       const root = p?.root;
       if (typeof root !== "string" || !path.isAbsolute(root)) continue; // root 不成形的项目 ⑤⑥ 已点名
       const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+      let receiptKeys = null; // 本项目的回执文件键集，首次碰到红 key 时才盘（失败才有回执可言）
       let names;
       try { names = typeof forwardRunsList === "function" ? forwardRunsList(runsDir) : fs.readdirSync(runsDir); }
       catch (err) {
@@ -796,6 +823,18 @@ export function runDoctor({
           if (v.doc.is_error === true || v.doc.sent !== true) {
             buckets.red += 1;
             if (redNote.length < 3) redNote.push(key.slice(-8) + " —— " + String(v.doc.reason_first_line ?? "原因不明") + (v.doc.claude_code_version ? "（claude_code_version " + v.doc.claude_code_version + "）" : "（版本未知）"));
+            // R58：失败的还该有一条 forward_failed 回执（runner 写）—— 没有 = owner 至今
+            // 不知道没送达，点名。outbound 读不出时无法证明缺席，归查不清，不冒充核对过。
+            if (receiptKeys === null) receiptKeys = receiptKeysOf(root);
+            if (receiptKeys.ok) {
+              if (!receiptKeys.keys.has(key)) {
+                noReceipt += 1;
+                if (noReceiptKeys.length < 3) noReceiptKeys.push(key.slice(-8));
+              }
+            } else {
+              buckets.unclear += 1;
+              if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：失败回执核对不了（outbound 读不出：" + receiptKeys.why + "）");
+            }
           } else buckets.green += 1;
           continue;
         }
@@ -846,6 +885,7 @@ export function runDoctor({
     const body = scanned === 0 ? "近 24 小时没有转发结果（只盘 live_session 转发，没有转发就没有条目）"
       : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
         (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
+        (noReceipt > 0 ? "；失败无回执 " + noReceipt + "：" + noReceiptKeys.join("、") : "") +
         (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "") +
         (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "") +
         (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "");

@@ -17,7 +17,11 @@
  * 再 fsync 目录；失败清自己建的 tmp，诊断记一行到 stderr.log，绝不抛。读回 jsonl 只读
  * 末尾 256 KiB（超大文件不整读）。
  *
- * 结果文件是「跑完的事实」，不是回执：给不给 Frank 发失败回执要单独授权（另单），这里只落盘。
+ * 结果文件是「跑完的事实」；明确失败（is_error / 非零退出 / 起不来 → sent ≠ true）时，
+ * runner 再写一条 outbox 回执项 kind=forward_failed（R58，issue #140 后半；Frank
+ * 2026-09-10 已预授权这类自动写入），让 owner 知道那条消息没送达 —— 发布走既有
+ * 出站发布器（同一身份、同一话题选择规则），本模块不新增任何发送代码。成功不写；
+ * 超时（started 有、result 无）语义不变，仍归 doctor ⑯ 的「结果缺失」，不发回执。
  */
 
 import { spawn } from "node:child_process";
@@ -27,6 +31,7 @@ import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
+import { appendForwardFailureReceipt } from "./outbox.mjs";
 import { ROLE_ENV } from "./live-session.mjs";
 
 export const FORWARD_RESULT_SCHEMA = "forward_result_v1";
@@ -245,6 +250,34 @@ function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expect
   writeDocFile(targetPath, errPath, doc, maxBytes);
 }
 
+/**
+ * 失败 → outbox 回执（R58）。判据只有一条：result 投影 sent !== true（doctor ⑯ 的红
+ * 同源 —— is_error / 非零退出 / 崩溃 / 起不来全都落在这里，回执与体检不打架）。
+ * 未给 outboxDir 的调用方（旧 spec / 不想测回执的路径）跳过，由 doctor ⑯ 点名回执缺失。
+ * 幂等靠回执原语里的 O_EXCL；写不成记一行 stderr.log，绝不抛（runner 纪律）。
+ */
+function writeFailureReceipt({ spec, doc, errPath }) {
+  if (doc.sent === true) return; // 成功不写；失败 = is_error / 非零退出 / 崩溃 / 起不来（sent 必为 false）
+  if (typeof spec.outboxDir !== "string" || spec.outboxDir.length === 0) return;
+  const r = appendForwardFailureReceipt({
+    outboxDir: spec.outboxDir,
+    forwardKey: spec.key,
+    reasonFirstLine: doc.reason_first_line,
+    messageId: spec.messageId ?? null,
+    targetGenerationId: spec.originGenerationId ?? null,
+  });
+  // duplicate = 同 key 的回执已经在（重放）：正是想要的结果，不算失败。
+  if (!r.ok && r.reason !== "duplicate") {
+    noteErr(errPath, "失败回执没写成（" + r.reason + (r.error ? "：" + r.error : "") + "）");
+  }
+}
+
+/** result 落盘后紧跟回执判断 —— 三个结局路径共用这一份，不另抄。 */
+function writeResultAndMaybeReceipt(resultPath, errPath, doc, spec) {
+  writeValidatedDoc(resultPath, errPath, doc, forwardResultProblem, 64 * 1024, spec.key);
+  writeFailureReceipt({ spec, doc, errPath });
+}
+
 /** 有界读：只取文件末尾 256 KiB（O_NOFOLLOW 打开、同 fd fstat），逐行 JSON 解析，坏行跳过。 */
 function readJsonlLines(file) {
   let fd = null;
@@ -279,9 +312,9 @@ function runForwardRunner(spec) {
 
   const claudePath = resolveOnPath("claude", process.env.PATH);
   if (claudePath === null) {
-    writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, startedAt: Date.now(), finishedAt: Date.now(), notFound: true,
-    }), forwardResultProblem, 64 * 1024, spec.key);
+    }), spec);
     return;
   }
 
@@ -300,9 +333,9 @@ function runForwardRunner(spec) {
     );
   } catch {
     // spawn 同步抛（罕见：参数形不对）：也按 crash 落盘，不许 runner 崩了不写结果
-    writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, lines: readJsonlLines(jsonlPath), claudePath, startedAt, finishedAt: Date.now(),
-    }), forwardResultProblem, 64 * 1024, spec.key);
+    }), spec);
     return;
   } finally {
     fs.closeSync(out);
@@ -320,10 +353,10 @@ function runForwardRunner(spec) {
     if (done) return; // spawn 失败时 error 与 close 可能都来：结果只写一份
     done = true;
     clearInterval(keepalive);
-    writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, pid: child.pid, exitCode, lines: readJsonlLines(jsonlPath),
       claudePath, startedAt, finishedAt: Date.now(),
-    }), forwardResultProblem, 64 * 1024, spec.key);
+    }), spec);
   };
   child.on("error", () => finish(null));
   child.on("close", (code) => finish(Number.isFinite(code) ? code : null));
@@ -335,7 +368,11 @@ if (isDirectRun(import.meta.url)) {
   const bad = !spec || typeof spec !== "object"
     || typeof spec.key !== "string" || !FORWARD_KEY_RE.test(spec.key)
     || typeof spec.runsDir !== "string" || typeof spec.projectRoot !== "string"
-    || typeof spec.targetName !== "string" || typeof spec.prompt !== "string";
+    || typeof spec.targetName !== "string" || typeof spec.prompt !== "string"
+    // R58 可选字段：给了就必须成形（outboxDir 要拿去写文件， messageId/代际进回执记录）
+    || (spec.outboxDir !== undefined && (typeof spec.outboxDir !== "string" || !path.isAbsolute(spec.outboxDir)))
+    || (spec.messageId !== undefined && (typeof spec.messageId !== "string" || spec.messageId.length === 0))
+    || (spec.originGenerationId !== undefined && (typeof spec.originGenerationId !== "string" || spec.originGenerationId.length === 0));
   if (bad) {
     process.stderr.write("forward-runner：spec 不对（需要 key/runsDir/projectRoot/targetName/prompt 的 JSON）\n");
     process.exit(2);

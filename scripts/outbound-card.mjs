@@ -93,6 +93,7 @@ const RUNTIME = {
 
 const PRESENTATION = {
   reply: { label: "本轮答复" },
+  forward_failed: { label: "转发失败" },
   milestone: { label: "里程碑" },
   decision: { label: "决定" },
   risk: { label: "风险" },
@@ -100,7 +101,8 @@ const PRESENTATION = {
   next: { label: "下一步" },
 };
 
-const PRIORITY = ["risk", "pending", "milestone", "decision", "next", "reply"];
+// forward_failed 在前：回执是「你那条消息根本没到」，比任何进展都急。
+const PRIORITY = ["forward_failed", "risk", "pending", "milestone", "decision", "next", "reply"];
 
 function truncate(value, max, suffix = "…") {
   const text = String(value ?? "").trim();
@@ -164,7 +166,9 @@ function conversationSummary(records, { input, status, title }) {
   const primary = records.find((record) => record?.kind === status.kind) ?? records[0];
   const detail = firstPlainLine(primary?.text);
   if (detail) {
-    const summary = status.kind === "reply" ? detail : status.label + "：" + detail;
+    // 正文自带类名前缀（如转发失败回执「转发失败：…」）就不再叠一层 —— 摘要读起来别打结。
+    const summary = status.kind === "reply" || detail.startsWith(status.label + "：")
+      ? detail : status.label + "：" + detail;
     return truncate(summary, MAX_SUMMARY_CHARS);
   }
   return truncate(title + " · " + status.label, MAX_SUMMARY_CHARS);

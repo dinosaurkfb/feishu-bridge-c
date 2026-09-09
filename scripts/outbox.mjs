@@ -4,7 +4,9 @@
  * 存在的理由：进展不该只在 Frank 发问时才流出去。长期任务自己干完一件事、
  * 做了一个决定、撞上一个风险，Frank 应该自动收到，而不是需要先想起来去问。
  *
- * 只收五类（与需求一致）：里程碑、决定、风险、待人工拍板、下一步。
+ * 只收五类（与需求一致）：里程碑、决定、风险、待人工拍板、下一步；
+ * 另有机器生成的转发失败回执 `forward_failed`（R58，issue #140 后半）：
+ * forward-runner 在转发明确失败后写入，不走人工判断，所以不占五类的名分。
  * 完整对话、模型思维过程、工具轨迹一律不进 outbox。
  */
 
@@ -33,10 +35,11 @@ import { gateBlocks } from "./maintenance-gate-core.mjs";
  * 五类随之退居二线，只服务**没有对话轮次可依附**的东西 —— 比如绑定到期体检，
  * 那是钩子生成的，不属于任何一轮回答。我不再手写它们。
  */
-export const KINDS = ["reply", "milestone", "decision", "risk", "pending", "next"];
+export const KINDS = ["reply", "forward_failed", "milestone", "decision", "risk", "pending", "next"];
 
 /** reply 没有标签：它不是某一类进展，它就是答复本身。 */
 export const KIND_LABEL = {
+  forward_failed: "转发失败",
   milestone: "里程碑",
   decision: "决定",
   risk: "风险",
@@ -128,6 +131,79 @@ export function appendEvent({
     fs.rmSync(tmp, { force: true });
   }
   return { ok: true, id, file };
+}
+
+/**
+ * 转发失败回执的正文（R58，issue #140 后半）：
+ * 「转发失败：<原因首行>；本条未送达，请重发或在终端查看 doctor ⑯」。
+ *
+ * 「首行」在这里兑底（不信任调用方已切好）：先取第一行；再控制字符
+ * （C0/DEL/C1）剥成空格；限 200 码点截断 —— Array.from 按码点切，
+ * 增补平面字符（如 emoji）不许被从代理对中间劈开。
+ * 净化后为空就说「原因不明」，不产出空正文（appendEvent 的 empty_text 纪律同源）。
+ */
+export function forwardFailureText(reasonFirstLine) {
+  const firstLine = String(reasonFirstLine ?? "").split("\n", 1)[0];
+  const clean = Array.from(firstLine.replace(/\p{Cc}/gu, " ").trim())
+    .slice(0, 200).join("").trim();
+  return "转发失败：" + (clean || "原因不明") + "；本条未送达，请重发或在终端查看 doctor ⑯";
+}
+
+/** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
+export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
+
+/**
+ * 转发失败回执入 outbox（R58）。**这是预授权的自动写入**（Frank 2026-09-10 批准
+ * 「失败回执」这一类），所以 born eligible：publish_eligible_at 在创建时即冻结。
+ *
+ * 调用方是 forward-runner（result 落盘后发现明确失败时）；成功路径根本不调这里。
+ * 幂等：文件名 = <key>.forward-failed.outbox.json，O_EXCL|O_NOFOLLOW 原子建 ——
+ * 同一 key 重放输给 EEXIST 就不再写，第一条内容一个字节不动。
+ * key 核 64 位十六进制（与 FORWARD_KEY_RE / CLAIM_KEY_SHAPE 同形状）：
+ * 文件名要拿 key 派生路径，形状不对就拒在写入之前，不产越界文件。
+ * 维护门同 appendEvent：门在或读不出 → 不写（调用方按「没记下」如实说）。
+ */
+export function appendForwardFailureReceipt({
+  outboxDir, forwardKey, reasonFirstLine, messageId, targetGenerationId,
+  source = "forward-runner",
+}) {
+  if (typeof outboxDir !== "string" || outboxDir.length === 0) return { ok: false, reason: "outbox_dir_missing" };
+  if (typeof forwardKey !== "string" || !/^[0-9a-f]{64}$/u.test(forwardKey)) return { ok: false, reason: "key_shape" };
+  const text = forwardFailureText(reasonFirstLine);
+  { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
+  const createdAt = new Date().toISOString();
+  const record = {
+    schema_version: "1.0",
+    artifact_type: "codex_feishu_bridge_event",
+    zone: "work",
+    classification: "internal",
+    id: "forward-failed-" + forwardKey,
+    kind: "forward_failed",
+    text,
+    event_key: "forward-failed:" + forwardKey,
+    source: typeof source === "string" && source ? source : "forward-runner",
+    input_origin: null,
+    input_text: null,
+    target_channel_generation_id: usableGeneration(targetGenerationId) ? targetGenerationId : null,
+    run_id: null,
+    forward_key: forwardKey,
+    message_id: typeof messageId === "string" && messageId ? messageId : null,
+    created_at: createdAt,
+    publish_eligible_at: createdAt,
+    published_at: null,
+  };
+  fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
+  const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
+  let fd = null;
+  try {
+    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    fs.writeFileSync(fd, JSON.stringify(record, null, 2) + "\n");
+    fs.fsyncSync(fd);
+  } catch (err) {
+    if (err?.code === "EEXIST") return { ok: false, reason: "duplicate", file };
+    return { ok: false, reason: "io_error", error: String(err?.code ?? err?.message ?? err), file };
+  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+  return { ok: true, id: record.id, file };
 }
 
 export function listPending({ outboxDir }) {

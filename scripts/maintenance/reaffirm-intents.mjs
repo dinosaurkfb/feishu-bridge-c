@@ -207,6 +207,9 @@ function writeIntentsFile(dir, doc, { _inject = null } = {}) {
 
 /** 释放结果折叠成 released | residue | unclear 三态。 */
 export function foldLockReleaseState(rel) {
+  // P2：instance-bound outer 的 release() 返回规范化 {ok:false, reason:"reap_uncleared", path, error}——
+  //   不带 reapUncleared 字段；必须把该规范化 reason 也折成 residue 并点名路径。
+  if (rel?.reason === "reap_uncleared") return "residue";
   const clean = rel?.ok === true && !rel.absent && !rel.reapUncleared;
   if (clean) return "released";
   if (rel?.reapUncleared) return "residue";

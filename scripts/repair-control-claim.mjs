@@ -140,7 +140,7 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   let innerRes;
   let outerRel;
   try {
-    innerRes = repairControlCommittedUncleanInner({ claimsDir, key, uncleanRecord, env, _inject, sc });
+    innerRes = repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanRecord, env, _inject, sc });
   } finally {
     try { outerRel = acq.release(); } catch (err) { outerRel = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }
@@ -164,7 +164,7 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   return innerRes;
 }
 
-function repairControlCommittedUncleanInner({ claimsDir, key, uncleanRecord, env = process.env, _inject = undefined, sc = undefined } = {}) {
+function repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanRecord, env = process.env, _inject = undefined, sc = undefined } = {}) {
   // sc 由外层 repairControlCommittedUnclean 验证后传入；这里不再重复 verifySelectionContext。
   const d = resolveEndpointDir(sc.endpoint, { env });
   if (!d.ok) return { ok: false, reason: "endpoint_dir_unresolvable", why: d.why };
@@ -185,6 +185,15 @@ function repairControlCommittedUncleanInner({ claimsDir, key, uncleanRecord, env
   }
   if (unMessage !== sc.message) {
     return { ok: false, reason: "ledger_commit_unverifiable", why: "selection_message_id 与 claim 的 message 不一致，保持 control-committed-unclean" };
+  }
+  // P1-4b（续）：核 claim.selection_plan.target_id——plan 必须在场，且 plan / unclean / 账本 operation 三者
+  //   target_id 逐字一致。plan 缺席或任一不等 → ledger_commit_unverifiable（防止 plan 指向别的 target 仍被放行）。
+  const planTarget = claim?.selection_plan?.target_id;
+  if (typeof planTarget !== "string" || !ID_SHAPE.test(planTarget)) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "claim.selection_plan.target_id 缺席/不合法（须在场且 ta_ 形状），保持 control-committed-unclean" };
+  }
+  if (planTarget !== unTarget) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "claim.selection_plan.target_id（" + planTarget + "）与 uncleanRecord.result.target_id（" + unTarget + "）不一致，保持 control-committed-unclean" };
   }
   // 精确绑定的 request_key 与写入侧共用同一派生函数（P2）；不再保留本地字面拼接。
   const matches = Object.values(L.doc.operations).filter((op) =>

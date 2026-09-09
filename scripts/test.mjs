@@ -42368,6 +42368,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
         control: { control: "select", handle, handle_kind: "rfh" },
         selection_context: selCtx,
         selection_context_digest_v1: digest,
+        selection_plan: { target_id: b3 },
       }
     });
     assert.equal(cAcq.ok, true);
@@ -42426,7 +42427,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
     const messageId = "om_p14";
     const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14", handle, kind: "rfh" });
-    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+    const mkClaim = (handle, target) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)), selection_plan: { target_id: target } });
 
     // ① 反例：cleanReaffirmIntent 返回 residue/unclear（intent 锁释放不净）→ repair 必须判非绿、不转 consumed。
     const b3 = seedB3B(dir, "r57b_p14", 45, "sess-b-45");
@@ -42439,7 +42440,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     });
     const uncleanRecord = { schema_version: "1.0", claim_key: "f", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3, selection_message_id: messageId } };
     const repOK = repairControlCommittedUnclean({
-      claim: mkClaim(intent.reaffirm_handle),
+      claim: mkClaim(intent.reaffirm_handle, b3),
       claimsDir,
       key: "f",
       uncleanRecord,
@@ -42469,7 +42470,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     // uncleanRecord 认为本次选择的消息 = messageId；op 却是 om_forged999 → 精确绑定必须拒（不转 consumed）。
     const uncleanB = { schema_version: "1.0", claim_key: "g", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3b, selection_message_id: messageId } };
     const repForged = repairControlCommittedUnclean({
-      claim: mkClaim(intentB.reaffirm_handle),
+      claim: mkClaim(intentB.reaffirm_handle, b3b),
       claimsDir,
       key: "g",
       uncleanRecord: uncleanB,
@@ -42482,7 +42483,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   test("R57b 返修三 P1-4a：repair 也走 outer → intent 锁序——outer 忙/残骸/释放失败 → 非绿、保持 committed-unclean 点名", () => withLedgerB((root, dir) => {
     const messageId = "om_p14a";
     const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14a", handle, kind: "rfh" });
-    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+    const mkClaim = (handle, target) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)), selection_plan: { target_id: target } });
     const mkUnclean = (handle, target) => ({ schema_version: "1.0", claim_key: "h", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: target, selection_message_id: messageId } });
 
     const mkCommitted = (handle, target) => {
@@ -42501,7 +42502,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const orderLock = DW.acquireOrderLock(EP57B, process.env);
     assert.equal(orderLock.ok, true, "预占 outer 锁");
     const repBusy = repairControlCommittedUnclean({
-      claim: mkClaim(h1),
+      claim: mkClaim(h1, b3),
       claimsDir: path.join(root, "claims_p14a"),
       key: "h",
       uncleanRecord: mkUnclean(h1, b3),
@@ -42517,7 +42518,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const h2 = mkCommitted(b3b, b3b);
     fs.mkdirSync(path.join(dir, "m1a-order.lock"), { recursive: true });
     const repResidue = repairControlCommittedUnclean({
-      claim: mkClaim(h2),
+      claim: mkClaim(h2, b3b),
       claimsDir: path.join(root, "claims_p14ab"),
       key: "h",
       uncleanRecord: mkUnclean(h2, b3b),
@@ -42530,7 +42531,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b3c = seedB3B(dir, "r57b_p14ac", 49, "sess-b-49");
     const h3 = mkCommitted(b3c, b3c);
     const repReleaseFail = repairControlCommittedUnclean({
-      claim: mkClaim(h3),
+      claim: mkClaim(h3, b3c),
       claimsDir: path.join(root, "claims_p14ac"),
       key: "h",
       uncleanRecord: mkUnclean(h3, b3c),
@@ -42544,7 +42545,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   test("R57b 返修三 P1-4b：逐字绑定不许降级——缺 detail.result / message 不等 → ledger_commit_unverifiable；P2 两侧 request_key 派生逐字相等", () => withLedgerB((root, dir) => {
     const messageId = "om_p14b";
     const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14b", handle, kind: "rfh" });
-    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+    const mkClaim = (handle, target) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)), selection_plan: { target_id: target } });
 
     // P2：request_key 两侧共用同一派生函数——写入侧（ownerSelectReaffirm）与 repair 侧（ownerSelectReaffirmRequestKey）逐字相等。
     const tgt = "ta_" + "1".repeat(32);
@@ -42559,7 +42560,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
     // ① 反例：uncleanRecord 缺 result（旧代码「用缺 detail.result 越过」）→ 拒。
     const repNoResult = repairControlCommittedUnclean({
-      claim: mkClaim(intent.reaffirm_handle),
+      claim: mkClaim(intent.reaffirm_handle, b3),
       claimsDir: path.join(root, "claims_p14b"),
       key: "h",
       uncleanRecord: { ...realUnclean, result: undefined },
@@ -42571,7 +42572,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
     // ② 反例：selection_message_id 与 claim 的 message 不等 → 拒。
     const repMsgMismatch = repairControlCommittedUnclean({
-      claim: mkClaim(intent.reaffirm_handle),
+      claim: mkClaim(intent.reaffirm_handle, b3),
       claimsDir: path.join(root, "claims_p14b2"),
       key: "h",
       uncleanRecord: { ...realUnclean, result: { target_id: b3, selection_message_id: "om_othermsg" } },
@@ -42593,14 +42594,50 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.ok(writeOp, "写入侧 op 在场");
     assert.equal(writeOp.request_key, TAL.ownerSelectReaffirmRequestKey({ target: b3, handle: intent.reaffirm_handle }), "写入侧 request_key 与共享派生函数逐字相等");
     const repOk = repairControlCommittedUnclean({
-      claim: mkClaim(intent.reaffirm_handle),
+      claim: mkClaim(intent.reaffirm_handle, b3),
       claimsDir: path.join(root, "claims_p14b3"),
       key: "h",
       uncleanRecord: realUnclean,
       env: process.env,
     });
     assert.equal(repOk.ok, true, "完整顶层 unclean record 转 consumed：" + JSON.stringify(repOk));
+
+    // ④ P1-4b（续）反例：claim.selection_plan.target_id 指向另一 target（unclean/op 自洽）→ 拒。
+    const repPlanMismatch = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, "ta_" + "9".repeat(32)),
+      claimsDir: path.join(root, "claims_p14b4"),
+      key: "h",
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repPlanMismatch.ok, false, "plan 指向另一 target 必须拒");
+    assert.equal(repPlanMismatch.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repPlanMismatch.why, /selection_plan.target_id.*不一致/u, "点名 plan 不一致");
+
+    // ⑤ P1-4b（续）反例：claim.selection_plan 缺席 → 拒。
+    const noPlanClaim = (() => { const c = mkClaim(intent.reaffirm_handle, b3); delete c.selection_plan; return c; })();
+    const repPlanAbsent = repairControlCommittedUnclean({
+      claim: noPlanClaim,
+      claimsDir: path.join(root, "claims_p14b5"),
+      key: "h",
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repPlanAbsent.ok, false, "plan 缺席必须拒");
+    assert.equal(repPlanAbsent.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repPlanAbsent.why, /selection_plan.target_id 缺席/u, "点名 plan 缺席");
   }));
+
+  test("R57b 返修四 P2：foldLockReleaseState 认不出规范化 reap_uncleared reason——应折成 residue 并点名路径", () => {
+    const ri = RI;
+    // ① 反例：带 reapUncleared 字段（原始形状）→ residue（已有支持）。
+    assert.equal(ri.foldLockReleaseState({ ok: false, reason: "reap_uncleared", reapUncleared: { path: "/x/.reaped-1", error: "EIO" } }), "residue");
+    // ② 反例：规范化 {ok:false, reason:"reap_uncleared", path, error}（不带 reapUncleared 字段）→ 旧的 fold 判 unclear；改后必须 residue。
+    assert.equal(ri.foldLockReleaseState({ ok: false, reason: "reap_uncleared", path: "/y/m1a-order.lock", error: "EIO" }), "residue", "规范化 reap_uncleared reason 折成 residue");
+    // 正例：clean → released；unknown → unclear。
+    assert.equal(ri.foldLockReleaseState({ ok: true }), "released");
+    assert.equal(ri.foldLockReleaseState({ ok: false, reason: "release_failed" }), "unclear");
+  });
 
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {
     // 手工 transition 账本：activate 增量 op 产 owner_select 双证 + tombstone（owner_select_merge_v1）。

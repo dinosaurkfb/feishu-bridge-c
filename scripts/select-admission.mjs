@@ -211,10 +211,10 @@ export function selectRejectTextByReason(reason) {
   return "控制执行失败（" + reason + "）";
 }
 
-/** rfh 成功文案（按 result 分支如实说签了什么）。 */
+/** rfh 成功文案（按 result 分支如实说签了什么；P2 最小披露：不泄露内部 target id）。 */
 export function selectReaffirmSuccessText(result) {
   const what = result?.new_binding_proof ? "绑定与链路证明" : "链路证明";
-  return "已按你的确认重签该目标的" + what + "（target " + String(result?.target_id ?? "?").slice(0, 40) + "）";
+  return "已按你的确认重签该目标的" + what + "。";
 }
 
 /**

@@ -7,15 +7,16 @@
  * intent 文件（intent 文件锁内 CAS：同 target 无未清 intent，过期项先受验清理；unreadable fail-closed）。
  *
  * 用法：node scripts/feishu-reaffirm-issue.mjs <target_id> [--apply]
- * 退出码：0 = 预览/签发完成；1 = 干净拒绝（参数/盘点/CAS）。
+ * 退出码：0 = 预览/签发完成；1 = 干净拒绝（参数/盘点/CAS）；2 = CLI 参数错误。
  */
-
-import fs from "node:fs";
-import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
-import { ENDPOINT_SHAPE, ID_SHAPE, ledgerRootFor, loadLedger, familyOf, ownerSelectReaffirmClosureDigest } from "./topic-agent-ledger.mjs";
+import { loadCodexTemplate } from "./codex/state.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
+import { maintenanceDir } from "./maintenance/journal.mjs";
+import { aggregateEndpointReceipts } from "./maintenance/ledger-receipt.mjs";
+import { ID_SHAPE, loadByEndpoint, familyOf } from "./topic-agent-ledger.mjs";
 import { REAFFIRM_TARGET_FAMILIES, issueReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
 
 const fail = (msg, code = 1) => {
@@ -23,53 +24,124 @@ const fail = (msg, code = 1) => {
   process.exit(code);
 };
 
-function findTarget({ targetId, env }) {
-  const root = ledgerRootFor(env);
-  if (!root) fail("账本根说不清（HOME / FEISHU_BRIDGE_LEDGER_DIR）");
-  let names;
-  try { names = fs.readdirSync(root); } catch (err) { fail("账本根读不出：" + String(err.code ?? err.message)); }
-  for (const name of names.sort()) {
-    if (!ENDPOINT_SHAPE.test(name)) continue;
-    const l = loadLedger(path.join(root, name), { endpointId: name });
-    if (!l.ok) continue; // 读不出的 endpoint 不冒充命中（fail-closed：不猜）
-    const rec = l.doc.records[targetId];
-    if (rec && rec.kind === "live") return { endpointId: name, doc: l.doc, rec };
+export function parseIssueArgs(argv) {
+  let applyCount = 0;
+  const positional = [];
+  for (const a of argv) {
+    if (a === "--apply") {
+      applyCount++;
+      if (applyCount > 1) return { ok: false, reason: "重复的 --apply 参数" };
+    } else if (a.startsWith("-")) {
+      return { ok: false, reason: "未知参数：" + a };
+    } else {
+      positional.push(a);
+    }
   }
-  return null;
+  if (positional.length !== 1) {
+    return { ok: false, reason: "用法：node scripts/feishu-reaffirm-issue.mjs <target_id> [--apply]" };
+  }
+  const targetId = positional[0];
+  if (!ID_SHAPE.test(targetId)) {
+    return { ok: false, reason: "target_id 形状不对（须 ta_+32hex）：" + targetId };
+  }
+  return { ok: true, targetId, apply: applyCount === 1 };
+}
+
+export function findTarget({ targetId, env = process.env }) {
+  const mDir = maintenanceDir(env);
+  if (!mDir) return { ok: false, reason: "maintenance_dir_unresolvable", why: "维护目录说不清（FEISHU_BRIDGE_MAINTENANCE_DIR / realUserHome）" };
+  const agg = aggregateEndpointReceipts({ dir: mDir });
+  if (!agg.ok) {
+    return { ok: false, reason: "receipts_unusable", why: agg.why ?? "收据矛盾或读不出" };
+  }
+  const endpointIds = [...new Set(agg.endpoints.filter((e) => e.initDone === true).map((e) => e.endpointId))].sort();
+  if (endpointIds.length === 0) {
+    return { ok: false, reason: "no_initialized_endpoints", why: "无受验已初始化 endpoint" };
+  }
+
+  const hits = [];
+  for (const ep of endpointIds) {
+    const l = loadByEndpoint(ep, { env });
+    if (!l.ok) {
+      return { ok: false, reason: "endpoint_ledger_unreadable", why: "endpoint " + ep + " 账本读不出（" + (l.why ?? l.granular ?? l.reason) + "）" };
+    }
+    const rec = l.doc.records[targetId];
+    if (rec && rec.kind === "live") {
+      hits.push({ endpointId: ep, doc: l.doc, rec });
+    }
+  }
+
+  if (hits.length === 0) {
+    return { ok: false, reason: "target_not_found", why: "账本里找不到 live 记录 " + targetId };
+  }
+  if (hits.length > 1) {
+    return { ok: false, reason: "multiple_targets_found", count: hits.length, why: "目标 " + targetId + " 在多个账本中命中（数量：" + hits.length + "）" };
+  }
+  return { ok: true, hit: hits[0] };
+}
+
+export function loadAndVerifyTemplate({ doc, rec, env = process.env }) {
+  const chain = doc.chain;
+  let tplRes;
+  if (chain === "claude") {
+    tplRes = loadChainTemplate(undefined, env);
+  } else if (chain === "codex") {
+    tplRes = loadCodexTemplate();
+  } else {
+    return { ok: false, reason: "unknown_chain", why: "未知账本 chain（" + String(chain) + "）" };
+  }
+  if (!tplRes || !tplRes.ok) {
+    return { ok: false, reason: "template_unreadable", why: "链路模板读不出：" + (tplRes?.reason ?? "不可用") };
+  }
+  const template = tplRes.template;
+  if (template.chain !== chain) {
+    return { ok: false, reason: "chain_mismatch", why: "模板 chain（" + template.chain + "）与账本 chain（" + chain + "）不一致" };
+  }
+  if (template.chat_id !== rec.chat_id) {
+    return { ok: false, reason: "chat_mismatch", why: "模板 chat_id（" + template.chat_id + "）与记录 chat_id（" + rec.chat_id + "）不一致" };
+  }
+  const expectedEndpoint = legacyEndpointId({ runtime: chain, agentUid: template.agent_uid });
+  if (expectedEndpoint !== doc.endpoint_id) {
+    return { ok: false, reason: "endpoint_mismatch", why: "模板 agent_uid 重算 endpoint（" + expectedEndpoint + "）与账本 endpoint_id（" + doc.endpoint_id + "）不一致" };
+  }
+  const authorizedOwner = template.frank_sender_id;
+  if (typeof authorizedOwner !== "string" || !/^[0-9]+$/u.test(authorizedOwner)) {
+    return { ok: false, reason: "bad_frank_sender_id", why: "模板 frank_sender_id 形状不对" };
+  }
+  return { ok: true, template, authorizedOwner };
 }
 
 function main() {
-  const argv = process.argv.slice(2);
-  const apply = argv.includes("--apply");
-  const positional = argv.filter((a) => !a.startsWith("--"));
-  if (positional.length !== 1) fail("用法：node scripts/feishu-reaffirm-issue.mjs <target_id> [--apply]");
-  const targetId = positional[0];
-  if (!ID_SHAPE.test(targetId)) fail("target_id 形状不对（须 ta_+32hex）：" + targetId);
+  const parsed = parseIssueArgs(process.argv.slice(2));
+  if (!parsed.ok) fail(parsed.reason, 2);
 
-  const hit = findTarget({ targetId, env: process.env });
-  if (!hit) fail("账本里找不到 live 记录 " + targetId);
-  const { endpointId, doc, rec } = hit;
+  const found = findTarget({ targetId: parsed.targetId, env: process.env });
+  if (!found.ok) fail(found.why ?? found.reason, 1);
+  const { endpointId, doc, rec } = found.hit;
+
   const fam = familyOf(rec.facts);
   if (!REAFFIRM_TARGET_FAMILIES.includes(fam)) fail("family " + String(fam) + " 不在 reaffirm 范围（只对 B3/B3'/B4/A3/A4）");
-  const digest = ownerSelectReaffirmClosureDigest(doc, targetId);
 
-  if (!apply) {
+  const tplVer = loadAndVerifyTemplate({ doc, rec, env: process.env });
+  if (!tplVer.ok) fail(tplVer.why ?? tplVer.reason, 1);
+
+  if (!parsed.apply) {
     console.log("reaffirm 签发预览（零写；加 --apply 才签发）");
-    console.log("  endpoint : " + endpointId);
-    console.log("  target   : " + targetId);
+    console.log("  target   : " + parsed.targetId);
     console.log("  family   : " + fam);
-    console.log("  chat_id  : " + rec.chat_id);
-    console.log("  session  : " + String(rec.aliases.session_id));
-    console.log("  root_om  : " + String(rec.aliases.root_om));
-    console.log("  expected_old_proof_closure_digest : " + digest);
+    console.log("  有效期   : 15 分钟（签发后）");
     console.log("");
-    console.log("签发后会在对应话题消费；消费时记录再变动会拒（digest CAS / family 核）。");
+    console.log("签发后需在对应话题发送 /feishu-select <rfh_…> 确认。");
     return;
   }
 
-  const tpl = loadChainTemplate();
-  if (!tpl.ok) fail("链路模板读不出（frank_sender_id 是消费时 sender 核验的依据）：" + (tpl.reason ?? "?"));
-  const issued = issueReaffirmIntent({ endpointId, targetId, authorizedOwner: tpl.template.frank_sender_id, chatId: rec.chat_id, env: process.env });
+  const issued = issueReaffirmIntent({
+    endpointId,
+    targetId: parsed.targetId,
+    authorizedOwner: tplVer.authorizedOwner,
+    chatId: rec.chat_id,
+    env: process.env,
+  });
   if (!issued.ok) fail("签发被拒：" + issued.reason + (issued.why ? "（" + issued.why + "）" : ""));
   if (issued.cleaned_count > 0) console.log("  已受验清理该 target 的过期 intent：" + issued.cleaned_count + " 条");
   console.log("已签发 reaffirm intent：");

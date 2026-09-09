@@ -41837,7 +41837,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 // ─────────────────────────── R57b：reaffirm intent store + owner_select_reaffirm（§8.1 / §6 / §12） ───────────────────────────
 
 {
-  const EP57B = "endpoint_" + "8".repeat(24);
+  const EP57B = legacyEndpointId({ runtime: "claude", agentUid: "agent_b" });
   const T0B = Date.parse("2026-09-11T09:00:00.000Z");
   const ISO0B = "2026-09-11T09:00:00.000Z";
   const TGTB = (n) => ({ runtime: "claude", project_root: "/p/r57b", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
@@ -42630,34 +42630,167 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
   // ── D. 终端签发命令 scripts/feishu-reaffirm-issue.mjs（预览零写；--apply 才写）──
 
-  test("R57b 终端命令：预览零写（不落 intent 文件、退出 0、打印 digest/族）；--apply 写 intent 并打印 rfh_；未知 target 非零退出", () => withLedgerB((root, dir) => {
+  test("R57b 返修一 P1-6/P2 终端命令：收据聚合+模板四核+CLI矩阵封闭+最小披露；--apply 写 intent 并打印 rfh_", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_cli", 53, "sess-b-53");
+    const maintDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "maint-r57b-")));
     const tplFile = path.join(root, "chain.json");
-    // frank_sender_id 形状 = 纯数字（chain-template SHAPE），正是消费时 sender 核验的 authorized_owner。
-    fs.writeFileSync(tplFile, JSON.stringify({ chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "5730000000000000001", chat_name: "群", chat_id: "oc_r57b", default_freshness_ms: 900000, agent_uid: "agent_b" }));
-    const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "feishu-reaffirm-issue.mjs"), ...args], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_LEDGER_DIR: root, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
-    // 预览：退出 0、零写
-    let r = run([b3]);
-    assert.equal(r.status, 0, "预览退出 0：" + r.stdout + r.stderr);
-    assert.equal(readIntentsB(dir), null, "预览零写");
-    assert.match(r.stdout, /B3/u, "打印族");
-    assert.match(r.stdout, /[0-9a-f]{64}/u, "打印 expected_old_proof_closure_digest");
-    // --apply：写 intent、打印 rfh_ 与下一步
-    r = run([b3, "--apply"]);
-    assert.equal(r.status, 0, r.stdout + r.stderr);
-    const doc = readIntentsB(dir);
-    assert.ok(doc, "--apply 落 intent 文件");
-    const handle = Object.keys(doc.entries)[0];
-    assert.match(handle, /^rfh_[0-9a-f]{32}$/u);
-    assert.match(r.stdout, new RegExp(handle, "u"), "打印 rfh_ 供 owner 在话题里 /feishu-select");
-    assert.match(r.stdout, /feishu-select/u, "打印下一步");
-    // 已有未清 intent 再 --apply → 干净拒绝（退出 1）
-    r = run([b3, "--apply"]);
-    assert.equal(r.status, 1, "已有未清 intent → 退出 1");
-    assert.match(r.stderr || r.stdout, /reaffirm_intent_exists|未清/u);
-    // 未知 target → 非零退出
-    r = run(["ta_" + "e".repeat(32)]);
-    assert.notEqual(r.status, 0, "未知 target 非零退出");
+    const writeTpl = (over = {}) => {
+      fs.writeFileSync(tplFile, JSON.stringify({
+        chain: "claude",
+        transport_agent_name: "T",
+        transport_app_id: "cli_x",
+        transport_open_id: "ou_t",
+        outbound_agent_name: "O",
+        outbound_app_id: "cli_y",
+        outbound_open_id: "ou_o",
+        lark_cli_profile: "claude",
+        lark_cli_bin: "/bin/lark",
+        lark_cli_home: "/home/lark",
+        frank_sender_id: "5730000000000000001",
+        chat_name: "群",
+        chat_id: "oc_r57b",
+        default_freshness_ms: 900000,
+        agent_uid: "agent_b",
+        ...over,
+      }));
+    };
+    writeTpl();
+
+    const mkDoneInitJournal = (tok, ep) => {
+      const ats = "2026-09-11T09:00:00.000Z";
+      const sha = "b".repeat(64);
+      const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+      const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+      const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+      const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+      const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: ats, chain: null });
+      const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+      const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+      return {
+        schema_version: "1.2",
+        operation_kind: "ledger_init",
+        token: tok,
+        reason: "test init",
+        started_at: ats,
+        updated_at: ats,
+        phase: "done",
+        steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep],
+        notes: [],
+      };
+    };
+
+    const tok1 = "00000000-0000-4000-8000-000000000001";
+    fs.writeFileSync(path.join(maintDir, tok1 + ".json"), JSON.stringify(mkDoneInitJournal(tok1, EP57B)));
+
+    const run = (args, envOver = {}) => spawnSync(process.execPath, [path.resolve("scripts", "feishu-reaffirm-issue.mjs"), ...args], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        FEISHU_BRIDGE_LEDGER_DIR: root,
+        FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+        FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile,
+        ...envOver,
+      },
+    });
+
+    try {
+      // 1. 预览：退出 0、零写、最小披露（不泄露 session / root_om / chat_id / digest）
+      let r = run([b3]);
+      assert.equal(r.status, 0, "预览退出 0：" + r.stdout + r.stderr);
+      assert.equal(readIntentsB(dir), null, "预览零写");
+      assert.match(r.stdout, /B3/u, "打印族");
+      assert.match(r.stdout, /15 分钟/u, "打印有效期");
+      assert.doesNotMatch(r.stdout, /[0-9a-f]{64}/u, "最小披露：不泄露 digest");
+      assert.doesNotMatch(r.stdout, /sess-b-53/u, "最小披露：不泄露 session_id");
+      assert.doesNotMatch(r.stdout, /om_rb53/u, "最小披露：不泄露 root_om");
+      assert.doesNotMatch(r.stdout, /oc_r57b/u, "最小披露：不泄露 chat_id");
+
+      // 2. --apply：写 intent、打印 rfh_ 与下一步
+      r = run([b3, "--apply"]);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      const doc = readIntentsB(dir);
+      assert.ok(doc, "--apply 落 intent 文件");
+      const handle = Object.keys(doc.entries)[0];
+      assert.match(handle, /^rfh_[0-9a-f]{32}$/u);
+      assert.match(r.stdout, new RegExp(handle, "u"), "打印 rfh_ 供 owner 在话题里 /feishu-select");
+      assert.match(r.stdout, /feishu-select/u, "打印下一步");
+
+      // 3. 已有未清 intent 再 --apply → 干净拒绝（退出 1）
+      r = run([b3, "--apply"]);
+      assert.equal(r.status, 1, "已有未清 intent → 退出 1");
+      assert.match(r.stderr || r.stdout, /reaffirm_intent_exists|未清/u);
+
+      // 4. 未知 target → 退出 1
+      r = run(["ta_" + "e".repeat(32)]);
+      assert.equal(r.status, 1, "未知 target 退出 1");
+      assert.match(r.stderr, /找不到 live 记录/u);
+
+      // 5. P2 CLI 参数矩阵封闭：退出码 2
+      r = run([b3, "--apply", "--apply"]);
+      assert.equal(r.status, 2, "重复 --apply 退出 2");
+      assert.match(r.stderr, /重复的 --apply/u);
+
+      r = run([b3, "--bogus"]);
+      assert.equal(r.status, 2, "未知参数退出 2");
+      assert.match(r.stderr, /未知参数/u);
+
+      r = run(["bad_target_id"]);
+      assert.equal(r.status, 2, "非法 target_id 形状退出 2");
+      assert.match(r.stderr, /target_id 形状不对/u);
+
+      r = run([]);
+      assert.equal(r.status, 2, "缺参退出 2");
+      assert.match(r.stderr, /用法：/u);
+
+      // 6. P1-6 模板四核反例（chain / chat / endpoint / bad owner）→ 退出 1
+      writeTpl({ chain: "codex" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "chain 不符 → 退出 1");
+      assert.match(r.stderr, /chain.*不一致/u);
+
+      writeTpl({ chat_id: "oc_mismatch" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "chat_id 不符 → 退出 1");
+      assert.match(r.stderr, /chat_id.*不一致/u);
+
+      writeTpl({ agent_uid: "agent_wrong" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "endpoint 不符 → 退出 1");
+      assert.match(r.stderr, /endpoint.*不一致/u);
+
+      writeTpl({ frank_sender_id: "not_a_number" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "bad frank_sender_id → 退出 1");
+      assert.match(r.stderr, /frank_sender_id|链路模板/u);
+
+      writeTpl(); // 恢复正确模板
+
+      // 7. P1-6 收据矛盾（duplicate init）→ 退出 1 fail-closed
+      const dupTok = "00000000-0000-4000-8000-000000000002";
+      fs.writeFileSync(path.join(maintDir, dupTok + ".json"), JSON.stringify(mkDoneInitJournal(dupTok, EP57B)));
+      r = run([b3]);
+      assert.equal(r.status, 1, "收据矛盾 → 退出 1");
+      assert.match(r.stderr, /收据矛盾/u);
+      fs.unlinkSync(path.join(maintDir, dupTok + ".json"));
+
+      // 8. P1-6 目标在多个账本中命中 → 退出 1，只报数量
+      const EP57B_2 = legacyEndpointId({ runtime: "claude", agentUid: "agent_b2" });
+      const dir2 = path.join(root, EP57B_2);
+      fs.mkdirSync(dir2, { recursive: true, mode: 0o700 });
+      // 复制一份含相同 target b3 的 live 账本
+      const doc2 = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+      doc2.endpoint_id = EP57B_2;
+      fs.writeFileSync(path.join(dir2, "ledger.json"), JSON.stringify(doc2, null, 2) + "\n", { mode: 0o600 });
+      const tok2 = "00000000-0000-4000-8000-000000000003";
+      fs.writeFileSync(path.join(maintDir, tok2 + ".json"), JSON.stringify(mkDoneInitJournal(tok2, EP57B_2)));
+
+      r = run([b3]);
+      assert.equal(r.status, 1, "多账本命中 → 退出 1");
+      assert.match(r.stderr, /多个账本中命中.*数量：2/u);
+      assert.doesNotMatch(r.stderr, new RegExp(EP57B_2, "u"), "只报数量不泄露其他账本 endpoint 详情");
+    } finally {
+      fs.rmSync(maintDir, { recursive: true, force: true });
+    }
   }));
 
 }

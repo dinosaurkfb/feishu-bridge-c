@@ -8,6 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
+// 两套件共用一份注册器（R59）：async 用例拒绝、汇总/退出码一致都在那里
+import { createTestHarness, installUnhandledRejectionGuard } from "../test-harness.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -168,34 +170,13 @@ const TEMPLATE = {
   chat_name: "test", chat_id: "oc_test", default_freshness_ms: 900000,
   agent_uid: "agent_test", bridge_root: ROOT, inbound_prefix: null,
 };
-let passed = 0;
-let failed = 0;
-/**
- * `TEST_FILTER` —— 与 Claude 侧 test.mjs 同一机制（逗号分隔子串，命中任一即跑），
- * 设计理由与退出码约定全在那一侧写清：未设置时一个分支都走走不到，0 命中走退出码 2。
- */
-const TEST_FILTER = (process.env.TEST_FILTER ?? "").split(",")
-  .map((s) => s.trim()).filter((s) => s.length > 0);
-let registered = 0;   // 注册进来的条数（含被过滤掉的）
-let executed = 0;     // 命中并真的跑的
-/**
- * 汇总打印之后就封条 —— 与 Claude 侧 test.mjs 同一条保障，理由也相同：
- * 把新测试追加到文件末尾时，它的结果不会计入统计，而套件照样报绿。
- * Claude 侧 2026-08-23 真实发生过一次，一口气三条从未生效。
- */
-let summarySealed = false;
-const test = (name, fn) => {
-  if (summarySealed) {
-    console.error("\n✗ 测试「" + name + "」写在汇总之后 —— 它的结果不会计入统计。");
-    process.exit(1);
-  }
-  registered += 1;
-  // 没命中的不调用 fn()：被跳过的测试不许留下副作用。
-  if (TEST_FILTER.length > 0 && !TEST_FILTER.some((needle) => name.includes(needle))) return;
-  executed += 1;
-  try { fn(); passed += 1; }
-  catch (err) { failed += 1; console.error("FAIL " + name + "\n" + (err.stack ?? err)); }
-};
+// ── 测试注册器：与 scripts/test.mjs 共用一份（R59，scripts/test-harness.mjs）──
+// async 用例拒绝、汇总/退出码一致、TEST_FILTER 语义都在共用侧；失败呈现的差异留在这一侧：
+// 当场打 FAIL + 完整栈（Claude 侧是记清单、汇总后统一打）。
+const { test, sealSummary, printSummary, TEST_FILTER } = createTestHarness({
+  onFail: (name, err) => { console.error("FAIL " + name + "\n" + (err.stack ?? err)); },
+});
+installUnhandledRejectionGuard();
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
 
 /**
@@ -3340,7 +3321,7 @@ test("Codex 测试文件里没有写在汇总之后的 test()", () => {
   // 这条从结构上兜住，两层各覆盖一种情形。
   const src = fs.readFileSync(path.resolve(ROOT, "scripts", "codex", "test.mjs"), "utf-8")
     .split("\n");
-  const sealAt = src.findIndex((line) => line.startsWith("summarySealed = true;"));
+  const sealAt = src.findIndex((line) => line.startsWith("sealSummary();"));
   assert.ok(sealAt > 0, "找不到封条那一行 —— 它被改名或删掉了，本检查会失效");
   const late = [];
   for (let i = sealAt + 1; i < src.length; i += 1) {
@@ -10393,16 +10374,5 @@ test("R52a 返修四 P2: Codex 侧 repair 消费者显式按 kind 穷举（contr
   assert.equal(selRes.reason, "select_off");
 });
 
-summarySealed = true;
-console.log("Codex adapter 通过 " + passed + " / 失败 " + failed);
-if (TEST_FILTER.length > 0) {
-  console.log("TEST_FILTER 命中 " + executed + " / 总 " + registered
-    + "（子串：" + TEST_FILTER.join(" | ") + "）—— 这不是全量，不许当全量绿");
-}
-if (failed > 0) process.exit(1);
-// 0 命中走退出码 2（跟 Claude 侧同一约定）：1 = 有测试红，runner 那边读成 KILLED；
-// 2 = 过滤器没挑中任何东西，不能当成"没红所以升级全量"。
-if (TEST_FILTER.length > 0 && executed === 0) {
-  console.log("  ✗ 一个测试名都没命中 —— 跑了 0 项不等于全绿（退出码 2 只说这一件事）");
-  process.exit(2);
-}
+sealSummary();
+printSummary({ suiteLabel: "Codex adapter" });

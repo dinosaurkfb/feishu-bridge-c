@@ -38998,6 +38998,50 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 返修五 P1-4 ②：complete 恢复支逐 endpoint 复核——complete 写后、恢复前把 endpoint 换成 1.0（非 strict）→ 拒 complete_members_drift", () => {
+    const fx = r53SetupB({});
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.endsWith(":complete")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "complete 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      fx.ctx.afterWrite = null;
+      // 恢复前：把一个 endpoint 换成 1.0（schema 非 strict）——complete 恢复支逐 endpoint 复核必拒。
+      const ep = fx.eps[0];
+      const doc = r52Doc10(ep, []);
+      fs.writeFileSync(path.join(fx.ledgerRoot, ep, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "complete 恢复支现场被改必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "complete_members_drift", "拒因：" + r.reason);
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修五 P1-4 ③：B/direct 撤门核最终 schema step.after —— B（无 mint）撤门前把 schema_endpoint 的 after.ledger_sha256 改成另一个合法 SHA（现场不变）→ reopening_incomplete（改前不核）", () => {
+    const fx = r53SetupB({ crashAfter: 15 }); // on done 后崩（forward 未 setPhase(ledger_reopening)）
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "on 后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // 改 schema_endpoint step 的 after + intended_after 的 ledger_sha256（都改成另一合法 SHA，保持 after===intended_after 才过 journal）
+      //   → 现场账本 SHA ≠ 预期 → reopening_incomplete（改前无 mint 不核）。
+      const j = readJournal({ dir: fx.dir, token: act.token });
+      const jd = JSON.parse(JSON.stringify(j.doc));
+      const se = jd.steps.find((s) => s.kind === "schema_endpoint");
+      se.after.ledger_sha256 = "0".repeat(64);
+      se.intended_after.ledger_sha256 = "0".repeat(64);
+      fs.writeFileSync(path.join(fx.dir, act.token + ".json"), JSON.stringify(jd, null, 2) + "\n", { mode: 0o600 });
+      const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.ok(ex.ok === false, "预期 SHA 与现场不符 → 撤门复盘拒：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase, incomplete: ex.incomplete }));
+      assert.equal(ex.phase, "reopening_incomplete", "phase=reopening_incomplete 实际=" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase, incomplete: ex.incomplete }));
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
     // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
     const run = (kind, ctxFn) => {

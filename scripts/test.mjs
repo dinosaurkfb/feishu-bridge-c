@@ -38779,6 +38779,70 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R53 返修四：六把刀 + campaign complete 屏障负例——B/direct 的 schema / writer on 步 failDirFsync 屏障、on 预算漂移、complete 屏障失败", () => {
+    const mkDirect = (crashAfter = null) => {
+      const fx = r52Setup({ twoEps: false, crashAfter });
+      for (const ep of fx.eps) {
+        const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+        dd.records = {};
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: [] };
+        fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+      }
+      return fx;
+    };
+    const resumeB = (fx, tok, inject) => osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: inject });
+    const crashAfterWrite = (fx, kind, pred) => { fx.ctx.afterWrite = (id) => { if (typeof id === "string" && pred(id)) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); }; let crashed = false; try { osmEnter52(fx.ctx, { kind, apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; } assert.equal(crashed, true, kind + " 写后崩"); const act = readActive({ dir: fx.dir }); releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") }); fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true }); fx.ctx.afterWrite = null; return act; };
+    // ① B schema 步 failDirFsync（恢复窗）→ 屏障拒 recovery_seal_failed、step prepared。
+    {
+      const fx = r53SetupB({});
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "B schema 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "B schema failDirFsync：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.kind === "schema_endpoint" && s.state !== "done").state, "prepared", "B schema step 不记 done");
+      } finally { fx.cleanup(); }
+    }
+    // ② direct schema 步 failDirFsync → 屏障拒、step prepared。
+    {
+      const fx = mkDirect();
+      try { const act = crashAfterWrite(fx, "direct", (id) => id.startsWith("schema_endpoint:")); const r = resumeB(fx, act.token, { failDirFsync: true }); assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "direct schema failDirFsync：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase })); assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.kind === "schema_endpoint" && s.state !== "done").state, "prepared", "direct schema step 不记 done"); } finally { fx.cleanup(); }
+    }
+    // ③ B writer on 步 failDirFsync → 屏障拒、step prepared。
+    {
+      const fx = r53SetupB({});
+      try { const act = crashAfterWrite(fx, "b", (id) => id.startsWith("writer_state:")); const r = resumeB(fx, act.token, { failDirFsync: true }); assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "B on failDirFsync：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase })); assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.kind === "writer_state" && s.state !== "done").state, "prepared", "B on step 不记 done"); } finally { fx.cleanup(); }
+    }
+    // ④ direct writer on 步 failDirFsync → 屏障拒、step prepared。
+    {
+      const fx = mkDirect();
+      try { const act = crashAfterWrite(fx, "direct", (id) => id.startsWith("writer_state:")); const r = resumeB(fx, act.token, { failDirFsync: true }); assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "direct on failDirFsync：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase })); assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.kind === "writer_state" && s.state !== "done").state, "prepared", "direct on step 不记 done"); } finally { fx.cleanup(); }
+    }
+    // ⑤ B on 预算漂移：篡改 journal 的 on intended_after.sha256 → writer_budget_drift、不写 on、step prepared。
+    {
+      const fx = r53SetupB({ crashAfter: 14 }); // complete done 后崩（on prepared）
+      try { let crashed = false; try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (e) { crashed = e?.simulatedCrash === true; } assert.equal(crashed, true); const act = readActive({ dir: fx.dir }); releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") }); fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true }); const tok = act.token; const j = readJournal({ dir: fx.dir, token: tok }); const ws = j.doc.steps.find((s) => s.kind === "writer_state"); ws.intended_after.sha256 = r52Sha("9"); fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(j.doc, null, 2) + "\n", { mode: 0o600 }); const r = resumeB(fx, tok, {}); assert.ok(r.ok === false && r.reason === "writer_budget_drift", "B on 预算漂移：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase })); assert.equal(readJournal({ dir: fx.dir, token: tok }).doc.steps.find((s) => s.kind === "writer_state").state, "prepared", "B on step 不写不记 done"); } finally { fx.cleanup(); }
+    }
+    // ⑥ direct on 预算漂移 → writer_budget_drift（crashAfter 13 = complete done，on prepared）。
+    {
+      const fx = mkDirect(13);
+      try { let crashed = false; try { osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env }); } catch (e) { crashed = e?.simulatedCrash === true; } assert.equal(crashed, true); const act = readActive({ dir: fx.dir }); releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") }); fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true }); const tok = act.token; const j = readJournal({ dir: fx.dir, token: tok }); const ws = j.doc.steps.find((s) => s.kind === "writer_state"); ws.intended_after.sha256 = r52Sha("9"); fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(j.doc, null, 2) + "\n", { mode: 0o600 }); const r = resumeB(fx, tok, {}); assert.ok(r.ok === false && r.reason === "writer_budget_drift", "direct on 预算漂移：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase })); } finally { fx.cleanup(); }
+    }
+    // ⑦ B campaign complete 步 failDirFsync（恢复窗）→ 屏障拒、complete step prepared。
+    {
+      const fx = r53SetupB({});
+      try { const act = crashAfterWrite(fx, "b", (id) => id.endsWith(":complete")); const r = resumeB(fx, act.token, { failDirFsync: true }); assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "B complete failDirFsync：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase })); assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.id.endsWith(":complete")).state, "prepared", "B complete step 不记 done"); } finally { fx.cleanup(); }
+    }
+  });
+
   test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
     // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
     const run = (kind, ctxFn) => {

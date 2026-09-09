@@ -687,6 +687,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.1-transition", toSchema: "1.1", env, _inject });
           const sc = stepCommitCheck(r, "ledger");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id);
         }
         const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: LEDGER_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -715,6 +716,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
         const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -741,6 +743,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
         const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -807,6 +810,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1", env, _inject });
           const sc = stepCommitCheck(r, "ledger");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
         const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: LEDGER_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -833,6 +837,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
         const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -860,6 +865,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
         const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -885,6 +891,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
         const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };

@@ -143,6 +143,8 @@ const campaignAllowedFor = (frozen) => (name, st) => {
   const isDir = st.isDirectory() && !st.isSymbolicLink();
   return (isDir && (frozen ?? []).includes(name)) || (isFile && (name === "owner-select-campaign.json" || name === "owner-select-writer-state.json"));
 };
+/** 返修五追加：ledger 目录允许制品 = 普通文件 ∧ 非 symlink（只认 ledger.json / ledger.json.prev，同名 symlink 一律残骸）。 */
+const ledgerAllowed = (name, st) => !!st && st.isFile() && !st.isSymbolicLink() && (name === "ledger.json" || name === "ledger.json.prev");
 
 function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed = null, inject = null }) {
   __sealCalls++;
@@ -524,7 +526,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           targetDir: d.dir,
           readVerified: () => { const a = loadLedger(d.dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { schema_version: a.doc.schema_version, revision: a.doc.revision, ledger_sha256: a.sha256 } : {} }; },
           intended: st.intended_after,
-          residueAllowed: (n) => n === "ledger.json" || n === "ledger.json.prev",
+          residueAllowed: ledgerAllowed,
           inject: _inject,
         });
         if (!s.ok) return { ok: false, reason: schemaAtIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -567,7 +569,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           targetDir: dd.dir,
           readVerified: () => { const a = loadLedger(dd.dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { revision: a.doc.revision, null_b1_count: migrationInventory(a.doc).null_b1_count, ledger_sha256: a.sha256 } : {} }; },
           intended: ia,
-          residueAllowed: (n) => n === "ledger.json" || n === "ledger.json.prev",
+          residueAllowed: ledgerAllowed,
           inject: _inject,
         });
         if (!s.ok) return { ok: false, reason: mintAtIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };

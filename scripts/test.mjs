@@ -38261,6 +38261,29 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     run((fx) => { fs.mkdirSync(path.join(fx.ledgerRoot, "endpoint_" + "b".repeat(24)), { recursive: true, mode: 0o700 }); });
   });
 
+  test("R52 返修五追加：ledger 允许清单核（普通文件 ∧ 非 symlink）——ledger 目录放同名 symlink → 屏障拒、step 不记 done", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "schema 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // ledger 目录放一个名为 ledger.json.prev 的 symlink（先把既有真实 .prev 移除）→ ledgerAllowed 必须拒。
+      const ep = fx.eps[0];
+      fs.rmSync(path.join(fx.ledgerRoot, ep, "ledger.json.prev"), { force: true });
+      fs.symlinkSync("/nonexistent", path.join(fx.ledgerRoot, ep, "ledger.json.prev"));
+      fx.ctx.afterWrite = null;
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "ledger 同名 symlink 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "recovery_seal_failed", "ledger 同名 symlink → recovery_seal_failed");
+      const j = readJournal({ dir: fx.dir, token: act.token });
+      assert.equal(j.doc.steps.find((s) => s.kind === "schema_endpoint" && s.state !== "done").state, "prepared", "schema step 不记 done（ledger 同名 symlink）");
+    } finally { fx.cleanup(); }
+  });
+
   test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
     // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
     {
@@ -38486,7 +38509,6 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.expected_ledger_sha256 = r52Sha("a"); });
         const dfx = r52DrainedFixture({ fx, tok });
         const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
-        process.stderr.write("R52D " + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase }) + "\n");
         assert.ok(r.ok === false, "重演算不符拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
         assert.equal(r.reason, "mint_plan_mismatch", "重演算不符拒");
       } finally { fx.cleanup(); }
@@ -38504,7 +38526,6 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
         for (const rec of Object.values(d.records)) if (rec.kind === "live") { rec.selection_handle = null; rec.handle_expires_at = null; rec.rebind_handle = null; rec.rebind_expires_at = null; }
         fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
         const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
-        process.stderr.write("R52D " + JSON.stringify({ ok: r.ok, reason: r.reason, rollback: r.rollback }) + "\n");
         assert.equal(r.ok, false, "账本非 1.0 拒");
         assert.equal(r.reason, "schema_not_old", "schema_not_old 拒：" + r.reason);
         assert.ok(r.rollback && r.rollback.ok === true, "回退清场");

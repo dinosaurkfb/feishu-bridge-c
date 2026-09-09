@@ -40649,10 +40649,14 @@ test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不�
   assert.equal(kept.target_channel_generation_id, "gen-9", "记录冻结出站代际");
   assert.equal(kept.published_at, null);
   assert.ok(isCanonicalIso(kept.publish_eligible_at), "born eligible（预授权的失败回执自动写入）");
-  // 路径型 key 拒在写入之前（文件名要拿 key 派生路径）
-  const esc = r58AppendReceipt({ outboxDir: dir, forwardKey: "../escape", reasonFirstLine: "x", messageId: "m", targetGenerationId: null });
+  // 路径型 key 拒在写入之前（文件名要拿 key 派生路径）。用本测试专属 mkdtemp 父目录做断言（P2 密闭）：
+  // 旧写法断言 path.join(dir, "..", ...) 落在共享 tmp 根，别的运行留下同名文件就假红。
+  const escParent = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58w-esc-"));
+  const escOutbox = path.join(escParent, "outbox");
+  fs.mkdirSync(escOutbox, { recursive: true });
+  const esc = r58AppendReceipt({ outboxDir: escOutbox, forwardKey: "../escape", reasonFirstLine: "x", messageId: "m", targetGenerationId: null });
   assert.deepEqual([esc.ok, esc.reason], [false, "key_shape"], JSON.stringify(esc));
-  assert.equal(fs.existsSync(path.join(dir, "..", "escape" + R58_RECEIPT_SUFFIX)), false, "没有越界文件");
+  assert.equal(fs.existsSync(path.join(escParent, "escape" + R58_RECEIPT_SUFFIX)), false, "没有越界文件");
   // 代际不可用 → null（写不出「字段在但不是代际」的损坏记录）；message_id 缺席 → null
   const w3 = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(10), reasonFirstLine: "x", messageId: "", targetGenerationId: "   " });
   assert.equal(w3.ok, true, JSON.stringify(w3));

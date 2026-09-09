@@ -157,12 +157,23 @@ export function readControlFailedRecord({ claimsDir, key }) {
   return problem ? { status: "unreadable", why: problem } : { status: "valid", record: r.doc };
 }
 
+const UNCLEAN_DETAIL_KEYS = "action,ledger,ledger_reason,legacy,plan_ref,request_key,target_id";
+const UNCLEAN_LEGACY_VALUES = Object.freeze(["committed", "not_committed", "unknown"]);
+const UNCLEAN_LEDGER_VALUES = Object.freeze(["committed", "not_committed", "unknown"]);
+
 export function controlCommittedUncleanRecordProblem(doc, key) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "doc 不是对象";
   if (doc.schema_version !== "1.0") return "schema_version 不认识";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (doc.state !== "control-committed-unclean") return "state 不是 control-committed-unclean";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
+  // P1-5a：持久证据的 detail 联合封闭 —— 键集 + 枚举值，缺一 → 拒读为 unreadable。
+  const d = doc.detail;
+  if (d === null || typeof d !== "object" || Array.isArray(d)) return "detail 不是对象";
+  if (Object.keys(d).sort().join(",") !== UNCLEAN_DETAIL_KEYS) return "detail 键集不对（须 " + UNCLEAN_DETAIL_KEYS + "）";
+  if (!UNCLEAN_LEGACY_VALUES.includes(d.legacy)) return "detail.legacy 枚举不在 committed/not_committed/unknown";
+  if (!UNCLEAN_LEDGER_VALUES.includes(d.ledger)) return "detail.ledger 枚举不在 committed/not_committed/unknown";
+  if (typeof d.ledger_reason !== "string") return "detail.ledger_reason 不是字符串";
   return null;
 }
 export function readControlCommittedUncleanRecord({ claimsDir, key }) {
@@ -413,6 +424,8 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
               locks: done.locks ?? null,
               changed: done.changed ?? false,
               result: done.result ?? null,
+              // P1-5a：持久化结构化持久证据（legacy / ledger / action / target_id / request_key / plan_ref / ledger_reason）。
+              detail: done.detail ?? null,
             },
           });
         } catch (err) {
@@ -435,6 +448,23 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
       : { control: intent.control, mode: intent.mode, changed };
     recordClaimState({ claimsDir, key, state: "consumed", detail });
   } catch (err) {
+    // P1-5b：select 支的 wiring 已确认 legacy+ledger 都提交（done.status === consumed），终态记录写失败
+    //   不是「未执行」—— 而是 control-committed-unclean（detail.legacy/ledger=committed，why=终态记录写失败），
+    //   回执按 unclean 口径，记录可被 repair 读到。
+    if (intent.control === "select" && done.ok === true && done.status === "consumed") {
+      const ucDetail = done.detail ?? { legacy: "committed", ledger: "committed", action: done.action ?? null, target_id: null, request_key: null, plan_ref: null, ledger_reason: "终态记录写失败" };
+      return {
+        ok: false,
+        status: "control-committed-unclean",
+        reason: "control_committed_unclean",
+        why: "终态记录写失败（legacy 与 ledger 均已提交）：" + String(err?.code ?? err?.message ?? err),
+        detail: ucDetail,
+        ledger: "committed",
+        intent_cleanup: "unclear",
+        locks: done.locks ?? null,
+        quarantined,
+      };
+    }
     return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, resumed: replay, quarantined };
   }
   const cleaned = cleanupConsumedResidue({ claimsDir, key });

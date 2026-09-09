@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem, readControlCommittedUncleanRecord } from "./control-command.mjs";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -44008,6 +44008,33 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
     const inspected = inspectControlClaim({ claimsDir, key });
     assert.equal(inspected.state, "control-committed-unclean", "inspectControlClaim 识别 control-committed-unclean");
+
+    // ① P1-5a：校验器封闭 detail 联合 —— 缺 legacy/键 → unreadable；完整结构化 detail → valid
+    const keyA = "a" + "b".repeat(63);
+    const goodRec = { schema_version: "1.0", claim_key: keyA, state: "control-committed-unclean", recorded_at: "2026-09-13T09:00:00.000Z", detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "b1_x", request_key: "rkx", plan_ref: "shax", ledger_reason: "ledger skip" } };
+    const badRec = { ...goodRec, detail: { ledger: "not_committed" } };
+    const uf = path.join(claimsDir, keyA + ".control-committed-unclean.json");
+    fs.writeFileSync(uf, JSON.stringify(goodRec));
+    assert.equal(readControlCommittedUncleanRecord({ claimsDir, key: keyA }).status, "valid", "完整 detail 应 valid");
+    fs.writeFileSync(uf, JSON.stringify(badRec));
+    assert.equal(readControlCommittedUncleanRecord({ claimsDir, key: keyA }).status, "unreadable", "detail 缺键/缺枚举 → unreadable");
+    fs.rmSync(uf, { force: true });
+
+    // ② P1-5b：consumed 写失败（key.consumed.json 提前建目录）→ control-committed-unclean，回执不说「未执行」
+    const claimsDir5 = path.join(claimsDir, "p15b-sub");
+    fs.mkdirSync(claimsDir5, { recursive: true, mode: 0o700 });
+    const h5 = "osh_" + "2".repeat(32);
+    const ctx5 = { endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: "om_p15b", session: "sess-p15b", handle: h5, kind: "osh" };
+    const acq5 = acquireClaim({ claimsDir: claimsDir5, messageId: "om_p15b", logicalTaskKey: "task_p15b", meta: { policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_001", control: { control: "select", handle: h5, handle_kind: "osh" }, selection_context: ctx5, selection_context_digest_v1: SA.selectionContextDigestV1(ctx5) } });
+    assert.equal(acq5.ok, true);
+    const key5 = acq5.key;
+    fs.mkdirSync(path.join(claimsDir5, key5 + ".consumed.json"), { recursive: true });
+    const tx5 = runControlTransaction({ claimsDir: claimsDir5, key: key5, intent: { control: "select", handle: h5, handle_kind: "osh" }, execute: () => ({ ok: true, status: "consumed", changed: true, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: "b1_x", request_key: "rkx", plan_ref: null, ledger_reason: "clean" } }) });
+    assert.equal(tx5.ok, false, "② consumed 写失败 → 非绿：" + JSON.stringify(tx5));
+    assert.equal(tx5.status, "control-committed-unclean", "② " + tx5.status + "（不是 ledger_unwritten/未执行）");
+    assert.match(tx5.why, /终态记录写失败/u, "② why 点名终态写失败");
+    assert.equal(tx5.detail.legacy, "committed", "② detail.legacy=committed");
+    assert.equal(tx5.detail.ledger, "committed", "② detail.ledger=committed");
 
     // 3. 反例：清 intent 失败 → 保持可恢复、intent 仍在
     const failRepair = resumeControlClaim({

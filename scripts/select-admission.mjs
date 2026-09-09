@@ -22,6 +22,7 @@ import path from "node:path";
 import { canonKey } from "./maintenance/canon.mjs";
 import { resolveSelectionCandidate } from "./select-resolve.mjs";
 import { wireSelectActivate, wireSelectAnchor, wireSelectRebind } from "./m1a/wiring.mjs";
+import { requestKeyFor } from "./m1a/dual-write.mjs";
 
 /**
  * 判定选择控制 outcome 的叶子纯函数（§8.1 / R57b / 与 R57d 返修一共用，不 import 维护编排）。
@@ -238,9 +239,19 @@ export function selectAmbiguityReceipt(doc, candidateIds) {
 /** 稳定序列化（键序递归排序）—— selection plan 的逐字比对用。 */
 const stableStringify = (v) => JSON.stringify(v, (_k, x) => (x !== null && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k2) => [k2, x[k2]])) : x));
 
+// P1-5a：selection plan 的 digest（与 selection-plan.mjs 同一约定：sha256(canonKey(plan))）。
+const planRefDigest = (plan) => (plan && typeof plan === "object") ? createHash("sha256").update(canonKey(plan)).digest("hex") : null;
+const actionOpType = (action) => (action === "anchor" ? "anchor" : action === "rebind" ? "rebind_session_alias" : "activate");
+/** P1-5a：结构化 uncleanness 证据（legacy / ledger 枚举 + action / target_id / request_key / plan_ref / ledger_reason）。
+ *  <key>.control-committed-unclean.json 持久化这份 detail，校验器按它封闭联合；repair 读到才知道走哪支。 */
+function uncleanDetail({ action, targetId, messageId, planRef, legacy, ledger, ledger_reason }) {
+  const k = requestKeyFor({ opType: actionOpType(action), externalRequestId: messageId, entityId: targetId });
+  return { legacy, ledger, action, target_id: targetId, request_key: k.ok ? k.request_key : null, plan_ref: planRef ?? null, ledger_reason };
+}
+
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
-function wiredOutcome(w, action) {
+function wiredOutcome(w, action, info = {}) {
   if (!w || typeof w !== "object") return { ok: false, status: "failed", reason: "select_op_failed", text: selectRejectTextByReason("select_op_failed") };
   if (w.ok !== true) {
     const reason = w.reason ?? "select_op_failed";
@@ -259,6 +270,7 @@ function wiredOutcome(w, action) {
     return {
       ok: false, status: "control-committed-unclean", reason: "control_committed_unclean",
       text: "已写入但收口不干净（legacy 映射已更新、账本未提交：" + ledgerWhy + "）——repair 按 plan 收尾",
+      detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "not_committed", ledger_reason: ledgerWhy }),
       ledger: "not_committed", intent_cleanup: "unclear",
       locks: { outer: w.release && w.release.ok === true ? "released" : "unclear", intent: "released" },
       why: "legacy 已成功但账本未提交（" + ledgerWhy + "），部分提交状态",
@@ -274,12 +286,13 @@ function wiredOutcome(w, action) {
     : (rel.ok === true && !rel.absent && !rel.reapUncleared ? "released" : (rel.reapUncleared ? "residue" : "unclear"));
   const outcome = classifySelectOutcome({ ledger, intentCleanup: "cleared", locks: { outer, intent: "released" } });
   if (outcome.status === "consumed") {
-    return { ok: true, status: "consumed", changed: step.idempotent !== true, action, text: selectExecutorSuccessText(action) };
+    return { ok: true, status: "consumed", changed: step.idempotent !== true, action, detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "committed", ledger_reason: "clean" }), text: selectExecutorSuccessText(action) };
   }
   if (outcome.status === "control-committed-unclean") {
     return {
       ok: false, status: "control-committed-unclean", reason: "control_committed_unclean",
       text: "已写入但收口不干净（" + String(outcome.why ?? "账本已写入但未收净") + "）",
+      detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "committed", ledger_reason: String(outcome.why ?? "") }),
       ledger: outcome.ledger, intent_cleanup: outcome.intent_cleanup, locks: outcome.locks, why: outcome.why,
     };
   }
@@ -315,6 +328,7 @@ export function executeSelectControl(intent, {
   const ej = selectReject(adm, intent?.handle_kind);
   if (ej) return { ok: false, reason: ej.reason, text: ej.text };
   const nowMs = Number.isFinite(now) ? now : clock();
+  let planRefVal = null;
   if (intent?.handle_kind === "rfh") {
     if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
       return { ok: false, status: "failed", reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
@@ -328,6 +342,7 @@ export function executeSelectControl(intent, {
         status: "control-committed-unclean",
         reason: "control_committed_unclean",
         text: "已写入但收口不干净（" + (res.why ?? "账本已写入但未收净，请联系管理员修复") + "）",
+        detail: { legacy: "committed", ledger: (res.ledger === "committed" ? "committed" : "unknown"), action: "reaffirm", target_id: res.result?.target_id ?? null, request_key: null, plan_ref: planRefVal, ledger_reason: (typeof res.why === "string" ? res.why : "") },
         ledger: res.ledger,
         intent_cleanup: res.intent_cleanup,
         locks: res.locks,
@@ -430,6 +445,7 @@ export function executeSelectControl(intent, {
           ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.anchor_candidate ?? null, expected_handle: (handle ?? target.selection_handle) ?? null, expected_expires_at: target.handle_expires_at ?? null, expected_anchor_candidate: target.anchor_candidate ?? null }
           : { new_session_id: eventSessionId ?? null, expected_old_session_id: target.aliases?.session_id ?? null, rebind_handle: (handle ?? target.rebind_handle) ?? null, expected_expires_at: target.rebind_expires_at ?? null },
     };
+    planRefVal = planRefDigest(plan);
     const prior = txCtx.claim.selection_plan;
     if (prior !== undefined) {
       if (stableStringify(prior) !== stableStringify(plan)) {
@@ -471,5 +487,5 @@ export function executeSelectControl(intent, {
   } else {
     w = wireSelectRebind({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, chatId, messageId, _inject, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
-  return wiredOutcome(w, action);
+  return wiredOutcome(w, action, { targetId: res.target_id, messageId, planRef: planRefVal });
 }

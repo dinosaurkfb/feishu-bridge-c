@@ -42437,7 +42437,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       selectAdmissionFn: () => ({ state: "partial" }),
       _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
     });
-    const uncleanRecord = { schema_version: "1.0", claim_key: "f", state: "control-committed-unclean", recorded_at: ISO0B, detail: { control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean" } };
+    const uncleanRecord = { schema_version: "1.0", claim_key: "f", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3, selection_message_id: messageId } };
     const repOK = repairControlCommittedUnclean({
       claim: mkClaim(intent.reaffirm_handle),
       claimsDir,
@@ -42467,7 +42467,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     doc.operations[realOpId].result = { ...doc.operations[realOpId].result, selection_message_id: "om_forged999" };
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     // uncleanRecord 认为本次选择的消息 = messageId；op 却是 om_forged999 → 精确绑定必须拒（不转 consumed）。
-    const uncleanB = { schema_version: "1.0", claim_key: "g", state: "control-committed-unclean", recorded_at: ISO0B, detail: { control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3b, selection_message_id: messageId } } };
+    const uncleanB = { schema_version: "1.0", claim_key: "g", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3b, selection_message_id: messageId } };
     const repForged = repairControlCommittedUnclean({
       claim: mkClaim(intentB.reaffirm_handle),
       claimsDir,
@@ -42477,6 +42477,129 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     });
     assert.equal(repForged.ok, false, "同 handle 但不同 message 的 op 不得被 loose 绑定转 consumed：" + JSON.stringify(repForged));
     assert.equal(repForged.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+  }));
+
+  test("R57b 返修三 P1-4a：repair 也走 outer → intent 锁序——outer 忙/残骸/释放失败 → 非绿、保持 committed-unclean 点名", () => withLedgerB((root, dir) => {
+    const messageId = "om_p14a";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14a", handle, kind: "rfh" });
+    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+    const mkUnclean = (handle, target) => ({ schema_version: "1.0", claim_key: "h", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: target, selection_message_id: messageId } });
+
+    const mkCommitted = (handle, target) => {
+      const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: target, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+      SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+        endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+        selectAdmissionFn: () => ({ state: "partial" }),
+        _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+      });
+      return intent.reaffirm_handle;
+    };
+
+    // ① outer 忙：预占 m1a-order.lock（持锁不释放）→ repair 必须拒、保持 committed-unclean 点名。
+    const b3 = seedB3B(dir, "r57b_p14a", 47, "sess-b-47");
+    const h1 = mkCommitted(b3, b3);
+    const orderLock = DW.acquireOrderLock(EP57B, process.env);
+    assert.equal(orderLock.ok, true, "预占 outer 锁");
+    const repBusy = repairControlCommittedUnclean({
+      claim: mkClaim(h1),
+      claimsDir: path.join(root, "claims_p14a"),
+      key: "h",
+      uncleanRecord: mkUnclean(h1, b3),
+      env: process.env,
+    });
+    assert.equal(repBusy.ok, false, "outer 忙 repair 必须拒");
+    assert.equal(repBusy.reason, "binding_busy", "reason 为 binding_busy");
+    assert.match(repBusy.why, /外层排序锁取不到/u, "点名外层锁取不到");
+    orderLock.release();
+
+    // ② outer 残骸：隔离树放一个 m1a-order.lock 残骸（目录）再跑 repair → 仍拒（旧行为：仍成功转 consumed）。
+    const b3b = seedB3B(dir, "r57b_p14ab", 48, "sess-b-48");
+    const h2 = mkCommitted(b3b, b3b);
+    fs.mkdirSync(path.join(dir, "m1a-order.lock"), { recursive: true });
+    const repResidue = repairControlCommittedUnclean({
+      claim: mkClaim(h2),
+      claimsDir: path.join(root, "claims_p14ab"),
+      key: "h",
+      uncleanRecord: mkUnclean(h2, b3b),
+      env: process.env,
+    });
+    assert.equal(repResidue.ok, false, "outer 锁残骸（目录）repair 必须拒");
+    fs.rmSync(path.join(dir, "m1a-order.lock"), { recursive: true, force: true });
+
+    // ③ outer 释放失败：内层走完、外层释放时删 m1a-order.lock → 释放报 lock_lost → 非绿。
+    const b3c = seedB3B(dir, "r57b_p14ac", 49, "sess-b-49");
+    const h3 = mkCommitted(b3c, b3c);
+    const repReleaseFail = repairControlCommittedUnclean({
+      claim: mkClaim(h3),
+      claimsDir: path.join(root, "claims_p14ac"),
+      key: "h",
+      uncleanRecord: mkUnclean(h3, b3c),
+      env: process.env,
+      _inject: { beforeRename: () => { try { fs.rmSync(path.join(dir, "m1a-order.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    assert.equal(repReleaseFail.ok, false, "outer 释放失败 repair 必须拒");
+    assert.equal(repReleaseFail.reason, "repair_outer_lock_release_unclean", "reason 为 repair_outer_lock_release_unclean");
+  }));
+
+  test("R57b 返修三 P1-4b：逐字绑定不许降级——缺 detail.result / message 不等 → ledger_commit_unverifiable；P2 两侧 request_key 派生逐字相等", () => withLedgerB((root, dir) => {
+    const messageId = "om_p14b";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14b", handle, kind: "rfh" });
+    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+
+    // P2：request_key 两侧共用同一派生函数——写入侧（ownerSelectReaffirm）与 repair 侧（ownerSelectReaffirmRequestKey）逐字相等。
+    const tgt = "ta_" + "1".repeat(32);
+    const hndl = "rfh_" + "2".repeat(32);
+    assert.equal(TAL.ownerSelectReaffirmRequestKey({ target: tgt, handle: hndl }), "osr:" + tgt + ":" + hndl, "P2 派生逐字相等（repair 侧）");
+    // 写入侧内部也走同一函数：下面消费成功后核对 op.request_key === ownerSelectReaffirmRequestKey(...)。
+
+    const b3 = seedB3B(dir, "r57b_p14b", 50, "sess-b-50");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    // 真实的 unclean record（runControlTransaction 落盘形状：result 在顶层）。
+    const realUnclean = { schema_version: "1.0", claim_key: "h", state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3, selection_message_id: messageId } };
+
+    // ① 反例：uncleanRecord 缺 result（旧代码「用缺 detail.result 越过」）→ 拒。
+    const repNoResult = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle),
+      claimsDir: path.join(root, "claims_p14b"),
+      key: "h",
+      uncleanRecord: { ...realUnclean, result: undefined },
+      env: process.env,
+    });
+    assert.equal(repNoResult.ok, false, "缺 result 必须拒");
+    assert.equal(repNoResult.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repNoResult.why, /target_id.*selection_message_id/u, "点名缺字段");
+
+    // ② 反例：selection_message_id 与 claim 的 message 不等 → 拒。
+    const repMsgMismatch = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle),
+      claimsDir: path.join(root, "claims_p14b2"),
+      key: "h",
+      uncleanRecord: { ...realUnclean, result: { target_id: b3, selection_message_id: "om_othermsg" } },
+      env: process.env,
+    });
+    assert.equal(repMsgMismatch.ok, false, "message 不等必须拒");
+    assert.equal(repMsgMismatch.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repMsgMismatch.why, /selection_message_id 与 claim 的 message 不一致/u, "点名 message 不一致");
+
+    // ③ 正例：完整顶层的 unclean record（账户本侧真实提交在场）→ 转 consumed。
+    SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    // P2 写侧同源：账本上那笔 op 的 request_key === ownerSelectReaffirmRequestKey（写入侧走同一函数）。
+    const docAfter = loadOkB(dir);
+    const writeOp = Object.values(docAfter.operations).find((o) => o.op_type === "owner_select_reaffirm" && o.request_key === "osr:" + b3 + ":" + intent.reaffirm_handle);
+    assert.ok(writeOp, "写入侧 op 在场");
+    assert.equal(writeOp.request_key, TAL.ownerSelectReaffirmRequestKey({ target: b3, handle: intent.reaffirm_handle }), "写入侧 request_key 与共享派生函数逐字相等");
+    const repOk = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle),
+      claimsDir: path.join(root, "claims_p14b3"),
+      key: "h",
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repOk.ok, true, "完整顶层 unclean record 转 consumed：" + JSON.stringify(repOk));
   }));
 
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {

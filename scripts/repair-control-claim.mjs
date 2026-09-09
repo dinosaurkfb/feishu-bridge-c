@@ -16,8 +16,9 @@ import { resolveProject } from "./project-resolve.mjs";
 import { expectationFromMapping, claudeControlPrecondition } from "./control-identity.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext } from "./select-admission.mjs";
-import { resolveEndpointDir, loadLedger } from "./topic-agent-ledger.mjs";
-import { cleanReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
+import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE } from "./topic-agent-ledger.mjs";
+import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
+import { acquireOrderLock } from "./m1a/dual-write.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -129,6 +130,42 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   if (!vCtx.ok) return { ok: false, reason: vCtx.reason, why: vCtx.why };
   const sc = vCtx.context;
 
+  // R57b 返修三 P1-4a：repair 同样走 outer → intent 锁序（同 P1-2 签发/消费纪律）。
+  //   顶层取 instance-bound outer（m1a-order lock），内层持 outer 的受验 capability。
+  //   两层释放都干净才闭合；outer 取不到/残骸/释放失败 → 非绿、保持 committed-unclean 点名。
+  const acq = acquireOrderLock(sc.endpoint, env);
+  if (!acq.ok) {
+    return { ok: false, reason: acq.reason ?? "outer_lock_unavailable", why: "repair 外层排序锁取不到（" + (acq.why ?? acq.reason ?? "?") + "），保持 control-committed-unclean", lock_state: "unclear" };
+  }
+  let innerRes;
+  let outerRel;
+  try {
+    innerRes = repairControlCommittedUncleanInner({ claimsDir, key, uncleanRecord, env, _inject, sc });
+  } finally {
+    try { outerRel = acq.release(); } catch (err) { outerRel = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
+  }
+  // 联合 outer / intent 两层释放结果：任一 residue/unclear → 非绿。
+  const outerLockState = foldLockReleaseState(outerRel);
+  const intentLockState = innerRes?.lock_state ?? "released";
+  if (outerLockState !== "released" || intentLockState !== "released") {
+    const reason = outerLockState !== "released" ? "repair_outer_lock_release_unclean" : (innerRes?.reason ?? "intent_cleanup_unclean");
+    return {
+      ...innerRes,
+      ok: false,
+      reason,
+      why: "repair 收口两侧锁释放不干净（outer=" + outerLockState + ", intent=" + intentLockState + "）：" + (innerRes?.why ?? ""),
+      locks: { outer: outerLockState, intent: intentLockState },
+      lockUncleared: {
+        outer: outerLockState !== "released" ? { reason: outerRel?.reason ?? "outer_lock_release", why: outerRel?.why ?? null, path: outerRel?.path ?? null } : null,
+        intent: innerRes?.lockUncleared ?? null,
+      },
+    };
+  }
+  return innerRes;
+}
+
+function repairControlCommittedUncleanInner({ claimsDir, key, uncleanRecord, env = process.env, _inject = undefined, sc = undefined } = {}) {
+  // sc 由外层 repairControlCommittedUnclean 验证后传入；这里不再重复 verifySelectionContext。
   const d = resolveEndpointDir(sc.endpoint, { env });
   if (!d.ok) return { ok: false, reason: "endpoint_dir_unresolvable", why: d.why };
 
@@ -136,19 +173,26 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   const L = loadLedger(d.dir, { endpointId: sc.endpoint });
   if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: L.why ?? L.reason };
 
-  // P1-4：逐字绑定本 claim 对应的唯一 op——精确 request_key = "osr:" + target_id + ":" + handle，
-  //   且 op 的 selection_message_id / target_id 与 uncleanRecord 一致；不像 P1-4 前用松散的后缀/selection_handle 搜索
-  //   （任一 request_key 以 :<handle> 结尾或 proof 带该 handle 就命中，伪做一笔同 handle 后缀但不同 message 的 op 也会通过）。
-  //   找不到或多于一笔 → 不转 consumed（fail-closed 点名）。
-  const unTarget = uncleanRecord?.detail?.result?.target_id;
-  const unMessage = uncleanRecord?.detail?.result?.selection_message_id ?? sc.message;
-  const exactKey = (t) => "osr:" + t + ":" + sc.handle;
+  // P1-4b：逐字绑定本 claim 对应的唯一 op——两字段（target_id / selection_message_id）**必须在场**且与
+  //   claim / intent **逐字一致**；不再降级（缺席不核 / 在场不比）。缺失或不等 → ledger_commit_unverifiable。
+  //   且 request_key 与写入侧共用同一派生函数（P2）。
+  //   注：recordClaimState 把 detail 铺平到记录顶层（state/claim_key/recorded_at 并列），result 在记录顶层。
+  const unResult = uncleanRecord?.result;
+  const unTarget = unResult?.target_id;
+  const unMessage = unResult?.selection_message_id;
+  if (typeof unTarget !== "string" || !ID_SHAPE.test(unTarget) || typeof unMessage !== "string" || !OM_SHAPE.test(unMessage)) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "uncleanRecord.result 缺 target_id/selection_message_id（均须在场且合法），保持 control-committed-unclean" };
+  }
+  if (unMessage !== sc.message) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection_message_id 与 claim 的 message 不一致，保持 control-committed-unclean" };
+  }
+  // 精确绑定的 request_key 与写入侧共用同一派生函数（P2）；不再保留本地字面拼接。
   const matches = Object.values(L.doc.operations).filter((op) =>
     op.op_type === "owner_select_reaffirm" &&
     op.result && typeof op.result.target_id === "string" &&
-    op.request_key === exactKey(op.result.target_id) &&
-    op.result.selection_message_id === unMessage &&
-    (unTarget == null || op.result.target_id === unTarget)
+    op.request_key === ownerSelectReaffirmRequestKey({ target: op.result.target_id, handle: sc.handle }) &&
+    op.result.target_id === unTarget &&
+    op.result.selection_message_id === unMessage
   );
   if (matches.length !== 1) {
     return { ok: false, reason: "ledger_commit_unverifiable", why: "账本中核不出 handle " + sc.handle + " 的唯一提交记录（命中 " + matches.length + " 笔），保持 control-committed-unclean" };
@@ -169,7 +213,7 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
     };
   }
 
-  return { ok: true, changed: true };
+  return { ok: true, changed: true, lock_state: "released" };
 }
 
 export { expectationFromMapping, claudeControlPrecondition as controlRepairPrecondition } from "./control-identity.mjs";

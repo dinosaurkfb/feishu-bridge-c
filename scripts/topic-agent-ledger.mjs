@@ -3253,6 +3253,11 @@ export function ownerSelectReaffirmClosureDigest(doc, targetId) {
 // reaffirm 可签发的族（§4：reaffirm_handle 落 sidecar，合法族 = 待 reaffirm 的 B3/B3'/B4/A3/A4）。
 const REAFFIRM_TARGET_FAMILIES = Object.freeze(["B3", "B3'", "B4", "A3", "A4"]);
 
+/** owner_select_reaffirm 的 request_key（§8.1：entity=target_id、ext=reaffirm_handle）——唯一派生函数，两侧共用（R57b 返修三 P2）。 */
+export function ownerSelectReaffirmRequestKey({ target, handle }) {
+  return "osr:" + String(target) + ":" + String(handle);
+}
+
 /** owner_select_reaffirm（§6 reaffirm 行；gated ledger op——intent 的消费编排方在 intent 锁内调本函数）。
  *  fp = {request_key, target_id, reaffirm_handle, expected_old_proof_closure_digest, selected_session_id,
  *  selected_root_om, selection_message_id}；request_key = "osr:" + target_id + ":" + reaffirm_handle
@@ -3261,7 +3266,7 @@ const REAFFIRM_TARGET_FAMILIES = Object.freeze(["B3", "B3'", "B4", "A3", "A4"]);
  *  link 一律重签 owner_selected_route_v1（selection_handle = rfh_ 消费值）；关联 owner_select_merge_v1
  *  tombstone 同笔 remap（按 old_tomb_id 排序）。**不复用 migrate_repair；不批量；不后台。** */
 export function ownerSelectReaffirm({ endpointId, targetId, targetFamily, expectedOldProofClosureDigest, reaffirmHandle, authorizedBy, chatId, selectedSessionId, selectedRootOm, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
-  const requestKey = "osr:" + String(targetId) + ":" + String(reaffirmHandle);
+  const requestKey = ownerSelectReaffirmRequestKey({ target: targetId, handle: reaffirmHandle });
   const inputs = { request_key: requestKey, target_id: targetId, reaffirm_handle: reaffirmHandle, expected_old_proof_closure_digest: expectedOldProofClosureDigest, selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_message_id: selectionMessageId };
   return gatedTx({
     endpointId, requestKey, env, _inject, replay: () => [{ opType: "owner_select_reaffirm", inputs }],

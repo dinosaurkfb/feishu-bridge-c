@@ -33818,6 +33818,26 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
     dReaffNotTomb.operations[opId2].result.tombstone_remap[0].old_tomb_id = taId1; // 指向 live 记录
     assert.equal(TAL.validateLedger(dReaffNotTomb, { endpointId: EP }).ok, false, "reaffirm old_tomb_id 指向非 tombstone 记录必拒");
 
+    // ── R57c 返修三 P1-1（Codex #146 三轮：1 P1）：reaffirm remap 重闭包宽容支 fail-open，逐字核实际 proof ──
+
+    // ① Codex 探针：正常 activate→reaffirm 重闭包后，把 tombstone 实际 proof 降级成形状合法的 legacy pairing（需 1.1-transition，strict 的 tombstoneProblem 会先拒而盖住 fail-open）
+    //   → validateLedger 仍 ok（fail-open），改后必拒。
+    const dLegacy = mkReaffirmBase();
+    dLegacy.schema_version = "1.1-transition";
+    // 形状合法的 no-token legacy pairing（过渡 schema 的 tombstoneProblem 允许）。
+    dLegacy.records[taId2].proof_ref = { kind: "pairing", om: "om_root1", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" };
+    assert.equal(TAL.validateLedger(dLegacy, { endpointId: EP }).ok, false, "reaffirm remap 后 tombstone 降级 legacy pairing 必拒（Codex 探针）");
+
+    // ② remap.new_proof_ref 与实际 proof 逐字不等 → 拒（唯一校验器两侧一致）。
+    const dRemapMismatch = mkReaffirmBase();
+    dRemapMismatch.records[taId2].proof_ref = { kind: "owner_select_merge_v1", selected_root_om: "om_root2", selection_handle: hRFH1, selection_operation_id: opId2 };
+    assert.equal(TAL.validateLedger(dRemapMismatch, { endpointId: EP }).ok, false, "remap.new_proof_ref 与实际 proof 不等必拒");
+
+    // ③ forwards_to ≠ reaffirm target_id → 拒（唯一校验器两侧一致）。
+    const dForwardsMismatch = mkReaffirmBase();
+    dForwardsMismatch.records[taId2].forwards_to = "ta_" + "9".repeat(32);
+    assert.equal(TAL.validateLedger(dForwardsMismatch, { endpointId: EP }).ok, false, "tombstone forwards_to ≠ reaffirm target_id 必拒");
+
     // ── P2-1 返修：selection_basis 枚举值域 ∧ selection_message_id 有界收拢 ──
 
     // 1. activate 带非枚举 selection_basis → 拒

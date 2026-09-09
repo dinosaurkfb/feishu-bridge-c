@@ -1381,7 +1381,29 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
 
-  // G13-tomb (§7.1)：tombstone 关联核验
+  // G13-tomb (§7.1)：tombstone 关联核验。reaffirm-remap 重闭包（正向 validateLedger + 反向 tombstoneBackstop）共用同一
+  //   校验器 reaffirmTombG13——两边同一套判据，不留第二套（Codex #146 三轮 P1）。
+  const reaffirmTombG13 = (tid, rec, doc) => {
+    const reOp = doc.operations[rec.origin_operation_id];
+    if (!reOp || reOp.op_type !== "owner_select_reaffirm") return "origin_operation_id 的 op 非 owner_select_reaffirm（无后续 reaffirm remap 闭环）";
+    const r = reOp.result;
+    if (!Array.isArray(r?.tombstone_remap)) return "reaffirm result 无 tombstone_remap";
+    const remap = r.tombstone_remap.find((m) => m.old_tomb_id === tid);
+    if (!remap) return "reaffirm tombstone_remap 未点名该 tombstone id";
+    const p = rec.proof_ref;
+    // ① 实际 proof_ref.kind 必须仍是 owner_select_merge_v1（降级 fail-open 封堵）。
+    if (!p || p.kind !== "owner_select_merge_v1") return "reaffirm remap 后 tombstone 实际 proof_ref.kind ≠ owner_select_merge_v1（降级 fail-open）";
+    // ③ forwards_to === reaffirm target_id。
+    if (rec.forwards_to !== r.target_id) return "tombstone forwards_to ≠ reaffirm target_id";
+    // ② 实际 proof_ref 逐字 === 对应 remap.new_proof_ref。
+    if (canonKey(p) !== canonKey(remap.new_proof_ref)) return "reaffirm remap 与 tombstone proof_ref 逐字不等";
+    // ④ root/handle === new_link_proof 对应字段；⑤ selection_operation_id === 本 op key。
+    if (p.selected_root_om !== r.new_link_proof?.selected_root_om || p.selection_handle !== r.new_link_proof?.selection_handle) {
+      return "reaffirm tombstone proof_ref 与 new_link_proof 不一致";
+    }
+    if (p.selection_operation_id !== rec.origin_operation_id) return "reaffirm tombstone selection_operation_id ≠ origin_operation_id";
+    return null;
+  };
   for (const [id, rec] of Object.entries(doc.records)) {
     if (rec.kind !== "forwarding_tombstone") continue;
     if (rec.proof_ref?.kind !== "owner_select_merge_v1") continue;
@@ -1401,19 +1423,8 @@ export function validateLedger(doc, { endpointId } = {}) {
       if (rec.proof_ref.selected_root_om !== r.selected_root_om || rec.proof_ref.selection_handle !== r.selection_handle) return bad(id + "：tombstone proof_ref 与 rebind result 不一致（G13-tomb）");
       if (rec.proof_ref.selection_operation_id !== rec.origin_operation_id) return bad(id + "：tombstone selection_operation_id 不等于 origin_operation_id（G13-tomb）");
     } else if (op.op_type === "owner_select_reaffirm") {
-      const remap = Array.isArray(r.tombstone_remap) ? r.tombstone_remap.find((m) => m.old_tomb_id === id) : null;
-      if (!remap) return bad(id + "：reaffirm tombstone_remap 未点名该 tombstone id（G13-tomb）");
-      if (rec.forwards_to !== r.target_id) return bad(id + "：tombstone forwards_to 不等于 reaffirm target_id（G13-tomb）");
-      if (remap.new_proof_ref.selected_root_om !== rec.proof_ref.selected_root_om ||
-          remap.new_proof_ref.selection_handle !== rec.proof_ref.selection_handle ||
-          remap.new_proof_ref.selection_operation_id !== rec.proof_ref.selection_operation_id) {
-        return bad(id + "：reaffirm tombstone_remap 与 tombstone proof_ref 不一致（G13-tomb）");
-      }
-      if (rec.proof_ref.selected_root_om !== r.new_link_proof?.selected_root_om ||
-          rec.proof_ref.selection_handle !== r.new_link_proof?.selection_handle ||
-          rec.proof_ref.selection_operation_id !== rec.origin_operation_id) {
-        return bad(id + "：reaffirm tombstone proof_ref 与 new_link_proof 不一致（G13-tomb）");
-      }
+      const e = reaffirmTombG13(id, rec, doc);
+      if (e) return bad(id + "：" + e + "（G13-tomb）");
     }
   }
 
@@ -1581,10 +1592,10 @@ export function validateLedger(doc, { endpointId } = {}) {
       }
       return null;
     }
-    const reOp = doc.operations[t.origin_operation_id];
-    const remapped = reOp?.op_type === "owner_select_reaffirm" && Array.isArray(reOp.result?.tombstone_remap)
-      && reOp.result.tombstone_remap.some((m) => m.old_tomb_id === tid);
-    if (!remapped) return bad(tid + "：origin_operation_id ≠ 本 op 且无后续 reaffirm remap 闭环 (G13-tomb-反向)");
+    // R57c 返修三 P1-1（Codex #146 三轮）：reaffirm-remap 重闭包走与正向 G13-tomb 同一校验器 reaffirmTombG13，
+    //   逐字核 proof_ref.kind / 逐字等 new_proof_ref / forwards_to===target_id / root+handle===new_link_proof / selection_operation_id===本 op key。
+    const e = reaffirmTombG13(tid, t, doc);
+    if (e) return bad(tid + "：" + e + " (G13-tomb-反向)");
     return null;
   };
   for (const [opId, op] of Object.entries(doc.operations)) {

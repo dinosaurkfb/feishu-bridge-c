@@ -747,12 +747,15 @@ const runSelect = (replay) => {
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
     execute: () => executeSelectControl(control, {
       selectAdmissionFn,
-      // R57b §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；chat=链路模板登记群
-      // （账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；messageId=本条命令消息。
+      // R57b/R57d §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；
+      // chat=链路模板登记群（账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；
+      // messageId=本条命令消息；eventSessionId/eventRootOm=R57d osh/orh 执行支的选择五元输入。
       senderId: event.sender_id ?? null,
       chatId: bootTpl.template?.chat_id ?? null,
       endpointId: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
       messageId: verdict.messageId,
+      eventSessionId: event.session_id ?? null,
+      eventRootOm: mapping.feishu_root_message_id_reference ?? null, // routed mapping 的根 om 引用字段（root_message_id 不在映射上）
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: CLAIMS,
@@ -786,10 +789,10 @@ const runSelect = (replay) => {
   }
   const rfh = control.handle_kind === "rfh";
   if (!replay && !tx.replayed) {
-    // R57b：rfh 支是真消费 → 落正式 consumed 收据；osh/orh 支仍执行器缺席，收据保持 select_pending 语义。
-    writeReceipt((rfh ? "select-" : "select-pending-") + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_pending", ...base, claim_acquired: true, changed: tx.changed });
+    // R57d：三支都是真消费 → 落正式 consumed 收据。
+    writeReceipt("select-" + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_executed", ...base, claim_acquired: true, changed: tx.changed });
   }
-  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "已收到选择，执行器尚未接入");
+  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "该选择之前已处理（同一条消息的重放）");
   finish("control", { text: doneText + lockNote, taskName: config.task_display_name },
     { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
 };

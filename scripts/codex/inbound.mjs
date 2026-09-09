@@ -607,12 +607,15 @@ const runControl = (replay) => {
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: paths.claims, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
+    // R57b/R57d：三支真执行器——事件事实按 §8.1 消费侧核验传入（sender/endpoint/chat/session/根 om）。
     execute: () => executeSelectControl(control, {
       selectAdmissionFn,
       senderId: event.sender_id ?? null,
       chatId: template.template?.chat_id ?? null,
       endpointId: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
       messageId: verdict.messageId,
+      eventSessionId: event.session_id ?? null,
+      eventRootOm: routed.mapping?.feishu_root_message_id_reference ?? null,
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: paths.claims,
@@ -646,10 +649,9 @@ const runSelect = (replay) => {
   }
   const rfh = control.handle_kind === "rfh";
   if (!replay && !tx.replayed) {
-    // R57b：rfh 支是真消费 → 落正式 consumed 收据；osh/orh 支仍执行器缺席，收据保持 select_pending 语义。
-    writeReceipt((rfh ? "select-" : "select-pending-") + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_pending", ...base, claim_acquired: true, changed: tx.changed });
+    writeReceipt("select-" + verdict.messageId, { status: "consumed", reason: control.handle_kind === "rfh" ? "select_reaffirm_consumed" : "select_executed", ...base, claim_acquired: true, changed: tx.changed });
   }
-  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "已收到选择，执行器尚未接入");
+  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "该选择之前已处理（同一条消息的重放）");
   finish("control", { text: doneText + lockNote, taskName: task.task_display_name },
     { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
 };

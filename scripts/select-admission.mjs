@@ -6,14 +6,18 @@
 // selectReject(adm, handle_kind)：给定准入状态联合（off / partial / on / unreadable）与 handle_kind，返回拒绝
 //   { reason, text } 或 null（放行）。这是"三态准入"的确定性投影，测试用假 adm 覆盖四支。
 //
-// R57b：rfh 支接真执行器（owner_select_reaffirm，§8.1 消费编排 consumeReaffirmIntent）；
-// osh/orh 支仍落 failed 终态 select_executor_absent（另单，PR #136 二轮裁定：failed 是终态，重做须发新消息）。
+// R57b：rfh 支接真执行器（owner_select_reaffirm，§8.1 消费编排 consumeReaffirmIntent）。
+// R57d：osh / orh / 省略 支接真执行器（§12 + §5 + §6）——select_executor_absent 路径删除；
+//   osh → activate(B1) / anchor(A2)，orh → rebind_session_alias，省略 → 三候选集合并集恰一；
+//   失败按 reason 封闭映射，ambiguous 回执列 opaque id（§13 不回 handle 值）。
 
 import { createHash } from "node:crypto";
-import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE } from "./topic-agent-ledger.mjs";
+import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint, familyOf } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
 import { canonKey } from "./maintenance/canon.mjs";
+import { resolveSelectionCandidate } from "./select-resolve.mjs";
+import { activate, anchor, rebindSessionAlias } from "./topic-agent-ledger.mjs";
 
 /**
  * 判定选择控制 outcome 的叶子纯函数（§8.1 / R57b / 与 R57d 返修一共用，不 import 维护编排）。
@@ -92,7 +96,7 @@ export function verifySelectionContext(claim) {
   return { ok: true, context: ctx };
 }
 
-/** 写入准入 —— 默认读真实状态（执行器未接入期准入通过也落 failed(select_executor_absent) 终态，见 executeSelectControl）。 */
+/** 写入准入 —— 默认读真实状态（执行器已全量接入；准入仍 fail-closed）。 */
 export function selectAdmission(env = process.env) {
   return readOwnerSelectAdmission(env);
 }
@@ -131,6 +135,12 @@ export function selectRejectTextByReason(reason) {
   if (reason === "reaffirm_intents_unreadable") return "重确认意图文件读不出（fail-closed），未执行；请人工检查";
   if (reason === "reaffirm_intents_busy") return "重确认处理忙，请稍后重发一条新消息";
   if (reason === "reaffirm_intents_unwritable") return "重确认意图写不进（fail-closed），未执行；请人工检查";
+  // R57d：osh/orh/省略 支的失败映射
+  if (reason === "ambiguous_selection") return "选择不唯一，请带上对应 handle 重新发送 /feishu-select";
+  if (reason === "no_candidate") return "账本里没有符合条件的选择目标（可能已过期、不在该话题或已被处理）";
+  if (reason === "no_a1") return "当前会话上没有待绑定的 A1 记录，无法完成绑定";
+  if (reason === "cas_mismatch") return "选择与账本现场不符（记录可能已变动），请重新发起选择";
+  if (reason === "select_endpoint_unknown") return "无法确定所属 endpoint，未执行";
   if (reason === "ledger_corrupt" || reason === "ledger_unreadable") return "账本读不出，未执行（fail-closed）";
   if (reason === "schema_not_11") return "账本还没升到 1.1，不能重签";
   return "控制执行失败（" + reason + "）";
@@ -142,47 +152,132 @@ export function selectReaffirmSuccessText(result) {
   return "已按你的确认重签该目标的" + what + "。";
 }
 
+/** osh/orh/省略 成功文案（按 action 措辞）。 */
+export function selectExecutorSuccessText(action) {
+  if (action === "activate") return "已按你的选择完成绑定（activate）：绑定已生效";
+  if (action === "anchor") return "已按你的选择完成锚定（anchor）：根消息锚定已生效";
+  if (action === "rebind") return "已按你的选择完成换绑（rebind）：会话已切换";
+  return "已按你的选择完成处理";
+}
+
+/** owner-select f4（无 token 三项 + absent）：owner-select 的配对证据是 owner 授权本身，不声称 token 核验。 */
+const ownerSelectF4 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" });
+
 /**
  * 执行选择控制命令（在控制事务锁内跑）。
- * R52a（PR #136 二轮回带）：准入通过但执行器缺席 → 落普通 failed 终态 select_executor_absent（终态不重试）。
- * R57b（§8.1/§12）：rfh 支接真执行器 —— owner_select_reaffirm 消费 reaffirm intent；入站 sender /
- * endpoint / chat 的消费侧核验在消费编排与 ledger op 内（§8.1 五核），本入口只负责把事件事实带进去。
- * 注入面：selectAdmissionFn / consumeReaffirm（测试密闭，不读环境变量开关）。
+ * R52a（PR #136）：准入不过 → failed 终态；R57b：rfh 支接 owner_select_reaffirm；
+ * R57d：osh / orh / 省略 支接真执行器——§8.1 消费侧核验（chat 过滤在解析器、endpoint 由受验
+ * 账本自证、sender 的 owner 闸由入站路由 R3/R4 先行）+ §6 增量形输入：
+ *   选择五元 = { selected_session_id: 事件会话, selected_root_om: 事件根 om, selection_handle:
+ *   命中 handle, selection_message_id: 事件 message id, selection_basis: 解析结果 }；
+ *   anchor 另带 expected 三件（取自命中记录）；rebind 带 expected_expires_at；
+ *   request_key = "sel:" + message id（同 message 重放 → ledger 幂等 + 事务层判已完成）。
+ * select_executor_absent 路径已删除（执行器全量接入）。注入面：selectAdmissionFn / consumeReaffirm。
  */
 export function executeSelectControl(intent, {
   selectAdmissionFn = selectAdmission,
   consumeReaffirm = consumeReaffirmIntent,
   senderId = null, chatId = null, endpointId = null, messageId = null,
-  now = Date.now(), env = process.env, _inject = undefined,
+  eventSessionId = null, eventRootOm = null,
+  now = undefined, clock = () => Date.now(), env = process.env, _inject = undefined,
   claimsDir = undefined, key = undefined,
 } = {}) {
   const adm = selectAdmissionFn(env);
   const ej = selectReject(adm, intent?.handle_kind);
   if (ej) return { ok: false, reason: ej.reason, text: ej.text };
-  if (intent?.handle_kind !== "rfh") {
-    return { ok: false, reason: "select_executor_absent", text: "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送" };
+  const nowMs = Number.isFinite(now) ? now : clock();
+  if (intent?.handle_kind === "rfh") {
+    if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
+      return { ok: false, status: "failed", reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
+    }
+    // R57b 返修七 P1-1：执行器只是透传 claimsDir/key；强制校验收口在 mutation 层（consumeReaffirmIntentInner）——
+    //   否者公开的 consumeReaffirmIntent 可直接省略上下文越过 plan 后提交账本。
+    const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env, _inject, claimsDir, key });
+    if (res.status === "control-committed-unclean") {
+      return {
+        ok: false,
+        status: "control-committed-unclean",
+        reason: "control_committed_unclean",
+        text: "已写入但收口不干净（" + (res.why ?? "账本已写入但未收净，请联系管理员修复") + "）",
+        ledger: res.ledger,
+        intent_cleanup: res.intent_cleanup,
+        locks: res.locks,
+        result: res.result,
+        why: res.why,
+      };
+    }
+    if (!res.ok) {
+      return { ok: false, status: "failed", reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
+    }
+    return { ok: true, status: "consumed", changed: res.idempotent === true ? false : true, action: "reaffirm", text: selectReaffirmSuccessText(res.result) };
   }
-  if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
-    return { ok: false, reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
+
+  // ── R57d：osh / orh / 省略 ──
+  const kind = intent?.handle_kind ?? null;
+  const handle = intent?.handle ?? null;
+  if (kind === "osh" && (typeof handle !== "string" || !SELECTION_HANDLE_SHAPE.test(handle))) {
+    return { ok: false, reason: "no_candidate", text: selectRejectTextByReason("no_candidate") };
   }
-  // R57b 返修七 P1-1：执行器只是透传 claimsDir/key；强制校验收口在 mutation 层（consumeReaffirmIntentInner）——
-  //   否者公开的 consumeReaffirmIntent 可直接省略上下文越过 plan 后提交账本。
-  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env, _inject, claimsDir, key });
-  if (res.status === "control-committed-unclean") {
-    return {
-      ok: false,
-      status: "control-committed-unclean",
-      reason: "control_committed_unclean",
-      text: "已写入但收口不干净（" + (res.why ?? "账本已写入但未收净，请联系管理员修复") + "）",
-      ledger: res.ledger,
-      intent_cleanup: res.intent_cleanup,
-      locks: res.locks,
-      result: res.result,
-      why: res.why,
-    };
+  if (kind === "orh" && (typeof handle !== "string" || !REBIND_HANDLE_SHAPE.test(handle))) {
+    return { ok: false, reason: "no_candidate", text: selectRejectTextByReason("no_candidate") };
+  }
+  if (endpointId === null) return { ok: false, reason: "select_endpoint_unknown", text: selectRejectTextByReason("select_endpoint_unknown") };
+  const L = loadByEndpoint(endpointId, { env });
+  if (!L.ok) {
+    // absent = 该 endpoint 还没有账本（准入 on 但从未建账/无候选）→ no_candidate，不是 fail-closed；
+    // unreadable / corrupt（FIFO/symlink/坏 JSON/校验不过）才是 fail-closed 账本读不出。
+    if (L.granular !== "absent" && L.granular !== "corrupt" || L.granular === "corrupt") {
+      const reason = L.granular === "corrupt" ? "ledger_corrupt" : "ledger_unreadable";
+      return { ok: false, reason, text: selectRejectTextByReason(reason) };
+    }
+    return { ok: false, reason: "no_candidate", text: selectRejectTextByReason("no_candidate") };
+  }
+  const doc = L.doc;
+
+  // 候选解析（§5）：osh → activate(B1) 再 anchor(A2)；orh → rebind；省略 → 三候选集合并集恰一
+  let res = null, action = null;
+  if (kind === "osh") {
+    res = resolveSelectionCandidate({ doc, endpointId, chatId, action: "activate", handle, now: nowMs });
+    if (res.ok) { action = "activate"; }
+    else {
+      const r2 = resolveSelectionCandidate({ doc, endpointId, chatId, action: "anchor", handle, now: nowMs });
+      if (r2.ok) { res = r2; action = "anchor"; }
+    }
+  } else if (kind === "orh") {
+    res = resolveSelectionCandidate({ doc, endpointId, chatId, action: "rebind", handle, now: nowMs });
+    if (res.ok) action = "rebind";
+  } else {
+    const tries = [
+      ["activate", resolveSelectionCandidate({ doc, endpointId, chatId, action: "activate", handle: null, now: nowMs })],
+      ["anchor", resolveSelectionCandidate({ doc, endpointId, chatId, action: "anchor", handle: null, now: nowMs })],
+      ["rebind", resolveSelectionCandidate({ doc, endpointId, chatId, action: "rebind", handle: null, now: nowMs })],
+    ];
+    const hits = tries.filter(([, r]) => r.ok);
+    const ambs = tries.filter(([, r]) => r.reason === "ambiguous");
+    if (hits.length === 1 && ambs.length === 0) { res = hits[0][1]; action = hits[0][0]; }
+    else if (ambs.length > 0) res = ambs[0][1];
+    else if (hits.length > 1) res = { ok: false, reason: "ambiguous", candidates: hits.flatMap(([, r]) => [r.target_id]) };
+    else res = { ok: false, reason: "no_candidate" };
   }
   if (!res.ok) {
-    return { ok: false, status: "failed", reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
+    if (res.reason === "ambiguous") {
+      const ids = (res.candidates ?? []).map((x) => String(x).slice(0, 40)).join("、");
+      return { ok: false, reason: "ambiguous_selection", text: "选择不唯一（" + (res.candidates?.length ?? 0) + " 个候选）：" + ids + " —— 请带上对应 handle 重新发送 /feishu-select" };
+    }
+    return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }
-  return { ok: true, status: "consumed", changed: res.idempotent === true ? false : true, text: selectReaffirmSuccessText(res.result) };
+  const target = doc.records[res.target_id];
+  const requestKey = "sel:" + String(messageId ?? "").slice(0, 200);
+  let r;
+  if (action === "activate") {
+    const a1 = Object.values(doc.records).find((x) => x?.kind === "live" && familyOf(x.facts) === "A1" && x.chat_id === chatId && x.aliases.session_id === eventSessionId);
+    if (!a1) return { ok: false, status: "failed", reason: "no_a1", text: selectRejectTextByReason("no_a1") };
+    r = activate({ endpointId, requestKey, b1Id: res.target_id, a1Id: a1.topic_agent_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, selectionMessageId: messageId, selectionBasis: res.selection_basis, clock, env });
+  } else if (action === "anchor") {
+    r = anchor({ endpointId, requestKey, id: res.target_id, authorizedBy: senderId, selectedSessionId: target.aliases.session_id, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionMessageId: messageId, selectionBasis: res.selection_basis, clock, env });
+  } else {
+    r = rebindSessionAlias({ endpointId, requestKey, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle, expectedExpiresAt: target.rebind_expires_at, selectionMessageId: messageId, clock, env });
+  }
+  if (!r.ok) return { ok: false, status: "failed", reason: r.reason ?? "select_op_failed", text: selectRejectTextByReason(r.reason ?? "select_op_failed") + (r.why ? "（" + r.why + "）" : "") };
+  return { ok: true, status: "consumed", changed: r.idempotent === true ? false : true, action, text: selectExecutorSuccessText(action) };
 }

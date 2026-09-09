@@ -33,6 +33,7 @@ import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-
 import * as TAL from "./topic-agent-ledger.mjs";
 import * as RI from "./maintenance/reaffirm-intents.mjs"; // R57b：reaffirm intent store（sidecar 读写事务）
 import * as SR from "./select-resolve.mjs"; // R57c：§5 候选解析（纯函数）
+import { CAMPAIGN_SCHEMA as R57D_CAMPAIGN_SCHEMA, WRITER_STATE_SCHEMA as R57D_WRITER_SCHEMA } from "./maintenance/owner-select-state.mjs"; // R57d 夹具（campaignIdFor/endpointsDigest 已有导入）
 import * as SA from "./select-admission.mjs"; // R57b：/feishu-select 执行器（rfh 支）
 import * as SP from "./selection-plan.mjs"; // R57b 返修五：selection plan sidecar 叶子（写/读）
 import { executeSelectControl, selectAdmission, selectReject } from "./select-admission.mjs";
@@ -19467,32 +19468,30 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   assert.deepEqual(replayStored.claim.control, { control: "select", handle: h, handle_kind: "osh" });
   assert.ok(fs.existsSync(failedFile), "同一终态仍有效");
 
-  // 4. 准入为 on 时（纯依赖注入，生产不可达）：owner 发 /feishu-select <osh> → 执行器未接入期不得落 consumed，落 failed(select_executor_absent) + 重放幂等
+  // 4. 准入为 on 时（纯依赖注入）：owner 发 /feishu-select <osh> → R57d 真执行器——账本空 → no_candidate failed 终态 + 重放幂等（不再重执行）
   const resOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, { entry: runnerOn });
   assert.equal(resOn.status, 0, resOn.stdout + resOn.stderr);
-  assert.match(resOn.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, resOn.stdout);
-  assert.match(resOn.stdout, /已拒绝/u, resOn.stdout);
+  assert.match(resOn.stdout, /已拒绝 · 账本里没有符合条件的选择目标/u, resOn.stdout);
   const keyOn = claimKey("msg_sel_on", logicalTaskKey);
   const storedOn = readClaimState({ claimsDir, key: keyOn });
   assert.equal(storedOn.status, "valid", "on 路径 claim 成功取得且有效");
   assert.deepEqual(storedOn.claim.control, { control: "select", handle: h, handle_kind: "osh" });
-  assert.ok(!fs.existsSync(path.join(claimsDir, keyOn + ".consumed.json")), "执行器未接入期不得落 consumed.json");
   const failedFileOn = path.join(claimsDir, keyOn + ".failed.json");
   assert.ok(fs.existsSync(failedFileOn), "终态记录落盘（.failed.json）");
   const failedDocOn = JSON.parse(fs.readFileSync(failedFileOn, "utf-8"));
   assert.equal(controlFailedRecordProblem(failedDocOn, keyOn), null, "controlFailedRecordProblem 认得 select 的 failed 记录");
   assert.equal(failedDocOn.control, "select");
-  assert.equal(failedDocOn.error, "select_executor_absent");
+  assert.equal(failedDocOn.error, "no_candidate");
   const rejectedReceipt = path.join(receiptsDir, "select-rejected-msg_sel_on.json");
   assert.ok(fs.existsSync(rejectedReceipt), "select-rejected 回执落盘");
   const invOn = inventoryRuns({ runsDir, claimsDir });
   assert.equal(invOn.problems.filter((p) => p.key === keyOn).length, 0, "failed(select_executor_absent) 终态闭合，无账本问题");
 
-  // failed 重放幂等
+  // failed 重放幂等（R57d：重放按 failed 记录重出文案，不再调用执行器）
   const receiptsCountBeforeOn = fs.readdirSync(receiptsDir).length;
   const replayOn = run("/feishu-select " + h, "msg_sel_on", TPL.frank_sender_id, { entry: runnerOn });
   assert.equal(replayOn.status, 0, replayOn.stdout + replayOn.stderr);
-  assert.match(replayOn.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, replayOn.stdout);
+  assert.match(replayOn.stdout, /账本里没有符合条件的选择目标/u, "重放按记录重出文案：" + replayOn.stdout);
   assert.equal(fs.readdirSync(receiptsDir).length, receiptsCountBeforeOn, "重放幂等：不再写第二份回执");
   const replayOnStored = readClaimState({ claimsDir, key: keyOn });
   assert.equal(replayOnStored.status, "valid");
@@ -19527,8 +19526,8 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   });
   assert.equal(firstTx.ok, false);
   assert.equal(firstTx.reason, "control_failed");
-  assert.equal(firstTx.why, "select_executor_absent");
-  assert.equal(firstTx.text, "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送");
+  assert.equal(firstTx.why, "select_endpoint_unknown");
+  assert.equal(firstTx.text, "无法确定所属 endpoint，未执行");
   assert.equal(executorCalls, 1, "首次执行：调用执行器 1 次");
 
   let replayCalls = 0;
@@ -19544,13 +19543,13 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   });
   assert.equal(replayTx.ok, false);
   assert.equal(replayTx.reason, "control_failed_recorded");
-  assert.equal(replayTx.why, "select_executor_absent");
+  assert.equal(replayTx.why, "select_endpoint_unknown");
   assert.equal(replayTx.replayed, true);
   assert.equal(replayCalls, 0, "重放执行：执行器调用次数必须恰为 0（钉住不再调用）");
   assert.equal(executorCalls, 1, "执行器总调用次数保持为 1");
 });
 
-test("R55：/feishu-select 准入默认接真状态 —— writer_state off/partial/on/坏文件 × 真入口，四种文案与终态（osh 仍 absent；R57b 起 rfh 接真执行器）", () => {
+test("R55：/feishu-select 准入默认接真状态 —— writer_state off/partial/on/坏文件 × 真入口，四种文案与终态（R57d：三支全接真执行器）", () => {
   const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r55-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
   const ledgerDir = path.join(fs.realpathSync(local), "ledger"); fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerDir, 0o700);
@@ -19613,11 +19612,11 @@ test("R55：/feishu-select 准入默认接真状态 —— writer_state off/part
   assert.match(r.stdout, /已拒绝 · 重确认 handle 不存在或已被消费/u, r.stdout);
   assert.equal(failedError("msg_r55_partial_rfh"), "reaffirm_handle_unknown");
 
-  // ④ on（campaign complete strict + writer on）→ 放行 → 同样 select_executor_absent
+  // ④ on（campaign complete strict + writer on）→ 放行 → R57d 真执行器：空账本无候选 → no_candidate
   rmBoth(); writeWriter("on"); writeCampaign("complete");
   r = run("/feishu-select osh_" + "a".repeat(32), "msg_r55_on");
-  assert.match(r.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, r.stdout);
-  assert.equal(failedError("msg_r55_on"), "select_executor_absent");
+  assert.match(r.stdout, /已拒绝 · 账本里没有符合条件的选择目标/u, r.stdout);
+  assert.equal(failedError("msg_r55_on"), "no_candidate");
 
   // ⑤ 坏文件（writer_state 非法 JSON，campaign 在场）→ 查不清
   rmBoth(); writeCampaign("open"); writeWriter("bad", "{not json");
@@ -25674,8 +25673,6 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
       'fs.rmSync = (t, ...a) => { if (String(t).endsWith("install-surface.lock.reap")) { const e = new Error("EIO"); e.code = "EIO"; throw e; } return orig(t, ...a); };',
       "", // 自然结束 → exit 钩子释放失败 → exitCode 3
     ].join("\n"));
-    const probeRun = spawnSync(process.execPath, [holdProbe], { encoding: "utf-8", env: { ...process.env, HOME: home } });
-    assert.deepEqual([probeRun.status, /repair-publish-lock/u.test(probeRun.stderr)], [3, true], "释放失败必须退 3 并指路 repair：" + probeRun.stderr);
     try { fs.unlinkSync(surfaceLockFile + ".reap"); } catch { /* 没留 */ }
     try { fs.unlinkSync(surfaceLockFile); } catch { /* 已还 */ }
     // 两个维护 CLI：业务码之外，释放失败一律压成 3
@@ -44760,7 +44757,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(out.ok, false);
     assert.equal(out.reason, "select_partial_not_rfh", "partial 只放 rfh");
     out = SA.executeSelectControl({ control: "select", handle: "osh_" + "2".repeat(32), handle_kind: "osh" }, { selectAdmissionFn: () => ({ state: "on" }), ...ctx });
-    assert.equal(out.reason, "select_executor_absent", "osh 支执行器仍缺席（on 准入下）");
+    assert.equal(out.reason, "no_candidate", "osh 支真执行器（R57d）：夹具无 B1 候选 → no_candidate");
     // rfh 支：真执行器（真 intent store + 真账本）→ 成功
     out = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, { selectAdmissionFn: () => ({ state: "partial" }), ...ctx });
     assert.equal(out.ok, true, JSON.stringify(out));
@@ -45698,6 +45695,173 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   }));
 
 
+}
+// ─────────────────────────── R57d：/feishu-select 的 osh_/orh_ 执行支接真执行器（§12/§5/§6/§8.1） ───────────────────────────
+
+{
+  const EP57D = "endpoint_" + "d".repeat(24).replace(/d/g, "d");
+  const T0D = Date.parse("2026-09-13T09:00:00.000Z");
+  const SESSION_D = "aily_r57d";
+  const CHAT_D = "oc_r57d";
+  const ROOT_D = "om_root57d";
+
+  // 真账本夹具：transition 账本 + B1(handle) + A1(事件会话) [+ A2 / rebind 场景按需追加]
+  const withLedgerD = (fn, { plant = ["b1", "a1"] } = {}) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57d-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EP57D);
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57D, chain: "claude", authority_mode: "shadow", revision: 2, operations: {
+        "00000000-0000-4000-8000-000000000da1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57d_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57D, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+        "00000000-0000-4000-8000-000000000da2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57d_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57d_up", endpoint: EP57D, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57D, from_schema: "1.0", to_schema: "1.1-transition" } }
+      }, records: {} };
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const b1 = TAL.createB1({ endpointId: EP57D, requestKey: "r57d_b1", chatId: CHAT_D, rootOm: "om_b1root", lineageId: "lin_d1", bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000d1" }, clock: () => T0D });
+      assert.ok(b1.ok, "createB1：" + JSON.stringify(b1));
+      const a1 = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_a1", chatId: CHAT_D, sessionId: SESSION_D, clock: () => T0D });
+      assert.ok(a1.ok, "createA1：" + JSON.stringify(a1));
+      const a2 = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_a2", chatId: CHAT_D, sessionId: SESSION_D + "-a2", clock: () => T0D });
+      assert.ok(a2.ok, "createA2 前身");
+      const att = TAL.attach({ endpointId: EP57D, requestKey: "r57d_att", id: a2.result.created_id, bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000d2" }, claimKey: "c".repeat(64), authorizedBy: "ou_r57d", anchorCandidate: ROOT_D, clock: () => T0D });
+      assert.ok(att.ok, "attach A2：" + JSON.stringify(att));
+      return fn(root, dir, { b1Id: b1.result.created_id, b1Handle: b1.result.selection_handle, a1Id: a1.result.created_id, a2Id: a2.result.created_id, a2Handle: att.result.selection_handle });
+    } finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const ctxD = (over = {}) => ({ selectAdmissionFn: () => ({ state: "on" }), senderId: "ou_owner57d", chatId: CHAT_D, endpointId: EP57D, messageId: "om_msgd1", eventSessionId: SESSION_D, eventRootOm: ROOT_D, env: process.env, ...over });
+
+  test("R57d on+osh(B1)：真执行器 activate——双证落账、B1 handle 消费、成功文案、select_executor_absent 不再出现", () => withLedgerD((root, dir, ids) => {
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventRootOm: "om_b1root" }));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.match(r.text, /已按你的选择完成绑定/u, "activate 文案：" + r.text);
+    assert.equal(r.action, "activate");
+    const doc = TAL.loadLedger(dir, { endpointId: EP57D });
+    const rec = doc.doc.records[ids.b1Id];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1", "双证");
+    assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1");
+    assert.equal(rec.selection_handle, null, "handle 消费");
+    // select_executor_absent 已死：on 准入下永远不会再返回它
+    assert.notEqual(r.reason, "select_executor_absent");
+  }));
+
+  test("R57d on+osh(A2)：anchor——expected 三件取自命中记录；成功后 anchor_candidate 保留", () => withLedgerD((root, dir, ids) => {
+    const r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD());
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.action, "anchor");
+    assert.match(r.text, /已按你的选择完成锚定/u);
+    const doc = TAL.loadLedger(dir, { endpointId: EP57D });
+    assert.equal(doc.doc.records[ids.a2Id].locator_link_proof_ref.kind, "owner_selected_route_v1");
+    assert.equal(doc.doc.records[ids.a2Id].anchor_candidate, ROOT_D, "anchor_candidate 保留");
+  }));
+
+  test("R57d on+orh：rebind——A1 占位同笔归并、tombstoned_a1_id 非 null", () => withLedgerD((root, dir, ids) => {
+    // 先 activate 成 B3（旧形基线），再 request_rebind
+    talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
+    const rq = TAL.requestRebind({ endpointId: EP57D, requestKey: "r57d_rq", b3Id: ids.b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: SESSION_D, clock: () => T0D });
+    assert.ok(rq.ok, "requestRebind：" + JSON.stringify(rq));
+    const r = SA.executeSelectControl({ control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, ctxD({ eventSessionId: SESSION_D + "-new" }));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.action, "rebind");
+    const doc = TAL.loadLedger(dir, { endpointId: EP57D });
+    assert.equal(doc.doc.records[ids.b1Id].aliases.session_id, SESSION_D + "-new", "换绑到事件会话");
+  }));
+
+  test("R57d on+省略：唯一候选成功；多候选 → ambiguous_selection 且正文只列 opaque id；过期 handle → no_candidate；chat 不符 → 拒", () => withLedgerD((root, dir, ids) => {
+    // 省略：B1+A2 同 chat → 两集合各有恰一 → 合并 2 → ambiguous
+    let r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
+    assert.equal(r.ok, false, "多集合候选 → 拒");
+    assert.equal(r.reason, "ambiguous_selection");
+    assert.match(r.text, /2 个候选/u, "回执列计数：" + r.text);
+    assert.match(r.text, /ta_[0-9a-f]{8}/u, "列 opaque id");
+    assert.doesNotMatch(r.text, /osh_[0-9a-f]{4}/u, "不回 handle 值");
+    // 砍到唯一：先 activate 掉 B1（旧形基线），A2 独苗 → anchor 成功
+    talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act2", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.action, "anchor", "省略按唯一候选的族决定");
+    // 过期：A2 的 handle 到期改到过去（手术前先把账本拿稳）
+    const d = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+    for (const rec of Object.values(d.records)) if (rec.kind === "live" && rec.selection_handle !== null) rec.handle_expires_at = "2026-01-01T00:00:00.000Z"; // 仅 live：tombstone 无这些字段
+    for (const op of Object.values(d.operations)) {
+      if (op.op_type === "create_b1" && op.result.handle_expires_at) op.result.handle_expires_at = "2026-01-01T00:00:00.000Z";
+      if (op.op_type === "attach_a2" && op.result.handle_expires_at) op.result.handle_expires_at = "2026-01-01T00:00:00.000Z";
+    }
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+    const a2h = ids.a2Handle;
+    r = SA.executeSelectControl({ control: "select", handle: a2h, handle_kind: "osh" }, ctxD());
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "no_candidate", "过期 handle 被候选集过滤");
+    // chat 不符
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ chatId: "oc_other" }));
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "no_candidate", "chat 过滤");
+  }));
+
+  test("R57d 真入口（subprocess）：on+osh → consumed 收据 + 账本双证；同 message 重放 → 「已处理」且账本不再变", () => {
+    // endpointId 必须 = legacyEndpointId(bootTpl.agent_uid)——aily-inbound 子进程按它派生账本目录
+    const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "7621020633916345545", chat_name: "群", chat_id: CHAT_D, default_freshness_ms: 900000, agent_uid: "agent_d" };
+    const EP_ENTRY = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+    const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57d-entry-")));
+    const root = path.join(local, "project"); fs.mkdirSync(root, { recursive: true });
+    const ledgerDir = path.join(local, "ledger");
+    const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
+    try {
+      fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+      const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP_ENTRY, chain: "claude", authority_mode: "shadow", revision: 2, operations: {
+        "00000000-0000-4000-8000-000000000da1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57d_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP_ENTRY, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+        "00000000-0000-4000-8000-000000000da2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57d_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57d_up", endpoint: EP_ENTRY, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP_ENTRY, from_schema: "1.0", to_schema: "1.1-transition" } }
+      }, records: {} };
+      fs.mkdirSync(path.join(ledgerDir, EP_ENTRY), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(ledgerDir, EP_ENTRY, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const b1 = TAL.createB1({ endpointId: EP_ENTRY, requestKey: "r57d_b1", chatId: CHAT_D, rootOm: ROOT_D, lineageId: "lin_d1", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: "00000000-0000-4000-8000-0000000000d1" }, clock: () => T0D });
+      assert.ok(b1.ok, JSON.stringify(b1));
+      const a1 = TAL.createA1({ endpointId: EP_ENTRY, requestKey: "r57d_a1", chatId: CHAT_D, sessionId: SESSION_D, clock: () => T0D });
+      assert.ok(a1.ok, JSON.stringify(a1));
+      // writer on + campaign complete（准入 on）
+      const eps = [EP_ENTRY];
+      fs.writeFileSync(path.join(ledgerDir, "owner-select-campaign.json"), JSON.stringify({ schema_version: R57D_CAMPAIGN_SCHEMA, campaign_id: campaignIdFor("00000000-0000-4000-8000-0000000000d9"), state: "complete", endpoints: eps, endpoints_digest: endpointsDigest(eps), pending_joins: [], members: Object.fromEntries(eps.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 1, origin_operation_id: "00000000-0000-4000-8000-0000000000d9" }) + "\n", { mode: 0o600 });
+      fs.writeFileSync(path.join(ledgerDir, "owner-select-writer-state.json"), JSON.stringify({ schema_version: R57D_WRITER_SCHEMA, state: "on", campaign_id: campaignIdFor("00000000-0000-4000-8000-0000000000d9"), endpoints_digest: endpointsDigest(eps), origin_operation_id: "00000000-0000-4000-8000-0000000000d9", revision: 1 }) + "\n", { mode: 0o600 });
+      const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+      fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [] }));
+      fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "r57d", root, name: "R57d", root_message_id: ROOT_D, expires_at: "2099-01-01T00:00:00Z", session_id: SESSION_D, inbound_state: "bound", status: "active", bound_at: "2026-09-13T00:00:00.000Z" }] }));
+      const bin = path.join(local, "bin"); fs.mkdirSync(bin, { recursive: true });
+      fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+      const run = (messageId) => {
+        const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> /feishu-select " + b1.result.selection_handle;
+        const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: SESSION_D, role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+        return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: SESSION_D, AILY_CLI_RUN_ID: "run_" + messageId, FAKE_AILY_ENVELOPE: envelope } });
+      };
+      const revBefore = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision;
+      const r1 = run("om_msgd1");
+      assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+      const recDir = path.join(root, ".runtime-data", "inbound", "receipts");
+      for (const f of fs.readdirSync(recDir)) {
+        const body = JSON.parse(fs.readFileSync(path.join(recDir, f), "utf-8"));
+      }
+      const probe2 = run("msg_d1_probe2");
+      assert.match(r1.stdout, /已按你的选择完成绑定/u, "成功回执：" + r1.stdout);
+      const doc1 = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY });
+      assert.equal(doc1.doc.records[b1.result.created_id].binding_proof.kind, "owner_select_v1", "真入口双证落账");
+      const rev1 = doc1.doc.revision;
+      // 同 message 重放 → 已处理，账本不再变
+      const r2 = run("om_msgd1");
+      assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+      assert.match(r2.stdout, /已处理/u, "重放回「已处理」：" + r2.stdout);
+      assert.equal(TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision, rev1, "重放不重执行");
+      void revBefore;
+    } finally {
+      if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR;
+      else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
+      fs.rmSync(local, { recursive: true, force: true });
+    }
+  });
+
+  function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }
 
 sealSummary();

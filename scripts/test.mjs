@@ -42820,6 +42820,51 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(w6r.ok, true, "同内容不同键序 → reused");
     assert.equal(w6r.reused, true, "reused:true（canonKey 深层全符）");
 
+    // ── R57b 返修八：link 发布残骸窗口 ──
+
+    // 窗口②（正）：link 完成、tmp 未 unlink（同 inode nlink=2）→ 读取受验恢复（final 可读、tmp 被清）。
+    const key9 = "9".repeat(64);
+    SP.writeSelectionPlan({ claimsDir, key: key9, plan: mkPlan({ claim_key: key9 }) });
+    const final9 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(key9));
+    const tmp9 = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(key9) + ".stale");
+    fs.linkSync(final9, tmp9);
+    assert.equal(fs.lstatSync(final9).nlink, 2, "预造同 inode nlink=2（link 后未 unlink）");
+    const r9 = SP.readSelectionPlan({ claimsDir, key: key9 });
+    assert.equal(r9.ok, true, "受验恢复后 final 可读：" + JSON.stringify(r9));
+    assert.equal(r9.plan.target_id, target, "恢复后读回 plan");
+    assert.equal(fs.lstatSync(final9).nlink, 1, "受验恢复后 nlink=1");
+    assert.equal(fs.existsSync(tmp9), false, "受验恢复后 tmp 被清");
+
+    // 窗口②（负）：tmp 与 final 同目录但不同 inode / 内容不等 → 不自动清（residue 点名，fail-closed）。
+    const keyA = "a" + "0".repeat(63);
+    SP.writeSelectionPlan({ claimsDir, key: keyA, plan: mkPlan({ claim_key: keyA }) });
+    const tmpA = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(keyA) + ".mismatch");
+    fs.writeFileSync(tmpA, JSON.stringify(mkPlan({ claim_key: keyA, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    const rA = SP.readSelectionPlan({ claimsDir, key: keyA });
+    assert.equal(rA.ok, false, "不匹配 tmp → fail-closed（residue 点名）");
+    assert.ok(Array.isArray(rA.residue) && rA.residue.includes(tmpA), "residue 点名 tmp");
+    assert.equal(fs.existsSync(tmpA), true, "不匹配 tmp 不自动清（待人工）");
+
+    // 窗口①：EEXIST（并发写）后 reused / conflict 都不留本次 tmp。用 beforeLink 注入并发写 final。
+    const keyB = "b" + "0".repeat(63);
+    const planB = mkPlan({ claim_key: keyB });
+    const wB = SP.writeSelectionPlan({ claimsDir, key: keyB, plan: planB, _inject: { beforeLink: () => {
+      fs.writeFileSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyB)), JSON.stringify(planB, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wB.ok, true, "并发写同 plan → reused：" + JSON.stringify(wB));
+    assert.equal(wB.reused, true, "reused:true");
+    assert.equal(fs.readdirSync(claimsDir).filter((n) => n.startsWith(SP.SELECTION_PLAN_TMP_PREFIX(keyB))).length, 0, "reused 不留 tmp（窗口①）");
+
+    const keyC = "c" + "0".repeat(63);
+    const planC = mkPlan({ claim_key: keyC });
+    const wC = SP.writeSelectionPlan({ claimsDir, key: keyC, plan: mkPlan({ claim_key: keyC, target_id: "ta_" + "9".repeat(32) }), _inject: { beforeLink: () => {
+      fs.writeFileSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyC)), JSON.stringify(planC, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wC.ok, false, "并发写不同 plan → conflict");
+    assert.equal(wC.reason, "selection_plan_conflict", "reason 为 selection_plan_conflict");
+    assert.equal(fs.readdirSync(claimsDir).filter((n) => n.startsWith(SP.SELECTION_PLAN_TMP_PREFIX(keyC))).length, 0, "conflict 不留 tmp（窗口①）");
+
+
     fs.rmSync(claimsDir, { recursive: true, force: true });
   });
 

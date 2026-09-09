@@ -116,7 +116,15 @@ function copyBackup(dest, bytes) {
     if (!s.ok) return { ok: false, reason: "backup_seal_failed", why: "复用备份重新 seal 失败（" + s.why + "）" };
     return { ok: true, sha256: sha, bytes: bytes.length };
   }
-  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+  // R53 返修六 P1-1：新建分支异常结构化（write/fsync/close 不裸抛）+ 写后受验读回；任一步失败→结构化拒（调用方走 failWithStagedClean），
+  //   不再让异常冒泡成泛化 osm_forward_failed 且留 .staged 残留。
+  let werr = null;
+  try { fs.writeFileSync(fd, bytes); } catch (err) { werr = err; }
+  if (werr === null) { try { fs.fsyncSync(fd); } catch (err) { werr = err; } }
+  try { fs.closeSync(fd); } catch (err) { if (werr === null) werr = err; }
+  if (werr !== null) return { ok: false, reason: "backup_write_failed", why: "新备份写/刷盘异常：" + errText(werr) };
+  const v = readStagedVerified(dest, { sha256: sha, bytes: bytes.length });
+  if (!v.ok) return { ok: false, reason: "backup_verify_failed", why: "新备份写后受验读回不符（" + (v.why ?? "") + "）" };
   return { ok: true, sha256: sha, bytes: bytes.length };
 }
 
@@ -198,7 +206,6 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
 const campaignProj = (env) => { const a = readCampaignState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints: a.endpoints, endpoints_digest: a.endpoints_digest } }; };
 const writerProj = (env) => { const a = readWriterState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints_digest: a.endpoints_digest, revision: a.revision } }; };
 const ledgerProj = (ep, dir) => { const a = loadLedger(dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { schema_version: a.doc.schema_version, revision: a.doc.revision, ledger_sha256: a.sha256 } : {} }; };
-const LEDGER_ALLOWED = (n) => n === "ledger.json" || n === "ledger.json.prev";
 
 /** P1-3（返修二 P1-1）：核**两条链**的已装 runtime 是否支持过渡（§8 进门前置）。
  *  目标从**受验 journal** 的 `current:<chain>.before` 取（绝不读桩 manifest 的 original_current——
@@ -704,7 +711,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id);
         }
-        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: LEDGER_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: ledgerAllowed, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -802,7 +809,8 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
-          copyBackup(path.join(ctx.dir, token + ".staged", "backup-campaign.json"), serializeLedger(rebuild.doc)); // seal/complete 步备份合同
+          // R53 返修六 P1-1：删掉旧的、未锚定的 backup-campaign.json 遗留写（返回值此前被忽略）——direct 的 campaign 备份已由
+          //   P1-1（返修五）的 step-id 编码备份覆盖，这里不再按旧名写。
         }
         const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -841,7 +849,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
-        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: LEDGER_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: ledgerAllowed, inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };

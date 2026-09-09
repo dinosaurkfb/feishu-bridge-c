@@ -39042,6 +39042,68 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 返修六 P1-1 ①：正式 backup-<step>.json 新建分支注入 fd fsync EIO → 结构化拒 backup_write_failed + staged 清理（不再 osm_forward_failed/drained 且 .staged 残留）", () => {
+    const fx = r53SetupB({});
+    try {
+      const _realFsync = fs.fsyncSync, _realOpen = fs.openSync;
+      const fdPath = new Map();
+      fs.openSync = function (...a) { const fd = _realOpen.apply(fs, a); fdPath.set(fd, String(a[0])); return fd; };
+      fs.fsyncSync = function (fd) { const p = fdPath.get(fd) ?? ""; if (p.includes("backup-") && p.includes(".staged")) throw Object.assign(new Error("inject EIO"), { code: "EIO" }); return _realFsync.call(fs, fd); };
+      let r = null;
+      try { r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); }
+      finally { fs.fsyncSync = _realFsync; fs.openSync = _realOpen; }
+      assert.ok(r.ok === false, "备份 fsync EIO 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.notEqual(r.reason, "osm_forward_failed", "不再泛化 osm_forward_failed");
+      assert.equal(r.reason, "backup_write_failed", "拒因：" + r.reason);
+      assert.equal(fs.existsSync(path.join(fx.dir, r.token + ".staged")), false, "staged 已清理（无残留）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修六 P1-2：B 恢复窗把 ledger.json.prev 换成 symlink → 不记 done、点名残骸（ledgerAllowed 类型封闭，不再只按名字放行）", () => {
+    const fx = r53SetupB({});
+    try {
+      // schema 写后崩（epA step 仍 prepared），把 epA 的 ledger.json.prev 换成 symlink → 续跑 sealAndVerifyStep 按 ledgerAllowed 判残骸。
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "schema 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      fx.ctx.afterWrite = null;
+      // 把 epA 的 ledger.json.prev 换成 symlink（指向 ledger.json）。
+      const epA = fx.eps[0];
+      const dirA = path.join(fx.ledgerRoot, epA);
+      const prevPath = path.join(dirA, "ledger.json.prev");
+      if (fs.existsSync(prevPath)) fs.rmSync(prevPath);
+      fs.symlinkSync(path.join(dirA, "ledger.json"), prevPath);
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "symlink 残骸必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.match(String(r.why ?? ""), /残骸|不是普通文件|symlink|引用/, "why 点名残骸：" + r.why);
+      assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.kind === "schema_endpoint" && s.state !== "done").state, "prepared", "schema step 不记 done");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修六 P2：B precheck 四字段等式——precheck 记 intended 后用真实 ledger op（合法账本）推进 revision/SHA → precheck_failed（why 点名 revision/SHA），删等式应红", () => {
+    const fx = r53SetupB({ crashAfter: 8 }); // forward-entered，precheck prepared
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "进段后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // 用一笔真实 createA1 推进 epA 的 revision/SHA（仍是合法账本，不是裸改 revision）。
+      const epA = fx.eps[0];
+      const cr = TAL.createA1({ endpointId: epA, requestKey: "r53_ret_drift_a1", chatId: "oc_r53", sessionId: "sess-drift", clock: () => T052, env: fx.env });
+      assert.ok(cr.ok, "createA1 推进 revision：" + JSON.stringify(cr));
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "precheck 投影与预算漂移必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "precheck_failed", "拒因：" + r.reason);
+      assert.match(String(r.why ?? ""), /revision|ledger_sha256|预算/, "why 点名 revision/SHA：" + r.why);
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
     // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
     const run = (kind, ctxFn) => {

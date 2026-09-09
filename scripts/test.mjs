@@ -45706,10 +45706,15 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   const ROOT_D = "om_root57d";
 
   // 真账本夹具：transition 账本 + B1(handle) + A1(事件会话) [+ A2 / rebind 场景按需追加]
+  // R57d 返修一 P1-1：执行器 shadow 期必须走 M1a 复合双写（runWired）——夹具同时种 ledger_init done
+  //   收据（FEISHU_BRIDGE_MAINTENANCE_DIR 指到本夹具），让端点处于「已启用」态（否则 runWired 合法
+  //   legacy-only，账本 op 不会跑）。
   const withLedgerD = (fn, { plant = ["b1", "a1"] } = {}) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57d-")));
     const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    const savedMaint = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
     process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(root, "maint");
     const dir = path.join(root, EP57D);
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -45726,16 +45731,119 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.ok(a2.ok, "createA2 前身");
       const att = TAL.attach({ endpointId: EP57D, requestKey: "r57d_att", id: a2.result.created_id, bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000d2" }, claimKey: "c".repeat(64), authorizedBy: "ou_r57d", anchorCandidate: ROOT_D, clock: () => T0D });
       assert.ok(att.ok, "attach A2：" + JSON.stringify(att));
+      // M1a 收据（ledger_init done）→ endpointReceipt 判 ok（runWired 双写强制路径）
+      seedReceipt57d(path.join(root, "maint"), EP57D);
       return fn(root, dir, { b1Id: b1.result.created_id, b1Handle: b1.result.selection_handle, a1Id: a1.result.created_id, a2Id: a2.result.created_id, a2Handle: att.result.selection_handle });
     } finally {
       if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      if (savedMaint === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaint;
       fs.rmSync(root, { recursive: true, force: true });
     }
   };
+  // M1a ledger_init done 收据（journal 形状与 maintenance/ledger-receipt 判据一致）—— R57d 返修一 P1-1 夹具件。
+  const seedReceipt57d = (maintDir, ep) => {
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const at = "2026-09-13T08:00:00.000Z";
+    const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+    const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const steps = ["claude", "codex"].flatMap((ch) => [
+      { id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null },
+      { id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null },
+      { id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null },
+    ]);
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "r57d seed", started_at: at, updated_at: at, phase: "done", steps: [...steps, { id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null }, ledgerStep], notes: [] }), { mode: 0o600 });
+    assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 出的 ledger_init 收据应判 ok");
+  };
   const ctxD = (over = {}) => ({ selectAdmissionFn: () => ({ state: "on" }), senderId: "ou_owner57d", chatId: CHAT_D, endpointId: EP57D, messageId: "om_msgd1", eventSessionId: SESSION_D, eventRootOm: ROOT_D, env: process.env, ...over });
+  const mappingStub = (calls) => (ctx) => { calls.push(ctx); return { ok: true, legacyCommitted: true }; };
+
+  test("R57d 返修一 P1-1（wiring 层）：wireSelect* 按 authority_mode 分派——shadow 复合双写（outer 锁 + legacy 回调；anchor 为显式 no-op）、busy 整笔拒不直写、authoritative ledger-only 不碰 legacy", () => withLedgerD((root, dir, ids) => {
+    const recAt = () => TAL.loadLedger(dir, { endpointId: EP57D }).doc.records;
+    // ① shadow + 已启用：activate → legacy 回调被调 → 账本 op 落账；outer 锁被持有且释放
+    let calls = 0;
+    const wA = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, messageId: "om_w1", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    assert.ok(wA.ok, "① activate 复合成功：" + JSON.stringify(wA));
+    assert.equal(calls, 1, "① shadow：legacy 回调被调");
+    assert.equal(wA.legacy.legacyCommitted, true, "① legacy 提交投影");
+    assert.equal(wA.shadow[0].op, "activate", "① 一笔账本 op");
+    assert.ok(wA.shadow[0].ok, "① op 成功：" + JSON.stringify(wA.shadow[0]));
+    assert.ok(wA.release && wA.release.ok, "① outer 锁被持有且干净释放");
+    assert.equal(wA.shadow[0].result.selection_basis, "explicit_handle");
+    // ② busy：外层锁被占 → 整笔拒（binding_busy）、legacy 未跑、账本不动（shadow 期禁绕过 outer 直写）
+    const acq = DW.acquireOrderLock(EP57D, process.env);
+    assert.ok(acq.ok, "② 测试持锁");
+    const revBefore = TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision;
+    let busyCalls = 0;
+    const wB = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { busyCalls += 1; return { ok: true }; }, messageId: "om_w2", b1Id: ids.a2Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: ROOT_D, selectionHandle: ids.a2Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    assert.equal(wB.ok, false, "② busy → 整笔拒");
+    assert.equal(wB.reason, "binding_busy", "② reason：" + JSON.stringify(wB));
+    assert.equal(busyCalls, 0, "② busy 时 legacy 未跑");
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision, revBefore, "② 账本不动（禁直写）");
+    assert.ok(acq.release().ok, "② 释放");
+    // ③ anchor：没有 legacy mapping 权威事实 → legacy 显式 no-op 记录，但仍走 outer 排序 + ledger
+    const a2rec = recAt()[ids.a2Id];
+    const wC = WIRE.wireSelectAnchor({ endpointId: EP57D, env: process.env, messageId: "om_w3", id: ids.a2Id, authorizedBy: "ou_owner57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionBasis: "explicit_handle", clock: () => T0D });
+    assert.ok(wC.ok, "③ anchor 复合成功：" + JSON.stringify(wC));
+    assert.equal(wC.legacy.noop, true, "③ anchor legacy 显式 no-op（不伪造 mapping 写）");
+    assert.ok(wC.shadow[0].ok, "③ ledger op 成功：" + JSON.stringify(wC.shadow[0]));
+    assert.ok(wC.release && wC.release.ok, "③ outer 锁照取照还");
+    // ④ authoritative：ledger-only —— legacy 不被调、无 outer 锁、账本 op 照落
+    const lp = TAL.loadLedger(dir, { endpointId: EP57D });
+    const plan = TAL.cutoverPlan({ endpointId: EP57D, chain: "claude", requestKey: "r57d_cut", operationId: "00000000-0000-4000-8000-000000000c01", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: "e".repeat(64), sidecarShas: { expiry: "e".repeat(64), pending_claims: "f".repeat(64), policy: "a".repeat(64) } });
+    assert.ok(plan.ok, "④ cutoverPlan：" + JSON.stringify(plan));
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(plan.doc, null, 2) + "\n", { mode: 0o600 });
+    // 新造一个 pending B1 + 可归并 A1（activate 目标不能是已消费的；A1 locator 同 chat 同 session 唯一，换新会话）
+    const a3 = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_a3", chatId: CHAT_D, sessionId: SESSION_D + "-x", clock: () => T0D });
+    assert.ok(a3.ok, "④ 新 A1：" + JSON.stringify(a3));
+    const b2 = TAL.createB1({ endpointId: EP57D, requestKey: "r57d_b2", chatId: CHAT_D, rootOm: "om_b2root", lineageId: "lin_d2", bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000d3" }, clock: () => T0D });
+    assert.ok(b2.ok, "④ 新 B1：" + JSON.stringify(b2));
+    let authCalls = 0;
+    const wD = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { authCalls += 1; return { ok: true }; }, messageId: "om_w4", b1Id: b2.result.created_id, chatId: CHAT_D, eventSessionId: SESSION_D + "-x", authorizedBy: "ou_owner57d", selectedRootOm: "om_b2root", selectionHandle: b2.result.selection_handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    assert.ok(wD.ok, "④ authoritative ledger-only 成功：" + JSON.stringify(wD));
+    assert.equal(wD.ledgerOnly, true, "④ ledgerOnly 投影");
+    assert.equal(authCalls, 0, "④ authoritative：不碰 legacy");
+    assert.equal(wD.legacy, null, "④ legacy 恒 null");
+    assert.ok(wD.shadow[0].ok, "④ 账本 op 成功");
+    assert.equal(wD.release, null, "④ 无 outer 锁");
+  }));
+
+  test("R57d 返修一 P1-1（wiring 层）：锁内复核 A1 缺席 → no_a1；账本 mode 说不清 → fail-closed", () => withLedgerD((root, dir, ids) => {
+    // 锁内复核：事件会话上没有可归并 A1 → no_a1（§12 ⑥），legacy 仍被调（复合语义：legacy 已提交、账本 op 拒）
+    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => ({ ok: true, legacyCommitted: true }), messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    assert.ok(w.ok, "wired.ok 仍 true（legacy 成、账本步拒）：" + JSON.stringify(w));
+    assert.equal(w.shadow[0].ok, false, "账本步拒");
+    assert.equal(w.shadow[0].reason, "no_a1", "锁内复核缺 A1 → no_a1");
+  }));
+
+  test("R57d 返修一 P1-1（执行器层）：shadow 缺 mappingUpdate → select_legacy_required 且账本不动（禁直写）；注入后复合成功且回调带选择上下文；anchor 免注入", () => withLedgerD((root, dir, ids) => {
+    const rev0 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision;
+    // ① shadow + 未注入 mappingUpdate → 拒，账本 revision 不变（禁绕过复合直写账本）
+    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD());
+    assert.equal(r.ok, false, "① 拒：" + JSON.stringify(r));
+    assert.equal(r.reason, "select_legacy_required", "① reason：" + r.reason);
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision, rev0, "① 账本不动");
+    // ② 注入 mappingUpdate → 复合成功；回调收到选择上下文；账本双证落账
+    const calls = [];
+    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventRootOm: "om_b1root", mappingUpdate: mappingStub(calls) }));
+    assert.equal(r.ok, true, "② 成功：" + JSON.stringify(r));
+    assert.equal(r.action, "activate");
+    assert.equal(calls.length, 1, "② legacy 回调被调一次");
+    assert.equal(calls[0].action, "activate", "② 回调带 action");
+    assert.equal(calls[0].targetId, ids.b1Id, "② 回调带 targetId");
+    assert.equal(calls[0].eventSessionId, SESSION_D, "② 回调带事件会话");
+    const rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1", "② 账本双证落账");
+    // ③ anchor 免注入（legacy 显式 no-op）——成功
+    r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD());
+    assert.equal(r.ok, true, "③ anchor 免 mappingUpdate：" + JSON.stringify(r));
+    assert.equal(r.action, "anchor");
+  }));
 
   test("R57d on+osh(B1)：真执行器 activate——双证落账、B1 handle 消费、成功文案、select_executor_absent 不再出现", () => withLedgerD((root, dir, ids) => {
-    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventRootOm: "om_b1root" }));
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventRootOm: "om_b1root", mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.match(r.text, /已按你的选择完成绑定/u, "activate 文案：" + r.text);
     assert.equal(r.action, "activate");
@@ -45763,7 +45871,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
     const rq = TAL.requestRebind({ endpointId: EP57D, requestKey: "r57d_rq", b3Id: ids.b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: SESSION_D, clock: () => T0D });
     assert.ok(rq.ok, "requestRebind：" + JSON.stringify(rq));
-    const r = SA.executeSelectControl({ control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, ctxD({ eventSessionId: SESSION_D + "-new" }));
+    const r = SA.executeSelectControl({ control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, ctxD({ eventSessionId: SESSION_D + "-new", mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.action, "rebind");
     const doc = TAL.loadLedger(dir, { endpointId: EP57D });
@@ -45822,6 +45930,12 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.ok(b1.ok, JSON.stringify(b1));
       const a1 = TAL.createA1({ endpointId: EP_ENTRY, requestKey: "r57d_a1", chatId: CHAT_D, sessionId: SESSION_D, clock: () => T0D });
       assert.ok(a1.ok, JSON.stringify(a1));
+      // R57d 返修一 P1-1：真入口在 shadow 期必须走复合双写（mappingUpdate 由调用方注入，子进程注不进去）
+      //   —— 夹具把账本切到 authoritative，执行器走 ledger-only 分派（owner_select writer on ≠ 账本 authoritative）。
+      const lp = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY });
+      const cut = TAL.cutoverPlan({ endpointId: EP_ENTRY, chain: "claude", requestKey: "r57d_entry_cut", operationId: "00000000-0000-4000-8000-000000000c02", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: "e".repeat(64), sidecarShas: { expiry: "e".repeat(64), pending_claims: "f".repeat(64), policy: "a".repeat(64) } });
+      assert.ok(cut.ok, JSON.stringify(cut));
+      fs.writeFileSync(path.join(ledgerDir, EP_ENTRY, "ledger.json"), JSON.stringify(cut.doc, null, 2) + "\n", { mode: 0o600 });
       // writer on + campaign complete（准入 on）
       const eps = [EP_ENTRY];
       fs.writeFileSync(path.join(ledgerDir, "owner-select-campaign.json"), JSON.stringify({ schema_version: R57D_CAMPAIGN_SCHEMA, campaign_id: campaignIdFor("00000000-0000-4000-8000-0000000000d9"), state: "complete", endpoints: eps, endpoints_digest: endpointsDigest(eps), pending_joins: [], members: Object.fromEntries(eps.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 1, origin_operation_id: "00000000-0000-4000-8000-0000000000d9" }) + "\n", { mode: 0o600 });

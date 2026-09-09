@@ -19,7 +19,7 @@ import path from "node:path";
 
 import { acquireOrderLock, requestKeyFor } from "./dual-write.mjs";
 import {
-  createA1, createB1, activate, attach, voidPending, unbind, restore, retarget, rebindSessionAlias,
+  createA1, createB1, activate, anchor, attach, voidPending, unbind, restore, retarget, rebindSessionAlias,
   resolveLiveId, loadByEndpoint, familyOf,
 } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
@@ -467,4 +467,82 @@ export function wireBind({ endpointId, env = process.env, legacy, externalReques
     // R57a 返修二 P1-2：create_b1 不传数值 now（TTL 走锁内 clock()）
     return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env }))];
   } });
+}
+
+/* ── R57d 返修一 P1-1：owner_select 执行器的三个具名 wrapper（owner-select-route.md §12 ①）──
+ * 按账本 authority_mode 封闭分派：authoritative → ledger-only（无 legacy、无 outer 锁——没有
+ * legacy 提交就没有排序对象，账本事务自带文件锁）；shadow → runWired 复合双写（m1a-order.lock →
+ * legacy 提交回调 → 账本 op）；其它值 → 拒 fail-closed。owner_select writer on ≠ 账本 authoritative。
+ * 执行器没有第二个入口：outer 锁只由 runWired 取，本组 wrapper 是 select 执行的唯一写面。
+ * anchor 没有 legacy mapping 权威事实可更新 → legacy 显式 no-op（outer 排序保留、不伪造 mapping 写）；
+ * activate / rebind 的 legacy 回调更新 mapping —— 由调用方注入，shadow 期缺席 → 拒（不做无 legacy
+ * 的半笔双写）。request_key 按 §5.1 通式从持久外部 id（事件 message id）+ 目标 id 逐 op 派生。 */
+
+/** 分派前提：账本 authority_mode 三值读取（absent → no_candidate；corrupt → ledger_corrupt；其余 → ledger_unreadable）。 */
+function selectAuthorityMode({ endpointId, env }) {
+  const L = loadByEndpoint(endpointId, { env });
+  if (!L.ok) {
+    const reason = L.granular === "absent" ? "no_candidate" : L.granular === "corrupt" ? "ledger_corrupt" : "ledger_unreadable";
+    return { ok: false, reason, why: L.why ?? null };
+  }
+  const mode = L.doc?.authority_mode;
+  if (mode !== "shadow" && mode !== "authoritative") return { ok: false, reason: "ledger_unreadable", why: "authority_mode=" + String(mode) + " 越界（fail-closed）" };
+  return { ok: true, mode };
+}
+
+/** authoritative 支的 ledger-only 结果：单笔 capture 原样投影（legacy 恒 null、无 outer 锁）。 */
+function selectLedgerOnly(step) {
+  return step.ok === true
+    ? { ok: true, ledgerOnly: true, legacy: null, shadow: [step], release: null }
+    : { ok: false, commit: "not_committed", ledgerOnly: true, reason: step.reason ?? "select_op_failed", why: step.why ?? null, legacy: null, shadow: [step], release: null };
+}
+
+/** shadow 支的前置拒（activate / rebind 必须带 legacy 提交回调；缺席 → 不做无 legacy 的半笔双写）。 */
+const selectLegacyMissing = () => ({ ok: false, commit: "not_committed", reason: "select_legacy_required", why: "shadow 期该动作必须带 legacy 提交回调（更新 mapping）；缺席 → 拒", legacy: null, shadow: null, release: null });
+
+/** wireSelectActivate —— owner_select activate（B1+A1 归并）的双写分派。
+ * shadow：outer 锁内先复核事件会话/chat 上仍存在可归并 A1（§12 ⑥，缺 → no_a1）再 legacy → activate。 */
+export function wireSelectActivate({ endpointId, env = process.env, legacy = null, messageId, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
+  const mode = selectAuthorityMode({ endpointId, env });
+  if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
+  const submit = () => {
+    const l = loadByEndpoint(endpointId, { env });
+    if (!l.ok) return [{ op: "activate", ok: false, reason: "ledger_unreadable", why: l.why ?? null }];
+    const a1 = Object.values(l.doc.records).find((x) => x?.kind === "live" && familyOf(x.facts) === "A1" && x.chat_id === chatId && x.aliases.session_id === eventSessionId);
+    if (!a1) return [{ op: "activate", ok: false, reason: "no_a1", why: "锁内复核：事件会话/chat 上无可归并 A1（§12 ⑥）" }];
+    const k = rk("activate", messageId, b1Id);
+    if (!k.ok) return [{ op: "activate", ...k }];
+    return [capture("activate", activate({ endpointId, requestKey: k.request_key, b1Id, a1Id: a1.topic_agent_id, authorizedBy, selectedSessionId: eventSessionId, selectedRootOm, selectionHandle, selectionMessageId: messageId, selectionBasis, clock, env }))];
+  };
+  if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
+  if (typeof legacy !== "function") return selectLegacyMissing();
+  return runWired({ endpointId, env, legacy, submit });
+}
+
+/** wireSelectAnchor —— owner_select anchor（A2 → A3 补链路证明）的双写分派。
+ * legacy 恒为显式 no-op：anchor 没有 legacy mapping 权威事实可更新，不伪造 mapping 写；outer 排序照走。 */
+export function wireSelectAnchor({ endpointId, env = process.env, messageId, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionBasis, clock = () => Date.now() }) {
+  const mode = selectAuthorityMode({ endpointId, env });
+  if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
+  const submit = () => {
+    const k = rk("anchor", messageId, id);
+    if (!k.ok) return [{ op: "anchor", ...k }];
+    return [capture("anchor", anchor({ endpointId, requestKey: k.request_key, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionMessageId: messageId, selectionBasis, clock, env }))];
+  };
+  if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
+  return runWired({ endpointId, env, legacy: () => ({ ok: true, noop: true, why: "anchor 无 legacy mapping 权威事实（§12 ①：显式 no-op，不伪造 mapping 写）" }), submit });
+}
+
+/** wireSelectRebind —— owner_select rebind_session_alias（B3 换绑事件会话）的双写分派。 */
+export function wireSelectRebind({ endpointId, env = process.env, legacy = null, messageId, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
+  const mode = selectAuthorityMode({ endpointId, env });
+  if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
+  const submit = () => {
+    const k = rk("rebind_session_alias", messageId, id);
+    if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
+    return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId: messageId, clock, env }))];
+  };
+  if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
+  if (typeof legacy !== "function") return selectLegacyMissing();
+  return runWired({ endpointId, env, legacy, submit });
 }

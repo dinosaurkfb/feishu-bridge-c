@@ -12,12 +12,12 @@
 //   失败按 reason 封闭映射，ambiguous 回执列 opaque id（§13 不回 handle 值）。
 
 import { createHash } from "node:crypto";
-import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint, familyOf } from "./topic-agent-ledger.mjs";
+import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
 import { canonKey } from "./maintenance/canon.mjs";
 import { resolveSelectionCandidate } from "./select-resolve.mjs";
-import { activate, anchor, rebindSessionAlias } from "./topic-agent-ledger.mjs";
+import { wireSelectActivate, wireSelectAnchor, wireSelectRebind } from "./m1a/wiring.mjs";
 
 /**
  * 判定选择控制 outcome 的叶子纯函数（§8.1 / R57b / 与 R57d 返修一共用，不 import 维护编排）。
@@ -141,6 +141,10 @@ export function selectRejectTextByReason(reason) {
   if (reason === "no_a1") return "当前会话上没有待绑定的 A1 记录，无法完成绑定";
   if (reason === "cas_mismatch") return "选择与账本现场不符（记录可能已变动），请重新发起选择";
   if (reason === "select_endpoint_unknown") return "无法确定所属 endpoint，未执行";
+  // R57d 返修一 P1-1：按 authority_mode 分派走 m1a wrapper 的新失败面
+  if (reason === "select_legacy_required") return "迁移未完成（账本仍是影子），执行需要同步更新绑定登记；这一步不可用，未执行";
+  if (reason === "select_legacy_failed") return "绑定登记更新失败，未执行（账本未落）；请稍后重试";
+  if (reason === "select_ledger_skipped") return "选择没有落到账本（该端点账本未启用镜像），未生效";
   if (reason === "ledger_corrupt" || reason === "ledger_unreadable") return "账本读不出，未执行（fail-closed）";
   if (reason === "schema_not_11") return "账本还没升到 1.1，不能重签";
   return "控制执行失败（" + reason + "）";
@@ -163,6 +167,27 @@ export function selectExecutorSuccessText(action) {
 /** owner-select f4（无 token 三项 + absent）：owner-select 的配对证据是 owner 授权本身，不声称 token 核验。 */
 const ownerSelectF4 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" });
 
+/** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
+ * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
+function wiredOutcome(w, action) {
+  if (!w || typeof w !== "object") return { ok: false, reason: "select_op_failed", text: selectRejectTextByReason("select_op_failed") };
+  if (w.ok !== true) {
+    const reason = w.reason ?? "select_op_failed";
+    return { ok: false, reason, text: selectRejectTextByReason(reason) + (w.why ? "（" + w.why + "）" : "") };
+  }
+  if (w.legacy && w.legacy.ok === false) {
+    const why = String(w.legacy.why ?? w.legacy.reason ?? "");
+    return { ok: false, reason: "select_legacy_failed", text: selectRejectTextByReason("select_legacy_failed") + (why ? "（" + why + "）" : "") };
+  }
+  const step = Array.isArray(w.shadow) ? w.shadow[0] : null;
+  if (!step) return { ok: false, reason: "select_ledger_skipped", text: selectRejectTextByReason("select_ledger_skipped") };
+  if (step.ok !== true) {
+    const reason = step.reason ?? "select_op_failed";
+    return { ok: false, reason, text: selectRejectTextByReason(reason) + (step.why ? "（" + step.why + "）" : "") };
+  }
+  return { ok: true, changed: step.idempotent !== true, action, text: selectExecutorSuccessText(action) };
+}
+
 /**
  * 执行选择控制命令（在控制事务锁内跑）。
  * R52a（PR #136）：准入不过 → failed 终态；R57b：rfh 支接 owner_select_reaffirm；
@@ -179,6 +204,7 @@ export function executeSelectControl(intent, {
   consumeReaffirm = consumeReaffirmIntent,
   senderId = null, chatId = null, endpointId = null, messageId = null,
   eventSessionId = null, eventRootOm = null,
+  mappingUpdate = null,
   now = undefined, clock = () => Date.now(), env = process.env, _inject = undefined,
   claimsDir = undefined, key = undefined,
 } = {}) {
@@ -267,17 +293,19 @@ export function executeSelectControl(intent, {
     return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }
   const target = doc.records[res.target_id];
-  const requestKey = "sel:" + String(messageId ?? "").slice(0, 200);
-  let r;
+  // R57d 返修一 P1-1：按账本 authority_mode 分派走 m1a/wiring.mjs 的三个具名 wrapper（唯一写面；
+  //   shadow 期不碰 activate/anchor/rebindSessionAlias 直调，不给第二个入口）。mappingUpdate 是
+  //   activate/rebind 的 legacy 提交回调（更新 mapping）；shadow 期缺席 → wrapper 拒 select_legacy_required。
+  const legacy = typeof mappingUpdate === "function"
+    ? () => mappingUpdate({ action, endpointId, targetId: res.target_id, chatId, eventSessionId, senderId, messageId })
+    : null;
+  let w;
   if (action === "activate") {
-    const a1 = Object.values(doc.records).find((x) => x?.kind === "live" && familyOf(x.facts) === "A1" && x.chat_id === chatId && x.aliases.session_id === eventSessionId);
-    if (!a1) return { ok: false, status: "failed", reason: "no_a1", text: selectRejectTextByReason("no_a1") };
-    r = activate({ endpointId, requestKey, b1Id: res.target_id, a1Id: a1.topic_agent_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, selectionMessageId: messageId, selectionBasis: res.selection_basis, clock, env });
+    w = wireSelectActivate({ endpointId, env, legacy, messageId, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
   } else if (action === "anchor") {
-    r = anchor({ endpointId, requestKey, id: res.target_id, authorizedBy: senderId, selectedSessionId: target.aliases.session_id, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionMessageId: messageId, selectionBasis: res.selection_basis, clock, env });
+    w = wireSelectAnchor({ endpointId, env, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: target.aliases.session_id, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
-    r = rebindSessionAlias({ endpointId, requestKey, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle, expectedExpiresAt: target.rebind_expires_at, selectionMessageId: messageId, clock, env });
+    w = wireSelectRebind({ endpointId, env, legacy, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
-  if (!r.ok) return { ok: false, status: "failed", reason: r.reason ?? "select_op_failed", text: selectRejectTextByReason(r.reason ?? "select_op_failed") + (r.why ? "（" + r.why + "）" : "") };
-  return { ok: true, status: "consumed", changed: r.idempotent === true ? false : true, action, text: selectExecutorSuccessText(action) };
+  return wiredOutcome(w, action);
 }

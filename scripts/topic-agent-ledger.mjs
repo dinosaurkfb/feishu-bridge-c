@@ -3287,7 +3287,6 @@ export function ownerSelectReaffirm({ endpointId, targetId, targetFamily, expect
       if (rec.binding_proof === null || rec.locator_link_proof_ref === null) return { ok: false, reason: "reaffirm_scope", why: "无证记录不可 reaffirm" };
       const nowMs = Number.isFinite(now) ? now : clock(); // 事件记账时间
       const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
-      const lockMs = clock(); // R57a 返修二 P1-2：锁内时钟（reaffirm 无 TTL 字段，保持 seam 一致）
       // R57b 返修一 P1-1：reaffirm 必须让迁移收敛——pairing binding 也要换成 owner_select_v1
       // 检查关联 tombstone 的 proof kind：未知 kind → 整笔拒
       const relatedTombstones = Object.values(doc.records)

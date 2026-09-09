@@ -19916,7 +19916,7 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
       assert.deepEqual([ro.ok, ro.reason, executed], [false, "control_lock_unavailable", 0], "目录不可写：连事务锁都建不了，不执行：" + JSON.stringify(ro));
     } finally { fs.chmodSync(claimsDir, 0o700); }
   }
-  assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "failed_unreadable", "in_flight"]);
+  assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "control-committed-unclean", "failed_unreadable", "in_flight"]);
   // ── 事务锁协议（评审第 6 轮）──
   // ① 锁内状态对所有调用者权威：重复投递先闭合，原持有者晚到（自称首次）也不再执行、不覆写记录
   const lateKey = acquireClaim({ claimsDir, messageId: "msg_late", logicalTaskKey: "t",
@@ -42405,6 +42405,49 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(r.reason, "reaffirm_handle_unknown", "已消费再发 → unknown（要重做请重新签发）");
   }));
 
+  test("R57b 返修一 P1-7：TTL/过期判据一律 intent 锁内 clock()——锁外 now 未到期但锁内 clock 已到期判到期；TTL 采样自锁内 clock", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p17", 61, "sess-b-61");
+    const TTL = TAL.OWNER_SELECT_REAFFIRM_TTL_MS;
+    // 签发：clock 采样在锁内，issued_at 与 expires_at 严格基于锁内 clock
+    let clockSampled = false;
+    const issued = talOkB(RI.issueReaffirmIntent({
+      endpointId: EP57B,
+      targetId: b3,
+      authorizedOwner: "ou_owner57b",
+      chatId: "oc_r57b",
+      clock: () => { clockSampled = true; return T0B; },
+    }), "issue with lock clock");
+    assert.ok(clockSampled, "锁内采样 clock()");
+    assert.equal(Date.parse(issued.entry.issued_at), T0B, "issued_at 采样自锁内 clock");
+    assert.equal(Date.parse(issued.entry.expires_at), T0B + TTL, "expires_at 严格基于锁内 clock 采样加 TTL");
+
+    // 反例：消费时锁外 now 未到期（T0B + 1000），但锁内 clock() 已到期（T0B + TTL + 1）→ 判到期
+    const rExpired = RI.consumeReaffirmIntent({
+      endpointId: EP57B,
+      reaffirmHandle: issued.reaffirm_handle,
+      sender: "ou_owner57b",
+      chatId: "oc_r57b",
+      selectionMessageId: "om_sel57b",
+      now: T0B + 1000, // 锁外 now 看起来没到期
+      clock: () => T0B + TTL + 1, // 锁内 clock 已到期
+    });
+    assert.equal(rExpired.ok, false, "锁内 clock 已到期必拒");
+    assert.equal(rExpired.reason, "reaffirm_intent_expired", "判到期");
+    assert.ok(readIntentsB(dir), "过期核拒不清 intent");
+
+    // 反向：锁外 now 看起来超时（T0B + 30 * 86400e3），但锁内 clock() 未到期（T0B + 1000）→ 判未到期，消费成功
+    const rOk = talOkB(RI.consumeReaffirmIntent({
+      endpointId: EP57B,
+      reaffirmHandle: issued.reaffirm_handle,
+      sender: "ou_owner57b",
+      chatId: "oc_r57b",
+      selectionMessageId: "om_sel57b",
+      now: T0B + 30 * 86400e3, // 锁外 now
+      clock: () => T0B + 1000, // 锁内 clock 未到期
+    }), "消费成功");
+    assert.equal(rOk.cleared, true, "成功消费并清理 intent");
+  }));
+
   // ── C. /feishu-select 接真执行器（仅 rfh 支；§12 三态准入不变）──
 
   test("R57b /feishu-select rfh 支：partial 准入下真执行器成功（changed=true）；osh 支仍 select_executor_absent 终态；准入 off 仍拒", () => withLedgerB((root, dir) => {
@@ -42699,7 +42742,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       assert.equal(r.status, 0, "预览退出 0：" + r.stdout + r.stderr);
       assert.equal(readIntentsB(dir), null, "预览零写");
       assert.match(r.stdout, /B3/u, "打印族");
-      assert.match(r.stdout, /15 分钟/u, "打印有效期");
+      assert.match(r.stdout, /7 天/u, "打印有效期");
       assert.doesNotMatch(r.stdout, /[0-9a-f]{64}/u, "最小披露：不泄露 digest");
       assert.doesNotMatch(r.stdout, /sess-b-53/u, "最小披露：不泄露 session_id");
       assert.doesNotMatch(r.stdout, /om_rb53/u, "最小披露：不泄露 root_om");

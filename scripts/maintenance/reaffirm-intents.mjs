@@ -24,6 +24,9 @@ import { isCanonicalIso, canonicalIso, isCanonicalMs } from "../canonical-time.m
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { acquireOrderLock, verifyOrderLockCapability } from "../m1a/dual-write.mjs";
 import { readOwnerSelectAdmission } from "./owner-select-state.mjs";
+import { loadChainTemplate } from "../chain-template.mjs";
+import { loadCodexTemplate } from "../codex/state.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 import {
   OWNER_SELECT_REAFFIRM_TTL_MS, REAFFIRM_HANDLE_SHAPE, ID_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE,
   AUTHORIZED_BY_SHAPE, SHA_SHAPE, resolveEndpointDir, loadLedger, familyOf,
@@ -279,9 +282,8 @@ export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner
     const cur = readReaffirmIntents({ endpointDir: d.dir });
     if (!cur.ok) return { ok: false, reason: "reaffirm_intents_unreadable", why: cur.problem };
     const doc = cur.doc;
-    const lockNow = clock();
-    const issuedMs = Number.isFinite(now) ? now : lockNow;
-    const iso = isCanonicalMs(issuedMs) ? canonicalIso(issuedMs) : null;
+    const lockNow = clock(); // P1-7：签发 TTL 与清理一律 intent 锁内 clock()
+    const iso = isCanonicalMs(lockNow) ? canonicalIso(lockNow) : null;
     if (iso === null) return { ok: false, reason: "bad_time" };
 
     // 受验清理：只动本 target 的过期项（§8.1「先受验清理该 target 的过期项」；他 target 的过期项归其下次签发清理）
@@ -473,4 +475,39 @@ export function cleanReaffirmIntent({ endpointDir, reaffirmHandle, env = process
     if (!w.ok) return { ok: false, reason: "intent_cleanup_failed", why: w.why ?? w.problem };
     return { ok: true, cleaned: true };
   }, { env });
+}
+
+/**
+ * 模板按 doc.chain 选，核 chain、chat、endpoint 与 owner。
+ * 住 maintenance 侧避免 Claude 脚本反向 import codex。
+ */
+export function loadAndVerifyTemplate({ doc, rec, env = process.env }) {
+  const chain = doc.chain;
+  let tplRes;
+  if (chain === "claude") {
+    tplRes = loadChainTemplate(undefined, env);
+  } else if (chain === "codex") {
+    tplRes = loadCodexTemplate();
+  } else {
+    return { ok: false, reason: "unknown_chain", why: "未知账本 chain（" + String(chain) + "）" };
+  }
+  if (!tplRes || !tplRes.ok) {
+    return { ok: false, reason: "template_unreadable", why: "链路模板读不出：" + (tplRes?.reason ?? "不可用") };
+  }
+  const template = tplRes.template;
+  if (template.chain !== chain) {
+    return { ok: false, reason: "chain_mismatch", why: "模板 chain（" + template.chain + "）与账本 chain（" + chain + "）不一致" };
+  }
+  if (template.chat_id !== rec.chat_id) {
+    return { ok: false, reason: "chat_mismatch", why: "模板 chat_id（" + template.chat_id + "）与记录 chat_id（" + rec.chat_id + "）不一致" };
+  }
+  const expectedEndpoint = legacyEndpointId({ runtime: chain, agentUid: template.agent_uid });
+  if (expectedEndpoint !== doc.endpoint_id) {
+    return { ok: false, reason: "endpoint_mismatch", why: "模板 agent_uid 重算 endpoint（" + expectedEndpoint + "）与账本 endpoint_id（" + doc.endpoint_id + "）不一致" };
+  }
+  const authorizedOwner = template.frank_sender_id;
+  if (typeof authorizedOwner !== "string" || !/^[0-9]+$/u.test(authorizedOwner)) {
+    return { ok: false, reason: "bad_frank_sender_id", why: "模板 frank_sender_id 形状不对" };
+  }
+  return { ok: true, template, authorizedOwner };
 }

@@ -11,13 +11,10 @@
  */
 
 import { isDirectRun } from "./direct-run.mjs";
-import { loadChainTemplate } from "./chain-template.mjs";
-import { loadCodexTemplate } from "./codex/state.mjs";
-import { legacyEndpointId } from "./subscription.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { aggregateEndpointReceipts } from "./maintenance/ledger-receipt.mjs";
 import { ID_SHAPE, loadByEndpoint, familyOf } from "./topic-agent-ledger.mjs";
-import { REAFFIRM_TARGET_FAMILIES, issueReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
+import { REAFFIRM_TARGET_FAMILIES, issueReaffirmIntent, loadAndVerifyTemplate } from "./maintenance/reaffirm-intents.mjs";
 
 const fail = (msg, code = 1) => {
   console.error("✗ " + msg);
@@ -80,36 +77,7 @@ export function findTarget({ targetId, env = process.env }) {
   return { ok: true, hit: hits[0] };
 }
 
-export function loadAndVerifyTemplate({ doc, rec, env = process.env }) {
-  const chain = doc.chain;
-  let tplRes;
-  if (chain === "claude") {
-    tplRes = loadChainTemplate(undefined, env);
-  } else if (chain === "codex") {
-    tplRes = loadCodexTemplate();
-  } else {
-    return { ok: false, reason: "unknown_chain", why: "未知账本 chain（" + String(chain) + "）" };
-  }
-  if (!tplRes || !tplRes.ok) {
-    return { ok: false, reason: "template_unreadable", why: "链路模板读不出：" + (tplRes?.reason ?? "不可用") };
-  }
-  const template = tplRes.template;
-  if (template.chain !== chain) {
-    return { ok: false, reason: "chain_mismatch", why: "模板 chain（" + template.chain + "）与账本 chain（" + chain + "）不一致" };
-  }
-  if (template.chat_id !== rec.chat_id) {
-    return { ok: false, reason: "chat_mismatch", why: "模板 chat_id（" + template.chat_id + "）与记录 chat_id（" + rec.chat_id + "）不一致" };
-  }
-  const expectedEndpoint = legacyEndpointId({ runtime: chain, agentUid: template.agent_uid });
-  if (expectedEndpoint !== doc.endpoint_id) {
-    return { ok: false, reason: "endpoint_mismatch", why: "模板 agent_uid 重算 endpoint（" + expectedEndpoint + "）与账本 endpoint_id（" + doc.endpoint_id + "）不一致" };
-  }
-  const authorizedOwner = template.frank_sender_id;
-  if (typeof authorizedOwner !== "string" || !/^[0-9]+$/u.test(authorizedOwner)) {
-    return { ok: false, reason: "bad_frank_sender_id", why: "模板 frank_sender_id 形状不对" };
-  }
-  return { ok: true, template, authorizedOwner };
-}
+export { loadAndVerifyTemplate };
 
 function main() {
   const parsed = parseIssueArgs(process.argv.slice(2));
@@ -129,7 +97,7 @@ function main() {
     console.log("reaffirm 签发预览（零写；加 --apply 才签发）");
     console.log("  target   : " + parsed.targetId);
     console.log("  family   : " + fam);
-    console.log("  有效期   : 15 分钟（签发后）");
+    console.log("  有效期   : 7 天（签发后）");
     console.log("");
     console.log("签发后需在对应话题发送 /feishu-select <rfh_…> 确认。");
     return;

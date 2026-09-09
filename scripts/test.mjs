@@ -40662,10 +40662,16 @@ test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不�
   assert.deepEqual([esc.ok, esc.reason], [false, "key_shape"], JSON.stringify(esc));
   assert.equal(fs.existsSync(path.join(escParent, "escape" + R58_RECEIPT_SUFFIX)), false, "没有越界文件");
   // 代际不可用 → null（写不出「字段在但不是代际」的损坏记录）；message_id 缺席 → null
+  // P1-1 反例：targetGenerationId 缺失/空白/不可用 → 不生成回执（generation_unavailable）、不进发布队列；可用 → 记录带该代际。
   const w3 = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(10), category: "session_error", messageId: "", targetGenerationId: "   " });
-  assert.equal(w3.ok, true, JSON.stringify(w3));
-  const rec3 = JSON.parse(fs.readFileSync(w3.file, "utf-8"));
-  assert.equal(rec3.target_channel_generation_id, null);
+  assert.deepEqual([w3.ok, w3.reason], [false, "generation_unavailable"], JSON.stringify(w3));
+  assert.equal(fs.existsSync(path.join(dir, r54Key(10) + R58_RECEIPT_SUFFIX)), false, "不可用代际不写回执");
+  const w3b = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(11), category: "session_error", messageId: "", targetGenerationId: null });
+  assert.deepEqual([w3b.ok, w3b.reason], [false, "generation_unavailable"], "null 代际拒");
+  const w3c = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(12), category: "session_error", messageId: "", targetGenerationId: "gen-r58" });
+  assert.equal(w3c.ok, true, "可用代际写回执：" + JSON.stringify(w3c));
+  const rec3 = JSON.parse(fs.readFileSync(w3c.file, "utf-8"));
+  assert.equal(rec3.target_channel_generation_id, "gen-r58", "可用冻结代际带出");
   assert.equal(rec3.message_id, null);
   // 与共用审计判据互证：解释得清、三态 pending（进得了既有发布队列）
   assert.deepEqual(explainabilityGaps(kept), []);
@@ -40735,7 +40741,7 @@ test("R58 发布器 dry-run：forward_failed 走既有出站发布器按回执�
   fs.writeFileSync(path.join(outbox, r54Key(21) + R58_RECEIPT_SUFFIX), JSON.stringify({
     schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal",
     id: "forward-failed-" + r54Key(21), kind: "forward_failed",
-    text: "转发失败：API Error: 400 model；本条未送达，请重发或在终端查看 doctor ⑯",
+    text: outboxModule.FORWARD_FAILURE_TEXT.session_error,
     event_key: "forward-failed:" + r54Key(21), source: "forward-runner",
     input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null,
     forward_key: r54Key(21), message_id: "om_m1",
@@ -40745,7 +40751,7 @@ test("R58 发布器 dry-run：forward_failed 走既有出站发布器按回执�
   assert.equal(r.status, "dry_run", JSON.stringify({ status: r.status, reason: r.reason, detail: r.details ?? r.why ?? null }));
   assert.equal(r.count, 1);
   assert.match(r.text, /【转发失败】/u, "按现有回执格式分组渲染：\n" + r.text);
-  assert.match(r.text, /转发失败：API Error: 400 model/u);
+  assert.match(r.text, /转发失败：会话执行报错/u);
   const card = r.cards?.[0];
   assert.ok(card, "dry-run 出卡片");
   assert.match(JSON.stringify(card), /转发失败/u, "卡片正文含回执");

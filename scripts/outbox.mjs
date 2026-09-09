@@ -172,6 +172,8 @@ export function appendForwardFailureReceipt({
   // P1-4：正文封闭 —— 类别必须合法，reasonFirstLine 一个字不进正文。
   const text = forwardFailureText(category);
   if (text === null) return { ok: false, reason: "unknown_failure_category", why: "未知失败类别（不接受任意模型输出进正文）" };
+  // P1-1：代际必须可用（可用冻结代际）。缺失 / 不可用 → 不生成回执、不写 null（绝不写 null 令发布器回落当前话题）。
+  if (!usableGeneration(targetGenerationId)) return { ok: false, reason: "generation_unavailable", why: "targetGenerationId 缺失或不可用（不生成回执、不写 null）" };
   { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
   const createdAt = new Date().toISOString();
   const record = {
@@ -186,7 +188,7 @@ export function appendForwardFailureReceipt({
     source: typeof source === "string" && source ? source : "forward-runner",
     input_origin: null,
     input_text: null,
-    target_channel_generation_id: usableGeneration(targetGenerationId) ? targetGenerationId : null,
+    target_channel_generation_id: targetGenerationId,
     run_id: null,
     forward_key: forwardKey,
     message_id: typeof messageId === "string" && messageId ? messageId : null,

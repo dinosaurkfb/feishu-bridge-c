@@ -46090,28 +46090,46 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   }));
 
 
-  test("R57d 返修三 P1-4：selection plan 持久化进 claim 文件 + 封闭键集 + path key 封闭", () => withLedgerD((root, dir, ids) => {
+  test("R57d 对齐 P1-4：selection plan 走 writeSelectionPlan sidecar（封闭键集含 schema_version/kind/claim_key/basis）+ claim.json 不再内嵌 + key 形状封闭 + 写失败不执行", () => withLedgerD((root, dir, ids) => {
     fs.mkdirSync(path.join(root, "claims", "0".repeat(64) + ".claim"), { recursive: true });
     const claimsDir = path.join(root, "claims");
     const claim0 = { control: { control: "select", handle: ids.b1Handle, handle_kind: "osh" }, selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" }, selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" }) };
     const txCtx = { claimsDir, key: "0".repeat(64), claim: claim0 };
-    // ① 首次执行 → plan 写入 claim 文件
+    // ① 首次执行 → plan 写 sidecar（<key>.selection-plan.json，R57b 同一写原语），claim.json 不再有 selection_plan
     const r1 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), capability: capD(ids.b1Handle, "osh"), txCtx }));
     assert.equal(r1.ok, true, "① 首次成功：" + JSON.stringify(r1));
+    const planFile = path.join(claimsDir, txCtx.key + ".selection-plan.json");
+    assert.ok(fs.existsSync(planFile), "plan sidecar 落盘");
+    const planDoc = JSON.parse(fs.readFileSync(planFile, "utf-8"));
+    assert.deepEqual(Object.keys(planDoc).sort(), ["action", "basis", "cas", "claim_key", "handle", "kind", "schema_version", "target_id"], "plan 封闭键集（R57b 同形）");
+    assert.equal(planDoc.schema_version, SP.SELECTION_PLAN_SCHEMA, "schema_version 用 SELECTION_PLAN_SCHEMA");
+    assert.equal(planDoc.kind, "osh");
+    assert.equal(planDoc.claim_key, txCtx.key, "claim_key 绑定同一 key");
+    assert.equal(planDoc.action, "activate");
+    assert.equal(planDoc.target_id, ids.b1Id);
+    assert.ok(["explicit_handle", "resolved"].includes(planDoc.basis), "basis 受控：" + planDoc.basis);
     const claimFile = path.join(claimsDir, txCtx.key + ".claim", "claim.json");
-    const claimRec = JSON.parse(fs.readFileSync(claimFile, "utf-8"));
-    assert.ok(claimRec.selection_plan, "plan 已写进 claim 文件");
-    assert.deepEqual(Object.keys(claimRec.selection_plan).sort(), ["action", "cas", "handle", "selection_basis", "target_id"], "plan 键集");
-    assert.equal(claimRec.selection_plan.action, "activate");
-    assert.equal(claimRec.selection_plan.target_id, ids.b1Id);
-    // ② path key 封闭：key 带 ../ → plan 不写盘、不执行
-    fs.mkdirSync(path.join(root, "claims", "escape-claim"), { recursive: true });
-    const r2 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), capability: capD(ids.b1Handle, "osh"), txCtx: { claimsDir, key: "../../escape", claim: claim0 } }));
-    assert.equal(r2.ok, false, "② path key 拒：" + JSON.stringify(r2));
-    // ③ 同 key 不同 plan（prior 指向 activate/b1，但 resolution 出 anchor/a2）→ conflict
-    const claimDiff = { ...claim0, control: { control: "select", handle: ids.a2Handle, handle_kind: "osh" }, selection_context: { ...claim0.selection_context, handle: ids.a2Handle }, selection_context_digest_v1: SA.selectionContextDigestV1({ ...claim0.selection_context, handle: ids.a2Handle }), selection_plan: { action: "activate", target_id: ids.b1Id, selection_basis: "explicit_handle", handle: ids.b1Handle, cas: {} } };
-    const r3 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), capability: capD(ids.a2Handle, "osh"), txCtx: { claimsDir, key: "0".repeat(64), claim: claimDiff } }));
+    if (fs.existsSync(claimFile)) {
+      assert.equal(JSON.parse(fs.readFileSync(claimFile, "utf-8")).selection_plan, undefined, "claim.json 不再内嵌 plan（repair 读 sidecar）");
+    }
+    // ② key 形状封闭：未消费目标（a2）+ 非法 key，**目录预建仍拒**（拒因是 key 守卫，不是路径写失败侥幸）
+    fs.mkdirSync(path.join(claimsDir, "..", "escape-claim"), { recursive: true });
+    const r2 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), capability: capD(ids.a2Handle, "osh"), txCtx: { claimsDir, key: "../../escape", claim: claim0 } }));
+    assert.equal(r2.ok, false, "② key 封闭拒：" + JSON.stringify(r2));
+    assert.equal(r2.reason, "select_plan_key_invalid", "② reason：" + r2.reason);
+    // ③ 同 key 不同 plan（sidecar 已有 activate/b1，本次解析出 anchor/a2）→ select_plan_conflict（不覆盖）
+    const r3 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), capability: capD(ids.a2Handle, "osh"), txCtx: { claimsDir, key: "0".repeat(64), claim: claim0 } }));
     assert.equal(r3.reason, "select_plan_conflict", "③ 不同 plan conflict：" + r3.reason);
+    // ④ 写失败（claimsDir 是个普通文件 → residue fail-closed）→ select_plan_unwritten，且不执行（账本 revision 不变、无 activate op）
+    const claimsFile = path.join(root, "claims-file");
+    fs.writeFileSync(claimsFile, "not a dir", { mode: 0o600 });
+    const before = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+    const r4 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), capability: capD(ids.a2Handle, "osh"), txCtx: { claimsDir: claimsFile, key: "0".repeat(64), claim: claim0 } }));
+    assert.equal(r4.ok, false, "④ 写失败拒：" + JSON.stringify(r4));
+    assert.equal(r4.reason, "select_plan_unwritten", "④ reason：" + r4.reason);
+    const after = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+    assert.equal(after.revision, before.revision, "④ plan 没落盘就不进账本");
+    assert.equal(Object.keys(after.operations).length, Object.keys(before.operations).length, "④ 账本无新增 op（不执行）");
   }));
 
   test("R57d 返修三 P1-3：claim 判别联合由 claim.control 决定——省略 claim 合法；rfh claim 被篡改成 osh/null context → 拒；显式 context 与 control 逐字不等 → 拒", () => {
@@ -46410,14 +46428,20 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(r2.status, 0, r2.stdout + r2.stderr);
       assert.match(r2.stdout, /已处理/u, "重放回「已处理」：" + r2.stdout);
       assert.equal(TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision, rev1, "重放不重执行");
-      // B 段 P1-3：执行前持久化的 immutable selection plan 写进 claim 记录（省略/续做可复现的封闭形状）
+      // B 段 P1-3 + R57d 对齐 P1-4：执行前持久化的 immutable selection plan 走 sidecar（<key>.selection-plan.json，
+      //   R57b 同一写原语；claim.json 不再内嵌）——省略/续做可复现的封闭形状。
       const claimsDirEntry = path.join(root, ".runtime-data", "inbound", "delivery-claims");
       const claimDirs = fs.readdirSync(claimsDirEntry, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.endsWith(".claim"));
       assert.equal(claimDirs.length, 1, "claim 目录恰一份：" + claimDirs.map((d) => d.name).join(","));
+      const entryKey = claimDirs[0].name.slice(0, -".claim".length);
       const claimRec = JSON.parse(fs.readFileSync(path.join(claimsDirEntry, claimDirs[0].name, "claim.json"), "utf-8"));
-      const plan = claimRec.selection_plan;
-      assert.ok(plan, "claim 里有 selection_plan");
-      assert.deepEqual(Object.keys(plan).sort(), ["action", "cas", "handle", "selection_basis", "target_id"], "plan 封闭键集：" + JSON.stringify(Object.keys(plan)));
+      assert.equal(claimRec.selection_plan, undefined, "claim.json 不再内嵌 plan（对齐后 repair 读 sidecar）");
+      const plan = JSON.parse(fs.readFileSync(path.join(claimsDirEntry, entryKey + ".selection-plan.json"), "utf-8"));
+      assert.ok(plan, "plan sidecar 落盘");
+      assert.deepEqual(Object.keys(plan).sort(), ["action", "basis", "cas", "claim_key", "handle", "kind", "schema_version", "target_id"], "plan 封闭键集（R57b 同形）：" + JSON.stringify(Object.keys(plan)));
+      assert.equal(plan.schema_version, SP.SELECTION_PLAN_SCHEMA, "schema_version");
+      assert.equal(plan.kind, "osh");
+      assert.equal(plan.claim_key, entryKey, "claim_key 绑定同一 key");
       assert.equal(plan.action, "activate");
       assert.equal(plan.target_id, b1.result.created_id);
       assert.equal(plan.handle, b1.result.selection_handle);

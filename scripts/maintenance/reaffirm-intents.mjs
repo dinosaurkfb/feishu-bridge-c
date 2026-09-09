@@ -29,6 +29,7 @@ import {
   AUTHORIZED_BY_SHAPE, SHA_SHAPE, resolveEndpointDir, loadLedger, familyOf,
   ownerSelectReaffirmClosureDigest, ownerSelectReaffirm,
 } from "../topic-agent-ledger.mjs";
+import { classifySelectOutcome } from "../select-admission.mjs";
 
 export const REAFFIRM_INTENTS_FILE = "reaffirm-intents.json";
 export const REAFFIRM_INTENTS_LOCK = "reaffirm-intents.lock";
@@ -196,14 +197,21 @@ function writeIntentsFile(dir, doc, { _inject = null } = {}) {
   return { ok: true, commit: "committed_clean" };
 }
 
+/** 释放结果折叠成 released | residue | unclear 三态。 */
+export function foldLockReleaseState(rel) {
+  const clean = rel?.ok === true && !rel.absent && !rel.reapUncleared;
+  if (clean) return "released";
+  if (rel?.reapUncleared) return "residue";
+  return "unclear";
+}
+
 /** 把 intent 锁释放结果折进返回值（released | residue | unclear 三态外显）。 */
 function foldIntentsLockRelease(result, rel, lockDir) {
-  const clean = rel?.ok === true && !rel.absent && !rel.reapUncleared;
-  if (clean) {
+  const lock_state = foldLockReleaseState(rel);
+  if (lock_state === "released") {
     return { ...result, lock_state: "released" };
   }
-  const isResidue = Boolean(rel?.reapUncleared);
-  const lock_state = isResidue ? "residue" : "unclear";
+  const isResidue = lock_state === "residue";
   const lockResidue = isResidue ? (rel.reapUncleared?.path ?? lockDir) : null;
   const lockUncleared = {
     reason: rel?.reason ?? (rel?.absent ? "lock_absent_on_release" : isResidue ? "reap_residue_uncleared" : "release_failed"),
@@ -329,25 +337,60 @@ export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner
 export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
   if (!outerCapability) {
     const acq = acquireOrderLock(endpointId, env);
-    if (!acq.ok) return { ok: false, reason: acq.reason ?? "binding_busy", why: acq.why ?? null, gate: acq.gate ?? null, text: acq.text ?? null };
+    if (!acq.ok) return { ok: false, status: "failed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, gate: acq.gate ?? null, text: acq.text ?? null };
+    let innerRes;
+    let outerRel;
     try {
       const cap = Object.freeze({ kind: "m1a_order_lock", token: acq.token, endpointId });
-      return consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability: cap, _inject });
+      innerRes = consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability: cap, _inject });
     } finally {
-      acq.release();
+      try {
+        outerRel = acq.release();
+      } catch (err) {
+        outerRel = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) };
+      }
     }
+    const outerLockState = foldLockReleaseState(outerRel);
+    const locks = {
+      outer: outerLockState,
+      intent: innerRes?.lock_state ?? "released",
+    };
+    const outcome = classifySelectOutcome({
+      ledger: innerRes?.ledger_res ?? innerRes,
+      intentCleanup: innerRes?.intent_cleanup ?? (innerRes?.cleared ? "cleared" : "unclear"),
+      locks,
+    });
+    return {
+      ...innerRes,
+      ...outcome,
+      locks,
+    };
   }
-  return consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability, _inject });
+  const innerRes = consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability, _inject });
+  const locks = {
+    outer: "released",
+    intent: innerRes?.lock_state ?? "released",
+  };
+  const outcome = classifySelectOutcome({
+    ledger: innerRes?.ledger_res ?? innerRes,
+    intentCleanup: innerRes?.intent_cleanup ?? (innerRes?.cleared ? "cleared" : "unclear"),
+    locks,
+  });
+  return {
+    ...innerRes,
+    ...outcome,
+    locks,
+  };
 }
 
 export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
   const vCap = verifyOrderLockCapability(endpointId, outerCapability, env);
-  if (!vCap.ok) return { ok: false, reason: vCap.reason ?? "outer_lock_required", why: vCap.why ?? "outer 未持有" };
+  if (!vCap.ok) return { ok: false, status: "failed", reason: vCap.reason ?? "outer_lock_required", why: vCap.why ?? "outer 未持有" };
 
-  if (typeof reaffirmHandle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(reaffirmHandle)) return { ok: false, reason: "reaffirm_handle_unknown" };
-  if (typeof sender !== "string" || !AUTHORIZED_BY_SHAPE.test(sender)) return { ok: false, reason: "sender_mismatch", why: "sender 形状不对" };
+  if (typeof reaffirmHandle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(reaffirmHandle)) return { ok: false, status: "failed", reason: "reaffirm_handle_unknown" };
+  if (typeof sender !== "string" || !AUTHORIZED_BY_SHAPE.test(sender)) return { ok: false, status: "failed", reason: "sender_mismatch", why: "sender 形状不对" };
   const d = resolveEndpointDir(endpointId, { env });
-  if (!d.ok) return { ok: false, reason: d.reason ?? "endpoint_dir_unresolvable", why: d.why ?? null };
+  if (!d.ok) return { ok: false, status: "failed", reason: d.reason ?? "endpoint_dir_unresolvable", why: d.why ?? null };
 
   return withIntentsLock(d.dir, (intentToken) => {
     // admission === partial 在 outer + intent 锁内重核（不只在入口看一眼）
@@ -355,34 +398,79 @@ export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender,
       const lockAdm = selectAdmissionFn(env);
       if (!lockAdm || lockAdm.state !== "partial") {
         const reason = lockAdm?.state === "off" ? "select_off" : "select_not_partial";
-        return { ok: false, reason, why: "准入锁内重核未通过（state=" + (lockAdm?.state ?? "null") + "）" };
+        return { ok: false, status: "failed", reason, why: "准入锁内重核未通过（state=" + (lockAdm?.state ?? "null") + "）" };
       }
     }
 
     const cur = readReaffirmIntents({ endpointDir: d.dir });
-    if (!cur.ok) return { ok: false, reason: "reaffirm_intents_unreadable", why: cur.problem };
+    if (!cur.ok) return { ok: false, status: "failed", reason: "reaffirm_intents_unreadable", why: cur.problem };
     const entry = cur.doc.entries[reaffirmHandle];
-    if (!entry || entry.endpoint !== endpointId) return { ok: false, reason: "reaffirm_handle_unknown", why: "intent 不在场（未签发、已消费或属别的 endpoint）" };
+    if (!entry || entry.endpoint !== endpointId) return { ok: false, status: "failed", reason: "reaffirm_handle_unknown", why: "intent 不在场（未签发、已消费或属别的 endpoint）" };
     const lockNow = clock(); // P1-7：过期核一律 intent 锁内 clock()
-    if (Date.parse(entry.expires_at) <= lockNow) return { ok: false, reason: "reaffirm_intent_expired", why: "过期不清（等签发侧同锁受验清理）" };
-    if (entry.authorized_owner !== sender) return { ok: false, reason: "sender_mismatch", why: "只有签发时登记的 owner 本人才可消费这个 handle" };
+    if (Date.parse(entry.expires_at) <= lockNow) return { ok: false, status: "failed", reason: "reaffirm_intent_expired", why: "过期不清（等签发侧同锁受验清理）" };
+    if (entry.authorized_owner !== sender) return { ok: false, status: "failed", reason: "sender_mismatch", why: "只有签发时登记的 owner 本人才可消费这个 handle" };
     // 别名解析（供 fp 的 selected_* 字面输入）：handle → target → 当前别名；ledger op 内再原子 CAS。
     const L = loadLedger(d.dir, { endpointId });
-    if (!L.ok) return { ok: false, reason: L.reason === "ledger_corrupt" ? "ledger_corrupt" : "ledger_unreadable", why: L.why ?? L.reason ?? null };
+    if (!L.ok) return { ok: false, status: "failed", reason: L.reason === "ledger_corrupt" ? "ledger_corrupt" : "ledger_unreadable", why: L.why ?? L.reason ?? null };
     const rec = L.doc.records[entry.target_id];
-    if (!rec || rec.kind !== "live") return { ok: false, reason: "reaffirm_target_missing" };
+    if (!rec || rec.kind !== "live") return { ok: false, status: "failed", reason: "reaffirm_target_missing" };
     const res = ownerSelectReaffirm({
       endpointId, targetId: entry.target_id, targetFamily: entry.target_family,
       expectedOldProofClosureDigest: entry.expected_old_proof_closure_digest,
       reaffirmHandle, authorizedBy: sender, chatId,
       selectedSessionId: rec.aliases.session_id, selectedRootOm: rec.aliases.root_om,
-      selectionMessageId, now, clock, env, _inject: undefined,
+      selectionMessageId, now, clock, env, _inject,
     });
     if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return res;
-    // 提交成功（committed_clean / committed_durability_uncertain / replayed）→ 清 intent
+
+    // 只有账本干净提交才允许清 intent；未收净不得当成功清 intent
+    const isLedgerClean = res.ok &&
+      ["committed_clean", "replayed", "already"].includes(res.commit) &&
+      (!res.residue || res.residue.length === 0) &&
+      !res.lockUncleared &&
+      res.lock_state !== "unclear";
+
+    let cleared = false;
+    let intentCleanupWhy = null;
+    if (isLedgerClean) {
+      if (typeof _inject?.afterCommit === "function") {
+        _inject.afterCommit();
+      }
+      delete cur.doc.entries[reaffirmHandle];
+      const w = writeIntentsFile(d.dir, cur.doc, { _inject });
+      cleared = w.ok === true;
+      if (!cleared) {
+        intentCleanupWhy = "intent 清理失败（" + (w.why ?? w.problem ?? "?") + "）：账本已提交，同 handle 重发可幂等清 intent";
+      }
+    }
+
+    return {
+      ...res,
+      cleared,
+      intent_cleanup: cleared ? "cleared" : "unclear",
+      ledger_res: res,
+      ...(intentCleanupWhy ? { why: intentCleanupWhy } : {}),
+    };
+  }, { env });
+}
+
+/**
+ * 显式维护/修复专用：只在确认账本已提交后清理单个 reaffirm intent。
+ * 不跑业务事务，只取 intent 锁做安全清理。
+ */
+export function cleanReaffirmIntent({ endpointDir, reaffirmHandle, env = process.env, _inject = undefined } = {}) {
+  return withIntentsLock(endpointDir, (intentToken) => {
+    const cur = readReaffirmIntents({ endpointDir });
+    if (!cur.ok) return { ok: false, reason: "reaffirm_intents_unreadable", why: cur.problem };
+    if (!cur.doc.entries[reaffirmHandle]) {
+      return { ok: true, cleaned: false };
+    }
+    if (_inject?.failIntentCleanup) {
+      return { ok: false, reason: "intent_cleanup_failed", why: "injected_intent_cleanup_failure" };
+    }
     delete cur.doc.entries[reaffirmHandle];
-    const w = writeIntentsFile(d.dir, cur.doc);
-    const cleared = w.ok;
-    return { ...res, cleared, ...(cleared ? {} : { why: "intent 清理失败（" + (w.problem ?? "?") + "）：账本已提交，同 handle 重发可幂等清 intent" }) };
+    const w = writeIntentsFile(endpointDir, cur.doc, { _inject });
+    if (!w.ok) return { ok: false, reason: "intent_cleanup_failed", why: w.why ?? w.problem };
+    return { ok: true, cleaned: true };
   }, { env });
 }

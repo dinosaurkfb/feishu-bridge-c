@@ -9,9 +9,163 @@
 // R57b：rfh 支接真执行器（owner_select_reaffirm，§8.1 消费编排 consumeReaffirmIntent）；
 // osh/orh 支仍落 failed 终态 select_executor_absent（另单，PR #136 二轮裁定：failed 是终态，重做须发新消息）。
 
+import { createHash } from "node:crypto";
 import { REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
+import { canonKey } from "./maintenance/canon.mjs";
+
+/**
+ * 判定选择控制 outcome 的叶子纯函数（§8.1 / R57b / 与 R57d 返修一共用，不 import 维护编排）。
+ * 分别给出三份结果：
+ * 1. 账本提交（clean / unclean / not_committed）
+ * 2. intent 清理提交（cleared / unclear）
+ * 3. 两层锁释放（outer / intent 各 released / residue / unclear）
+ * 只有三份都干净才 ok → consumed + 绿色文案；已提交未收净 → control-committed-unclean。
+ */
+export function classifySelectOutcome({
+  ledger = null,
+  intentCleanup = null,
+  locks = null,
+} = {}) {
+  let ledgerStatus = "not_committed";
+  if (typeof ledger === "string") {
+    if (["clean", "unclean", "not_committed"].includes(ledger)) {
+      ledgerStatus = ledger;
+    }
+  } else if (ledger && typeof ledger === "object") {
+    const isCleanCommit = ledger.ok === true &&
+      ["committed_clean", "replayed", "already"].includes(ledger.commit) &&
+      (!ledger.residue || ledger.residue.length === 0) &&
+      !ledger.lockUncleared &&
+      ledger.lock_state !== "unclear";
+
+    if (isCleanCommit) {
+      ledgerStatus = "clean";
+    } else if (
+      ledger.commit === "committed_durability_uncertain" ||
+      ledger.commit === "committed_with_residue" ||
+      (typeof ledger.commit === "string" && ledger.commit.startsWith("committed")) ||
+      ledger.lockUncleared != null ||
+      ledger.lock_state === "unclear" ||
+      (ledger.residue && ledger.residue.length > 0)
+    ) {
+      ledgerStatus = "unclean";
+    } else {
+      ledgerStatus = "not_committed";
+    }
+  }
+
+  let intentStatus = "unclear";
+  if (intentCleanup === "cleared" || intentCleanup === true) {
+    intentStatus = "cleared";
+  } else if (intentCleanup === "unclear" || intentCleanup === false || intentCleanup === null) {
+    intentStatus = "unclear";
+  }
+
+  const outerLock = locks?.outer ?? "released";
+  const intentLock = locks?.intent ?? "released";
+  const locksStatus = {
+    outer: ["released", "residue", "unclear"].includes(outerLock) ? outerLock : "unclear",
+    intent: ["released", "residue", "unclear"].includes(intentLock) ? intentLock : "unclear",
+  };
+
+  const isAllClean =
+    ledgerStatus === "clean" &&
+    intentStatus === "cleared" &&
+    locksStatus.outer === "released" &&
+    locksStatus.intent === "released";
+
+  if (isAllClean) {
+    return {
+      ok: true,
+      status: "consumed",
+      ledger: ledgerStatus,
+      intent_cleanup: intentStatus,
+      locks: locksStatus,
+    };
+  }
+
+  if (ledgerStatus === "clean" || ledgerStatus === "unclean") {
+    return {
+      ok: false,
+      status: "control-committed-unclean",
+      ledger: ledgerStatus,
+      intent_cleanup: intentStatus,
+      locks: locksStatus,
+      reason: "control_committed_unclean",
+      why: "已写入但收口不干净（" +
+        (ledgerStatus !== "clean" ? "账本未净: " + ledgerStatus : "") +
+        (intentStatus !== "cleared" ? "；intent未清" : "") +
+        (locksStatus.outer !== "released" ? "；outer锁: " + locksStatus.outer : "") +
+        (locksStatus.intent !== "released" ? "；intent锁: " + locksStatus.intent : "") +
+        "）",
+    };
+  }
+
+  return {
+    ok: false,
+    status: "failed",
+    ledger: ledgerStatus,
+    intent_cleanup: intentStatus,
+    locks: locksStatus,
+    reason: (typeof ledger === "object" && ledger?.reason) ? ledger.reason : "not_committed",
+    why: (typeof ledger === "object" && ledger?.why) ? ledger.why : null,
+  };
+}
+
+/** selection_context 稳定摘要计算（§8.1/R57b/R57d：不含 root，缺项显式 null）。 */
+export function selectionContextDigestV1({
+  endpoint = null,
+  chat = null,
+  session = null,
+  message = null,
+  sender = null,
+  handle = null,
+  kind = null,
+} = {}) {
+  const payload = canonKey({
+    domain: "selection_context_v1",
+    chat: chat ?? null,
+    endpoint: endpoint ?? null,
+    handle: handle ?? null,
+    kind: kind ?? null,
+    message: message ?? null,
+    sender: sender ?? null,
+    session: session ?? null,
+  });
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+/** 校验 claim 里的 selection_context 与 digest，fail-closed 点名缺项。 */
+export function verifySelectionContext(claim) {
+  if (!claim || typeof claim !== "object") {
+    return { ok: false, reason: "selection_context_missing", why: "claim 为空或不是对象" };
+  }
+  const ctx = claim.selection_context;
+  if (!ctx || typeof ctx !== "object") {
+    return { ok: false, reason: "selection_context_missing", why: "缺 selection_context（旧形 claim）" };
+  }
+  const digest = claim.selection_context_digest_v1;
+  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/u.test(digest)) {
+    return { ok: false, reason: "selection_context_digest_missing", why: "缺 selection_context_digest_v1（旧形 claim）" };
+  }
+  const missing = [];
+  if (!ctx.endpoint) missing.push("endpoint");
+  if (!ctx.chat) missing.push("chat");
+  if (!ctx.sender) missing.push("sender");
+  if (!ctx.message) missing.push("message");
+  if (!ctx.handle) missing.push("handle");
+  if (!ctx.kind) missing.push("kind");
+  if (missing.length > 0) {
+    return { ok: false, reason: "selection_context_incomplete", why: "selection_context 缺项：" + missing.join(", ") };
+  }
+  const expectedDigest = selectionContextDigestV1(ctx);
+  if (digest !== expectedDigest) {
+    return { ok: false, reason: "select_context_conflict", why: "selection_context_digest_v1 与内容不一致" };
+  }
+  return { ok: true, context: ctx };
+}
 
 /** 写入准入 —— 默认读真实状态（执行器未接入期准入通过也落 failed(select_executor_absent) 终态，见 executeSelectControl）。 */
 export function selectAdmission(env = process.env) {
@@ -74,7 +228,7 @@ export function executeSelectControl(intent, {
   selectAdmissionFn = selectAdmission,
   consumeReaffirm = consumeReaffirmIntent,
   senderId = null, chatId = null, endpointId = null, messageId = null,
-  now = Date.now(), env = process.env,
+  now = Date.now(), env = process.env, _inject = undefined,
 } = {}) {
   const adm = selectAdmissionFn(env);
   const ej = selectReject(adm, intent?.handle_kind);
@@ -85,9 +239,23 @@ export function executeSelectControl(intent, {
   if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
     return { ok: false, reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
   }
-  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env });
-  if (!res.ok) {
-    return { ok: false, reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
+  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env, _inject });
+  if (res.status === "control-committed-unclean") {
+    return {
+      ok: false,
+      status: "control-committed-unclean",
+      reason: "control_committed_unclean",
+      text: "已写入但收口不干净（" + (res.why ?? "账本已写入但未收净，请联系管理员修复") + "）",
+      ledger: res.ledger,
+      intent_cleanup: res.intent_cleanup,
+      locks: res.locks,
+      result: res.result,
+      why: res.why,
+    };
   }
-  return { ok: true, changed: res.idempotent === true ? false : true, text: selectReaffirmSuccessText(res.result) };
+  if (!res.ok) {
+    return { ok: false, status: "failed", reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
+  }
+  return { ok: true, status: "consumed", changed: res.idempotent === true ? false : true, text: selectReaffirmSuccessText(res.result) };
 }
+

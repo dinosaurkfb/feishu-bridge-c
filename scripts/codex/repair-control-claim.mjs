@@ -27,10 +27,10 @@ if (isDirectRun(import.meta.url)) {
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
   if (parsed.apply && (RESUMABLE_CONTROL_STATES.includes(seen.state) || seen.state === "consumed")) {
     result = resumeControlClaim({ claimsDir, key: parsed.key, expect,
-      execute: (target) => dispatchControlRepair(target, {
+      execute: (target, ctx) => dispatchControlRepair(target, {
         onMode: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
           precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }),
-      }) });
+      }, ctx) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

@@ -157,6 +157,22 @@ export function readControlFailedRecord({ claimsDir, key }) {
   return problem ? { status: "unreadable", why: problem } : { status: "valid", record: r.doc };
 }
 
+export function controlCommittedUncleanRecordProblem(doc, key) {
+  if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "doc 不是对象";
+  if (doc.schema_version !== "1.0") return "schema_version 不认识";
+  if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
+  if (doc.state !== "control-committed-unclean") return "state 不是 control-committed-unclean";
+  if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
+  return null;
+}
+export function readControlCommittedUncleanRecord({ claimsDir, key }) {
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { status: "unreadable", why: "key 形状不对" };
+  const r = readRecordFile(path.join(claimsDir, key + ".control-committed-unclean.json"));
+  if (r.status !== "read") return r;
+  const problem = controlCommittedUncleanRecordProblem(r.doc, key);
+  return problem ? { status: "unreadable", why: problem } : { status: "valid", record: r.doc };
+}
+
 /** 同一 key 的 consumed 临时制品（写到一半 / rename 失败留下的）：受控形状，报 consumed_in_flight；成功写出后清掉。 */
 export const CONSUMED_TMP_RE = /^([0-9a-f]{64})\.consumed\.json\.tmp\.\d+\.\d+$/u;
 /** 损坏的 failed 记录被隔离后的名字：受控形状，账本按 control_failed_quarantined 报，人工看完再删。 */
@@ -356,8 +372,40 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
     quarantined.push(name);
   }
   // consumed 缺席或损坏、failed 不在场：执行（首次）或续做（重放）
-  const done = execute(intent.control === "select" ? intent : intent.control === "mode" ? intent.mode : intent);
+  const done = execute(
+    intent.control === "select" ? intent : intent.control === "mode" ? intent.mode : intent,
+    { claim: claim.claim, claimsDir, key }
+  );
   if (!done.ok) {
+    if (done.status === "control-committed-unclean") {
+      const why = done.why ?? done.reason ?? done.error ?? "committed_unclean";
+      if (consumed.status === "absent") {
+        try {
+          recordClaimState({
+            claimsDir,
+            key,
+            state: "control-committed-unclean",
+            detail: {
+              control: intent.control,
+              handle: intent.handle ?? null,
+              handle_kind: intent.handle_kind ?? null,
+              reason: "control_committed_unclean",
+              status: "control-committed-unclean",
+              error: why,
+              why,
+              ledger: done.ledger ?? null,
+              intent_cleanup: done.intent_cleanup ?? null,
+              locks: done.locks ?? null,
+              changed: done.changed ?? false,
+              result: done.result ?? null,
+            },
+          });
+        } catch (err) {
+          return { ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why, ledger: "unclean_unwritten：" + String(err?.code ?? err?.message ?? err), quarantined };
+        }
+      }
+      return { ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why, text: done.text, quarantined };
+    }
     const why = done.reason ?? done.error ?? "?";
     if (consumed.status === "absent") {
       try { recordClaimState({ claimsDir, key, state: "failed", detail: { reason: "control_failed", control: intent.control, error: why } }); }
@@ -397,6 +445,7 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   if (intent === undefined) return { state: "not_control" };
   const consumed = readConsumedRecord({ claimsDir, key });
   const failed = readControlFailedRecord({ claimsDir, key });
+  const unclean = readControlCommittedUncleanRecord({ claimsDir, key });
   const listed = listControlSidecars({ claimsDir, key });
   const extras = listed.status === "listed"
     ? { residue: listed.residue, quarantined: listed.quarantined, listingProblem: null }
@@ -411,11 +460,13 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   }
   if (failed.status === "valid") return { state: "failed", intent, record: failed.record, ...extras };
   if (failed.status === "unreadable") return { state: "failed_unreadable", intent, why: failed.why, ...extras };
+  if (unclean.status === "valid") return { state: "control-committed-unclean", intent, record: unclean.record, ...extras };
+  if (unclean.status === "unreadable") return { state: "control_committed_unclean_unreadable", intent, why: unclean.why, ...extras };
   return { state: "in_flight", intent, ...extras };
 }
 
 /** 维护入口允许续做的状态 —— 唯一一份，两条链的 CLI 都引用它。 */
-export const RESUMABLE_CONTROL_STATES = Object.freeze(["in_flight", "consumed_unreadable", "failed_unreadable"]);
+export const RESUMABLE_CONTROL_STATES = Object.freeze(["in_flight", "consumed_unreadable", "failed_unreadable", "control-committed-unclean"]);
 /**
  * 维护入口的恢复动作：锁外先看一眼状态（拒掉明显不该动的），真正的判定与动作都交给锁内的事务：
  *   · consumed：不执行，锁内再清一次残骸（清不掉 / 枚举不了照样带回）；
@@ -430,6 +481,7 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
     if (intent === undefined) return { ok: false, reason: "not_control", why: null };
     const consumed = readConsumedRecord({ claimsDir, key });
     const failed = readControlFailedRecord({ claimsDir, key });
+    const unclean = readControlCommittedUncleanRecord({ claimsDir, key });
     const listed = listControlSidecars({ claimsDir, key });
     const quarantined = listed.status === "listed" ? listed.quarantined : [];
     if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "conflict", why: jointWhy(failed, consumed) };
@@ -443,6 +495,28 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
       return { ok: true, already: true, changed: consumed.record.changed, intent, residueUncleared: cleaned.uncleared, residueUnknown: cleaned.unknown, quarantined };
     }
     if (failed.status === "valid") return { ok: false, reason: "failed", why: null };
+    if (unclean.status === "valid") {
+      // 专用恢复路径（R57b P1-4）：重读账本核已提交 → 只做清理/释放收尾 → 转 consumed；核不出 → 保持并点名
+      const tx = execute(
+        intent.control === "select" ? intent : intent.control === "mode" ? intent.mode : intent,
+        { claim: claim.claim, claimsDir, key, uncleanRecord: unclean.record }
+      );
+      if (!tx.ok) {
+        return { ok: false, status: tx.status ?? "control-committed-unclean", reason: tx.reason, why: tx.why, quarantined };
+      }
+      const changed = tx.changed !== false;
+      try {
+        const detail = intent.control === "select"
+          ? { control: "select", handle: intent.handle, handle_kind: intent.handle_kind, changed }
+          : { control: intent.control, mode: intent.mode, changed };
+        recordClaimState({ claimsDir, key, state: "consumed", detail });
+        try { fs.unlinkSync(path.join(claimsDir, key + ".control-committed-unclean.json")); } catch {}
+      } catch (err) {
+        return { ok: false, reason: "ledger_unwritten", why: String(err?.code ?? err?.message ?? err), changed, quarantined };
+      }
+      const cleaned = cleanupConsumedResidue({ claimsDir, key });
+      return { ok: true, intent, changed, text: tx.text ?? null, resumed: true, replayed: false, residueUncleared: cleaned.uncleared, residueUnknown: cleaned.unknown, quarantined };
+    }
     // consumed 缺席 / 损坏、failed 缺席 / 损坏：可续做 —— 同一把锁里跑事务核心（不再取锁）
     const tx = runLockedTransaction({ claimsDir, key, intent: null, execute, replay: true, expect });
     return tx.ok

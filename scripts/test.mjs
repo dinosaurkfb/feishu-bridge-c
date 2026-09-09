@@ -92,7 +92,7 @@ import {
   runRouteSha256, markPublished, readPublishLedger, writePublishLedger, publishHold } from "./outbound.mjs";
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
-import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair, dispatchControlRepair } from "./repair-control-claim.mjs";
+import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair, dispatchControlRepair, repairControlCommittedUnclean } from "./repair-control-claim.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
 import {
   describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
@@ -42181,6 +42181,114 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(rFsync.ok, false, "目录 fsync 失败必须报 durability_uncertain");
     assert.equal(rFsync.commit, "committed_durability_uncertain", "commit 为 committed_durability_uncertain");
     assert.equal(rFsync.reason, "dir_fsync_failed", "reason 为 dir_fsync_failed");
+  }));
+
+  test("R57b 返修一 P1-4：已提交未收净——注入 committed_with_residue 报 committed-unclean 且非绿；repair 收尾后转 consumed；清 intent 失败保持可恢复且 intent 仍在", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p1_4", 39, "sess-b-39");
+    const rIss = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(rIss.ok, true, "签发成功");
+    const handle = rIss.reaffirm_handle;
+
+    // 1. 反例：注入 committed_with_residue → executeSelectControl 报 control-committed-unclean + 非绿
+    const rUnclean = SA.executeSelectControl({ control: "select", handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_sel57b",
+      selectAdmissionFn: () => ({ state: "partial" }),
+      _inject: {
+        afterLedgerRename: () => {
+          // 删掉账本锁让 release 报 absent，从而 foldRelease 出 committed_with_residue
+          const lockDir = path.join(dir, "ledger.lock");
+          try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+        }
+      }
+    });
+
+    assert.equal(rUnclean.ok, false, "未收净不得 ok:true");
+    assert.equal(rUnclean.status, "control-committed-unclean", "status 必须为 control-committed-unclean");
+    assert.match(rUnclean.text, /已写入但收口不干净/u, "文案提示已写入但收口不干净（非绿）");
+    assert.doesNotMatch(rUnclean.text, /已按你的确认重签/u, "不得出现绿色成功文案");
+
+    // 盘上 intent 不得被清理（因为账本未干净收口）
+    let diskIntents = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.equal(diskIntents.ok, true);
+    assert.ok(diskIntents.doc.entries[handle], "未收净时 intent 不得被清");
+
+    // 2. 模拟控制事务环境：写入带有选择上下文的新形 claim
+    const claimsDir = path.join(root, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const messageId = "om_sel57b";
+    const logicalTaskKey = "task_sel57b";
+    const selCtx = {
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      sender: "ou_owner57b",
+      message: messageId,
+      session: "sess-b-39",
+      handle,
+      kind: "rfh",
+    };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const cAcq = acquireClaim({
+      claimsDir,
+      messageId,
+      logicalTaskKey,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle, handle_kind: "rfh" },
+        selection_context: selCtx,
+        selection_context_digest_v1: digest,
+      }
+    });
+    assert.equal(cAcq.ok, true);
+    const key = cAcq.key;
+
+    // 跑控制事务，执行器返回 control-committed-unclean，事务落盘 .control-committed-unclean.json 而非 failed/consumed
+    const txUnclean = runControlTransaction({
+      claimsDir,
+      key,
+      intent: { control: "select", handle, handle_kind: "rfh" },
+      execute: () => rUnclean,
+    });
+    assert.equal(txUnclean.ok, false);
+    assert.equal(txUnclean.status, "control-committed-unclean");
+
+    const inspected = inspectControlClaim({ claimsDir, key });
+    assert.equal(inspected.state, "control-committed-unclean", "inspectControlClaim 识别 control-committed-unclean");
+
+    // 3. 反例：清 intent 失败 → 保持可恢复、intent 仍在
+    const failRepair = resumeControlClaim({
+      claimsDir,
+      key,
+      execute: (target, ctx) => dispatchControlRepair(target, {
+        onSelect: (t, c) => repairControlCommittedUnclean({
+          claim: c.claim,
+          claimsDir,
+          key,
+          uncleanRecord: c.uncleanRecord,
+          env: process.env,
+          _inject: { failIntentCleanup: true },
+        })
+      }, { claim: readClaimState({ claimsDir, key }).claim, claimsDir, key })
+    });
+    assert.equal(failRepair.ok, false, "清理 intent 失败 repair 不得成功");
+    const inspectedAfterFail = inspectControlClaim({ claimsDir, key });
+    assert.equal(inspectedAfterFail.state, "control-committed-unclean", "清理失败状态保持可恢复");
+    diskIntents = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.ok(diskIntents.doc.entries[handle], "清理失败 intent 仍在");
+
+    // 4. 正例：repair 收尾后转 consumed，intent 从盘上清理
+    const okRepair = resumeControlClaim({
+      claimsDir,
+      key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx)
+    });
+    assert.equal(okRepair.ok, true, "repair 收尾成功");
+    const inspectedAfterOk = inspectControlClaim({ claimsDir, key });
+    assert.equal(inspectedAfterOk.state, "consumed", "repair 后转 consumed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".control-committed-unclean.json")), false, "unclean 记录被移除");
+    diskIntents = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.equal(diskIntents.doc.entries[handle], undefined, "repair 成功后 intent 被清");
   }));
 
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {

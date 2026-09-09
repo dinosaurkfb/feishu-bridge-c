@@ -251,6 +251,19 @@ function wiredOutcome(w, action) {
     return { ok: false, status: "failed", reason: "select_legacy_failed", text: selectRejectTextByReason("select_legacy_failed") + (why ? "（" + why + "）" : "") };
   }
   const step = Array.isArray(w.shadow) ? w.shadow[0] : null;
+  // R57d 返修三 P1-5：legacy 已成功 + ledger 未提交 = 部分提交 → control-committed-unclean（不落普通 failed）。
+  //   这不是 classifySelectOutcome 能表达的（它只知道 ledger 状态不知道 legacy 是否已提交）——
+  //   在分类之前显式拦截：mapping 已被 legacy 改了、账本没落 → 可恢复态。
+  if (w.legacy && w.legacy.ok === true && (!step || step.ok !== true)) {
+    const ledgerWhy = step ? (step.reason ?? "select_op_failed") : "select_ledger_skipped";
+    return {
+      ok: false, status: "control-committed-unclean", reason: "control_committed_unclean",
+      text: "已写入但收口不干净（legacy 映射已更新、账本未提交：" + ledgerWhy + "）——repair 按 plan 收尾",
+      ledger: "not_committed", intent_cleanup: "unclear",
+      locks: { outer: w.release && w.release.ok === true ? "released" : "unclear", intent: "released" },
+      why: "legacy 已成功但账本未提交（" + ledgerWhy + "），部分提交状态",
+    };
+  }
   // R57d 返修一 B 段 P1-7：三份结果分类（账本提交 / claim 清理 / 锁释放）——与 rfh 共用叶子
   //   classifySelectOutcome（select-outcome.mjs，无反向依赖）与同一 control-committed-unclean 可恢复态。
   const ledger = step

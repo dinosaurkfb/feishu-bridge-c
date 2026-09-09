@@ -46020,6 +46020,22 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     } finally { fs.rmSync(local, { recursive: true, force: true }); }
   });
 
+  test("R57d 返修三 P1-5：legacy 已成功、ledger 未提交 → control-committed-unclean（不落普通 failed）", () => withLedgerD((root, dir, ids) => {
+    fs.mkdirSync(path.join(root, "claims", "5".repeat(64) + ".claim"), { recursive: true });
+    const claimsDir = path.join(root, "claims");
+    const claim0 = { control: { control: "select", handle: ids.b1Handle, handle_kind: "osh" }, selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" }, selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle: ids.b1Handle, kind: "osh" }) };
+    const legacyKillsA1 = () => {
+      const d = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+      delete d.records[ids.a1Id];
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+      return { ok: true, legacyCommitted: true };
+    };
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: legacyKillsA1, capability: capD(ids.b1Handle, "osh"), txCtx: { claimsDir, key: "5".repeat(64), claim: claim0 } }));
+    assert.equal(r.ok, false, "拒：" + JSON.stringify(r));
+    assert.equal(r.status, "control-committed-unclean", "status：" + r.status + " reason：" + r.reason + "（不落普通 failed）");
+  }));
+
+
   test("R57d 返修三 P1-4：selection plan 持久化进 claim 文件 + 封闭键集 + path key 封闭", () => withLedgerD((root, dir, ids) => {
     fs.mkdirSync(path.join(root, "claims", "0".repeat(64) + ".claim"), { recursive: true });
     const claimsDir = path.join(root, "claims");
@@ -46146,7 +46162,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const stepClock = () => T0D + (++n) * 20 * day; // ①解析 ②op 记账 ③锁内到期核（handle TTL 30 天）
     const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  mappingUpdate: mappingStub([]), clock: stepClock }));
     assert.equal(r.ok, false, JSON.stringify(r));
-    assert.equal(r.reason, "handle_expired", "刚过期 handle → 拒：" + r.reason);
+    // P1-5 后：legacy（mappingStub）成功 + ledger 拒 → unclean（部分提交）；拒绝原因在 why 里
+    assert.ok(r.reason === "handle_expired" || (r.status === "control-committed-unclean" && String(r.why ?? "").includes("handle_expired")),
+      "锁内到期拒（handle_expired 或 unclean 含 handle_expired）：" + r.reason + " " + (r.why ?? ""));
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].facts.binding, "pending", "handle 未被消费");
   }));
 

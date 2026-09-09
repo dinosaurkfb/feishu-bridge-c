@@ -43762,7 +43762,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b1 = b1WithHandle(dir, "r57c_act_b1", 86, "om_act86");
     const a1 = a1Of(dir, "r57c_act_a1", "sess-c-86");
     const sel = { selectedSessionId: "sess-c-86", selectedRootOm: "om_act86", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_msgc86", selectionBasis: "explicit_handle" };
-    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_act86"), authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "activate 增量");
+    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "activate 增量");
     const r = act.result;
     assert.equal(Object.keys(r).sort().join(","), "affected_live_ids_after_commit,authorized_at,authorized_by,demoted_historical_id,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id,surviving_id,tombstoned_id", "§6 增量键集");
     assert.deepEqual(r.affected_live_ids_after_commit, [b1.result.created_id]);
@@ -43773,7 +43773,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const opId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "activate");
     assert.equal(r.selection_operation_id, opId, "selection_operation_id = 本 op key");
     assert.equal(opId.fingerprint ?? doc.operations[opId].fingerprint, doc.operations[opId].fingerprint);
-    assert.equal(doc.operations[opId].fingerprint, TAL.fingerprintOf("activate", { request_key: "r57c_act", b1_id: b1.result.created_id, a1_id: a1.result.created_id, matched_om: "om_act86", selected_session_id: "sess-c-86", selected_root_om: "om_act86", selection_handle: b1.result.selection_handle, selection_message_id: "om_msgc86", selection_basis: "explicit_handle" }), "五元入 fp");
+    assert.equal(doc.operations[opId].fingerprint, TAL.fingerprintOf("activate", { request_key: "r57c_act", b1_id: b1.result.created_id, a1_id: a1.result.created_id, selected_session_id: "sess-c-86", selected_root_om: "om_act86", selection_handle: b1.result.selection_handle, selection_message_id: "om_msgc86", selection_basis: "explicit_handle" }), "五元入 fp（owner_select 不含 matched_om）");
     const rec = doc.records[b1.result.created_id];
     assert.equal(rec.binding_proof.kind, "owner_select_v1", "owner_select binding");
     assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1", "owner_select link");
@@ -43795,7 +43795,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b1b = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57c_d2", chatId: "oc_r57c", rootOm: "om_d87b", lineageId: lin, bindingTarget: TGTC(87), clock: () => T0C }), "第二代 B1（同 lineage 同 target，G6）");
     const a1b = a1Of(dir, "r57c_d2a", "sess-c-87b");
     const sel = { selectedSessionId: "sess-c-87b", selectedRootOm: "om_d87b", selectionHandle: b1b.result.selection_handle, selectionMessageId: "om_msgc87", selectionBasis: "unique_candidate" };
-    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d2act", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, f4: F4C("om_d87b"), authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "activate 增量 demoted");
+    const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d2act", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "activate 增量 demoted");
     const r = act.result;
     const expectedAffected = [b1b.result.created_id, b1a.result.created_id].sort();
     assert.deepEqual(r.affected_live_ids_after_commit, expectedAffected, "affected = [surviving, demoted] 排序");
@@ -43805,7 +43805,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     ].sort((x, y) => (x.topic_agent_id < y.topic_agent_id ? -1 : 1)), "demoted preserved/preserved");
     loadOkC(dir);
     // 重放幂等
-    const r2 = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d2act", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, f4: F4C("om_d87b"), authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "重放");
+    const r2 = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_d2act", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, authorizedBy: "ou_owner57c", ...sel, clock: () => T0C }), "重放");
     assert.equal(r2.idempotent, true);
     assert.equal(r2.result.selection_handle, b1b.result.selection_handle);
   }));
@@ -43813,20 +43813,20 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   test("R57c activate 增量：CAS（selection_handle/root/session 与现场不符 → 拒）；1.0 账本传选择输入 → bad_input；无选择输入保持旧形", () => withLedgerC((root, dir) => {
     const b1 = b1WithHandle(dir, "r57c_cas", 89, "om_cas89");
     const a1 = a1Of(dir, "r57c_cas_a1", "sess-c-89");
-    let r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas1", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_cas89", selectionHandle: "osh_" + "0".repeat(32), selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
+    let r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas1", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_cas89", selectionHandle: "osh_" + "0".repeat(32), selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.ok, false); assert.equal(r.reason, "cas_mismatch", "handle CAS");
-    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas2", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-OTHER", selectedRootOm: "om_cas89", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
+    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas2", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_owner57c", selectedSessionId: "sess-OTHER", selectedRootOm: "om_cas89", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.reason, "cas_mismatch", "session CAS");
-    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas3", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_OTHER", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
+    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas3", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_OTHER", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.reason, "cas_mismatch", "root CAS");
-    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas4", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_cas89"), authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_cas89", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "rebind", clock: () => T0C });
+    r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_cas4", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-89", selectedRootOm: "om_cas89", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_m89", selectionBasis: "rebind", clock: () => T0C });
     assert.equal(r.reason, "bad_input", "basis 值域封闭（activate 不认 rebind）");
   }));
 
   test("R57c activate：1.0 账本传选择输入 → bad_input；无选择输入旧形不变（1.0 与 1.1 都然）", () => withLedgerC((root, dir) => {
     const b1 = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57c_10_b1", chatId: "oc_r57c", rootOm: "om_10", lineageId: "lin_10", bindingTarget: TGTC(90), clock: () => T0C }), "createB1@1.0");
     const a1 = talOkC(TAL.createA1({ endpointId: EP57C, requestKey: "r57c_10_a1", chatId: "oc_r57c", sessionId: "sess-c-90", clock: () => T0C }), "createA1@1.0");
-    const r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_10_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_10"), authorizedBy: "ou_r57c", selectedSessionId: "sess-c-90", selectedRootOm: "om_10", selectionHandle: "osh_" + "2".repeat(32), selectionMessageId: "om_m90", selectionBasis: "explicit_handle", clock: () => T0C });
+    const r = TAL.activate({ endpointId: EP57C, requestKey: "r57c_10_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-c-90", selectedRootOm: "om_10", selectionHandle: "osh_" + "2".repeat(32), selectionMessageId: "om_m90", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.ok, false, "1.0 不收选择增量");
     assert.equal(r.reason, "bad_input");
     const act = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_10_act2", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_10"), authorizedBy: "ou_r57c", clock: () => T0C }), "1.0 旧形");
@@ -43849,11 +43849,11 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const a2 = a2Of(dir, "r57c_anc", 91, "sess-c-91", "om_cand91");
     const cur = loadOkC(dir).records[a2];
     // 候选改指被挡：expected 三件任一不符 → cas_mismatch
-    let r = TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc1", id: a2, f4: { root_om: "om_cand91", ...F4C("om_cand91") }, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_OTHER", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C });
+    let r = TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc1", id: a2, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_OTHER", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.ok, false); assert.equal(r.reason, "cas_mismatch", "候选改指被 CAS 挡");
-    r = TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc2", id: a2, f4: { root_om: "om_cand91", ...F4C("om_cand91") }, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: "osh_" + "0".repeat(32), expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_cand91", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C });
+    r = TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc2", id: a2, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: "osh_" + "0".repeat(32), expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_cand91", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C });
     assert.equal(r.reason, "cas_mismatch", "handle CAS");
-    const anc = talOkC(TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc3", id: a2, f4: { root_om: "om_cand91", ...F4C("om_cand91") }, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_cand91", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C }), "anchor 增量");
+    const anc = talOkC(TAL.anchor({ endpointId: EP57C, requestKey: "r57c_anc3", id: a2, authorizedBy: "ou_owner57c", selectedSessionId: "sess-c-91", selectedRootOm: "om_cand91", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_cand91", selectionMessageId: "om_m91", selectionBasis: "explicit_handle", clock: () => T0C }), "anchor 增量");
     const rr = anc.result;
     assert.equal(Object.keys(rr).sort().join(","), "affected_id,affected_live_ids_after_commit,authorized_at,authorized_by,expected_anchor_candidate,proof_effects,selected_root_om,selected_session_id,selection_basis,selection_handle,selection_message_id,selection_operation_id", "§6 anchor 增量键集");
     assert.equal(rr.expected_anchor_candidate, "om_cand91");
@@ -43867,7 +43867,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(rec.anchor_candidate, "om_cand91", "anchor 不清 anchor_candidate");
     assert.equal(rec.aliases.root_om, "om_cand91");
     const opId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "anchor");
-    assert.equal(doc.operations[opId].fingerprint, TAL.fingerprintOf("anchor", { request_key: "r57c_anc3", topic_agent_id: a2, root_om: "om_cand91", matched_om: "om_cand91", selected_session_id: "sess-c-91", selected_root_om: "om_cand91", selection_handle: cur.selection_handle, selection_message_id: "om_m91", selection_basis: "explicit_handle", expected_handle: cur.selection_handle, expected_expires_at: cur.handle_expires_at, expected_anchor_candidate: "om_cand91" }), "fp = 五元 + 三件");
+    assert.equal(doc.operations[opId].fingerprint, TAL.fingerprintOf("anchor", { request_key: "r57c_anc3", topic_agent_id: a2, selected_session_id: "sess-c-91", selected_root_om: "om_cand91", selection_handle: cur.selection_handle, selection_message_id: "om_m91", selection_basis: "explicit_handle", expected_handle: cur.selection_handle, expected_expires_at: cur.handle_expires_at, expected_anchor_candidate: "om_cand91" }), "fp = 五元 + 三件（owner_select 不含 root_om/matched_om）");
   }));
 
   // ── D. rebind_session_alias 的 A1 归并 ──
@@ -43898,6 +43898,152 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const r2 = TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc2", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-new", newSessionId: "sess-c-93", authorizedBy: "ou_owner57c", rebindHandle: rq2.result.rebind_handle, expectedExpiresAt: rq2.result.rebind_expires_at, selectionMessageId: "om_m93rc", clock: () => T0C + 1000 });
     assert.equal(r2.ok, false);
     assert.equal(r2.reason, "alias_occupied", "B3 占位仍拒");
+  }));
+
+
+
+  // ── R57c 返修一（Codex #146 首轮 T1–T6）──
+
+  test("R57c 返修一 T1：A2 记录侧 anchor_candidate 被真改指（旧候选做三值一致 CAS）→ cas_mismatch 点名 anchor_candidate", () => withLedgerC((root, dir) => {
+    const a2 = a2Of(dir, "r57cf_t1", 95, "sess-cf-95", "om_oldcand");
+    const cur = loadOkC(dir).records[a2];
+    // 手术：记录侧 anchor_candidate 被改指到另一 om（产生 op result 同步改，骗过 G-handle）
+    const f = path.join(dir, "ledger.json");
+    const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+    for (const rec of Object.values(d.records)) if (rec.topic_agent_id === a2) rec.anchor_candidate = "om_newcand";
+    for (const op of Object.values(d.operations)) if (op.op_type === "attach_a2" && op.result.anchor_candidate) op.result.anchor_candidate = "om_newcand";
+    fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+    // 调用方仍以旧候选三值一致调 anchor → 必须 cas_mismatch
+    const r = TAL.anchor({ endpointId: EP57C, requestKey: "r57cf_t1a", id: a2, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-95", selectedRootOm: "om_oldcand", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_oldcand", selectionMessageId: "om_cf95", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.ok, false, "改指后旧候选必须拒");
+    assert.equal(r.reason, "cas_mismatch", "cas_mismatch");
+    assert.match(String(r.why ?? ""), /anchor_candidate/u, "why 点名 anchor_candidate");
+  }));
+
+  test("R57c 返修一 T2：resolveSelectionCandidate 同 chat 过滤——跨 chat B1 不得计入；显式 handle 命中跨 chat 记录 → no_candidate", () => withLedgerC((root, dir) => {
+    b1WithHandle(dir, "r57cf_t2a", 96, "om_t2a");  // 同 chat（oc_r57c）
+    // 另一 chat 的 B1，handle 在场未过期
+    talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57cf_t2b", chatId: "oc_other", rootOm: "om_t2b", lineageId: "lin_t2b", bindingTarget: TGTC(97), clock: () => T0C }), "B1 other chat");
+    const d = loadOkC(dir);
+    // 省略 handle：同 chat 恰一 + 跨 chat 一 = 候选集应只含同 chat 的 → unique_candidate
+    let r = SR.resolveSelectionCandidate({ doc: d, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    assert.equal(r.ok, true, "同 chat 恰一 → unique_candidate（跨 chat 不算）");
+    assert.equal(r.selection_basis, "unique_candidate");
+    // 删掉 chat 过滤后此处的另一 chat B1 会计入 → ambiguous → 转红
+    // 显式 handle 命中跨 chat 的记录 → no_candidate
+    const otherB1 = Object.values(d.records).find((x) => x.kind === "live" && x.chat_id === "oc_other" && x.selection_handle !== null);
+    r = SR.resolveSelectionCandidate({ doc: d, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: otherB1.selection_handle, now: T0C });
+    assert.equal(r.ok, false, "显式 handle 命中跨 chat 记录 → no_candidate");
+    assert.equal(r.reason, "no_candidate");
+  }));
+
+  test("R57c 返修一 T3：activate / anchor 在账本锁内复核 handle 未到期——clock()===expires_at → handle_expired；早 1ms 通过", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57cf_t3", 98, "om_t3");
+    const a1 = a1Of(dir, "r57cf_t3aa", "sess-cf-98");
+    const expMs = Date.parse("2099-01-01T00:00:00.000Z");
+    // 手术：B1 handle 到期 = expMs（create op result 同步）
+    const f = path.join(dir, "ledger.json");
+    const d0 = JSON.parse(fs.readFileSync(f, "utf-8"));
+    for (const rec of Object.values(d0.records)) if (rec.selection_handle !== null) rec.handle_expires_at = "2099-01-01T00:00:00.000Z";
+    for (const op of Object.values(d0.operations)) if (op.op_type === "create_b1" && op.result.handle_expires_at) op.result.handle_expires_at = "2099-01-01T00:00:00.000Z";
+    fs.writeFileSync(f, JSON.stringify(d0, null, 2) + "\n", { mode: 0o600 });
+    // clock() === expires_at → 恰好到期 → 拒
+    let r = TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t3act_a", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-98", selectedRootOm: "om_t3", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_cf98a", selectionBasis: "explicit_handle", clock: () => expMs });
+    assert.equal(r.ok, false, "clock===expiry → 拒");
+    assert.equal(r.reason, "handle_expired", "reason=handle_expired");
+    assert.match(String(r.why ?? ""), /handle.*到期|handle_expired/u, "why 点名 handle 到期");
+    // 早 1ms → 通过
+    r = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t3act_b", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-98", selectedRootOm: "om_t3", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_cf98b", selectionBasis: "explicit_handle", clock: () => expMs - 1 }), "早 1ms 通过");
+    // anchor 也核
+    const a2 = a2Of(dir, "r57cf_t3c", 99, "sess-cf-99", "om_t3cand");
+    const cur = loadOkC(dir).records[a2];
+    r = TAL.anchor({ endpointId: EP57C, requestKey: "r57cf_t3c", id: a2, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-99", selectedRootOm: "om_t3cand", selectionHandle: cur.selection_handle, expectedExpiresAt: cur.handle_expires_at, expectedAnchorCandidate: "om_t3cand", selectionMessageId: "om_cf99", selectionBasis: "explicit_handle", clock: () => Date.parse(cur.handle_expires_at) });
+    assert.equal(r.ok, false, "anchor clock===expiry → 拒");
+    assert.equal(r.reason, "handle_expired");
+  }));
+
+  test("R57c 返修一 T4：带 owner_select 输入的调用不被 1.0 旧操作重放吞——旧 key 加选择五元 → request_conflict（activate + anchor 各测）", () => withLedgerC((root, dir) => {
+    const b1 = talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57cf_t4b1", chatId: "oc_r57c", rootOm: "om_t4", lineageId: "lin_t4", bindingTarget: TGTC(100), clock: () => T0C }), "createB1@1.0");
+    const a1 = talOkC(TAL.createA1({ endpointId: EP57C, requestKey: "r57cf_t4a1", chatId: "oc_r57c", sessionId: "sess-cf-t4", clock: () => T0C }), "createA1@1.0");
+    // 1.0 旧形 activate（无选择输入）
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t4k", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_t4"), authorizedBy: "ou_r57c", clock: () => T0C }), "旧形@1.0");
+    // 同 key 加选择五元 → request_conflict（不是 idempotent）
+    const r = TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t4k", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-t4", selectedRootOm: "om_t4", selectionHandle: "osh_" + "3".repeat(32), selectionMessageId: "om_t4m", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "request_conflict", "旧 key 加选择五元 → request_conflict（改前 idempotent:true）");
+  }, { schema: "1.0" }));
+
+  test("R57c 返修一 T5：tombstoned_a1_id 反向不变量——删 tombstone / 替换为 live / 改 forwards_to → ledger_corrupt", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57cf_t5", 101, "om_t5");
+    const a1Old = a1Of(dir, "r57cf_t5a", "sess-cf-t5-old");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t5act", b1Id: b1.result.created_id, a1Id: a1Old.result.created_id, f4: F4C("om_t5"), authorizedBy: "ou_r57c", clock: () => T0C }), "activate 旧形");
+    const a1New = a1Of(dir, "r57cf_t5n", "sess-cf-t5-new");
+    const rq = talOkC(TAL.requestRebind({ endpointId: EP57C, requestKey: "r57cf_t5rq", b3Id: b1.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: "sess-cf-t5-old", clock: () => T0C }), "requestRebind");
+    talOkC(TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57cf_t5rc", id: b1.result.created_id, expectedOldSessionId: "sess-cf-t5-old", newSessionId: "sess-cf-t5-new", authorizedBy: "ou_owner57c", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_t5m", clock: () => T0C + 1000 }), "消费+归并");
+    const docBefore = loadOkC(dir);
+    const tombId = docBefore.operations[Object.keys(docBefore.operations).find((k) => docBefore.operations[k].op_type === "rebind_session_alias")].result.tombstoned_a1_id;
+    assert.ok(tombId, "tombstoned_a1_id 非空");
+    // 手术①：删 tombstone 记录
+    const mutate = (fn) => {
+      const f = path.join(dir, "ledger.json");
+      const d = JSON.parse(fs.readFileSync(f, "utf-8"));
+      fn(d);
+      fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+      return d;
+    };
+    let d = mutate((x) => { delete x.records[tombId]; });
+    let v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "删 tombstone → corrupt");
+    assert.match(String(v.why ?? ""), /tombstoned_a1_id|反向/u);
+    // 手术②：替换为 live
+    d = mutate((x) => { x.records[tombId] = { kind: "live", topic_agent_id: tombId, chat_id: "oc_r57c", aliases: { session_id: "sess-cf-t5-new", root_om: null }, facts: { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, generation_lineage_id: null, anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: Object.keys(x.operations).find((k) => x.operations[k].op_type === "rebind_session_alias"), created_at: x.records[b1.result.created_id].created_at, updated_at: x.records[b1.result.created_id].updated_at }; });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "替换为 live → corrupt");
+    // 手术③：改 forwards_to
+    d = mutate((x) => { if (x.records[tombId]?.kind === "forwarding_tombstone") x.records[tombId].forwards_to = "ta_" + "f".repeat(32); });
+    v = TAL.validateLedger(d, { endpointId: EP57C });
+    assert.equal(v.ok, false, "改 forwards_to → corrupt");
+  }));
+
+  test("R57c 返修一 T6：resolveSelectionCandidate handle 先 typeof 再正则——Symbol / 数字 / 对象 → handle_kind_mismatch 不裸抛", () => {
+    const doc = { endpoint_id: "ep", records: {} };
+    for (const bad of [Symbol("x"), 42, {}]) {
+      const r = SR.resolveSelectionCandidate({ doc, endpointId: "ep", chatId: "oc", action: "activate", handle: bad, now: T0C });
+      assert.equal(r.ok, false, String(typeof bad) + " → 拒");
+      assert.equal(r.reason, "handle_kind_mismatch", String(typeof bad) + " → handle_kind_mismatch");
+    }
+  });
+  test("R57c 返修一 T7：owner_select 增量不收 f4——传了 → bad_input；产物里不含 matched_om", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57cf_t7", 102, "om_t7");
+    const a1 = a1Of(dir, "r57cf_t7aa", "sess-cf-t7");
+    const sel = { selectedSessionId: "sess-cf-t7", selectedRootOm: "om_t7", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_t7m", selectionBasis: "explicit_handle" };
+    // ownerSel + f4 → bad_input
+    const r = TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t7act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: F4C("om_t7"), authorizedBy: "ou_r57c", ...sel, clock: () => T0C });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "bad_input");
+    assert.match(String(r.why ?? ""), /不收 f4/u);
+    // ownerSel 不传 f4 → 成功；产物无 matched_om
+    const r2 = talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t7b", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", ...sel, clock: () => T0C }), "ownerSel 无 f4");
+    const doc = loadOkC(dir);
+    const rec = doc.records[b1.result.created_id];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1");
+    const bpStr = JSON.stringify(rec.binding_proof);
+    assert.equal(bpStr.includes("matched_om"), false, "产物不含 matched_om");
+    assert.equal(bpStr.includes("matched_fields"), false, "产物不含 matched_fields");
+    assert.equal(bpStr.includes("pending_token_state"), false, "产物不含 pending_token_state");
+    // anchor T7：传 f4 + owner_select → bad_input
+    const a2 = a2Of(dir, "r57cf_t7a2", 103, "sess-cf-t7-a2", "om_t7cand");
+    const cur2 = loadOkC(dir).records[a2];
+    const r3 = TAL.anchor({ endpointId: EP57C, requestKey: "r57cf_t7c", id: a2, f4: { root_om: "om_t7cand", matched_om: "om_t7cand", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-t7-a2", selectedRootOm: "om_t7cand", selectionHandle: cur2.selection_handle, expectedExpiresAt: cur2.handle_expires_at, expectedAnchorCandidate: "om_t7cand", selectionMessageId: "om_t7cm", selectionBasis: "explicit_handle", clock: () => T0C });
+    assert.equal(r3.ok, false);
+    assert.equal(r3.reason, "bad_input");
+    assert.match(String(r3.why ?? ""), /不收 f4/u);
+    // anchor 不传 f4 + owner_select → 成功
+    const r4 = talOkC(TAL.anchor({ endpointId: EP57C, requestKey: "r57cf_t7d", id: a2, authorizedBy: "ou_r57c", selectedSessionId: "sess-cf-t7-a2", selectedRootOm: "om_t7cand", selectionHandle: cur2.selection_handle, expectedExpiresAt: cur2.handle_expires_at, expectedAnchorCandidate: "om_t7cand", selectionMessageId: "om_t7cm2", selectionBasis: "explicit_handle", clock: () => T0C }), "anchor ownerSel 无 f4");
+    const rec2 = loadOkC(dir).records[a2];
+    assert.equal(rec2.locator_link_proof_ref.kind, "owner_selected_route_v1");
+    const lpStr = JSON.stringify(rec2.locator_link_proof_ref);
+    assert.equal(lpStr.includes("matched_om"), false, "anchor 产物不含 matched_om");
   }));
 
 

@@ -28,8 +28,9 @@ export function resolveSelectionCandidate({ doc, endpointId, chatId, action, han
   if (!SELECTION_ACTIONS.includes(action)) return { ok: false, reason: "bad_action" };
   if (!Number.isSafeInteger(now) || now < 0) return { ok: false, reason: "bad_now" };
   if (handle !== null) {
+    if (typeof handle !== "string") return { ok: false, reason: "handle_kind_mismatch" };
     const shapeOk = action === "rebind" ? REBIND_HANDLE_SHAPE.test(handle) : SELECTION_HANDLE_SHAPE.test(handle);
-    if (typeof handle !== "string" || !shapeOk) return { ok: false, reason: "handle_kind_mismatch" };
+    if (!shapeOk) return { ok: false, reason: "handle_kind_mismatch" };
   }
   const wantFam = action === "activate" ? "B1" : action === "anchor" ? "A2" : "B3";
   const hField = action === "rebind" ? "rebind_handle" : "selection_handle";

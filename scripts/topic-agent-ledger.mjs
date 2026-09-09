@@ -1558,6 +1558,22 @@ export function validateLedger(doc, { endpointId } = {}) {
     }
   }
 
+  // R57c 返修一 T5：tombstoned_a1_id 反向不变量——op result 点名的 A1 tombstone 必须实际存在且逐字一致
+  for (const [opId, op] of Object.entries(doc.operations)) {
+    if (op.op_type !== "rebind_session_alias" || op.result?.tombstoned_a1_id == null) continue;
+    const tid = op.result.tombstoned_a1_id;
+    const t = doc.records[tid];
+    if (!t) return bad("op " + opId + "：tombstoned_a1_id " + tid + " 无对应记录 (G13-tomb-rebind)");
+    if (t.kind !== "forwarding_tombstone") return bad("op " + opId + "：tombstoned_a1_id " + tid + " 不是 forwarding_tombstone（被替换为 " + t.kind + "）(G13-tomb-rebind)");
+    if (t.forwards_to !== op.result.affected_id) return bad(tid + "：forwards_to ≠ rebind affected_id (G13-tomb-rebind)");
+    if (t.origin_operation_id !== opId) return bad(tid + "：origin_operation_id ≠ 本 rebind op (G13-tomb-rebind)");
+    const pr = t.proof_ref;
+    if (!pr || pr.kind !== "owner_select_merge_v1") return bad(tid + "：proof_ref 不是 owner_select_merge_v1 (G13-tomb-rebind)");
+    if (pr.selected_root_om !== op.result.selected_root_om || pr.selection_handle !== op.result.selection_handle || pr.selection_operation_id !== opId) {
+      return bad(tid + "：proof_ref 与 op result 不一致 (G13-tomb-rebind)");
+    }
+  }
+
   // 跨 op 核验：affected_live_ids_after_commit 与 proof_effects 关联等式
   for (const [opId, op] of Object.entries(doc.operations)) {
     const r = op.result;
@@ -2615,12 +2631,14 @@ export function seedRecords({ endpointId, requestKey, candidates, now = Date.now
  *  → 基线旧形（不改）。CAS：selection_handle/root/session 与现场逐字相符。 */
 export function activate({ endpointId, requestKey, b1Id, a1Id, f4, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, selectionMessageId, selectionBasis, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const ownerSelect = selectionMessageId !== undefined;
-  const baseInputs = { request_key: requestKey, b1_id: b1Id, a1_id: a1Id, matched_om: f4?.matched_om };
-  const inputsFor = (doc) => (ownerSelect && doc !== null && is11Schema(doc))
-    ? { ...baseInputs, selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_message_id: selectionMessageId, selection_basis: selectionBasis }
-    : baseInputs;
+  const baseInputs = { request_key: requestKey, b1_id: b1Id, a1_id: a1Id };
+  // R57c 返修一 T4：owner_select 输入的 replay 描述符不按 schema 抹字段——带选择五元的调用
+  // 必须携带完整增量载荷（1.0 下 fresh key → mutate 内 bad_input；旧 key → request_conflict）
+  const inputsFor = () => (ownerSelect)
+    ? { request_key: requestKey, b1_id: b1Id, a1_id: a1Id, selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_message_id: selectionMessageId, selection_basis: selectionBasis }
+    : { ...baseInputs, matched_om: f4?.matched_om };
   return gatedTx({
-    endpointId, requestKey, env, replay: (doc) => [{ opType: "activate", inputs: inputsFor(doc) }], _inject,
+    endpointId, requestKey, env, replay: () => [{ opType: "activate", inputs: inputsFor() }], _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(b1Id) || !isId(a1Id)) return { ok: false, reason: "bad_id" };
@@ -2629,7 +2647,9 @@ export function activate({ endpointId, requestKey, b1Id, a1Id, f4, authorizedBy,
       if (!b1 || b1.kind !== "live" || b1.facts.binding !== "pending") return { ok: false, reason: "b1_not_pending" };
       if (!a1 || a1.kind !== "live" || familyOf(a1.facts) !== "A1") return { ok: false, reason: "a1_not_chat" };
       if (a1.chat_id !== b1.chat_id) return { ok: false, reason: "chat_mismatch" };
-      if (!isObj(f4) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state)) return { ok: false, reason: "bad_f4" };
+      // R57c 返修一 T7：owner_select 增量不收 f4（行政选择不是 transport 配对证据）
+      if (ownerSelect && f4 != null) return { ok: false, reason: "bad_input", why: "owner_select 增量不收 f4" };
+      if (!ownerSelect && (!isObj(f4) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state))) return { ok: false, reason: "bad_f4" };
       if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
       const nowMs = Number.isFinite(now) ? now : clock(); // 事件记账时间
       const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
@@ -2646,6 +2666,11 @@ export function activate({ endpointId, requestKey, b1Id, a1Id, f4, authorizedBy,
         // CAS：五元与现场逐字相符（handle/root 即 B1 现场；session 即 A1 现场）
         if (b1.aliases.root_om !== selectedRootOm) return { ok: false, reason: "cas_mismatch", why: "selected_root_om ≠ B1.root_om" };
         if (b1.selection_handle !== selectionHandle) return { ok: false, reason: "cas_mismatch", why: "selection_handle ≠ B1.selection_handle" };
+        // R57c 返修一 T3：锁内复核 handle 未到期（解析只在锁外过滤，提交时再核一次）
+        const actExp = b1.handle_expires_at;
+        if (actExp != null && isCanonicalIso(actExp) && clock() >= Date.parse(actExp)) {
+          return { ok: false, reason: "handle_expired", why: "selection_handle 已到期（" + actExp + "）：锁内 clock() ≥ handle_expires_at" };
+        }
         if (a1.aliases.session_id !== selectedSessionId) return { ok: false, reason: "cas_mismatch", why: "selected_session_id ≠ A1.session_id" };
         sel = { selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_message_id: selectionMessageId, selection_basis: selectionBasis };
       }
@@ -2842,23 +2867,25 @@ export function attachF4({ endpointId, requestKey, id, bindingTarget, claimKey, 
 export function anchor({ endpointId, requestKey, id, f4, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionMessageId, selectionBasis, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const ownerSelect = selectionMessageId !== undefined;
   const baseInputs = { request_key: requestKey, topic_agent_id: id, root_om: f4?.root_om, matched_om: f4?.matched_om };
-  const inputsFor = (doc) => (ownerSelect && doc !== null && is11Schema(doc))
-    ? { ...baseInputs, selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_message_id: selectionMessageId, selection_basis: selectionBasis, expected_handle: selectionHandle, expected_expires_at: expectedExpiresAt, expected_anchor_candidate: expectedAnchorCandidate }
-    : baseInputs;
+  const inputsFor = () => (ownerSelect)
+    ? { request_key: requestKey, topic_agent_id: id, selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_message_id: selectionMessageId, selection_basis: selectionBasis, expected_handle: selectionHandle, expected_expires_at: expectedExpiresAt, expected_anchor_candidate: expectedAnchorCandidate }
+    : { ...baseInputs, root_om: f4?.root_om, matched_om: f4?.matched_om };
   return gatedTx({
-    endpointId, requestKey, env, replay: (doc) => [{ opType: "anchor", inputs: inputsFor(doc) }], _inject,
+    endpointId, requestKey, env, replay: () => [{ opType: "anchor", inputs: inputsFor() }], _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(id)) return { ok: false, reason: "bad_id" };
       const rec = doc.records[id];
       if (!rec || rec.kind !== "live" || familyOf(rec.facts) !== "A2") return { ok: false, reason: "not_a2" };
-      if (!isObj(f4) || typeof f4.root_om !== "string" || !OM_SHAPE.test(f4.root_om) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state)) return { ok: false, reason: "bad_f4" };
-      if (liveLocatorInUse(doc, f4.root_om)) return { ok: false, reason: "locator_exists" };
+      // R57c 返修一 T7：owner_select 增量不收 f4
+      if (ownerSelect && f4 != null) return { ok: false, reason: "bad_input", why: "owner_select 增量不收 f4" };
+      if (!ownerSelect && (!isObj(f4) || typeof f4.root_om !== "string" || !OM_SHAPE.test(f4.root_om) || typeof f4.matched_om !== "string" || !OM_SHAPE.test(f4.matched_om) || matchedFieldsBad(f4.matched_fields, f4.pending_token_state))) return { ok: false, reason: "bad_f4" };
+      if (ownerSelect && !is11Schema(doc)) return { ok: false, reason: "bad_input", why: "选择增量只住 1.1-transition/1.1" };
+      const ownerSel = ownerSelect && is11Schema(doc);
+      if (liveLocatorInUse(doc, ownerSel ? (typeof selectedRootOm === "string" ? selectedRootOm : "") : f4.root_om)) return { ok: false, reason: "locator_exists" };
       const nowMs = Number.isFinite(now) ? now : clock(); // 事件记账时间
       const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
       const inputs = inputsFor(doc);
-      if (ownerSelect && !is11Schema(doc)) return { ok: false, reason: "bad_input", why: "选择增量只住 1.1-transition/1.1" };
-      const ownerSel = ownerSelect && is11Schema(doc);
       let sel = null;
       if (ownerSel) {
         if (typeof selectedSessionId !== "string" || !AILY_SESSION_SHAPE.test(selectedSessionId)) return { ok: false, reason: "bad_input", why: "selected_session_id 形状不对" };
@@ -2872,9 +2899,14 @@ export function anchor({ endpointId, requestKey, id, f4, authorizedBy, selectedS
         // CAS 三件：A2 的 handle/expiry/anchor_candidate 逐字
         if (rec.selection_handle !== selectionHandle) return { ok: false, reason: "cas_mismatch", why: "selection_handle ≠ A2.selection_handle" };
         if (rec.handle_expires_at !== expectedExpiresAt) return { ok: false, reason: "cas_mismatch", why: "expected_expires_at ≠ A2.handle_expires_at" };
+        // R57c 返修一 T1：anchor_candidate CAS 独立核——候选真被改指（记录侧已换 om）时调用方仍以旧值调 → 挡
         if (rec.anchor_candidate !== expectedAnchorCandidate) return { ok: false, reason: "cas_mismatch", why: "expected_anchor_candidate ≠ A2.anchor_candidate（候选改指被挡）" };
-        // f4.root_om / selected_root_om / expected_anchor_candidate 三位一体（shape 钉 === selected_root_om）
-        if (f4.root_om !== selectedRootOm || expectedAnchorCandidate !== selectedRootOm) return { ok: false, reason: "cas_mismatch", why: "f4.root_om / selected_root_om / expected_anchor_candidate 不一致" };
+        // R57c 返修一 T3：锁内复核 handle 未到期
+        const ancExp = rec.handle_expires_at;
+        if (ancExp != null && isCanonicalIso(ancExp) && clock() >= Date.parse(ancExp)) {
+          return { ok: false, reason: "handle_expired", why: "selection_handle 已到期（" + ancExp + "）：锁内 clock() ≥ handle_expires_at" };
+        }
+        // R57c 返修一 T7：owner_select 形不收 f4 → 三位一体改为 CAS 即可（T1 已独立核 anchor_candidate CAS）
         if (rec.aliases.session_id !== selectedSessionId) return { ok: false, reason: "cas_mismatch", why: "selected_session_id ≠ A2.session_id" };
         sel = { selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_message_id: selectionMessageId, selection_basis: selectionBasis, expected_anchor_candidate: expectedAnchorCandidate };
       }
@@ -2883,7 +2915,8 @@ export function anchor({ endpointId, requestKey, id, f4, authorizedBy, selectedS
         : { affected_id: id };
       return { ok: true, next: stampAndBuild(doc, { opType: "anchor", inputs, result, mutateRecords: (n, opId) => {
         const r = n.records[id];
-        r.aliases.root_om = f4.root_om; r.facts.anchor = "present"; r.facts.locator_link_proof = "present";
+        r.aliases.root_om = ownerSel ? selectedRootOm : f4.root_om;
+        r.facts.anchor = "present"; r.facts.locator_link_proof = "present";
         if (ownerSel) {
           // R57c：link 补 owner_selected_route_v1（binding 保留 attach 显式授权）；anchor 不清 anchor_candidate
           r.locator_link_proof_ref = { kind: "owner_selected_route_v1", authorized_by: authorizedBy, authorized_at: iso, by_identity: "owner_authorization", selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_handle: selectionHandle, selection_operation_id: opId };

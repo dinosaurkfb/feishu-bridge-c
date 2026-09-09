@@ -38537,6 +38537,35 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R53 返修五 P1-2：campaign 全文读取走受验 fd raw——注入 readFileSync(campaignPath) 换内容不生效（seal 预算仍按原始 raw 派生，非二读假内容）", () => {
+    const fx = r53SetupB({ crashAfter: 8 });
+    try {
+      const cp = campaignPath(fx.env);
+      const origCampaignBytes = fs.readFileSync(cp); // 夹具原始字节
+      const openDoc = JSON.parse(origCampaignBytes.toString("utf-8"));
+      const sealDoc = { ...openDoc, state: "sealed", pending_joins: [], revision: openDoc.revision + 1 };
+      const expectedSealSha = crypto.createHash("sha256").update(TAL.serializeLedger(sealDoc)).digest("hex");
+      // 注入：把 campaign 路径的 bare readFileSync 换成假内容（验证编排不用按路径二读、不读到假内容）。
+      const realReadFile = fs.readFileSync;
+      fs.readFileSync = function (p, ...rest) {
+        if (typeof p === "string" && p === cp) return Buffer.from("FAKE-CAMPAIGN-REPLACED");
+        return realReadFile.call(fs, p, ...rest);
+      };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); }
+      catch (err) { crashed = err?.simulatedCrash === true; }
+      finally { fs.readFileSync = realReadFile; }
+      assert.equal(crashed, true, "B 进段后崩");
+      const tok = readActive({ dir: fx.dir }).token;
+      const j = readJournal({ dir: fx.dir, token: tok });
+      const sealStep = j.doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":seal"));
+      assert.equal(sealStep.intended_after.sha256, expectedSealSha, "seal intended_after.sha256 按原始 raw 派生（非注入假内容）");
+      assert.equal(sealStep.before.sha256, crypto.createHash("sha256").update(origCampaignBytes).digest("hex"), "seal before.sha256 = 原始 raw sha");
+      const bakBytes = fs.readFileSync(sealStep.backup);
+      assert.equal(crypto.createHash("sha256").update(bakBytes).digest("hex"), crypto.createHash("sha256").update(origCampaignBytes).digest("hex"), "seal 备份字节 === 原始 raw");
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 ②-② B 崩溃恢复矩阵：seal/precheck/strict/complete/on 每步后崩溃 → --exit 只向前收敛", () => {
     // afterStep 序列：enter 7 次 + forward：8=进段后 9=seal 10=precheck A 11=precheck B 12=strict A 13=strict B 14=complete 15=on
     for (const crashAfter of [8, 9, 11, 13, 15]) {

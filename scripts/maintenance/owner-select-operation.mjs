@@ -654,7 +654,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "sealed";
         if (!atIntended) {
           let openFull;
-          try { openFull = JSON.parse(fs.readFileSync(campaignPath(env), "utf-8")); }
+          try { openFull = JSON.parse(cs.raw.toString("utf-8")); }
           catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
           if (openFull.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "seal 前现场非 open（" + openFull.state + "）", phase };
           const sealDoc = { ...openFull, state: "sealed", pending_joins: [], revision: openFull.revision + 1 };
@@ -718,7 +718,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "complete";
         if (!atIntended) {
           let sealedFull;
-          try { sealedFull = JSON.parse(fs.readFileSync(campaignPath(env), "utf-8")); }
+          try { sealedFull = JSON.parse(cs.raw.toString("utf-8")); }
           catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
           if (sealedFull.state !== "sealed") return { ok: false, reason: "campaign_state_bad", why: "complete 前现场非 sealed", phase };
           const completeDoc = { ...sealedFull, state: "complete", members: frozenMembersOf(ctx, { env, frozen: intended.endpoints }), revision: sealedFull.revision + 1 };
@@ -839,7 +839,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "sealed";
         if (!atIntended) {
           let openFull;
-          try { openFull = JSON.parse(fs.readFileSync(campaignPath(env), "utf-8")); }
+          try { openFull = JSON.parse(cs.raw.toString("utf-8")); }
           catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
           if (openFull.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "seal 前现场非 open", phase };
           const sealDoc = { ...openFull, state: "sealed", pending_joins: [], revision: openFull.revision + 1 };
@@ -867,7 +867,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "complete";
         if (!atIntended) {
           let sealedFull;
-          try { sealedFull = JSON.parse(fs.readFileSync(campaignPath(env), "utf-8")); }
+          try { sealedFull = JSON.parse(cs.raw.toString("utf-8")); }
           catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
           if (sealedFull.state !== "sealed") return { ok: false, reason: "campaign_state_bad", why: "complete 前现场非 sealed", phase };
           const completeDoc = { ...sealedFull, state: "complete", members: frozenMembersOf(ctx, { env, frozen: intended.endpoints }), revision: sealedFull.revision + 1 };
@@ -932,7 +932,7 @@ function osmPrecheckB(ctx, { env, j }) {
   if (!cs.exists) return { ok: false, reason: "campaign_absent", why: "B 前置要求 campaign open（文件缺席）" };
   if (cs.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "campaign state=" + cs.state + "（B 要求 open）" };
   let pending = [];
-  try { pending = JSON.parse(fs.readFileSync(campaignPath(env), "utf-8")).pending_joins ?? []; }
+  try { pending = JSON.parse(cs.raw.toString("utf-8")).pending_joins ?? []; }
   catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err) }; }
   if (pending.length !== 0) return { ok: false, reason: "pending_joins_pending", why: "campaign 有未落地的加入：" + pending.length + " 项（B 开始前必须清空）" };
   const ws = readWriterState(env);
@@ -995,7 +995,7 @@ function osmPrepareForwardB(ctx, { token, env, frozen, cid, digest }) {
   const ws = readWriterState(env);
   const writerBefore = { exists: true, sha256: ws.sha256, state: ws.state, campaign_id: ws.campaign_id, endpoints_digest: ws.endpoints_digest, revision: ws.revision };
   // open 全量现场 → seal/complete doc（同一现场派生，预算可对）
-  const openFull = JSON.parse(fs.readFileSync(campaignPath(env), "utf-8"));
+  const openFull = JSON.parse(cs.raw.toString("utf-8"));
   const sealDoc = { ...openFull, state: "sealed", pending_joins: [], revision: openFull.revision + 1 };
   const completeDoc = { ...sealDoc, state: "complete", members: Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: sealDoc.revision + 1 };
   const campaignBefore = { exists: true, sha256: cs.sha256, state: cs.state, campaign_id: cs.campaign_id, endpoints: cs.endpoints, endpoints_digest: cs.endpoints_digest };

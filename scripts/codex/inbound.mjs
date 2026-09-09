@@ -52,7 +52,7 @@ import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import { appendChannelSample, channelDisposition } from "../channel-samples.mjs";
-import { executeSelectControl, selectAdmission, selectRejectTextByReason } from "../select-admission.mjs";
+import { executeSelectControl, selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, selectionContextDigestV1 } from "../select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -607,11 +607,27 @@ const runControl = (replay) => {
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: paths.claims, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
-    execute: () => executeSelectControl(control, { selectAdmissionFn }),
+    execute: () => executeSelectControl(control, {
+      selectAdmissionFn,
+      senderId: event.sender_id ?? null,
+      chatId: template.template?.chat_id ?? null,
+      endpointId: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
+      messageId: verdict.messageId,
+      env: process.env,
+    }),
   });
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
   const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, logical_task_key: task.logical_task_key, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
   if (!tx.ok) {
+    if (tx.reason === "control_committed_unclean" || tx.status === "control-committed-unclean") {
+      const text = tx.text ?? ("已写入但收口不干净（" + (tx.why ?? "请联系管理员修复") + "）");
+      if (!replay && !tx.replayed) {
+        writeReceipt("select-" + verdict.messageId, { status: "control-committed-unclean", reason: tx.reason, ...base, claim_acquired: true, error: tx.why });
+      }
+      finish("control", { text: text + lockNote, taskName: task.task_display_name },
+        { reason: tx.reason, control: "select", replayed: tx.replayed, status: "control-committed-unclean" });
+      return;
+    }
     if (tx.reason === "control_failed" || tx.reason === "control_failed_recorded") {
       const text = selectRejectTextByReason(tx.why);
       if (!replay && !tx.replayed) {
@@ -625,12 +641,26 @@ const runSelect = (replay) => {
     finish("error", { detail: "选择命令未执行（" + tx.why + "）" + lockNote }, { reason: tx.reason });
     return;
   }
+  const rfh = control.handle_kind === "rfh";
   if (!replay && !tx.replayed) {
-    writeReceipt("select-pending-" + verdict.messageId, { status: "consumed", reason: "select_pending", ...base, claim_acquired: true });
+    // R57b：rfh 支是真消费 → 落正式 consumed 收据；osh/orh 支仍执行器缺席，收据保持 select_pending 语义。
+    writeReceipt((rfh ? "select-" : "select-pending-") + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_pending", ...base, claim_acquired: true, changed: tx.changed });
   }
-  finish("control", { text: "已收到选择，执行器尚未接入" + lockNote, taskName: task.task_display_name },
+  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "已收到选择，执行器尚未接入");
+  finish("control", { text: doneText + lockNote, taskName: task.task_display_name },
     { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
 };
+
+const selectionContext = (control && control.kind === "select") ? {
+  endpoint: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
+  chat: template.template?.chat_id ?? null,
+  session: event.session_id ?? null,
+  message: verdict.messageId,
+  sender: event.sender_id ?? null,
+  handle: control.handle,
+  kind: control.handle_kind,
+} : null;
+const selectionContextDigest = selectionContext ? selectionContextDigestV1(selectionContext) : null;
 
 const claim = acquireClaim({
   claimsDir: paths.claims,
@@ -639,6 +669,10 @@ const claim = acquireClaim({
   meta: {
     // R52a 返修一 P1：claim meta 按 kind 投影 —— mode → {control,mode}；select → {control,handle,handle_kind}。
     ...(control ? { control: control.kind === "select" ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : { control: control.kind, mode: control.mode } } : {}),
+    ...(selectionContext ? {
+      selection_context: selectionContext,
+      selection_context_digest_v1: selectionContextDigest,
+    } : {}),
     ...(rejectedProjection ? { rejected_control: rejectedProjection } : {}),
     session_id: event.session_id,
     codex_thread_id: task.codex_thread_id,

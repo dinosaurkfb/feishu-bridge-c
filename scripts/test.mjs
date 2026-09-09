@@ -19166,6 +19166,24 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
     logicalTaskKey,
     meta: {
       control: { control: "select", handle: h, handle_kind: "osh" },
+      selection_context: {
+        endpoint: legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid }),
+        chat: TPL.chat_id,
+        session: "aily_claude_ctl",
+        message: msgId,
+        sender: "ou_user_1",
+        handle: h,
+        kind: "osh",
+      },
+      selection_context_digest_v1: SA.selectionContextDigestV1({
+        endpoint: legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid }),
+        chat: TPL.chat_id,
+        session: "aily_claude_ctl",
+        message: msgId,
+        sender: "ou_user_1",
+        handle: h,
+        kind: "osh",
+      }),
       session_id: "aily_claude_ctl",
       binding_id: expect.bindingId,
       policy_id: MAPPING_POLICY_ID,
@@ -42418,6 +42436,197 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       assert.ok(t && t !== "控制执行失败（" + reason + "）", reason + " 有封闭文案：" + t);
     }
   });
+
+  test("R57b 返修一 P1-5：Codex 真入口与两条 repair 路径接通 rfh 上下文（新形 claim 续做同一 intent，旧形/缺上下文 fail-closed 点名）", () => withLedgerB((root, dir) => {
+    // 1. 旧形/缺项 claim fail-closed 点名
+    const claimsDir = path.join(root, "claims_p15");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const msgId = "msg_p15_fail";
+    const ltk = "task_p15_fail";
+    const h = "rfh_" + "5".repeat(32);
+
+    // 1a. 缺 selection_context（旧形 claim）
+    const oldClaim = acquireClaim({
+      claimsDir,
+      messageId: msgId,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: h, handle_kind: "rfh" },
+      }
+    });
+    const oldKey = oldClaim.key;
+    const oldDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: oldKey }).claim });
+    assert.equal(oldDirect.ok, false);
+    assert.equal(oldDirect.reason, "selection_context_missing", "旧形 claim 报 selection_context_missing");
+    assert.match(oldDirect.why, /旧形/u, "点名旧形 claim");
+
+    const oldRes = resumeControlClaim({
+      claimsDir,
+      key: oldKey,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(oldRes.ok, false);
+    assert.equal(oldRes.why, "selection_context_missing", "resumeControlClaim 归约到 selection_context_missing");
+
+    // 1b. 缺必需字段（例如缺 endpoint）
+    const msgIdIncomplete = "msg_p15_incomp";
+    const incompCtx = {
+      chat: "oc_r57b",
+      sender: "ou_owner57b",
+      message: msgIdIncomplete,
+      handle: h,
+      kind: "rfh",
+    };
+    const incompDigest = SA.selectionContextDigestV1(incompCtx);
+    const incompClaim = acquireClaim({
+      claimsDir,
+      messageId: msgIdIncomplete,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: h, handle_kind: "rfh" },
+        selection_context: incompCtx,
+        selection_context_digest_v1: incompDigest,
+      }
+    });
+    const incompDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: incompClaim.key }).claim });
+    assert.equal(incompDirect.ok, false);
+    assert.equal(incompDirect.reason, "selection_context_incomplete");
+    assert.match(incompDirect.why, /缺项：endpoint/u, "点名缺 endpoint");
+
+    const incompRes = resumeControlClaim({
+      claimsDir,
+      key: incompClaim.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(incompRes.ok, false);
+    assert.equal(incompRes.why, "selection_context_incomplete");
+
+    // 1c. digest 不一致
+    const msgIdBadDigest = "msg_p15_baddig";
+    const fullCtx = {
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      sender: "ou_owner57b",
+      message: msgIdBadDigest,
+      handle: h,
+      kind: "rfh",
+    };
+    const badDigestClaim = acquireClaim({
+      claimsDir,
+      messageId: msgIdBadDigest,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: h, handle_kind: "rfh" },
+        selection_context: fullCtx,
+        selection_context_digest_v1: "0".repeat(64),
+      }
+    });
+    const badDigestDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: badDigestClaim.key }).claim });
+    assert.equal(badDigestDirect.ok, false);
+    assert.equal(badDigestDirect.reason, "select_context_conflict");
+    assert.match(badDigestDirect.why, /digest_v1 与内容不一致/u);
+
+    const badDigestRes = resumeControlClaim({
+      claimsDir,
+      key: badDigestClaim.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(badDigestRes.ok, false);
+    assert.equal(badDigestRes.why, "select_context_conflict");
+
+    // 2. 新形 claim 崩溃后（in_flight 态）repair 续做同一 intent → 成功转 consumed 并清 intent
+    const b3 = seedB3B(dir, "r57b_p15", 55, "sess-b-55");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const msgIdRepair = "om_repair55";
+    const repairCtx = {
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      sender: "ou_owner57b",
+      message: msgIdRepair,
+      session: "sess-b-55",
+      handle: intent.reaffirm_handle,
+      kind: "rfh",
+    };
+    const repairDigest = SA.selectionContextDigestV1(repairCtx);
+    const inFlightClaim = acquireClaim({
+      claimsDir,
+      messageId: msgIdRepair,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" },
+        selection_context: repairCtx,
+        selection_context_digest_v1: repairDigest,
+      }
+    });
+    assert.equal(inFlightClaim.ok, true);
+    const insp = inspectControlClaim({ claimsDir, key: inFlightClaim.key });
+    assert.equal(insp.state, "in_flight");
+
+    const repairRes = resumeControlClaim({
+      claimsDir,
+      key: inFlightClaim.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {
+        onSelect: (t, c) => {
+          const v = SA.verifySelectionContext(c.claim);
+          if (!v.ok) return { ok: false, reason: v.reason, why: v.why };
+          return SA.executeSelectControl(t, {
+            endpointId: v.context.endpoint,
+            chatId: v.context.chat,
+            senderId: v.context.sender,
+            messageId: v.context.message,
+            selectAdmissionFn: () => ({ state: "partial" }),
+          });
+        }
+      }, ctx),
+    });
+    assert.equal(repairRes.ok, true, "repair 续做成功：" + JSON.stringify(repairRes));
+    const inspAfter = inspectControlClaim({ claimsDir, key: inFlightClaim.key });
+    assert.equal(inspAfter.state, "consumed", "转 consumed");
+    const intentsAfter = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.equal(intentsAfter.doc.entries[intent.reaffirm_handle], undefined, "intent 被清");
+
+    // 3. Codex 真入口事实传参：调用 executeSelectControl 传入从 template 与 event 派生的上下文 → partial 准入下成功
+    const codexEndpoint = legacyEndpointId({ runtime: "codex", agentUid: "agent_m5codex" });
+    const codexDir = path.join(root, codexEndpoint);
+    fs.mkdirSync(codexDir, { recursive: true, mode: 0o700 });
+    const docCodex = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: codexEndpoint, chain: "codex", authority_mode: "shadow", revision: 2, operations: {
+      "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57b_init_c", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: codexEndpoint, chain: "codex" }), result_revision: 1, result: { revision: 1 } },
+      "00000000-0000-4000-8000-0000000001a2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57b_up_c", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57b_up_c", endpoint: codexEndpoint, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: codexEndpoint, from_schema: "1.0", to_schema: "1.1-transition" } }
+    }, records: {} };
+    fs.writeFileSync(path.join(codexDir, "ledger.json"), JSON.stringify(docCodex, null, 2) + "\n", { mode: 0o600 });
+    const b1C = talOkB(TAL.createB1({ endpointId: codexEndpoint, requestKey: "r57b_c_b1", chatId: "oc_codexchat", rootOm: "om_codexroot", lineageId: "lin_codex", bindingTarget: { runtime: "codex", project_root: "/p/codex", codex_task_id: "tsk_codex99", codex_thread_id: "th_codex99" }, now: T0B }), "createB1");
+    const a1C = talOkB(TAL.createA1({ endpointId: codexEndpoint, requestKey: "r57b_c_a1", chatId: "oc_codexchat", sessionId: "sess-codex-99", now: T0B }), "createA1");
+    talOkB(TAL.activate({ endpointId: codexEndpoint, requestKey: "r57b_c_act", b1Id: b1C.result.created_id, a1Id: a1C.result.created_id, f4: { matched_om: "om_codexroot", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, authorizedBy: "ou_codex_owner", now: T0B }), "activate");
+    const codexTarget = b1C.result.created_id;
+    const codexIntent = talOkB(RI.issueReaffirmIntent({ endpointId: codexEndpoint, targetId: codexTarget, authorizedOwner: "ou_codex_owner", chatId: "oc_codexchat", clock: () => T0B }), "codex issue");
+
+    const codexInboundRes = SA.executeSelectControl({
+      control: "select",
+      handle: codexIntent.reaffirm_handle,
+      handle_kind: "rfh",
+    }, {
+      selectAdmissionFn: () => ({ state: "partial" }),
+      senderId: "ou_codex_owner",
+      chatId: "oc_codexchat",
+      endpointId: codexEndpoint,
+      messageId: "om_codexmsg1",
+    });
+    assert.equal(codexInboundRes.ok, true, "Codex 入口 partial+rfh 成功");
+    assert.equal(codexInboundRes.status, "consumed");
+    assert.match(codexInboundRes.text, /已按你的确认重签/u);
+  }));
 
   // ── D. 终端签发命令 scripts/feishu-reaffirm-issue.mjs（预览零写；--apply 才写）──
 

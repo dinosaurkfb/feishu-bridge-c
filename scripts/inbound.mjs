@@ -68,7 +68,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl } from "./select-admission.mjs";
+import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl, selectionContextDigestV1 } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -757,6 +757,15 @@ const runSelect = (replay) => {
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";
   const base = { control: "select", handle_kind: control.handle_kind, message_id: verdict.messageId, project_root: routed.root, handed_off: false, lock_uncleared: tx.lockUncleared ?? null };
   if (!tx.ok) {
+    if (tx.reason === "control_committed_unclean" || tx.status === "control-committed-unclean") {
+      const text = tx.text ?? ("已写入但收口不干净（" + (tx.why ?? "请联系管理员修复") + "）");
+      if (!replay && !tx.replayed) {
+        writeReceipt("select-" + verdict.messageId, { status: "control-committed-unclean", reason: tx.reason, ...base, claim_acquired: true, error: tx.why });
+      }
+      finish("control", { text: text + lockNote, taskName: config.task_display_name },
+        { reason: tx.reason, control: "select", replayed: tx.replayed, status: "control-committed-unclean" });
+      return;
+    }
     if (tx.reason === "control_failed" || tx.reason === "control_failed_recorded") {
       const text = selectRejectTextByReason(tx.why);
       if (!replay && !tx.replayed) {
@@ -780,6 +789,17 @@ const runSelect = (replay) => {
     { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
 };
 
+const selectionContext = (control && control.kind === "select") ? {
+  endpoint: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
+  chat: bootTpl.template?.chat_id ?? null,
+  session: event.session_id ?? null,
+  message: verdict.messageId,
+  sender: event.sender_id ?? null,
+  handle: control.handle,
+  kind: control.handle_kind,
+} : null;
+const selectionContextDigest = selectionContext ? selectionContextDigestV1(selectionContext) : null;
+
 // 校验通过才允许 claim。claim 是幂等的唯一保证。
 const claim = acquireClaim({
   claimsDir: CLAIMS,
@@ -788,6 +808,10 @@ const claim = acquireClaim({
   meta: {
     // R52a 返修一 P1：claim meta 按 kind 投影 —— mode → {control,mode}；select → {control,handle,handle_kind}（避免 controlIntentProblem 以 mode 形状核 select 而拒）。
     ...(control ? { control: control.kind === "select" ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : { control: control.kind, mode: control.mode } } : {}),
+    ...(selectionContext ? {
+      selection_context: selectionContext,
+      selection_context_digest_v1: selectionContextDigest,
+    } : {}),
     ...(rejectedProjection ? { rejected_control: rejectedProjection } : {}),
     session_id: event.session_id,
     binding_id: effectiveBindingId(mapping),

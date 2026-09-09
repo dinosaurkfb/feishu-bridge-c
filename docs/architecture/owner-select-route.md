@@ -85,7 +85,7 @@ chat_id、同 endpoint、handle 与候选一一映射且 eligible、owner 先验
 或同时无**。任一半有半无 = 损坏。
 
 **到期比较（P2-3）**：一律"持久化规范时间字段 + **锁内当前时间**比较"，**不依赖内存 timer**。
-**只有到期类事务核 `now ≥ expected_expires_at`**（B1 `void(expired)`、A2/rebind 的到期清理）；
+**只有到期类事务核 `now ≥ expected_expires_at`**（B1 `void(expired)`、A2/rebind 的到期清理）；**消费 handle 的事务（`activate` 消费 B1 handle、`anchor` 消费 A2 handle、`rebind_session_alias` 消费 rebind handle）在锁内 CAS 之后还要复核 `clock() < 记录上持久化的到期字段`，等于或超过即拒（`handle_expired`）——锁外候选解析按 now 过滤不算数（#146 一轮 P1-1 回带）**；
 **主动 `cancel_*`/`reissue_*` 不核时间**（可未到期做，P1-2）。清理/换发 fingerprint 一律含
 `expected_handle` + `expected_expires_at`（expected-value CAS，防陈旧定时器清掉后换发的新 handle）。
 **具体 TTL 数值必须在实现单开工前拍定为单一常量**（不可"字段已进 schema、有效期由各调用方自定"，
@@ -166,7 +166,7 @@ proof 非 null 的记录集**（十轮 P1-1）；**tombstone 只进 tombstone re
 | --- | --- | --- |
 | `create_b1` | （无新增；handle 随机不进 fp） | `selection_handle`, `handle_expires_at`, `affected_live_ids_after_commit:[b1_id]`, `proof_effects:[]` |
 | `attach_a2` | `expected_anchor_candidate`（=既有 live 字段 `anchor_candidate`，**不另造字段**，P1-3） | `selection_handle`, `handle_expires_at`（锚到既有 `anchor_candidate`）, `affected_live_ids_after_commit:[a2_id]`, `proof_effects:[{a2_id, produced, none}]` |
-| `activate` | 选择五元 `selected_session_id, selected_root_om, selection_handle, selection_message_id, selection_basis` | 授权/选择六字段 + `selection_message_id` + `selection_basis` + **`affected_live_ids_after_commit`**（=[surviving_id, demoted_historical_id?] 排序）+ **`proof_effects`**（surviving_id=produced/produced、demoted_historical_id=preserved/preserved；**tombstoned_id 只在 tombstone result、不进这两集**，八轮 P1-1）。**键名以账本基线为准**（`surviving_id/tombstoned_id/demoted_historical_id`，ledger §5.1）——增量只追加、不改名（R48 验收回带：此前本表写的 `demoted_current_id`/`tombstoned_a1_id` 是与基线不一致的笔误） |
+| `activate` | 选择五元 `selected_session_id, selected_root_om, selection_handle, selection_message_id, selection_basis`（**增量形不收 f4**——传了 → bad_input；proof 只用 owner_select_v1 六字段，#147 一轮 P1-5 回带） | 授权/选择六字段 + `selection_message_id` + `selection_basis` + **`affected_live_ids_after_commit`**（=[surviving_id, demoted_historical_id?] 排序）+ **`proof_effects`**（surviving_id=produced/produced、demoted_historical_id=preserved/preserved；**tombstoned_id 只在 tombstone result、不进这两集**，八轮 P1-1）。**键名以账本基线为准**（`surviving_id/tombstoned_id/demoted_historical_id`，ledger §5.1）——增量只追加、不改名（R48 验收回带：此前本表写的 `demoted_current_id`/`tombstoned_a1_id` 是与基线不一致的笔误） |
 | `anchor` | 选择五元 + `expected_handle, expected_expires_at, expected_anchor_candidate` | 授权/选择六字段 + `selection_message_id` + `selection_basis` + **`expected_anchor_candidate`**（result 复述 CAS 输入；shape 钉 `=== selected_root_om`，G13 钉 `=== A3 记录保留的 anchor_candidate`——`anchor` 不清该字段，PR #133 二轮 P1-3 回带） + `affected_live_ids_after_commit:[a3_id]` + `proof_effects`（a3_id=**`{binding_effect:"preserved", link_effect:"produced"}`**——binding 仍是 attach 显式授权、只补 link，七轮 P1-1） |
 | `request_rebind` | `expected_b3_id, expected_current_generation, expected_old_session_id, expect_no_handle:true`（**CAS**） | `rebind_handle`, `rebind_expires_at`, `affected_live_ids_after_commit:[b3_id]`, `proof_effects:[{b3_id, preserved, preserved}]` |
 | `rebind_session_alias` | `old_session_id, new_session_id, rebind_handle, expected_expires_at, selection_message_id` | `old_session_id, new_session_id, selection_handle(=orh_消费值), selected_root_om, selected_session_id(=new), authorized_by, authorized_at, tombstoned_a1_id\|null, selection_message_id, selection_basis:"rebind", affected_live_ids_after_commit:[b3_id], proof_effects:[{b3_id, binding_effect:(原 binding.kind==="owner_select_v1" ? "produced" : "preserved"), link_effect:"produced"}]`（十轮 P1-1 逐分支确定：原 binding 为 owner_select_v1 时六字段重签=produced，否则保持=preserved；link 一律重签=produced） |
@@ -257,7 +257,7 @@ frozen_at, handle_expires_at, **before_ledger_sha256**, expected_null_b1_ids:[�
 | B3(owner_select_v1) → `rebind_session_alias`（=`b3_id`） | 重签 | 重签 owner_select_v1（六字段全同步、handle=orh_） | 重签 owner_selected_route_v1 | B3 | 是 |
 | B3(binding≠owner_select_v1) → `rebind_session_alias` | 重签 link | 保持原 binding | 重签 owner_selected_route_v1 | B3 | 否 |
 | handle-only（`request_rebind`/`expire_*`/`cancel_*`/`reissue_*`）改 origin 的记录 | **保留**（P1-1） | 保持 | 保持 | 原族 | 保持 |
-| 存量 → `owner_select_reaffirm` | 重签（+关联 tombstone 同笔） | → owner_select_v1 或保留原 binding | → owner_selected_route_v1 | 原族 | binding=owner_select_v1 时是 |
+| 存量 → `owner_select_reaffirm` | 重签（+关联 tombstone 同笔） | **原 binding 是 pairing/legacy → 换成 owner_select_v1；原本已是 owner_select_v1 → 同样重签六字段——两种都是 `binding_effect:"produced"`（本笔重签了 binding 字段）；`"preserved"` 只用于 binding 原样不动的支（attach / retarget / migrated），reaffirm 的目标记录不走 preserved**——pairing 绝不保留，否则 `migrationInventory` 的 legacy 计数永不归零、operation B 无法收敛（#145 一轮 P1-1 回带） | → owner_selected_route_v1 | 原族 | 是（两支都产 owner_select 族 proof；关联 tombstone 里 proof kind ∈ {pairing, owner_select_merge_v1} 的同笔 remap 为 owner_select_merge_v1，`tombstone_remap` 有序封闭点名；未知 proof kind → 整笔拒） |
 | `migrate_seed(B1)` / `(B3/B3′/B4)` | 产 | null / migrated | null / migrated | B1 / — | — |
 | owner_select proof 现于 A1/B1 | — | — | — | ✘ | — |
 
@@ -298,6 +298,8 @@ owner_select_reaffirm}**（P1-6 补 reaffirm）、因果 revision 与直接归�
   `selection_handle` 前缀必与产生 op 相符——**activate/anchor**（attach_a3 已停产，不再列——P2-1）
   只收 `osh_`、rebind_session_alias 只收 `orh_`、owner_select_reaffirm 只收 `rfh_`；跨支即拒。
 
+**G-handle 的反向不变量（#144 一轮 P1-3 回带）**：G-handle 不只是「非空 handle 必可追溯到产生 op」；反向也成立——若记录当前的产生 op（`origin_operation_id` / `selection_operation_id` 语义）是一个**尚未被后续消费覆盖**的 handle 产生 op（`create_b1` / `attach_a2` / `mint_selection_handles` / `reissue_selection_handle` / `request_rebind`），则 live 的 handle 与到期字段必须与该 op 的 result **逐字相等且非空**；把已铸 handle 抹成 null 而保留 op 记录 = `ledger_corrupt`。新形 `create_b1` / `attach_a2` 的 result handle/expiry 不得双 null（`migrate_seed` 除外）。
+**跨 schema 重放（#144 一轮 P1-4 回带；三轮 P1 收紧）**：同 request_key 的重放判定**按既有 operation 的 `result_revision` 相对升级边界（首次离开 1.0 的 `schema_upgrade` 的 revision，与 G12 同一出处）二选一**——账本仍是 1.0、或 prior 落在边界之前 → 只接受旧 1.0 描述符；边界之后、或零升级历史的 1.1*/strict 账本 → 只接受当前描述符；**不得同时给两者**（否则边界后伪造的旧形指纹会被当幂等重放）。校验器同样钉：边界后的 `void` / `attach_a2` / `attach_a3` 必须是当前形——**判形靠不可变 result 的封闭键集（旧形 / 新形各一套），不靠从当前 live 记录回推历史指纹**（binding_target / claim_key 之类会被后续合法 retarget 改掉，回推会 fail-open；#144 四轮 P1-1 回带）；指纹只在 result 携带了全部指纹输入时重算核对（新形 result 必须携带），重建不了不得放行。attach 的 current 侧描述符含 attach_a2 与 attach_a3 两种新形，边界后二者的 result 都按 §6 新形键集写（含 `affected_live_ids_after_commit` + `proof_effects`）。首次执行只能用当前 schema 的新形。**带 owner_select 输入的调用（activate / anchor 增量形）其重放描述符必须携带完整增量载荷，不按当前 schema 抹字段**——1.0 账本下 fresh key 进 mutate 拒 `bad_input`、旧 key 同载荷不同 → `request_conflict`，不能被 1.0 旧形操作吞成 idempotent（#146 一轮 P1-2 回带）。**锁内时钟（#144 一轮 P1-5 回带）**：到期/签发/CAS 用的 now 必须在账本锁内由时钟 seam 读取，不得在取锁前预先求值。
 ## 8. 迁移状态机：两次维护 operation + 持久 campaign（P1-4/P1-5/P1-6）
 
 **过渡 schema**（合法容旧形+新形）破"旧 schema 不能存新形 / 严格不能在旧形非零时启用"的循环。
@@ -381,7 +383,7 @@ P1-2）：`campaign`/`writer_state`（文件态含 `exists`）同 sidecar——`
 （前 32 hex 按 8-4-4-4-12 排、版本位置 4、变体位置 8——与 OP_ID_SHAPE 相容），升版不改任何记录的 `updated_at`（只补显式 null），
 于是 `applySchemaUpgrade(beforeDoc, { operation_id, request_key, from, to })` 是纯函数，编排用它算 intended_after，执行器 `schemaUpgrade` 用同一函数产 next 并读回核等。
 **request_key 派生（#138 一轮 P2 回带）**：`schema_upgrade` 的 `request_key = token + ":schema:" + endpoint_id`（与 mint 的 `request_key = token` 不同键，避免同 token 两种 op 撞 request_key 幂等）；编排与执行器同一公式，reopening 身份核验按此逐字核。
-**执行器结果的记账规则（#138 一轮 P1-7 回带）**：编排把 step 记 done 的**精确条件**（#137 四轮放行口径）：`ok === true` ∧ `commit ∈ {committed_clean, replayed, already}` ∧ `residue` 为空 ∧ `lockUncleared === null` ∧ `lock_state !== "unclear"` ∧ 受验现场逐字段等于 journal `step.intended_after`；`ok:true` 单独绝不够；`committed_durability_uncertain` / `committed_with_residue` **不记 done**、operation 停在当前 phase（reason `commit_unclear`，残骸路径进 why），由 `--exit` 只向前收敛时重新读盘（原始字节 + 目录 fsync）核现场：现场 === intended_after → 记 done 续跑；否则说不清 → `reopening_incomplete`。**记 done 前的持久化屏障（#138 二轮 P1-2/P1-4 回带）**：无论首次提交还是恢复路径，记 done 之前必须：目标目录 fsync → 受验重读原始字节 → 完整投影 === intended_after → 无锁/tmp 残骸；staged 里复用既有 plan/backup 时同样要在受验 fd 上重新 fsync 文件与父目录（不能假设上一轮已落盘）；campaign/writer 备份只取受验读取器返回的同一 fd 字节，禁止路径二读。
+**执行器结果的记账规则（#138 一轮 P1-7 回带）**：编排把 step 记 done 的**精确条件**（#137 四轮放行口径）：`ok === true` ∧ `commit ∈ {committed_clean, replayed, already}` ∧ `residue` 为空 ∧ `lockUncleared === null` ∧ `lock_state !== "unclear"` ∧ 受验现场逐字段等于 journal `step.intended_after`；`ok:true` 单独绝不够；`committed_durability_uncertain` / `committed_with_residue` **不记 done**、operation 停在当前 phase（reason `commit_unclear`，残骸路径进 why），由 `--exit` 只向前收敛时重新读盘（原始字节 + 目录 fsync）核现场：现场 === intended_after → 记 done 续跑；否则说不清 → `reopening_incomplete`。**记 done 前的持久化屏障（#138 二轮 P1-2/P1-4 回带）**：无论首次提交还是恢复路径，记 done 之前必须：目标目录 fsync → 受验重读原始字节 → 完整投影 === intended_after → 无锁/tmp 残骸；staged 里复用既有 plan/backup 时同样要在受验 fd 上重新 fsync 文件与父目录（不能假设上一轮已落盘）；campaign/writer 备份只取受验读取器返回的同一 fd 字节，禁止路径二读。**屏障是同一个函数（#138 三轮回带）**：首次 clean 提交与所有恢复路径（含 ledger 执行器返回 `replayed` / `already` 的支、状态文件「现场已等于 intended」的支）都必须经过同一套「目录 fsync → 受验重读 → 完整投影 === intended_after → 残骸为空」函数才可记 done，不允许任何分支绕过；残骸盘点只忽略确定的 ENOENT，不得笼统跳过目录，`ledger.lock`、状态文件锁、`.reap` / `.reaped-*` 一律算残骸阻断。**残骸允许清单按「名字 + 类型 + 归属」三合一判（#138 四轮 P1 回带）**：允许判据接收 lstat 结果；state-root 下的 endpoint 项必须同时满足名字 ∈ 受验 journal 的冻结 endpoint 集、是目录、非 symlink，其余只允许两份固定状态文件且须为普通文件非 symlink；ledger 目录只允许 `ledger.json` / `ledger.json.prev` 两份普通文件。只按名字正则放行 = 缺陷（campaign 外合法形状的 endpoint 目录、同名普通文件、同名 symlink 都会被放过；维护门已 drained，此时不存在合法新增 endpoint 的理由）。
 **撤门前的不可变事务身份核验（#138 一轮 P1-7 回带）**：reopening 对每个 ep 逐字核——当前账本 SHA === 该 ep 最后一个 step 的 `after.ledger_sha256`；`operations[plan.operation_id]` 存在且 `op_type === "mint_selection_handles"`、`fingerprint === fingerprintOf("mint_selection_handles", plan 派生 inputs)`、result 触及集 === `plan.expected_null_b1_ids`；`operations[ownerSelectSchemaUpgradeOpId(token, ep)]` 存在且 from/to 与 step 相符；campaign / writer_state 文件的 state 与 kind 的终态一致。任一不符 → `reopening_incomplete`，门不撤。
 `mint` 同理已由 plan 冻结 `operation_id`。
 **执行器与 journal step 的 CAS（PR #137 一轮回带）**：`schemaUpgrade` / `mintSelectionHandles` 在账本写锁内核 `current SHA === step.before.ledger_sha256`（不等且 ≠ intended → `before_mismatch`；
@@ -513,7 +515,7 @@ migrate_repair**（合同冲突）；不批量/不后台；取不到 owner 动�
 自动进行。**
 
 ## 9. doctor
-- **⑯**：对 **`facts.locator_link_proof=present` 的 live 记录**，断言 kind/selected_*===aliases.*/
+- **⑰**（编号回带：⑯ 已被 R54「入站转发结果」占用，owner_select 对账定为 ⑰）：对 **`facts.locator_link_proof=present` 的 live 记录**，断言 kind/selected_*===aliases.*/
   按 §7.2 G13′（按来源 op `proof_effects` 判产证/保留）核来源相容 + G-handle；binding=
   owner_select_v1 另核六字段等。
 - **存量计数**：严格后恒 0，非 0 block；过渡期报 opaque id+计数。
@@ -554,13 +556,14 @@ assert body 匹配正则 ^/feishu-select(?: (osh_[0-9a-f]{32}|orh_[0-9a-f]{32}|r
   同一 message 的重放只回『之前已失败』，不再调用执行器；要重做必须发一条新消息**（PR #136 二轮裁定，改掉此前『重放可补做』的措辞——不给 failed→consumed 开可恢复转换）；测试注入准入只许依赖注入，**不许读环境变量**（生产不可达）。
 - **消费者穷举**：control 联合每加一种 kind，`inbound`（两链）、`repair-control-claim`（两链）、consumed/failed 记录读写、预览文案
   都必须按 kind 穷举，不得默认按 mode。
+- **执行支接入后的执行纪律（#147 一轮回带，R57d）**：① **按账本 `authority_mode` 封闭分派**——`shadow` 期 osh/orh 的 activate / anchor / rebind 必须走 M1a 复合双写（`m1a-order.lock` → legacy 提交回调 → 账本），`authoritative` 才可 ledger-only，其它值拒；owner_select writer on ≠ 账本已 authoritative。② **执行层消费受验 owner capability**：`/feishu-select` 是 R3 control；capability 由本次 R3 owner 放行后铸成、绑定本次选择上下文，**不持久化**（不收裸 sender id、不认通用 full）；control claim 持久化的是选择上下文（endpoint / chat / 事件 session / 事件 message / sender / handle+kind）与执行前解析出的 immutable selection plan（action / target_id / basis / 实际 handle / CAS 字段），repair 续做前重读 claim、重核角色 / endpoint / chat 后**重新铸** capability。③ **同 message 的事实漂移不得被终态 claim 遮蔽**：claim 记 `selection_context_digest_v1 = sha256(domain 前缀 + canonKey({endpoint, chat, session, message, sender, handle, kind}))`——**不含 root**、缺项显式 null；终态短路前逐字比较，不一致 → `select_context_conflict` 而非「之前已处理」。④ **不干净提交不落普通 consumed，也不落普通 failed**：只有账本提交 `committed_clean | replayed | already`、intent/claim 清理 cleared、两层锁释放 released 三份都干净才回「已生效」；任一不干净（`committed_durability_uncertain` / `committed_with_residue` / 锁或清理残骸）→ **可恢复状态 `control-committed-unclean`**（不是终态、不是普通 failed——落 failed 会让同 claim 永不再执行、封死恢复矩阵；收据与文案外显「已写入但收口不干净」；`repair-control-claim` 有专门收尾路径：重读账本核已提交 → 只做清理/释放 → 转 consumed，核不出则保持并点名）；判定抽叶子纯函数分别给出三份结果，口径同维护编排的 stepCommitCheck 但不依赖该模块。⑤ **owner_select 的 root / session 来源**：root = 命中 B1 的 `aliases.root_om` / A2 的 `anchor_candidate`（与 `selected_root_om` CAS），session = 受验入站事件 session；证明是 owner 的行政选择（owner_select_v1 六字段），**增量形不收 F4、不声称 transport 验过 thread_root**。⑥ activate 族的候选 eligibility 含「事件 session/chat 上存在可归并 A1」（解析层纳入、锁内复核），到期在锁内复核（§4）。⑦ 歧义回执按 §13：**上限 5**（≤5 全列；>5 按标签序列前 5 并提示还有 N 个）的 opaque handle + 安全标签，不回记录 id。
 - `request_rebind` 触发：终端 `/feishu-rebind`（走脚本）签发 `orh_` 并回执；`request_reaffirm`：
   终端 `/feishu-reaffirm-issue`（§8.1）签发 `rfh_`。
 
 ## 13. 多候选呈现边界（现在定下——P2-2）
 多候选回执列表**只对已过 owner 先验的回合产出**；**数量有上限**（超限提示收窄）；**只含 opaque
 handle + 稳定安全标签**。**标签来源必须持久（P2-2）**——**单一算法：只用已受验、已持久的 record `created_at`（同刻并列以
-`topic_agent_id` 字典序定序），投影为安全标签**（owner 能对应到已见接通卡；八轮 P2-2：不另加未落
+`topic_agent_id` 字典序定序），投影为安全标签**（渲染算法拍定于 #147 一轮回带：`created_at` 以 `Asia/Shanghai` 渲染为 `MM-DD HH:mm`，同一分钟并列按 `topic_agent_id` 字典序加后缀 `·a`、`·b`…；数量上限 5）（owner 能对应到已见接通卡；八轮 P2-2：不另加未落
 合同的 ordinal 字段、不留第二数据源），**绝不由每次盘点临时排序生成**
 （否则 owner 重试时标签漂移）；**绝不含** locator / root_om / 精确本地目标 / 会话 id / chat_id；
 **限码点数与控制字符**。reply_only 回合边界照旧。

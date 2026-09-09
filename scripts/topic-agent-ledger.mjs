@@ -903,6 +903,15 @@ function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBound
   // 指纹只在 result 携带全部指纹输入时重核（仅 void：reason 从不可变 voided_audit 记录取，expected 双键在 result）；
   //   重建不出来 → fail-closed 拒（不是跳过）。attach_a2/attach_a3 的指纹输入（target/claim_key）不入 result，无可靠来源 → 只判键集。
   if (op.op_type === "void") {
+    // R57a 返修七 P1-1（#144 五轮 P1-1）：reason 判别联合——expired ⇔ expected 双非空、manual|superseded ⇔ 双 null。
+    //   reason 只从不可变 voided_audit 记录取（同 voidFingerprintFor 的出处）；新形（含 expected 双键）才适用，旧形无此判别。
+    const rec = records[op.result?.voided_id];
+    const reason = rec && typeof rec.reason === "string" ? rec.reason : null;
+    if ((reason === "expired" || reason === "manual" || reason === "superseded") && keysOf(op.result) === CROSS_SCHEMA_NEW_KEYS.void) {
+      const bothNonNull = op.result.expected_handle !== null && op.result.expected_expires_at !== null;
+      if (reason === "expired" && !bothNonNull) return "void reason=expired 但 expected 双键非全非空";
+      if (reason !== "expired" && bothNonNull) return "void reason=" + reason + " 但 expected 双键非全 null";
+    }
     const wantFp = voidFingerprintFor(op, records);
     if (wantFp === null) return "void 重建不了指纹输入（voided_audit 记录缺失/畸形）——跨 schema 指纹形不符";
     if (op.fingerprint !== wantFp) return "void 指纹与 result 携带的指纹输入不符";
@@ -2669,7 +2678,10 @@ export function voidPending({ endpointId, requestKey, b1Id, reason, expectedHand
         if (reason === "expired" && b1.handle_expires_at != null && !(clock() >= Date.parse(b1.handle_expires_at))) {
           return { ok: false, reason: "not_expired", why: "void(expired) 核 now ≥ handle_expires_at（锁内）" };
         }
-        if (b1.selection_handle !== (expectedHandle ?? null) || b1.handle_expires_at !== (expectedExpiresAt ?? null)) {
+        // R57a 返修七 P1-1（#144 五轮 P1-1）：reason 判别联合——只有 expired 做持久 handle/expiry 的 CAS；
+        //   manual/superseded 的 expected 双键必须为 null（已在上面核过），**不据此要求当前 B1 的 handle 也为 null**
+        //   （带 handle 的 B1 也能被 manual/superseded 清，改前对所有 reason 都做 CAS → 误判 cas_mismatch）。
+        if (reason === "expired" && (b1.selection_handle !== (expectedHandle ?? null) || b1.handle_expires_at !== (expectedExpiresAt ?? null))) {
           return { ok: false, reason: "cas_mismatch", why: "当前 handle/expiry 与 expected 不符（防陈旧定时器清掉后换发的新 handle）" };
         }
       }

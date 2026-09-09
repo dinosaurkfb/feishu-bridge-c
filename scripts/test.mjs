@@ -40430,10 +40430,13 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "r57f_b1", chatId: "oc_r57", rootOm: "om_f1", lineageId: "lin_f1", bindingTarget: TGT57(61), clock: () => T0 }), "createB1");
     const doc0 = loadOk57(dir);
     const rec0 = doc0.records[b1.result.created_id];
-    // 手动 void：不带 expected（null）+ 记录有 handle → CAS mismatch
-    let r = TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v1", b1Id: b1.result.created_id, reason: "manual", clock: () => T0 + 1000 });
-    assert.equal(r.ok, false, "manual 但当前 handle 非空且 expected 缺省 → CAS 拒（P1-1 契约：manual 只对 null-handle blocker）");
-    assert.equal(r.reason, "cas_mismatch");
+    // 返修七 P1-1（#144 五轮）改：manual/superseded 的 expected 双键必须 null，**不据此要求当前 handle 为 null**——
+    //   带 handle 的 B1 也能被 manual 清（改前对所有 reason 做 CAS → 误判 cas_mismatch）。用独立 B1 验成功。
+    const b1m = talOk(TAL.createB1({ endpointId: EP57, requestKey: "r57f_b1m", chatId: "oc_r57", rootOm: "om_f1m", lineageId: "lin_f1m", bindingTarget: TGT57(63), clock: () => T0 }), "createB1m");
+    let r = TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v1", b1Id: b1m.result.created_id, reason: "manual", clock: () => T0 + 1000 });
+    assert.equal(r.ok, true, "manual 双 null 清带 handle 的 B1（fix7：不要求当前 handle null，改前 cas_mismatch）");
+    assert.equal(r.result.expected_handle, null, "manual result expected_handle null");
+    assert.equal(r.result.expected_expires_at, null, "manual result expected_expires_at null");
     // manual 显式带非 null expected → bad_input（manual/superseded 的双键必须显式 null）
     r = TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v2", b1Id: b1.result.created_id, reason: "manual", expectedHandle: rec0.selection_handle, expectedExpiresAt: rec0.handle_expires_at, clock: () => T0 + 1000 });
     assert.equal(r.ok, false);
@@ -40447,7 +40450,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     r = talOk(TAL.voidPending({ endpointId: EP57, requestKey: "r57f_v4", b1Id: b1.result.created_id, reason: "expired", expectedHandle: rec0.selection_handle, expectedExpiresAt: rec0.handle_expires_at, clock: () => Date.parse(rec0.handle_expires_at) + 1 }), "expired void with CAS");
     const doc1 = loadOk57(dir);
     assert.equal(doc1.records[b1.result.created_id].kind, "voided_audit");
-    const op = Object.values(doc1.operations).find((o) => o.op_type === "void");
+    const op = Object.values(doc1.operations).find((o) => o.op_type === "void" && o.result.voided_id === b1.result.created_id);
     assert.equal(op.fingerprint, TAL.fingerprintOf("void", { request_key: "r57f_v4", b1_id: b1.result.created_id, reason: "expired", expected_handle: rec0.selection_handle, expected_expires_at: rec0.handle_expires_at }), "fp 必含 expected 双键");
     assert.equal(doc1.revision, revBefore + 1);
     assert.equal(r.revision, doc1.revision);
@@ -40810,6 +40813,58 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(v.ok, false, "边界后 attach_a3 缺新形键必拒");
     assert.match(String(v.why), /attach_a3 跨 schema 结果形不符/, "why 点名 attach_a3 键集不符：" + v.why);
   }, { schema: "1.1-transition" }));
+
+  // ── R57a 返修七 P1-1（Codex #144 五轮：1 P1）——void 的 reason 判别联合：写入口 + 整本校验器 ──
+
+  test("R57a 返修七 P1-1 ①：带 handle 的 B1 执行 void(manual/superseded, 双 null) → 成功（改前 cas_mismatch：现对所有 reason 都做 handle CAS）", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "f7_a1", chatId: "oc_f7", rootOm: "om_f7a", lineageId: "lin_f7", bindingTarget: TGT57(21), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id;
+    assert.notEqual(b1.result.selection_handle, null, "B1 带 handle");
+    // manual：expected 双 null，不据此要求当前 B1 handle 为 null → 成功（改前 cas_mismatch）。
+    const r = talOk(TAL.voidPending({ endpointId: EP57, requestKey: "f7_va", b1Id, reason: "manual", expectedHandle: null, expectedExpiresAt: null, clock: () => T0 }), "manual void 带 handle 的 B1");
+    assert.equal(r.result.expected_handle, null, "manual result expected_handle null");
+    assert.equal(r.result.expected_expires_at, null, "manual result expected_expires_at null");
+    const doc = loadOk57(dir);
+    assert.equal(doc.records[b1Id].kind, "voided_audit", "B1 已 void，产物过 validateLedger");
+  }, { schema: "1.1-transition" }));
+
+  test("R57a 返修七 P1-1 ②：manual/superseded 带非 null expected → bad_input（写入口封闭）", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "f7_a2", chatId: "oc_f7", rootOm: "om_f7b", lineageId: "lin_f7", bindingTarget: TGT57(22), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id;
+    const r = TAL.voidPending({ endpointId: EP57, requestKey: "f7_vb", b1Id, reason: "manual", expectedHandle: b1.result.selection_handle, expectedExpiresAt: b1.result.handle_expires_at, clock: () => T0 });
+    assert.equal(r.ok, false, "manual 带非 null expected 必拒");
+    assert.equal(r.reason, "bad_input", "manual 带非 null expected → bad_input");
+  }, { schema: "1.1-transition" }));
+
+  test("R57a 返修七 P1-1 ③（Codex 探针）：合法 expired 结果 + 把审计 reason 改成 manual 并重算 fingerprint → validateLedger 拒（改前 ok：RESULT_SHAPE 只核同空/同非空）", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "f7_c1", chatId: "oc_f7", rootOm: "om_f7c", lineageId: "lin_f7", bindingTarget: TGT57(23), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id, handle = b1.result.selection_handle, expiry = b1.result.handle_expires_at;
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "f7_vc", b1Id, reason: "expired", expectedHandle: handle, expectedExpiresAt: expiry, clock: () => Date.parse(expiry) + 1 }), "expired void");
+    const doc = loadOk57(dir);
+    const voidKey = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "void");
+    const d1 = structuredClone(doc);
+    // 探针：result 仍带非空 expected（expired 形），但审计 reason 改 manual + fingerprint 按 manual+非空 expected 重算。
+    d1.records[b1Id].reason = "manual";
+    d1.operations[voidKey].fingerprint = TAL.fingerprintOf("void", { request_key: "f7_vc", b1_id: b1Id, reason: "manual", expected_handle: handle, expected_expires_at: expiry });
+    const v = TAL.validateLedger(d1, { endpointId: EP57 });
+    assert.equal(v.ok, false, "reason=manual 但 expected 键非全 null 必拒");
+    assert.match(String(v.why), /void reason=manual 但 expected 双键非全 null/, "why 点名 reason=manual 判别：" + v.why);
+  }, { schema: "1.1" }));
+
+  test("R57a 返修七 P1-1 ④：manual 结果却带非 null expected（伪造）→ 拒（reason 从不可变 voided_audit 取）", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "f7_d1", chatId: "oc_f7", rootOm: "om_f7d", lineageId: "lin_f7", bindingTarget: TGT57(24), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id, handle = b1.result.selection_handle, expiry = b1.result.handle_expires_at;
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "f7_vd", b1Id, reason: "expired", expectedHandle: handle, expectedExpiresAt: expiry, clock: () => Date.parse(expiry) + 1 }), "expired void");
+    const doc = loadOk57(dir);
+    const voidKey = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "void");
+    const d1 = structuredClone(doc);
+    // 伪造：审计 reason 改 manual + fingerprint 按 manual+非空 expected 重算；result 仍为 expired 形（非空 expected）→ 判别拒。
+    d1.records[b1Id].reason = "manual";
+    d1.operations[voidKey].fingerprint = TAL.fingerprintOf("void", { request_key: "f7_vd", b1_id: b1Id, reason: "manual", expected_handle: handle, expected_expires_at: expiry });
+    const v = TAL.validateLedger(d1, { endpointId: EP57 });
+    assert.equal(v.ok, false, "manual reason + 非 null expected（伪造）必拒");
+    assert.match(String(v.why), /void reason=manual 但 expected 双键非全 null/, "why 点名 reason=manual 判别：" + v.why);
+  }, { schema: "1.1" }));
 
 }
 

@@ -38,7 +38,9 @@ export function selectRejectTextByReason(reason) {
   if (reason === "select_executor_absent") return "已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送";
   if (reason === "select_writer_state_unreadable") return "选择功能状态读不清，未执行";
   if (reason === "select_off") return "选择功能未开放（迁移未开始）";
-  if (reason === "select_partial_not_rfh") return "迁移期间只接受 rfh_ 重确认 handle";
+  if (reason === "select_partial_not_rfh" || reason === "select_not_partial") return "迁移期间只接受 rfh_ 重确认 handle";
+  if (reason === "outer_lock_required") return "外层排序锁未持有，未执行";
+  if (reason === "maintenance") return "维护进行中，未执行";
   // R57b：rfh 支的失败映射（全部封闭，不让裸 reason 漏给 owner）
   if (reason === "reaffirm_handle_unknown") return "重确认 handle 不存在或已被消费；要重做请在终端重新签发一条";
   if (reason === "reaffirm_intent_expired") return "重确认 handle 已过期，请在终端重新签发";
@@ -83,7 +85,7 @@ export function executeSelectControl(intent, {
   if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
     return { ok: false, reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
   }
-  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, now, env });
+  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env });
   if (!res.ok) {
     return { ok: false, reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
   }

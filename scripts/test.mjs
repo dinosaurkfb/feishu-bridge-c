@@ -42073,6 +42073,58 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(rBad.ok, false, "未知 proof kind tombstone 必须拒");
   }));
 
+  test("R57b 返修一 P1-2：锁序与维护门——门内签发拒；内层无 capability 直调拒；锁内 admission 变成 on/off 拒", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p1_2", 36, "sess-b-36");
+
+    // 1. 反例：门内签发 → 拒（maintenance）
+    const gateFile = path.join(root, "maintenance.gate");
+    fs.symlinkSync(JSON.stringify({ schema_version: "1.0", pid: process.pid, at: ISO0B, token: "00000000-0000-0000-0000-000000000001", reason: "test" }), gateFile);
+    const maintEnv = { ...process.env, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+    const rGate = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B, env: maintEnv });
+    assert.equal(rGate.ok, false, "门内签发必须拒");
+    assert.equal(rGate.reason, "maintenance", "reason 为 maintenance");
+
+    // 2. 反例：内层无 capability 直调 → 拒（outer_lock_required）
+    const rNoCap = RI.issueReaffirmIntentInner({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(rNoCap.ok, false, "内层无 capability 签发必须拒");
+    assert.equal(rNoCap.reason, "outer_lock_required", "reason 为 outer_lock_required");
+
+    const rNoCapConsume = RI.consumeReaffirmIntentInner({ endpointId: EP57B, reaffirmHandle: "rfh_" + "a".repeat(32), sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(rNoCapConsume.ok, false, "内层无 capability 消费必须拒");
+    assert.equal(rNoCapConsume.reason, "outer_lock_required", "reason 为 outer_lock_required");
+
+    // 3. 反例：锁内 admission 变成 on/off → 拒
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+
+    // 锁内变成 off → 拒
+    let admCalls = 0;
+    const changingAdmOff = () => {
+      admCalls++;
+      if (admCalls === 1) return { state: "partial" };
+      return { state: "off" };
+    };
+    const rOff = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_sel57b",
+      selectAdmissionFn: changingAdmOff,
+    });
+    assert.equal(rOff.ok, false, "锁内变 off 必须拒");
+    assert.equal(rOff.reason, "select_off");
+
+    // 锁内变成 on → 拒
+    admCalls = 0;
+    const changingAdmOn = () => {
+      admCalls++;
+      if (admCalls === 1) return { state: "partial" };
+      return { state: "on" };
+    };
+    const rOn = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_sel57b",
+      selectAdmissionFn: changingAdmOn,
+    });
+    assert.equal(rOn.ok, false, "锁内变 on 必须拒");
+    assert.equal(rOn.reason, "select_not_partial");
+  }));
+
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {
     // 手工 transition 账本：activate 增量 op 产 owner_select 双证 + tombstone（owner_select_merge_v1）。
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-os-")));

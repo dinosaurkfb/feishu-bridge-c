@@ -21,7 +21,9 @@ import path from "node:path";
 
 import { canonKey, sha256, isObj } from "./canon.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "../canonical-time.mjs";
-import { acquireLockUngated, releasePublishLock } from "../registry.mjs";
+import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
+import { acquireOrderLock, verifyOrderLockCapability } from "../m1a/dual-write.mjs";
+import { readOwnerSelectAdmission } from "./owner-select-state.mjs";
 import {
   OWNER_SELECT_REAFFIRM_TTL_MS, REAFFIRM_HANDLE_SHAPE, ID_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE,
   AUTHORIZED_BY_SHAPE, SHA_SHAPE, resolveEndpointDir, loadLedger, familyOf,
@@ -132,13 +134,13 @@ function writeIntentsFile(dir, doc) {
   return { ok: true };
 }
 
-/** intent 文件锁（普通 gated）：acquire → fn() → release（释放失败折进结果，不静默吞）。 */
-function withIntentsLock(dir, fn) {
+/** intent 文件锁（普通 gated）：acquire → fn(token) → release（释放失败折进结果，不静默吞）。 */
+function withIntentsLock(dir, fn, { env = process.env } = {}) {
   const lockDir = path.join(dir, REAFFIRM_INTENTS_LOCK);
-  const acq = acquireLockUngated(lockDir, { reapUnrecognized: false });
-  if (!acq.ok) return { ok: false, reason: acq.reason === "publisher_busy" ? "reaffirm_intents_busy" : (acq.reason ?? "reaffirm_intents_lock"), why: acq.error ?? acq.reason ?? null, path: acq.path ?? null };
+  const acq = acquirePublishLock(lockDir, { reapUnrecognized: false, env });
+  if (!acq.ok) return { ok: false, reason: acq.reason === "maintenance" ? "maintenance" : acq.reason === "publisher_busy" ? "reaffirm_intents_busy" : (acq.reason ?? "reaffirm_intents_lock"), why: acq.error ?? acq.reason ?? null, gate: acq.gate ?? null, text: acq.text ?? null, path: acq.path ?? null };
   let out;
-  try { out = fn(); }
+  try { out = fn(acq.token); }
   finally {
     const rel = releasePublishLock(lockDir, { expectedToken: acq.token });
     if (!rel.ok) out = { ...out, lockUncleared: rel.reason ?? "release_failed" };
@@ -148,28 +150,46 @@ function withIntentsLock(dir, fn) {
 
 /**
  * request_reaffirm（§8.1 sidecar 写事务，非 ledger op）。
- * intent 锁内：unreadable 阻断 → 受验清理**该 target** 的过期项 → CAS「该 target 下无任何未清 intent」
- * → 算 expected_old_proof_closure_digest（§8.1 公式，family 在内）→ 签 rfh_（128-bit CSPRNG）→
- * tmp+rename+fsync 写回 → 返回 handle。family 越界 / 别名缺失 / chat 不符 → fail-closed 拒。
+ * 顶层取得并释放 instance-bound outer 锁（scripts/m1a/dual-write.mjs 的 acquireOrderLock，与 wiring 同一纪律）。
+ * 内层函数持 outer 的受验 capability。
  */
-export function issueReaffirmIntent({ endpointId, targetId, authorizedOwner, chatId, now = undefined, clock = () => Date.now(), env = process.env } = {}) {
-  // R57a 返修一 P1-5：签发时间由 intent 锁内的 clock seam 读取（显式 now 仅作确定性钉值）。
-  const nowMs = Number.isFinite(now) ? now : clock();
-  const iso = isCanonicalMs(nowMs) ? canonicalIso(nowMs) : null;
-  if (iso === null) return { ok: false, reason: "bad_time" };
+export function issueReaffirmIntent({ endpointId, targetId, authorizedOwner, chatId, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+  if (!outerCapability) {
+    const acq = acquireOrderLock(endpointId, env);
+    if (!acq.ok) return { ok: false, reason: acq.reason ?? "binding_busy", why: acq.why ?? null, gate: acq.gate ?? null, text: acq.text ?? null };
+    try {
+      const cap = Object.freeze({ kind: "m1a_order_lock", token: acq.token, endpointId });
+      return issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now, clock, env, outerCapability: cap, _inject });
+    } finally {
+      acq.release();
+    }
+  }
+  return issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now, clock, env, outerCapability, _inject });
+}
+
+export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+  const vCap = verifyOrderLockCapability(endpointId, outerCapability, env);
+  if (!vCap.ok) return { ok: false, reason: vCap.reason ?? "outer_lock_required", why: vCap.why ?? "outer 未持有" };
+
   if (typeof targetId !== "string" || !ID_SHAPE.test(targetId)) return { ok: false, reason: "bad_target_id" };
   if (typeof authorizedOwner !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedOwner)) return { ok: false, reason: "bad_authorized_owner" };
   if (typeof chatId !== "string" || !CHAT_SHAPE.test(chatId)) return { ok: false, reason: "bad_chat_id" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return { ok: false, reason: d.reason ?? "endpoint_dir_unresolvable", why: d.why ?? null };
-  return withIntentsLock(d.dir, () => {
+
+  return withIntentsLock(d.dir, (intentToken) => {
     const cur = readReaffirmIntents({ endpointDir: d.dir });
     if (!cur.ok) return { ok: false, reason: "reaffirm_intents_unreadable", why: cur.problem };
     const doc = cur.doc;
+    const lockNow = clock();
+    const issuedMs = Number.isFinite(now) ? now : lockNow;
+    const iso = isCanonicalMs(issuedMs) ? canonicalIso(issuedMs) : null;
+    if (iso === null) return { ok: false, reason: "bad_time" };
+
     // 受验清理：只动本 target 的过期项（§8.1「先受验清理该 target 的过期项」；他 target 的过期项归其下次签发清理）
     const cleaned = [];
     for (const [k, e] of Object.entries(doc.entries)) {
-      if (e.target_id === targetId && Date.parse(e.expires_at) <= nowMs) { cleaned.push(k); delete doc.entries[k]; }
+      if (e.target_id === targetId && Date.parse(e.expires_at) <= lockNow) { cleaned.push(k); delete doc.entries[k]; }
     }
     // CAS：no-existing-intent = 该 target 下无任何未清 intent（不是「忽略过期项」——否则同 target 堆积）
     if (Object.values(doc.entries).some((e) => e.target_id === targetId)) {
@@ -187,7 +207,7 @@ export function issueReaffirmIntent({ endpointId, targetId, authorizedOwner, cha
     const digest = ownerSelectReaffirmClosureDigest(L.doc, targetId);
     if (typeof digest !== "string") return { ok: false, reason: "target_not_live" };
     const handle = "rfh_" + crypto.randomBytes(16).toString("hex");
-    const expiresMs = nowMs + OWNER_SELECT_REAFFIRM_TTL_MS;
+    const expiresMs = lockNow + OWNER_SELECT_REAFFIRM_TTL_MS;
     const expires = isCanonicalMs(expiresMs) ? canonicalIso(expiresMs) : null;
     if (expires === null) return { ok: false, reason: "bad_time", why: "expires_at 越界" };
     doc.entries[handle] = {
@@ -200,22 +220,47 @@ export function issueReaffirmIntent({ endpointId, targetId, authorizedOwner, cha
     const w = writeIntentsFile(d.dir, doc);
     if (!w.ok) return { ok: false, reason: "reaffirm_intents_unwritable", why: w.problem };
     return { ok: true, reaffirm_handle: handle, entry: doc.entries[handle], cleaned, cleaned_count: cleaned.length };
-  });
+  }, { env });
 }
 
 /**
- * 消费编排（§8.1）：在消费方的 outer 锁内被调 → 本函数持 **intent 锁** → ownerSelectReaffirm 的
- * gatedTx 内持 **ledger 锁**（锁序 intent → ledger）。intent CAS：entry 在场（=handle 主键、endpoint 相符）、
- * 未过期、sender === authorized_owner；family/digest 的 CAS 在 ledger op 内对现账原子重核。
- * 提交成功（含崩溃恢复的 replayed）→ 清 intent；清失败不谎报——ok 保持 true（账本已提交），cleared:false
- * 带出，同 request_key 重发幂等清 intent（§8.1 崩溃恢复矩阵）。
+ * 消费编排（§8.1）：顶层取得并释放 instance-bound outer 锁 → intent 锁 → ledger 锁。
+ * 内层函数持 outer 的受验 capability。
+ * admission === partial 在 outer + intent 锁内重核。
  */
-export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env } = {}) {
+export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+  if (!outerCapability) {
+    const acq = acquireOrderLock(endpointId, env);
+    if (!acq.ok) return { ok: false, reason: acq.reason ?? "binding_busy", why: acq.why ?? null, gate: acq.gate ?? null, text: acq.text ?? null };
+    try {
+      const cap = Object.freeze({ kind: "m1a_order_lock", token: acq.token, endpointId });
+      return consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability: cap, _inject });
+    } finally {
+      acq.release();
+    }
+  }
+  return consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability, _inject });
+}
+
+export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+  const vCap = verifyOrderLockCapability(endpointId, outerCapability, env);
+  if (!vCap.ok) return { ok: false, reason: vCap.reason ?? "outer_lock_required", why: vCap.why ?? "outer 未持有" };
+
   if (typeof reaffirmHandle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(reaffirmHandle)) return { ok: false, reason: "reaffirm_handle_unknown" };
   if (typeof sender !== "string" || !AUTHORIZED_BY_SHAPE.test(sender)) return { ok: false, reason: "sender_mismatch", why: "sender 形状不对" };
   const d = resolveEndpointDir(endpointId, { env });
   if (!d.ok) return { ok: false, reason: d.reason ?? "endpoint_dir_unresolvable", why: d.why ?? null };
-  return withIntentsLock(d.dir, () => {
+
+  return withIntentsLock(d.dir, (intentToken) => {
+    // admission === partial 在 outer + intent 锁内重核（不只在入口看一眼）
+    if (typeof selectAdmissionFn === "function") {
+      const lockAdm = selectAdmissionFn(env);
+      if (!lockAdm || lockAdm.state !== "partial") {
+        const reason = lockAdm?.state === "off" ? "select_off" : "select_not_partial";
+        return { ok: false, reason, why: "准入锁内重核未通过（state=" + (lockAdm?.state ?? "null") + "）" };
+      }
+    }
+
     const cur = readReaffirmIntents({ endpointDir: d.dir });
     if (!cur.ok) return { ok: false, reason: "reaffirm_intents_unreadable", why: cur.problem };
     const entry = cur.doc.entries[reaffirmHandle];
@@ -233,7 +278,7 @@ export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chat
       expectedOldProofClosureDigest: entry.expected_old_proof_closure_digest,
       reaffirmHandle, authorizedBy: sender, chatId,
       selectedSessionId: rec.aliases.session_id, selectedRootOm: rec.aliases.root_om,
-      selectionMessageId, clock, env, _inject: undefined,
+      selectionMessageId, now, clock, env, _inject: undefined,
     });
     if (!res.ok || typeof res.commit !== "string" || !res.commit.startsWith("committed")) return res;
     // 提交成功（committed_clean / committed_durability_uncertain / replayed）→ 清 intent
@@ -241,5 +286,5 @@ export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chat
     const w = writeIntentsFile(d.dir, cur.doc);
     const cleared = w.ok;
     return { ...res, cleared, ...(cleared ? {} : { why: "intent 清理失败（" + (w.problem ?? "?") + "）：账本已提交，同 handle 重发可幂等清 intent" }) };
-  });
+  }, { env });
 }

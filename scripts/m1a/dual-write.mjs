@@ -6,6 +6,7 @@
 // #R29 P1.3（取向 a）：本轮删除 runFixedSequence 编排器与固定序列表 —— 库不接 legacy 回调、
 // 接受任意步序、只看 key 不核 fingerprint、pause 错做成 unbind→restore 两步，编排器放在这里只会腐化；
 // 真正的步序在 T3a 合并接线时按账本事务裁定。本轮只保留锁 + request_key 原语。
+import fs from "node:fs";
 import path from "node:path";
 import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
 import { resolveEndpointDir, canonKey, sha256 } from "../topic-agent-ledger.mjs";
@@ -81,3 +82,35 @@ export function requestKeyFor({ opType, externalRequestId, entityId }) {
   const digest = sha256(Buffer.from(canonKey({ domain: "m1a-rk-1", external_request_id: externalRequestId, op_type: opType, entity_id: entityId }), "utf-8")).slice(0, REQKEY_LEN);
   return { ok: true, request_key: "m1a_" + digest };
 }
+
+/**
+ * 校验 outer order 锁 capability（§8.1，与 wiring 同一纪律）：
+ * 证明调用方当前进程确实持有本次 acquisition 的 instance-bound token。
+ */
+export function verifyOrderLockCapability(endpointId, capability, env = process.env) {
+  if (!capability || typeof capability !== "object") {
+    return { ok: false, reason: "outer_lock_required", why: "outer lock capability 缺失" };
+  }
+  if (capability.kind !== "m1a_order_lock") {
+    return { ok: false, reason: "outer_lock_required", why: "capability.kind 不是 m1a_order_lock" };
+  }
+  if (capability.endpointId !== endpointId) {
+    return { ok: false, reason: "outer_lock_required", why: "capability.endpointId 与入参 endpoint 不符" };
+  }
+  if (typeof capability.token !== "string" || !capability.token) {
+    return { ok: false, reason: "outer_lock_required", why: "capability.token 无效" };
+  }
+  const p = m1aOrderLockPath(endpointId, env);
+  if (!p.ok) return { ok: false, reason: "outer_lock_required", why: p.why ?? p.reason };
+  try {
+    const raw = fs.readlinkSync(p.lock);
+    const parsed = JSON.parse(raw);
+    if (parsed.token !== capability.token || parsed.pid !== process.pid) {
+      return { ok: false, reason: "outer_lock_required", why: "outer 锁未持有或已被接管" };
+    }
+  } catch (err) {
+    return { ok: false, reason: "outer_lock_required", why: "outer 锁未持有：" + String(err?.message ?? err) };
+  }
+  return { ok: true };
+}
+

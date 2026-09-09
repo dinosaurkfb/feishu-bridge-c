@@ -38232,6 +38232,35 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 返修四（#138 四轮 P1）：残骸白名单 (name,st) 双参 + endpoint 项绑冻结集——同名普通文件 / 同名 symlink / 冻结集外 endpoint 目录一律算残骸", () => {
+    // 冻结集 = [EP52A]。用端点形状但非冻结集的残留项验证「按名字放行 → 残骸」。#138 四轮 P1：
+    // 同名普通文件（①）、同名 symlink（②）、冻结集外的 endpoint 目录（③）一律算残骸。
+    const nonFrozen = "endpoint_" + "c".repeat(24);
+    const run = (makeJunk) => {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.endsWith(":open")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        makeJunk(fx);
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "junk 残骸停门：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.match(String(r.why), /残骸/, "why 点名残骸：" + r.why);
+      } finally { fx.cleanup(); }
+    };
+    // ① 同名普通文件（匹配 endpoint 形状但非目录、非冻结集）→ 残骸。
+    run((fx) => { fs.writeFileSync(path.join(fx.ledgerRoot, nonFrozen), "x", { mode: 0o600 }); });
+    // ② 同名 symlink（匹配 endpoint 形状但为 symlink）→ 残骸。
+    run((fx) => { fs.symlinkSync("/nonexistent", path.join(fx.ledgerRoot, nonFrozen)); });
+    // ③ 冻结集外的 endpoint 目录（是目录但非本 operation 冻结集成员）→ 残骸。
+    run((fx) => { fs.mkdirSync(path.join(fx.ledgerRoot, "endpoint_" + "b".repeat(24)), { recursive: true, mode: 0o700 }); });
+  });
+
   test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
     // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
     {

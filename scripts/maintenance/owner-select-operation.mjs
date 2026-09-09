@@ -136,6 +136,14 @@ function sealReusedFile(file, dir) {
 let __sealCalls = 0;
 export const __sealCallCount = () => __sealCalls;
 export const __resetSealCalls = () => { __sealCalls = 0; };
+/** 返修四 #138 四轮 P1：ledger 根残骸白名单 (name, st)——endpoint 目录须 ∈ 受验冻结集 + 是目录 + 非 symlink；
+ *  两个状态文件须普通文件 + 非 symlink；同名的普通文件 / 同名的 symlink / 冻结集外的 endpoint 目录一律算残骸。 */
+const campaignAllowedFor = (frozen) => (name, st) => {
+  const isFile = st.isFile() && !st.isSymbolicLink();
+  const isDir = st.isDirectory() && !st.isSymbolicLink();
+  return (isDir && (frozen ?? []).includes(name)) || (isFile && (name === "owner-select-campaign.json" || name === "owner-select-writer-state.json"));
+};
+
 function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed = null, inject = null }) {
   __sealCalls++;
   let dfd = null;
@@ -162,7 +170,7 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
       st = fs.lstatSync(path.join(targetDir, n));
     }
     catch (err) { if (err?.code === "ENOENT") continue; return { ok: false, why: "lstat：" + errText(err) }; }
-    if (residueAllowed === null || !residueAllowed(n)) return { ok: false, why: "残骸：" + n + (st.isDirectory() ? "（目录）" : "") };
+    if (residueAllowed === null || !residueAllowed(n, st)) return { ok: false, why: "残骸：" + n + (st.isDirectory() ? "（目录）" : "") };
   }
   return { ok: true };
 }
@@ -487,7 +495,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           targetDir: path.dirname(campaignPath(env)),
           readVerified: () => { const a = readCampaignState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints: a.endpoints, endpoints_digest: a.endpoints_digest } }; },
           intended,
-          residueAllowed: (n) => ENDPOINT_SHAPE.test(n) || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
+          residueAllowed: campaignAllowedFor(intended?.endpoints),
           inject: _inject,
         });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
@@ -590,7 +598,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           targetDir: path.dirname(writerStatePath(env)),
           readVerified: () => { const a = readWriterState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints_digest: a.endpoints_digest, revision: a.revision } }; },
           intended,
-          residueAllowed: (n) => ENDPOINT_SHAPE.test(n) || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json",
+          residueAllowed: campaignAllowedFor(doc.steps.find((s) => s.kind === "campaign")?.intended_after.endpoints),
           inject: _inject,
         });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };

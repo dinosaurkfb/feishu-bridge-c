@@ -9,7 +9,9 @@
 // R57b：rfh 支接真执行器（owner_select_reaffirm，§8.1 消费编排 consumeReaffirmIntent）。
 // R57d：osh / orh / 省略 支接真执行器（§12 + §5 + §6）——select_executor_absent 路径删除；
 //   osh → activate(B1) / anchor(A2)，orh → rebind_session_alias，省略 → 三候选集合并集恰一；
-//   失败按 reason 封闭映射，ambiguous 回执列 opaque id（§13 不回 handle 值）。
+//   失败按 reason 封闭映射，ambiguous 回执按 §13（R57d 返修一 P1-8：opaque handle + 安全标签，上限 5）。
+// R57d 返修一 P1-4：省略 handle 命中唯一 rebind 时，rebindHandle 取命中记录的 rebind_handle
+//   （显式 orh 时二者相等）——原实现恒传原始 handle（省略分支恒 null）→ 必失败。
 
 import { createHash } from "node:crypto";
 import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint } from "./topic-agent-ledger.mjs";
@@ -305,7 +307,7 @@ export function executeSelectControl(intent, {
   } else if (action === "anchor") {
     w = wireSelectAnchor({ endpointId, env, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: target.aliases.session_id, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
-    w = wireSelectRebind({ endpointId, env, legacy, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle, expectedExpiresAt: target.rebind_expires_at, clock });
+    w = wireSelectRebind({ endpointId, env, legacy, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
   return wiredOutcome(w, action);
 }

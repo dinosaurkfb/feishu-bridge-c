@@ -45909,6 +45909,19 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(r.reason, "no_candidate", "chat 过滤");
   }));
 
+  test("R57d 返修一 P1-4：省略 handle 命中唯一 rebind → 传命中记录的 rebind_handle（原实现恒传 null → 必失败）", () => withLedgerD((root, dir, ids) => {
+    // 夹具：B1 → B3（旧形基线）、A2 handle 先被 anchor 消费 → 省略分支只剩 rebind 候选
+    talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act4", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
+    const a2rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
+    talTmp(TAL.anchor({ endpointId: EP57D, requestKey: "r57d_anc4", id: ids.a2Id, authorizedBy: "ou_r57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionMessageId: "om_fix4", selectionBasis: "explicit_handle", clock: () => T0D }));
+    const rq = TAL.requestRebind({ endpointId: EP57D, requestKey: "r57d_rq4", b3Id: ids.b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: SESSION_D, clock: () => T0D });
+    assert.ok(rq.ok, "requestRebind：" + JSON.stringify(rq));
+    const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: SESSION_D + "-new", mappingUpdate: mappingStub([]) }));
+    assert.equal(r.ok, true, "省略 orh 成功：" + JSON.stringify(r));
+    assert.equal(r.action, "rebind");
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].aliases.session_id, SESSION_D + "-new", "换绑到事件会话");
+  }));
+
   test("R57d 真入口（subprocess）：on+osh → consumed 收据 + 账本双证；同 message 重放 → 「已处理」且账本不再变", () => {
     // endpointId 必须 = legacyEndpointId(bootTpl.agent_uid)——aily-inbound 子进程按它派生账本目录
     const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "7621020633916345545", chat_name: "群", chat_id: CHAT_D, default_freshness_ms: 900000, agent_uid: "agent_d" };

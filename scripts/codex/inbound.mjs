@@ -37,9 +37,11 @@ import {
   appendConsumed, bridgeHome, buildCodexSubscriptionProjection, closeTaskTopicRotation,
   evaluatePromotion, findPendingTask,
   finalizeTaskDialogueTurn, findTaskForFeishuSession, interactionPolicyForTask,
-  isThreadBusy, loadCodexTemplate, promoteTask, reserveTaskDialogueTurn, setTaskInteractionMode,
+  isThreadBusy, loadCodexTemplate, loadRegistry, promoteTask, registryFile, reserveTaskDialogueTurn, setTaskInteractionMode,
+  topicStateForTask,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
+import { pendingGeneration } from "../topic-generation.mjs";
 import { controlAckText, runControlTransaction } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { senderRole } from "../sender-roles.mjs";
@@ -63,6 +65,28 @@ import { executeSelectControl, selectAdmission, selectRejectTextByReason, select
  * 刻意**不重排函数体的缩进**：这个文件近七百行，重排会让 diff 完全无法评审，
  * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
  */
+/**
+ * R57d 返修二 P1-1：owner_select activate 的 legacy 提交回调（$feishu-select shadow 期复合双写的 legacy 半笔）。
+ * 复用既有 promoteTask（W1 的 legacy writer，不另造）：目标 task 按 projectRoot 在 registry 里找
+ * （跨项目选择的本意；找不到回落事件 task），operationId 从其 pending 代际读出，generationId CAS
+ * 由载荷 lineageId 承担（promoteTask 自核 pending_generation_mismatch）。换绑（rebind）没有既有
+ * legacy writer（W2 的 legacy 是新代际认领，非原地换绑）→ 结构化拒，shadow 期 fail-closed。
+ */
+export function selectLegacyUpdate(u, { task, home = bridgeHome(), now = Date.now() } = {}) {
+  if (!u || typeof u !== "object" || u.action !== "activate") {
+    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "owner_select 换绑没有既有 legacy writer（W2 的 legacy 是新代际认领）" };
+  }
+  const reg = loadRegistry(registryFile(home));
+  if (!reg.ok) return reg;
+  const targetTask = (reg.tasks ?? []).find((t) => t.root === u.projectRoot) ?? task ?? null;
+  if (!targetTask) return { ok: false, reason: "entry_gone", why: "registry 里没有目标项目的 task" };
+  const loaded = topicStateForTask(targetTask, { now });
+  if (!loaded.ok) return loaded;
+  const pending = pendingGeneration(loaded.state);
+  if (!pending) return { ok: false, reason: "no_pending_generation", why: "目标 task 没有 pending 代际（可能已激活/已轮转）" };
+  return promoteTask({ logicalTaskKey: targetTask.logical_task_key, sessionId: u.eventSessionId, generationId: u.lineageId, operationId: loaded.state.rotation?.operation_id ?? null, home, now });
+}
+
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {
 
 // 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放
@@ -604,6 +628,7 @@ const runControl = (replay) => {
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };
 // ---------- $feishu-select 控制命令事务（R52a）：锁内确定性处置准入，落 failed 终态（执行器未接入期不落 consumed，PR #136 P1-4） ----------
+
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: paths.claims, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
@@ -617,6 +642,9 @@ const runSelect = (replay) => {
       endpointId: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
       messageId: verdict.messageId,
       eventSessionId: event.session_id ?? null,
+      // R57d 返修二 P1-1：shadow 期的 legacy 提交回调 —— 复用既有 promoteTask（W1 的 legacy writer），
+      //   实现在下方导出的 selectLegacyUpdate（单测直驱；目标 task 按 projectRoot 在 registry 里找）。
+      mappingUpdate: (u) => selectLegacyUpdate(u, { task, home: HOME }),
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: paths.claims,

@@ -52,7 +52,7 @@ import { loadChainTemplate } from "./chain-template.mjs";
 import { appendChannelSample, channelDisposition } from "./channel-samples.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
-  findPendingBinding, promoteBinding, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
+  findPendingBinding, promoteBinding, pendingGenerationIdentity, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
   isPrivateChatTurn,
 } from "./inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText } from "./chat-reply.mjs";
@@ -756,6 +756,15 @@ const runSelect = (replay) => {
       endpointId: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
       messageId: verdict.messageId,
       eventSessionId: event.session_id ?? null,
+      // R57d 返修二 P1-1：shadow 期的 legacy 提交回调 —— 复用既有 promoteBinding（W1 的 legacy writer），
+      //   载荷由执行器带足 generation/CAS 身份；operationId 从目标绑定的 pending 代际读出。
+      //   换绑（rebind）没有既有 legacy writer（W2 的 legacy 是新代际认领，非原地换绑）→ 结构化拒，shadow 期 fail-closed。
+      mappingUpdate: (u) => {
+        if (u.action !== "activate") return { ok: false, reason: "select_rebind_legacy_unsupported", why: "owner_select 换绑没有既有 legacy writer（W2 的 legacy 是新代际认领）" };
+        const idy = pendingGenerationIdentity({ root: u.projectRoot });
+        if (!idy.ok) return idy;
+        return promoteBinding({ root: u.projectRoot, generationId: u.lineageId, operationId: idy.operationId, sessionId: u.eventSessionId });
+      },
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: CLAIMS,

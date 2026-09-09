@@ -40,6 +40,7 @@ import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
+import { selectLegacyUpdate } from "./inbound.mjs";
 import { dispatchControlRepair } from "../repair-control-claim.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
@@ -10264,6 +10265,40 @@ test("R52a 返修三 P1-1: Codex 真入口 $feishu-select 全路径（claim meta
   const replayRes = run("$feishu-select " + h, "msg_sel_1");
   assert.equal(replayRes.status, 0, replayRes.stdout + replayRes.stderr);
   assert.match(replayRes.stdout, /选择功能未开放/u, "重放回执一致");
+});
+
+test("R57d 返修二 P1-1: Codex select 的 legacy 提交回调（selectLegacyUpdate）——真 promoteTask 激活 pending 代际到事件会话；rebind 结构化拒；lineage CAS 拒", () => {
+  const home = temp();
+  const projectB = path.join(home, "project-b");
+  fs.mkdirSync(projectB, { recursive: true });
+  // 事件 task（bound，无 pending）+ 目标 task B（pending 代际 lin_c1，root = projectB）——跨项目选择的本意
+  const taskA = makeTaskEntry({ root: path.join(home, "project-a"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  taskA.session_id = "aily_session_a";
+  taskA.inbound_state = "bound";
+  const taskB = makeTaskEntry({ root: projectB, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
+  taskB.topic_generation_state.generations[0].channel_generation_id = "lin_c1";
+  taskB.topic_generation_state.generations[0].root_message_id = "om_b";
+  writeRegistryFixtureUnvalidated([taskA, taskB], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // ② rebind：没有既有 legacy writer → 结构化拒（shadow 期 fail-closed，不伪造 mapping 写）
+  const r2 = selectLegacyUpdate({ action: "rebind", projectRoot: projectB, lineageId: "lin_c1", eventSessionId: "aily_session_b" }, { task: taskA, home });
+  assert.equal(r2.ok, false, "② rebind 拒：" + JSON.stringify(r2));
+  assert.equal(r2.reason, "select_rebind_legacy_unsupported", "② " + r2.reason);
+  // ③ lineage CAS：载荷 lineageId 与 pending 代际不符 → promoteTask 自拒（不静默换目标）
+  const r3 = selectLegacyUpdate({ action: "activate", projectRoot: projectB, lineageId: "lin_other", eventSessionId: "aily_session_c" }, { task: taskA, home });
+  assert.equal(r3.ok, false, "③ CAS 拒：" + JSON.stringify(r3));
+  assert.equal(r3.reason, "pending_generation_mismatch", "③ " + r3.reason);
+
+  // ① activate：真 promoteTask —— task B 的 pending 代际激活到事件会话
+  const r = selectLegacyUpdate({ action: "activate", projectRoot: projectB, lineageId: "lin_c1", eventSessionId: "aily_session_b" }, { task: taskA, home });
+  assert.equal(r.ok, true, "① activate 成功：" + JSON.stringify(r));
+  const reg1 = loadRegistry(path.join(home, "registry.json"));
+  const taskB1 = reg1.tasks.find((t) => t.root === projectB);
+  const gen1 = taskB1.topic_generation_state.generations[0];
+  assert.equal(gen1.status, "active", "legacy 代际已激活：" + JSON.stringify(gen1));
+  assert.equal(gen1.session_id, "aily_session_b", "legacy 会话 = 事件会话");
+  assert.equal(taskB1.channel_generation_id, "lin_c1", "mapping 代际 = 账本 lineage");
 });
 
 test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {

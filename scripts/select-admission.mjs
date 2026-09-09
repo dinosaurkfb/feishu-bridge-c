@@ -340,11 +340,18 @@ export function executeSelectControl(intent, {
     return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }
   const target = doc.records[res.target_id];
-  // R57d 返修一 P1-1：按账本 authority_mode 分派走 m1a/wiring.mjs 的三个具名 wrapper（唯一写面；
-  //   shadow 期不碰 activate/anchor/rebindSessionAlias 直调，不给第二个入口）。mappingUpdate 是
-  //   activate/rebind 的 legacy 提交回调（更新 mapping）；shadow 期缺席 → wrapper 拒 select_legacy_required。
+  // R57d 返修二 P1-1：载荷带足 legacy writer（Claude promoteBinding / Codex promoteTask）需要的身份 ——
+  //   generation（lineageId）/ CAS（rootOm、expectedOldSessionId、expectedExpiresAt）/ 目标项目根。
   const legacy = typeof mappingUpdate === "function"
-    ? () => mappingUpdate({ action, endpointId, targetId: res.target_id, chatId, eventSessionId, senderId, messageId })
+    ? () => mappingUpdate({
+        action, endpointId, targetId: res.target_id, handle,
+        projectRoot: target.binding_target?.project_root ?? null,
+        lineageId: target.generation_lineage_id ?? null,
+        rootOm: target.aliases?.root_om ?? null,
+        expectedOldSessionId: target.aliases?.session_id ?? null,
+        expectedExpiresAt: target.rebind_expires_at ?? null,
+        chatId, eventSessionId, senderId, messageId,
+      })
     : null;
   let w;
   if (action === "activate") {

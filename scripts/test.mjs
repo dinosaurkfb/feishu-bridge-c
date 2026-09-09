@@ -45837,6 +45837,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(calls[0].action, "activate", "② 回调带 action");
     assert.equal(calls[0].targetId, ids.b1Id, "② 回调带 targetId");
     assert.equal(calls[0].eventSessionId, SESSION_D, "② 回调带事件会话");
+    // 返修二 P1-1：载荷带足 legacy writer（promoteBinding/promoteTask）需要的 generation / CAS 身份
+    assert.equal(calls[0].projectRoot, "/p/r57d", "② 回调带目标项目根：" + JSON.stringify(calls[0]));
+    assert.equal(calls[0].lineageId, "lin_d1", "② 回调带代际（generationId CAS 输入）");
+    assert.equal(calls[0].rootOm, "om_b1root", "② 回调带命中根 om");
+    assert.equal(calls[0].handle, ids.b1Handle, "② 回调带 handle");
     const rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id];
     assert.equal(rec.binding_proof.kind, "owner_select_v1", "② 账本双证落账");
     // ③ anchor 免注入（legacy 显式 no-op）——成功（事件 session 取 A2 现场，见 P1-5）
@@ -46016,7 +46021,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].aliases.session_id, SESSION_D + "-new", "换绑到事件会话");
   }));
 
-  test("R57d 真入口（subprocess）：on+osh → consumed 收据 + 账本双证；同 message 重放 → 「已处理」且账本不再变", () => {
+  test("R57d 真入口（subprocess）：shadow+真 legacy 回调 → consumed 收据 + 账本双证 + mapping 一致；同 message 重放 → 「已处理」且账本不再变", () => {
     // endpointId 必须 = legacyEndpointId(bootTpl.agent_uid)——aily-inbound 子进程按它派生账本目录
     const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "7621020633916345545", chat_name: "群", chat_id: CHAT_D, default_freshness_ms: 900000, agent_uid: "agent_d" };
     const EP_ENTRY = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
@@ -46031,18 +46036,24 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
         "00000000-0000-4000-8000-000000000da1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57d_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP_ENTRY, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
         "00000000-0000-4000-8000-000000000da2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57d_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57d_up", endpoint: EP_ENTRY, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP_ENTRY, from_schema: "1.0", to_schema: "1.1-transition" } }
       }, records: {} };
+      // 跨项目 owner_select（§0 的本意）：事件话题的绑定（registry 条目 A，无 pending）路由本条 select；
+      //   被选 B1 属于项目 B —— 它的 pending 代际只住在项目 B 的映射文件里（不在 registry，
+      //   findPendingBinding 看不见它，认领路径不抢这条消息）。legacy 回调经 pendingGenerationIdentity
+      //   读到它，promoteBinding 走 project-files 支激活到事件会话。
+      const projectB = path.join(local, "project-b"); fs.mkdirSync(path.join(projectB, ".runtime-data", "inbound"), { recursive: true, mode: 0o700 });
+      const pendingGen = { channel_generation_id: "lin_d1", generation: 1, status: "pending", root_message_id: ROOT_D, session_id: null, created_at: "2026-09-13T00:00:00.000Z", pending_token: null, claim_expires_at: null };
+      const pendingState = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: "r57d-b@project-files", binding_status: "active", active_generation_id: null, rotation: null, generations: [pendingGen] };
+      fs.writeFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "r57d-b@project-files", status: "active", root_message_id: ROOT_D, session_id: null, channel_generation_id: "lin_d1", claude_session_id: "00000000-0000-4000-8000-0000000000d2", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: pendingState }, null, 2) + "\n", { mode: 0o600 });
       fs.mkdirSync(path.join(ledgerDir, EP_ENTRY), { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(ledgerDir, EP_ENTRY, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
-      const b1 = TAL.createB1({ endpointId: EP_ENTRY, requestKey: "r57d_b1", chatId: CHAT_D, rootOm: ROOT_D, lineageId: "lin_d1", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: "00000000-0000-4000-8000-0000000000d1" }, clock: () => T0D });
+      const b1 = TAL.createB1({ endpointId: EP_ENTRY, requestKey: "r57d_b1", chatId: CHAT_D, rootOm: ROOT_D, lineageId: "lin_d1", bindingTarget: { runtime: "claude", project_root: projectB, claude_session_id: "00000000-0000-4000-8000-0000000000d1" }, clock: () => T0D });
       assert.ok(b1.ok, JSON.stringify(b1));
       const a1 = TAL.createA1({ endpointId: EP_ENTRY, requestKey: "r57d_a1", chatId: CHAT_D, sessionId: SESSION_D, clock: () => T0D });
       assert.ok(a1.ok, JSON.stringify(a1));
-      // R57d 返修一 P1-1：真入口在 shadow 期必须走复合双写（mappingUpdate 由调用方注入，子进程注不进去）
-      //   —— 夹具把账本切到 authoritative，执行器走 ledger-only 分派（owner_select writer on ≠ 账本 authoritative）。
-      const lp = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY });
-      const cut = TAL.cutoverPlan({ endpointId: EP_ENTRY, chain: "claude", requestKey: "r57d_entry_cut", operationId: "00000000-0000-4000-8000-000000000c02", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: "e".repeat(64), sidecarShas: { expiry: "e".repeat(64), pending_claims: "f".repeat(64), policy: "a".repeat(64) } });
-      assert.ok(cut.ok, JSON.stringify(cut));
-      fs.writeFileSync(path.join(ledgerDir, EP_ENTRY, "ledger.json"), JSON.stringify(cut.doc, null, 2) + "\n", { mode: 0o600 });
+      // R57d 返修二 P1-1：真入口 shadow 期走真复合双写 —— 账本保持 shadow，两链入站接真 legacy 回调
+      //   （promoteBinding），M1a 收据种好让端点处于已启用态；不再用「切 authoritative 绕过」。
+      fs.mkdirSync(path.join(local, "maint"), { recursive: true, mode: 0o700 });
+      seedReceipt57d(path.join(local, "maint"), EP_ENTRY);
       // writer on + campaign complete（准入 on）
       const eps = [EP_ENTRY];
       fs.writeFileSync(path.join(ledgerDir, "owner-select-campaign.json"), JSON.stringify({ schema_version: R57D_CAMPAIGN_SCHEMA, campaign_id: campaignIdFor("00000000-0000-4000-8000-0000000000d9"), state: "complete", endpoints: eps, endpoints_digest: endpointsDigest(eps), pending_joins: [], members: Object.fromEntries(eps.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 1, origin_operation_id: "00000000-0000-4000-8000-0000000000d9" }) + "\n", { mode: 0o600 });
@@ -46055,19 +46066,21 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const run = (messageId) => {
         const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> /feishu-select " + b1.result.selection_handle;
         const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: SESSION_D, role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
-        return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: SESSION_D, AILY_CLI_RUN_ID: "run_" + messageId, FAKE_AILY_ENVELOPE: envelope } });
+        return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(local, "maint"), AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: SESSION_D, AILY_CLI_RUN_ID: "run_" + messageId, FAKE_AILY_ENVELOPE: envelope } });
       };
       const revBefore = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision;
       const r1 = run("om_msgd1");
       assert.equal(r1.status, 0, r1.stdout + r1.stderr);
-      const recDir = path.join(root, ".runtime-data", "inbound", "receipts");
-      for (const f of fs.readdirSync(recDir)) {
-        const body = JSON.parse(fs.readFileSync(path.join(recDir, f), "utf-8"));
-      }
-      const probe2 = run("msg_d1_probe2");
       assert.match(r1.stdout, /已按你的选择完成绑定/u, "成功回执：" + r1.stdout);
       const doc1 = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY });
       assert.equal(doc1.doc.records[b1.result.created_id].binding_proof.kind, "owner_select_v1", "真入口双证落账");
+      assert.equal(doc1.doc.authority_mode, "shadow", "账本保持 shadow（复合双写，不再切 authoritative 绕过）");
+      // legacy 真的被更新：项目 B 映射文件的 pending 代际被激活到事件会话，与账本一致
+      const mapB = JSON.parse(fs.readFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), "utf-8"));
+      assert.equal(mapB.topic_generation_state.generations[0].status, "active", "legacy 代际已激活：" + JSON.stringify(mapB.topic_generation_state));
+      assert.equal(mapB.topic_generation_state.generations[0].session_id, SESSION_D, "legacy 会话 = 事件会话");
+      assert.equal(mapB.channel_generation_id, "lin_d1", "mapping 代际 = 账本 lineage");
+      assert.equal(mapB.feishu_root_message_id_reference, ROOT_D, "mapping 根 = 账本 selected_root_om（promoteBinding 物化字段名）");
       const rev1 = doc1.doc.revision;
       // 同 message 重放 → 已处理，账本不再变
       const r2 = run("om_msgd1");

@@ -45987,6 +45987,39 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(fs.existsSync(path.join(claimsDir, key2 + ".control-committed-unclean.json")), false, "③ unclean 已清");
   }));
 
+  test("R57d 返修三 P1-1：shadow rebind 的 W2 复合——claude selectClaudeLegacyUpdate（W2 精确绑定 → promoteBinding 双写；无 pending / root 不符 → 结构化拒）", async () => {
+    const R = await import("./inbound.mjs");
+    const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57d-w2-")));
+    try {
+      const projectB = path.join(local, "project-b");
+      fs.mkdirSync(path.join(projectB, ".runtime-data", "inbound"), { recursive: true, mode: 0o700 });
+      const activeGen = { channel_generation_id: "lin_active", generation: 1, status: "active", root_message_id: "om_b3root", session_id: "aily_old", created_at: "2026-09-13T00:00:00.000Z", pending_token: null, claim_expires_at: null };
+      const pendingGen = { channel_generation_id: "lin_p2", generation: 2, status: "pending", root_message_id: "om_newroot", session_id: null, created_at: "2026-09-13T00:00:00.000Z", pending_token: "tok_w2", claim_expires_at: null };
+      const st = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: "b@project-files", binding_status: "active", active_generation_id: "lin_active", rotation: { operation_id: "rot_w2", status: "awaiting_claim", pending_generation_id: "lin_p2" }, generations: [activeGen, pendingGen] };
+      fs.writeFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "b@project-files", status: "active", root_message_id: "om_b3root", session_id: "aily_old", channel_generation_id: "lin_active", claude_session_id: "00000000-0000-4000-8000-0000000000d5", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: st }, null, 2) + "\n", { mode: 0o600 });
+      // ① W2 精确绑定：root 相符 → promoteBinding 激活新代际到事件会话
+      const r1 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new" }, { now: Date.parse("2026-09-13T10:00:00.000Z") });
+      assert.equal(r1.ok, true, "① W2 复合成功：" + JSON.stringify(r1));
+      const map = JSON.parse(fs.readFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), "utf-8"));
+      const gens = map.topic_generation_state.generations;
+      assert.equal(gens.find((g) => g.channel_generation_id === "lin_p2").status, "active", "新代际已激活");
+      assert.equal(gens.find((g) => g.channel_generation_id === "lin_p2").session_id, "aily_new", "新代际会话 = 事件会话");
+      assert.equal(gens.find((g) => g.channel_generation_id === "lin_active").status, "read-only", "旧代际 read_only：" + JSON.stringify(gens));
+      // ② root 不符（不是这个 B3 的 W2 继承）→ 结构化拒
+      const r2 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_other_b3", eventSessionId: "aily_x" }, { now: Date.parse("2026-09-13T10:00:00.000Z") });
+      assert.equal(r2.ok, false, "② root 不符拒：" + JSON.stringify(r2));
+      assert.equal(r2.reason, "select_rebind_legacy_unsupported", "② " + r2.reason);
+      // ③ 无 pending（ succession 对象不存在）→ 结构化拒
+      const st2 = JSON.parse(JSON.stringify(st));
+      st2.generations = st2.generations.filter((g) => g.channel_generation_id !== "lin_p2");
+      st2.rotation = null;
+      fs.writeFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "b@project-files", status: "active", root_message_id: "om_b3root", session_id: "aily_old", channel_generation_id: "lin_active", claude_session_id: "00000000-0000-4000-8000-0000000000d5", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: st2 }, null, 2) + "\n", { mode: 0o600 });
+      const r3 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new2" }, { now: Date.parse("2026-09-13T10:00:00.000Z") });
+      assert.equal(r3.ok, false, "③ 无 pending 拒：" + JSON.stringify(r3));
+      assert.equal(r3.reason, "select_rebind_legacy_unsupported", "③ " + r3.reason);
+    } finally { fs.rmSync(local, { recursive: true, force: true }); }
+  });
+
   test("R57d 返修三 P1-3：claim 判别联合由 claim.control 决定——省略 claim 合法；rfh claim 被篡改成 osh/null context → 拒；显式 context 与 control 逐字不等 → 拒", () => {
     // 省略 claim（control.handle_kind/handle 双 null，context 同）→ 合法
     const omitted = { control: { control: "select", handle: null, handle_kind: null }, selection_context: { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: null, kind: null }, selection_context_digest_v1: SA.selectionContextDigestV1({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_m", sender: "ou_o", handle: null, kind: null }) };

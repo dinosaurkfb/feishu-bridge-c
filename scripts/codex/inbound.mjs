@@ -41,7 +41,7 @@ import {
   topicStateForTask,
   shadowCodexFirstClaim, taskPaths,
 } from "./state.mjs";
-import { pendingGeneration } from "../topic-generation.mjs";
+import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import { controlAckText, runControlTransaction } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { senderRole } from "../sender-roles.mjs";
@@ -73,18 +73,27 @@ import { executeSelectControl, selectAdmission, selectRejectTextByReason, select
  * legacy writer（W2 的 legacy 是新代际认领，非原地换绑）→ 结构化拒，shadow 期 fail-closed。
  */
 export function selectLegacyUpdate(u, { task, home = bridgeHome(), now = Date.now() } = {}) {
-  if (!u || typeof u !== "object" || u.action !== "activate") {
-    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "owner_select 换绑没有既有 legacy writer（W2 的 legacy 是新代际认领）" };
+  if (!u || typeof u !== "object" || (u.action !== "activate" && u.action !== "rebind")) {
+    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "未知 action（" + String(u?.action) + "）" };
   }
   const reg = loadRegistry(registryFile(home));
   if (!reg.ok) return reg;
-  const targetTask = (reg.tasks ?? []).find((t) => t.root === u.projectRoot) ?? task ?? null;
-  if (!targetTask) return { ok: false, reason: "entry_gone", why: "registry 里没有目标项目的 task" };
+  // R57d 返修三 P1-1：按 projectRoot 找目标 task——找不到**直接拒**（绝不回退到事件 task，那会写错对象）。
+  const targetTask = (reg.tasks ?? []).find((t) => t.root === u.projectRoot) ?? null;
+  if (!targetTask) return { ok: false, reason: "select_legacy_target_missing", why: "registry 里没有 projectRoot（" + String(u.projectRoot) + "）对应的 task——不回退、不写错对象" };
   const loaded = topicStateForTask(targetTask, { now });
   if (!loaded.ok) return loaded;
   const pending = pendingGeneration(loaded.state);
-  if (!pending) return { ok: false, reason: "no_pending_generation", why: "目标 task 没有 pending 代际（可能已激活/已轮转）" };
-  return promoteTask({ logicalTaskKey: targetTask.logical_task_key, sessionId: u.eventSessionId, generationId: u.lineageId, operationId: loaded.state.rotation?.operation_id ?? null, home, now });
+  if (!pending) return { ok: false, reason: u.action === "rebind" ? "select_rebind_legacy_unsupported" : "no_pending_generation", why: "目标 task 没有 pending 代际（可能已激活/已轮转）" };
+  // rebind 的 W2 精确绑定：active 代际 root === 所选 B3 的 root（B3 是当前绑定的活跃代际，新代际认领构成 W2 继承）
+  if (u.action === "rebind") {
+    const active = activeGeneration(loaded.state);
+    if ((active?.root_message_id ?? null) !== (u.rootOm ?? null)) {
+      return { ok: false, reason: "select_rebind_legacy_unsupported", why: "active 代际 root（" + (active?.root_message_id ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+    }
+  }
+  const generationId = u.action === "activate" ? u.lineageId : pending.channel_generation_id;
+  return promoteTask({ logicalTaskKey: targetTask.logical_task_key, sessionId: u.eventSessionId, generationId, operationId: loaded.state.rotation?.operation_id ?? null, home, now });
 }
 
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {

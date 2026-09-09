@@ -81,6 +81,29 @@ import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, e
  * 刻意**不重排函数体的缩进**：这个文件近七百行，重排会让 diff 完全无法评审，
  * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
  */
+/**
+ * R57d 返修三 P1-1：owner_select 的 legacy 提交回调（Claude 链，$feishu-select shadow 期复合双写的 legacy 半笔）。
+ *   activate → 复用 promoteBinding（W1）；rebind → 存在与所选 B3 精确绑定的 W2 新代际 pending
+ *   （同项目 pending 代际在场 ∧ 其 active 代际 root_om === B3 的 root——B3 正是当前绑定的活跃代际，
+ *   新代际认领构成 W2 换绑继承）时复用 promoteBinding 激活新代际到事件会话；不存在 → 结构化拒
+ *   select_rebind_legacy_unsupported（不得把任意 orh_ 冒充 W2）。
+ */
+export function selectClaudeLegacyUpdate(u, { now = Date.now() } = {}) {
+  if (!u || typeof u !== "object" || (u.action !== "activate" && u.action !== "rebind")) {
+    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "未知 action（" + String(u?.action) + "）" };
+  }
+  const idy = pendingGenerationIdentity({ root: u.projectRoot, now });
+  if (!idy.ok) {
+    return u.action === "activate" ? idy
+      : { ok: false, reason: "select_rebind_legacy_unsupported", why: "所选 B3 的项目没有 pending 新代际（无 W2 继承），shadow 期换绑拒" };
+  }
+  if (u.action === "rebind" && (idy.activeRootOm ?? null) !== (u.rootOm ?? null)) {
+    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "active 代际 root（" + (idy.activeRootOm ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+  }
+  const generationId = u.action === "activate" ? u.lineageId : idy.generationId;
+  return promoteBinding({ root: u.projectRoot, generationId, operationId: idy.operationId, sessionId: u.eventSessionId, now });
+}
+
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {
 
 // 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放（stdout 就是给运输 agent 的回复）
@@ -741,6 +764,7 @@ const runControl = (replay) => {
   finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };
+
 // ---------- /feishu-select 控制命令事务（R52a）：锁内确定性处置准入，落 failed 终态（执行器未接入期不落 consumed，PR #136 P1-4） ----------
 const runSelect = (replay) => {
   const tx = runControlTransaction({
@@ -772,12 +796,7 @@ const runSelect = (replay) => {
       // R57d 返修二 P1-1：shadow 期的 legacy 提交回调 —— 复用既有 promoteBinding（W1 的 legacy writer），
       //   载荷由执行器带足 generation/CAS 身份；operationId 从目标绑定的 pending 代际读出。
       //   换绑（rebind）没有既有 legacy writer（W2 的 legacy 是新代际认领，非原地换绑）→ 结构化拒，shadow 期 fail-closed。
-      mappingUpdate: (u) => {
-        if (u.action !== "activate") return { ok: false, reason: "select_rebind_legacy_unsupported", why: "owner_select 换绑没有既有 legacy writer（W2 的 legacy 是新代际认领）" };
-        const idy = pendingGenerationIdentity({ root: u.projectRoot });
-        if (!idy.ok) return idy;
-        return promoteBinding({ root: u.projectRoot, generationId: u.lineageId, operationId: idy.operationId, sessionId: u.eventSessionId });
-      },
+      mappingUpdate: (u) => selectClaudeLegacyUpdate(u),
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: CLAIMS,

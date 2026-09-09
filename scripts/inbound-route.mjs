@@ -31,7 +31,7 @@ import {
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
 } from "./subscription.mjs";
 import {
-  activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
+  activatePendingTopicGeneration, activeGeneration, materializeLegacyTopicFields, pendingGeneration,
   topicGenerationStateForLegacy, effectiveBindingId,
   generationForSession,
 } from "./topic-generation.mjs";
@@ -587,7 +587,8 @@ export function pendingGenerationIdentity({ root, registryFile = registryPath(),
     if (!loaded.ok) return loaded;
     const pending = pendingGeneration(loaded.state);
     if (!pending) return { ok: false, reason: "no_pending_generation", why: "目标绑定没有 pending 代际（可能已激活/已轮转）" };
-    return { ok: true, generationId: pending.channel_generation_id, operationId: loaded.state.rotation?.operation_id ?? null };
+    const active = activeGeneration(loaded.state);
+    return { ok: true, generationId: pending.channel_generation_id, operationId: loaded.state.rotation?.operation_id ?? null, activeRootOm: active?.root_message_id ?? null };
   };
   try {
     const mapping = JSON.parse(fs.readFileSync(projectMappingPath(root), "utf-8"));

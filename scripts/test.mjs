@@ -18854,6 +18854,17 @@ test("R52a item 三：selectReject 四支（off/partial/on/unreadable + rfh 放�
   }
 });
 
+test("R53 返修六 P2（select-outcome 叶子模块）：classifySelectOutcome 对 committed_durability_uncertain / committed_with_residue 判 unclean（control-committed-unclean，不是 clean/consumed）——验收那边把刀存活", () => {
+  const base = { intentCleanup: "cleared", locks: { outer: "released", intent: "released" } };
+  const dur = SA.classifySelectOutcome({ ...base, ledger: { ok: true, commit: "committed_durability_uncertain" } });
+  assert.equal(dur.ok, false, "durability_uncertain 必非绿：" + JSON.stringify(dur));
+  assert.equal(dur.status, "control-committed-unclean", "durability_uncertain → control-committed-unclean：" + JSON.stringify(dur));
+  assert.equal(dur.ledger, "unclean", "ledger 分量 unclean");
+  const res = SA.classifySelectOutcome({ ...base, ledger: { ok: true, commit: "committed_with_residue", residue: [{ reap: ".reaped-x" }] } });
+  assert.equal(res.ok, false, "committed_with_residue 必非绿");
+  assert.equal(res.status, "control-committed-unclean", "committed_with_residue 同构 → unclean：" + JSON.stringify(res));
+});
+
 test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProblem 合法）/ /feishu-select R3 / 大小写变体 malformed", () => {
   const h = "osh_" + "a".repeat(32);
   assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null, "select claim meta 合法（P1 修后）");

@@ -23,96 +23,9 @@ import { canonKey } from "./maintenance/canon.mjs";
  * 3. 两层锁释放（outer / intent 各 released / residue / unclear）
  * 只有三份都干净才 ok → consumed + 绿色文案；已提交未收净 → control-committed-unclean。
  */
-export function classifySelectOutcome({
-  ledger = null,
-  intentCleanup = null,
-  locks = null,
-} = {}) {
-  let ledgerStatus = "not_committed";
-  if (typeof ledger === "string") {
-    if (["clean", "unclean", "not_committed"].includes(ledger)) {
-      ledgerStatus = ledger;
-    }
-  } else if (ledger && typeof ledger === "object") {
-    const isCleanCommit = ledger.ok === true &&
-      ["committed_clean", "replayed", "already"].includes(ledger.commit) &&
-      (!ledger.residue || ledger.residue.length === 0) &&
-      !ledger.lockUncleared &&
-      ledger.lock_state !== "unclear";
+import { classifySelectOutcome } from "./select-outcome.mjs";
+export { classifySelectOutcome };
 
-    if (isCleanCommit) {
-      ledgerStatus = "clean";
-    } else if (
-      ledger.commit === "committed_durability_uncertain" ||
-      ledger.commit === "committed_with_residue" ||
-      (typeof ledger.commit === "string" && ledger.commit.startsWith("committed")) ||
-      ledger.lockUncleared != null ||
-      ledger.lock_state === "unclear" ||
-      (ledger.residue && ledger.residue.length > 0)
-    ) {
-      ledgerStatus = "unclean";
-    } else {
-      ledgerStatus = "not_committed";
-    }
-  }
-
-  let intentStatus = "unclear";
-  if (intentCleanup === "cleared" || intentCleanup === true) {
-    intentStatus = "cleared";
-  } else if (intentCleanup === "unclear" || intentCleanup === false || intentCleanup === null) {
-    intentStatus = "unclear";
-  }
-
-  const outerLock = locks?.outer ?? "released";
-  const intentLock = locks?.intent ?? "released";
-  const locksStatus = {
-    outer: ["released", "residue", "unclear"].includes(outerLock) ? outerLock : "unclear",
-    intent: ["released", "residue", "unclear"].includes(intentLock) ? intentLock : "unclear",
-  };
-
-  const isAllClean =
-    ledgerStatus === "clean" &&
-    intentStatus === "cleared" &&
-    locksStatus.outer === "released" &&
-    locksStatus.intent === "released";
-
-  if (isAllClean) {
-    return {
-      ok: true,
-      status: "consumed",
-      ledger: ledgerStatus,
-      intent_cleanup: intentStatus,
-      locks: locksStatus,
-    };
-  }
-
-  if (ledgerStatus === "clean" || ledgerStatus === "unclean") {
-    return {
-      ok: false,
-      status: "control-committed-unclean",
-      ledger: ledgerStatus,
-      intent_cleanup: intentStatus,
-      locks: locksStatus,
-      reason: "control_committed_unclean",
-      why: "已写入但收口不干净（" +
-        (ledgerStatus !== "clean" ? "账本未净: " + ledgerStatus : "") +
-        (intentStatus !== "cleared" ? "；intent未清" : "") +
-        (locksStatus.outer !== "released" ? "；outer锁: " + locksStatus.outer : "") +
-        (locksStatus.intent !== "released" ? "；intent锁: " + locksStatus.intent : "") +
-        "）",
-    };
-  }
-
-  return {
-    ok: false,
-    status: "failed",
-    ledger: ledgerStatus,
-    intent_cleanup: intentStatus,
-    locks: locksStatus,
-    reason: (typeof ledger === "object" && ledger?.reason) ? ledger.reason : "not_committed",
-    why: (typeof ledger === "object" && ledger?.why) ? ledger.why : null,
-  };
-}
 
 /** selection_context 稳定摘要计算（§8.1/R57b/R57d：不含 root，缺项显式 null）。 */
 export function selectionContextDigestV1({

@@ -32,7 +32,7 @@ import {
   AUTHORIZED_BY_SHAPE, SHA_SHAPE, resolveEndpointDir, loadLedger, familyOf,
   ownerSelectReaffirmClosureDigest, ownerSelectReaffirm,
 } from "../topic-agent-ledger.mjs";
-import { classifySelectOutcome } from "../select-admission.mjs";
+import { classifySelectOutcome } from "../select-outcome.mjs";
 
 export const REAFFIRM_INTENTS_FILE = "reaffirm-intents.json";
 export const REAFFIRM_INTENTS_LOCK = "reaffirm-intents.lock";

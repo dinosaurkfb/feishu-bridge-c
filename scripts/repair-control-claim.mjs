@@ -15,7 +15,8 @@ import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { expectationFromMapping, claudeControlPrecondition } from "./control-identity.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { executeSelectControl, verifySelectionContext } from "./select-admission.mjs";
+import { executeSelectControl, verifySelectionContext, mintSelectCapability } from "./select-admission.mjs";
+import { senderRole } from "./sender-roles.mjs";
 import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE } from "./topic-agent-ledger.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
@@ -109,12 +110,20 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
         _inject: ctx?._inject,
       });
     }
+    // R57d 返修三 P1-2：repair 重核角色（角色表 owner）/ endpoint / chat 后才重新铸造 capability。
+    const ownerCtx = ctx?.ownerContext ?? null;
+    if (ownerCtx) {
+      const role = senderRole({ frank_sender_id: ownerCtx.frankSenderId, senders: ownerCtx.senders ?? [] }, sc.sender);
+      if (role !== "owner") return { ok: false, reason: "select_sender_mismatch", why: "repair 重核角色：claim 登记的 sender 当前不是 owner（角色=" + String(role) + "）" };
+      if (ownerCtx.chatId != null && sc.chat !== ownerCtx.chatId) return { ok: false, reason: "select_sender_mismatch", why: "repair 重核 chat：claim 的 chat（" + sc.chat + "）与当前链路登记（" + ownerCtx.chatId + "）不一致" };
+    }
     return executeSelectControl(target, {
       endpointId: sc.endpoint,
       chatId: sc.chat,
       senderId: sc.sender,
       messageId: sc.message,
       eventSessionId: sc.session ?? null,
+      capability: mintSelectCapability({ endpoint: sc.endpoint, chat: sc.chat, session: sc.session, message: sc.message, sender: sc.sender, handle: sc.handle, handleKind: sc.kind }),
       txCtx: ctx && ctx.claimsDir && ctx.key ? { claimsDir: ctx.claimsDir, key: ctx.key, claim: ctx.claim ?? null } : null,
       env: ctx?.env,
       _inject: ctx?._inject,
@@ -291,6 +300,15 @@ if (isDirectRun(import.meta.url)) {
   const expectation = claudeClaimExpectation({ root, claudeSessionId });
   if (!expectation.ok) { process.stdout.write("当前项目没有可用绑定（" + expectation.reason + "）\n"); process.exit(1); }
   const expect = expectation.expect;
+  // R57d 返修三 P1-2：repair 的 owner 重核上下文 —— 当前角色表（frank_sender_id + senders）与链路登记 chat
+  //   从链路模板解析；select 支重核角色 / chat 后才重铸 capability。模板读不出 → ownerContext 缺席（其余闸不变）。
+  let ownerContext = null;
+  try {
+    const tpl = loadChainTemplate();
+    if (tpl?.ok === true && typeof tpl.template?.frank_sender_id === "string") {
+      ownerContext = { frankSenderId: tpl.template.frank_sender_id, senders: tpl.template.senders ?? [], chatId: tpl.template.chat_id ?? null };
+    }
+  } catch { /* 读不出不阻断非 select 支 */ }
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
@@ -299,7 +317,7 @@ if (isDirectRun(import.meta.url)) {
       execute: (target, ctx) => dispatchControlRepair(target, {
         onMode: (mode) => setClaudeInteractionMode({ root, claudeSessionId: expect.claudeSessionId, mode,
           precondition: claudeControlPrecondition({ claimsDir, key: parsed.key, root }) }),
-      }, ctx) });
+      }, { ...ctx, ownerContext }) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

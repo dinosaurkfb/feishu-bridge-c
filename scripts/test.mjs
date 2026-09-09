@@ -45816,6 +45816,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   };
   const ctxD = (over = {}) => ({ selectAdmissionFn: () => ({ state: "on" }), senderId: "ou_owner57d", chatId: CHAT_D, endpointId: EP57D, messageId: "om_msgd1", eventSessionId: SESSION_D, env: process.env, ...over });
   const mappingStub = (calls) => (ctx) => { calls.push(ctx); return { ok: true, legacyCommitted: true }; };
+  // 返修三 P1-2：执行器层测试模拟调用方（R3 分支）铸造——与 SA.mintSelectCapability 同一口径
+  const capD = (handle = null, handleKind = null, over = {}) => SA.mintSelectCapability({ endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_msgd1", sender: "ou_owner57d", handle, handleKind, ...over });
   // B 段 P1-2：wiring 层直调测试用的受验 capability 铸造（执行器内铸同一形状）
   const mkCap = (over = {}) => Object.freeze({ kind: "owner_select_control_v1", endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_cap", sender: "ou_owner57d", handle: null, handleKind: "osh", ...over });
 
@@ -45844,7 +45846,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.ok(acq.release().ok, "② 释放");
     // ③ anchor：没有 legacy mapping 权威事实 → legacy 显式 no-op 记录，但仍走 outer 排序 + ledger
     const a2rec = recAt()[ids.a2Id];
-    const wC = WIRE.wireSelectAnchor({ endpointId: EP57D, env: process.env, capability: mkCap({ message: "om_w3", handle: ids.a2Handle }), messageId: "om_w3", id: ids.a2Id, authorizedBy: "ou_owner57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionBasis: "explicit_handle", clock: () => T0D });
+    const wC = WIRE.wireSelectAnchor({ endpointId: EP57D, env: process.env, capability: mkCap({ message: "om_w3", handle: ids.a2Handle, session: a2rec.aliases.session_id }), requestedHandle: ids.a2Handle, messageId: "om_w3", id: ids.a2Id, authorizedBy: "ou_owner57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.ok(wC.ok, "③ anchor 复合成功：" + JSON.stringify(wC));
     assert.equal(wC.legacy.noop, true, "③ anchor legacy 显式 no-op（不伪造 mapping 写）");
     assert.ok(wC.shadow[0].ok, "③ ledger op 成功：" + JSON.stringify(wC.shadow[0]));
@@ -45871,7 +45873,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
   test("R57d 返修一 B 段 P1-2（wiring 层）：wireSelect* 只认绑定本次选择上下文的 capability——缺/裸 sender/通用 full/上下文不符 → 拒且 legacy 不跑", () => withLedgerD((root, dir, ids) => {
     const base = { endpointId: EP57D, env: process.env, messageId: "om_cap1", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: SESSION_D, authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D };
-    const cap = (over = {}) => Object.freeze({ kind: "owner_select_control_v1", endpoint: EP57D, message: "om_cap1", sender: "ou_owner57d", handle: ids.b1Handle, handleKind: "osh", ...over });
+    const cap = (over = {}) => Object.freeze({ kind: "owner_select_control_v1", endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: "om_cap1", sender: "ou_owner57d", handle: ids.b1Handle, handleKind: "osh", ...over });
     let calls = 0;
     const legacy = () => { calls += 1; return { ok: true, legacyCommitted: true }; };
     // ① 缺 capability → 拒（不收裸上下文参数）
@@ -45885,7 +45887,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(w3.reason, "select_capability_required", "② 通用 full：" + w3.reason);
     // ③ 上下文不符（sender / handle / endpoint 任一）→ 拒
     for (const over of [{ sender: "ou_other" }, { handle: "osh_" + "0".repeat(32) }, { endpoint: "endpoint_" + "9".repeat(24) }]) {
-      const w = WIRE.wireSelectActivate({ ...base, legacy, capability: cap(over) });
+      const baseOver = over.handle ? { requestedHandle: over.handle } : over; // handle 不符例经 requestedHandle 驱动 want.handle
+      const capOver = over.handle ? {} : over; // capability 侧保留正确 handle，与被篡改的 requestedHandle 形成不等
+      const w = WIRE.wireSelectActivate({ ...base, ...baseOver, legacy, capability: cap(capOver) });
       assert.equal(w.ok, false, "③ 不符拒：" + JSON.stringify(over));
       assert.equal(w.reason, "select_capability_invalid", "③ " + JSON.stringify(over) + " → " + w.reason);
     }
@@ -45905,15 +45909,15 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     fs.mkdirSync(path.join(root, "claims", "0".repeat(64) + ".claim"), { recursive: true });
     const txCtx = { claimsDir: path.join(root, "claims"), key: "0".repeat(64), claim };
     // ① 旧形 claim（无 selection_context）→ fail-closed 点名
-    const r1 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx: { claimsDir: txCtx.claimsDir, key: txCtx.key, claim: { control: claim.control } } }));
+    const r1 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  mappingUpdate: mappingStub([]), txCtx: { claimsDir: txCtx.claimsDir, key: txCtx.key, claim: { control: claim.control } } }));
     assert.equal(r1.ok, false, "① 旧形 claim 拒：" + JSON.stringify(r1));
     assert.equal(r1.reason, "selection_context_missing", "① " + r1.reason);
     // ② 非 owner：执行 sender ≠ claim 登记的 owner → 拒
-    const r2 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx, senderId: "ou_other" }));
+    const r2 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh", { sender: "ou_other" }),  mappingUpdate: mappingStub([]), txCtx, senderId: "ou_other" }));
     assert.equal(r2.ok, false, "② 非 owner 拒：" + JSON.stringify(r2));
     assert.equal(r2.reason, "select_sender_mismatch", "② " + r2.reason);
     // ③ 正常：铸 capability → 复合成功；capability 不持久化（claims 目录 grep 不到）
-    const r3 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), txCtx }));
+    const r3 = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  mappingUpdate: mappingStub([]), txCtx }));
     assert.equal(r3.ok, true, "③ 成功：" + JSON.stringify(r3));
     let leaked = false;
     const walkClaims = (d) => {
@@ -45941,7 +45945,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     } });
     assert.equal(acquired.ok, true, "claim 取得：" + JSON.stringify(acquired));
     const runTx = (inject) => runControlTransaction({ claimsDir, key, intent: { control: "select", handle: ids.b1Handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
-      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ messageId: "om_unclean1", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: inject })) });
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(ids.b1Handle, "osh", { message: "om_unclean1" }), messageId: "om_unclean1", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: inject })) });
     // ① 注入目录 fsync 失败 → 账本已提交但收口不干净 → control-committed-unclean（不是 consumed、不是普通 failed）
     const tx1 = runTx({ failDirFsync: true });
     assert.equal(tx1.ok, false, "① 拒：" + JSON.stringify(tx1).slice(0, 300));
@@ -45974,7 +45978,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     } });
     assert.equal(acquired2.ok, true, "claim2 取得：" + JSON.stringify(acquired2));
     const tx3 = runControlTransaction({ claimsDir, key: key2, intent: { control: "select", handle: b2.result.selection_handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest2,
-      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ messageId: "om_unclean2", eventSessionId: SESSION_D + "-2", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: { failDirFsync: true } })) });
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(b2.result.selection_handle, "osh", { message: "om_unclean2", session: SESSION_D + "-2" }), messageId: "om_unclean2", eventSessionId: SESSION_D + "-2", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: { failDirFsync: true } })) });
     assert.equal(tx3.status, "control-committed-unclean", "③ 前置 unclean：" + JSON.stringify(tx3).slice(0, 200));
     // 目标已激活（B3），再跑会 no_candidate —— repair 的 osh/orh 收尾只核账本不重执行
     const repaired = resumeControlClaim({ claimsDir, key: key2, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
@@ -46005,7 +46009,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
   test("R57d 返修二 P1-6：A1 复核在 legacy 之前（preflight）——缺席 → no_a1 且 legacy 调用数为 0（Codex #147 二轮）", () => withLedgerD((root, dir, ids) => {
     let calls = 0;
-    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, capability: mkCap({ message: "om_w5", handle: ids.b1Handle }), messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, capability: mkCap({ message: "om_w5", handle: ids.b1Handle, session: "aily_none" }), requestedHandle: ids.b1Handle, messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
     assert.equal(w.ok, false, "preflight 拒 → 整笔拒：" + JSON.stringify(w));
     assert.equal(w.reason, "no_a1", "reason：" + w.reason);
     assert.equal(calls, 0, "legacy 调用数为 0（A1 复核在 legacy 之前，不再出现 legacy 已提交、shadow no_a1）");
@@ -46014,13 +46018,13 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   test("R57d 返修一 P1-1（执行器层）：shadow 缺 mappingUpdate → select_legacy_required 且账本不动（禁直写）；注入后复合成功且回调带选择上下文；anchor 免注入", () => withLedgerD((root, dir, ids) => {
     const rev0 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision;
     // ① shadow + 未注入 mappingUpdate → 拒，账本 revision 不变（禁绕过复合直写账本）
-    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD());
+    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  }));
     assert.equal(r.ok, false, "① 拒：" + JSON.stringify(r));
     assert.equal(r.reason, "select_legacy_required", "① reason：" + r.reason);
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision, rev0, "① 账本不动");
     // ② 注入 mappingUpdate → 复合成功；回调收到选择上下文；账本双证落账
     const calls = [];
-    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventRootOm: "om_b1root", mappingUpdate: mappingStub(calls) }));
+    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  eventRootOm: "om_b1root", mappingUpdate: mappingStub(calls) }));
     assert.equal(r.ok, true, "② 成功：" + JSON.stringify(r));
     assert.equal(r.action, "activate");
     assert.equal(calls.length, 1, "② legacy 回调被调一次");
@@ -46036,13 +46040,13 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(rec.binding_proof.kind, "owner_select_v1", "② 账本双证落账");
     // ③ anchor 免注入（legacy 显式 no-op）——成功（事件 session 取 A2 现场，见 P1-5）
     const a2rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
-    r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ eventSessionId: a2rec.aliases.session_id }));
+    r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.a2Handle, "osh", { session: a2rec.aliases.session_id }),  eventSessionId: a2rec.aliases.session_id }));
     assert.equal(r.ok, true, "③ anchor 免 mappingUpdate：" + JSON.stringify(r));
     assert.equal(r.action, "anchor");
   }));
 
   test("R57d on+osh(B1)：真执行器 activate——双证落账、B1 handle 消费、成功文案、select_executor_absent 不再出现", () => withLedgerD((root, dir, ids) => {
-    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]) }));
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.match(r.text, /已按你的选择完成绑定/u, "activate 文案：" + r.text);
     assert.equal(r.action, "activate");
@@ -46057,7 +46061,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
   test("R57d on+osh(A2)：anchor——expected 三件取自命中记录；成功后 anchor_candidate 保留", () => withLedgerD((root, dir, ids) => {
     const a2rec0 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
-    const r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ eventSessionId: a2rec0.aliases.session_id }));
+    const r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.a2Handle, "osh", { session: a2rec0.aliases.session_id }),  eventSessionId: a2rec0.aliases.session_id }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.action, "anchor");
     assert.match(r.text, /已按你的选择完成锚定/u);
@@ -46069,12 +46073,12 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   test("R57d 返修一 P1-6：activate 族 eligibility 进解析器——同 chat 且 session=事件 session 的 live A1 存在；省略分支不再把不可执行的 B1 算进歧义集合", () => withLedgerD((root, dir, ids) => {
     // ① 显式 osh：事件会话上无 A1（另一 A1 在别的 chat 上也不算）→ no_candidate（原实现走到 op 才 no_a1）
     talTmp(TAL.createA1({ endpointId: EP57D, requestKey: "r57d_a1other", chatId: "oc_other", sessionId: "aily_none", clock: () => T0D }));
-    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventSessionId: "aily_none" }));
+    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh", { session: "aily_none" }),  eventSessionId: "aily_none" }));
     assert.equal(r.ok, false);
     assert.equal(r.reason, "no_candidate", "① " + r.reason);
     // ② 省略：B1 不可执行 → activate 集空；A2 可执行 → 唯一候选 → anchor 成功（原实现 ambiguous 2 候选）
     const a2rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
-    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: a2rec.aliases.session_id }));
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ capability: capD(null, null, { session: a2rec.aliases.session_id }),  eventSessionId: a2rec.aliases.session_id }));
     assert.equal(r.ok, true, "② 省略 → 唯一 anchor 候选：" + JSON.stringify(r));
     assert.equal(r.action, "anchor");
   }));
@@ -46083,7 +46087,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const day = 24 * 3600 * 1000;
     let n = 0;
     const stepClock = () => T0D + (++n) * 20 * day; // ①解析 ②op 记账 ③锁内到期核（handle TTL 30 天）
-    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), clock: stepClock }));
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  mappingUpdate: mappingStub([]), clock: stepClock }));
     assert.equal(r.ok, false, JSON.stringify(r));
     assert.equal(r.reason, "handle_expired", "刚过期 handle → 拒：" + r.reason);
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].facts.binding, "pending", "handle 未被消费");
@@ -46097,7 +46101,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const att = TAL.attach({ endpointId: EP57D, requestKey: "r57d_pa" + i, id: a1.result.created_id, bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000e" + i }, claimKey: ("f".repeat(63) + String(i)), authorizedBy: "ou_r57d", anchorCandidate: "om_p" + i, clock: () => T0D });
       assert.ok(att.ok, "attach：" + JSON.stringify(att));
     }
-    const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
+    const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ capability: capD(null, null),  }));
     assert.equal(r.ok, false);
     assert.equal(r.reason, "ambiguous_selection");
     // 返修二 P1-8：activate 族（B1，可归并 A1 在事件会话上）+ anchor 族 6 = 并集 7——某族 ok 不再被另一族 ambiguous 遮住
@@ -46111,25 +46115,25 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   test("R57d 返修一 P2：endpoint 形状守卫 + granular 封闭分派——坏形状不进账本读；absent→no_candidate、corrupt→ledger_corrupt、unreadable→ledger_unreadable", () => withLedgerD((root, dir, ids) => {
     // ① endpoint 守卫：非 string / 空串 / 形状不符 → select_endpoint_unknown（原实现只挡 null，其余泄进账本读）
     for (const bad of [null, undefined, 123, "", "endpoint_short", "endpoint_" + "g".repeat(24)]) {
-      const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: bad }));
+      const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  endpointId: bad }));
       assert.equal(r.ok, false, String(bad));
       assert.equal(r.reason, "select_endpoint_unknown", String(bad) + " → " + r.reason);
     }
     // ② granular=absent（该 endpoint 无账本目录）→ no_candidate（不是 fail-closed）
     const epAbsent = "endpoint_" + "0".repeat(24);
-    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: epAbsent }));
+    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  endpointId: epAbsent }));
     assert.equal(r.ok, false);
     assert.equal(r.reason, "no_candidate", "absent → no_candidate：" + r.reason);
     // ③ granular=corrupt（可解析但校验不过）→ ledger_corrupt
     const epBad = "endpoint_" + "1".repeat(24);
     fs.mkdirSync(path.join(root, epBad), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(root, epBad, "ledger.json"), "{\"x\":1}", { mode: 0o600 });
-    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: epBad }));
+    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  endpointId: epBad }));
     assert.equal(r.reason, "ledger_corrupt", "corrupt → ledger_corrupt：" + r.reason);
     // ④ granular=unreadable（ledger.json 是目录 → EISDIR）→ ledger_unreadable
     const epDir2 = "endpoint_" + "2".repeat(24);
     fs.mkdirSync(path.join(root, epDir2, "ledger.json"), { recursive: true, mode: 0o700 });
-    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ endpointId: epDir2 }));
+    r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  endpointId: epDir2 }));
     assert.equal(r.reason, "ledger_unreadable", "unreadable → ledger_unreadable：" + r.reason);
   }));
 
@@ -46137,13 +46141,13 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     // ① 显式 osh 命中 B1：事件根不再传（eventRootOm 已删），B1 的根（om_b1root）≠ 旧 mapping 根（ROOT_D）→ 仍成功，
     //    账本 selected_root_om === 该 B1 的根（反例：非当前 mapping 根的 B1 也能被选中）
     assert.notEqual("om_b1root", ROOT_D, "夹具前提：B1 根 ≠ 旧 mapping 根");
-    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]) }));
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.b1Handle, "osh"),  mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, "① 成功：" + JSON.stringify(r));
     const b3 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id];
     assert.equal(b3.binding_proof.selected_root_om, "om_b1root", "① root = 命中 B1 的 aliases.root_om");
     assert.equal(b3.binding_proof.selected_root_om, b3.aliases.root_om, "① 六字段等式（G11′）");
     // ② anchor：root = A2.anchor_candidate；session = 受验入站事件 session（不再自填目标旧 session）
-    const r2 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ eventSessionId: SESSION_D + "-a2" }));
+    const r2 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ capability: capD(ids.a2Handle, "osh", { session: SESSION_D + "-a2" }),  eventSessionId: SESSION_D + "-a2" }));
     assert.equal(r2.ok, true, "② 成功：" + JSON.stringify(r2));
     const a3 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
     assert.equal(a3.locator_link_proof_ref.selected_root_om, a3.anchor_candidate, "② root = anchor_candidate");
@@ -46155,7 +46159,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
     const rq = TAL.requestRebind({ endpointId: EP57D, requestKey: "r57d_rq", b3Id: ids.b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: SESSION_D, clock: () => T0D });
     assert.ok(rq.ok, "requestRebind：" + JSON.stringify(rq));
-    const r = SA.executeSelectControl({ control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, ctxD({ eventSessionId: SESSION_D + "-new", mappingUpdate: mappingStub([]) }));
+    const r = SA.executeSelectControl({ control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, ctxD({ capability: capD(rq.result.rebind_handle, "orh", { session: SESSION_D + "-new" }),  eventSessionId: SESSION_D + "-new", mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.action, "rebind");
     const doc = TAL.loadLedger(dir, { endpointId: EP57D });
@@ -46164,7 +46168,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
   test("R57d on+省略：唯一候选成功；多候选 → ambiguous_selection 且正文只列 opaque id；过期 handle → no_candidate；chat 不符 → 拒", () => withLedgerD((root, dir, ids) => {
     // 省略：B1+A2 同 chat → 两集合各有恰一 → 合并 2 → ambiguous
-    let r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
+    let r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ capability: capD(null, null),  }));
     assert.equal(r.ok, false, "多集合候选 → 拒");
     assert.equal(r.reason, "ambiguous_selection");
     assert.match(r.text, /2 个候选/u, "回执列计数：" + r.text);
@@ -46177,7 +46181,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.doesNotMatch(r.text, /还有/u, "≤5 全列，无超限提示");
     // 砍到唯一：先 activate 掉 B1（旧形基线），A2 独苗 → anchor 成功
     talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act2", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
-    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: SESSION_D + "-a2" }));
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ capability: capD(null, null, { session: SESSION_D + "-a2" }),  eventSessionId: SESSION_D + "-a2" }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.action, "anchor", "省略按唯一候选的族决定");
     // 过期：A2 的 handle 到期改到过去（手术前先把账本拿稳）
@@ -46189,11 +46193,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
     const a2h = ids.a2Handle;
-    r = SA.executeSelectControl({ control: "select", handle: a2h, handle_kind: "osh" }, ctxD());
+    r = SA.executeSelectControl({ control: "select", handle: a2h, handle_kind: "osh" }, ctxD({ capability: capD(a2h, "osh"),  }));
     assert.equal(r.ok, false);
     assert.equal(r.reason, "no_candidate", "过期 handle 被候选集过滤");
     // chat 不符
-    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ chatId: "oc_other" }));
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ capability: capD(null, null, { chat: "oc_other" }),  chatId: "oc_other" }));
     assert.equal(r.ok, false);
     assert.equal(r.reason, "no_candidate", "chat 过滤");
   }));
@@ -46205,7 +46209,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     talTmp(TAL.anchor({ endpointId: EP57D, requestKey: "r57d_anc4", id: ids.a2Id, authorizedBy: "ou_r57d", selectedSessionId: a2rec.aliases.session_id, selectedRootOm: a2rec.anchor_candidate, selectionHandle: ids.a2Handle, expectedExpiresAt: a2rec.handle_expires_at, expectedAnchorCandidate: a2rec.anchor_candidate, selectionMessageId: "om_fix4", selectionBasis: "explicit_handle", clock: () => T0D }));
     const rq = TAL.requestRebind({ endpointId: EP57D, requestKey: "r57d_rq4", b3Id: ids.b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: SESSION_D, clock: () => T0D });
     assert.ok(rq.ok, "requestRebind：" + JSON.stringify(rq));
-    const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: SESSION_D + "-new", mappingUpdate: mappingStub([]) }));
+    const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ capability: capD(null, null, { session: SESSION_D + "-new" }),  eventSessionId: SESSION_D + "-new", mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, "省略 orh 成功：" + JSON.stringify(r));
     assert.equal(r.action, "rebind");
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].aliases.session_id, SESSION_D + "-new", "换绑到事件会话");

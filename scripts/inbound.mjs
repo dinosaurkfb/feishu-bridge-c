@@ -70,7 +70,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl, selectionContextDigestV1 } from "./select-admission.mjs";
+import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl, selectionContextDigestV1, mintSelectCapability } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -759,6 +759,16 @@ const runSelect = (replay) => {
       endpointId: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
       messageId: verdict.messageId,
       eventSessionId: event.session_id ?? null,
+      // R57d 返修三 P1-2：capability 只由 R3 成功分支（此处）铸造并显式传入；执行器不自铸。
+      capability: mintSelectCapability({
+        endpoint: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
+        chat: bootTpl.template?.chat_id ?? null,
+        session: event.session_id ?? null,
+        message: verdict.messageId,
+        sender: event.sender_id ?? null,
+        handle: control.handle ?? null,
+        handleKind: control.handle_kind ?? null,
+      }),
       // R57d 返修二 P1-1：shadow 期的 legacy 提交回调 —— 复用既有 promoteBinding（W1 的 legacy writer），
       //   载荷由执行器带足 generation/CAS 身份；operationId 从目标绑定的 pending 代际读出。
       //   换绑（rebind）没有既有 legacy writer（W2 的 legacy 是新代际认领，非原地换绑）→ 结构化拒，shadow 期 fail-closed。

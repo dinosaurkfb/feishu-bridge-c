@@ -113,6 +113,15 @@ export function verifySelectionContext(claim) {
   return { ok: true, context: ctx };
 }
 
+/** R57d 返修三 P1-2：owner capability 的**唯一**铸造函数——只准入站路由的 R3 成功分支
+ *  （两链 runSelect）与维护入口 repair 重核角色 / endpoint / chat 后的重铸调用；执行器不自铸。 */
+export function mintSelectCapability({ endpoint, chat, session, message, sender, handle, handleKind } = {}) {
+  return Object.freeze({
+    kind: "owner_select_control_v1", endpoint: endpoint ?? null, chat: chat ?? null, session: session ?? null,
+    message: message ?? null, sender: sender ?? null, handle: handle ?? null, handleKind: handleKind ?? null,
+  });
+}
+
 /** 写入准入 —— 默认读真实状态（执行器已全量接入；准入仍 fail-closed）。 */
 export function selectAdmission(env = process.env) {
   return readOwnerSelectAdmission(env);
@@ -284,6 +293,7 @@ export function executeSelectControl(intent, {
   senderId = null, chatId = null, endpointId = null, messageId = null,
   eventSessionId = null,
   mappingUpdate = null,
+  capability = null,
   txCtx = null,
   now = undefined, clock = () => Date.now(), env = process.env, _inject = undefined,
   claimsDir = undefined, key = undefined,
@@ -380,8 +390,11 @@ export function executeSelectControl(intent, {
     return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }
   const target = doc.records[res.target_id];
-  // R57d 返修一 B 段 P1-2：capability 由本次 R3 owner 放行后铸成、绑定本次选择上下文、不持久化。
-  //   先核 claim 的 selection_context（旧形 claim → 点名拒；osh/orh 省略 handle 合法）与 sender 归属（非 owner → 拒）。
+  // R57d 返修三 P1-2：capability 只由入站路由的 R3 成功分支铸造并显式传入——执行器不自铸（收不到 → 一律拒）。
+  if (!capability || capability.kind !== "owner_select_control_v1") {
+    return { ok: false, status: "failed", reason: "select_capability_required", text: selectRejectTextByReason("select_capability_required") };
+  }
+  // claim 的 selection_context 核验（旧形 claim → 点名拒）与 sender 归属（非 owner → 拒）保持不变。
   if (txCtx && txCtx.claim) {
     const vCtx = verifySelectionContext(txCtx.claim);
     if (!vCtx.ok) return { ok: false, status: "failed", reason: vCtx.reason, text: selectRejectTextByReason(vCtx.reason) };
@@ -390,7 +403,6 @@ export function executeSelectControl(intent, {
     }
   }
   const actualHandle = handle ?? (action === "rebind" ? target.rebind_handle : target.selection_handle) ?? null;
-  const capability = Object.freeze({ kind: "owner_select_control_v1", endpoint: endpointId, chat: chatId, session: eventSessionId, message: messageId, sender: senderId, handle: actualHandle, handleKind: action === "rebind" ? "orh" : "osh" });
   // R57d 返修一 B 段 P1-3：执行前把解析后的 immutable selection plan 持久化进 claim —— 否则省略 handle 的
   //   重放/续做无法复现同一目标。plan 已在（重放/续做）→ 逐字比对，不一致 → select_plan_conflict。
   if (txCtx && txCtx.claimsDir && txCtx.key && txCtx.claim) {
@@ -439,12 +451,12 @@ export function executeSelectControl(intent, {
   if (action === "activate") {
     // R57d 返修一 P1-5（§12 ⑤）：root = 命中 B1 的 aliases.root_om（selected_root_om 与之 CAS）；
     //   session = 受验入站事件 session。不收 transport 根（eventRootOm 已删，不声称验过 thread_root）。
-    w = wireSelectActivate({ endpointId, env, legacy, capability, messageId, _inject, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
+    w = wireSelectActivate({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, messageId, _inject, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
   } else if (action === "anchor") {
     // P1-5：root = A2 的 anchor_candidate；session = 事件 session（不再自填目标旧 session——那会让 CAS 变得恒真）
-    w = wireSelectAnchor({ endpointId, env, capability, messageId, _inject, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
+    w = wireSelectAnchor({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, chatId, messageId, _inject, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
-    w = wireSelectRebind({ endpointId, env, legacy, capability, messageId, _inject, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
+    w = wireSelectRebind({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, chatId, messageId, _inject, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
   return wiredOutcome(w, action);
 }

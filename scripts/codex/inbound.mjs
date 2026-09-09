@@ -54,7 +54,7 @@ import { isDirectRun } from "../direct-run.mjs";
 import { composeCrashReceipt } from "../crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import { appendChannelSample, channelDisposition } from "../channel-samples.mjs";
-import { executeSelectControl, selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, selectionContextDigestV1 } from "../select-admission.mjs";
+import { executeSelectControl, selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, selectionContextDigestV1, mintSelectCapability } from "../select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -645,6 +645,16 @@ const runSelect = (replay) => {
       endpointId: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
       messageId: verdict.messageId,
       eventSessionId: event.session_id ?? null,
+      // R57d 返修三 P1-2：capability 只由 R3 成功分支（此处）铸造并显式传入；执行器不自铸。
+      capability: mintSelectCapability({
+        endpoint: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
+        chat: template.template?.chat_id ?? null,
+        session: event.session_id ?? null,
+        message: verdict.messageId,
+        sender: event.sender_id ?? null,
+        handle: control.handle ?? null,
+        handleKind: control.handle_kind ?? null,
+      }),
       // R57d 返修二 P1-1：shadow 期的 legacy 提交回调 —— 复用既有 promoteTask（W1 的 legacy writer），
       //   实现在下方导出的 selectLegacyUpdate（单测直驱；目标 task 按 projectRoot 在 registry 里找）。
       mappingUpdate: (u) => selectLegacyUpdate(u, { task, home: HOME }),

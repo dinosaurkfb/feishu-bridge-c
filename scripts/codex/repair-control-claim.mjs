@@ -8,7 +8,7 @@ import { describeControlRepair, parseRepairControlArgs, repairExitCode, dispatch
 import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "../control-command.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, rejectRepairExitCode, resumeRejectedClaim } from "../reject-control.mjs";
-import { bridgeHome, findRegisteredTaskForCodexThread, setTaskInteractionMode, taskPaths } from "./state.mjs";
+import { bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, setTaskInteractionMode, taskPaths } from "./state.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import { executeSelectControl } from "../select-admission.mjs";
 
@@ -22,6 +22,14 @@ if (isDirectRun(import.meta.url)) {
   if (!found.ok) { process.stdout.write("找不到这个 thread 的 task（" + found.reason + "）\n"); process.exit(1); }
   const claimsDir = taskPaths(found.task, home).claims;
   const expect = { logicalTaskKey: found.task.logical_task_key, codexThreadId: parsed.root };
+  // R57d 返修三 P1-2：repair 的 owner 重核上下文（当前角色表 + 链路登记 chat），select 支重核后才重铸 capability。
+  let ownerContext = null;
+  try {
+    const tpl = loadCodexTemplate();
+    if (tpl?.ok === true && typeof tpl.template?.frank_sender_id === "string") {
+      ownerContext = { frankSenderId: tpl.template.frank_sender_id, senders: tpl.template.senders ?? [], chatId: tpl.template.chat_id ?? null };
+    }
+  } catch { /* 读不出不阻断非 select 支 */ }
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）
@@ -30,7 +38,7 @@ if (isDirectRun(import.meta.url)) {
       execute: (target, ctx) => dispatchControlRepair(target, {
         onMode: (mode) => setTaskInteractionMode({ threadId: parsed.root, mode, home,
           precondition: codexControlPrecondition({ claimsDir, key: parsed.key, expect }) }),
-      }, ctx) });
+      }, { ...ctx, ownerContext }) });
   }
   // 不是控制命令的 claim 也可能是收边的拒绝（第 3 层）：同一个入口，另一套事务。
   if (seen.state === "not_control") {

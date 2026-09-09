@@ -7605,6 +7605,90 @@ test("测试文件里没有写在汇总之后的 test()", () => {
     "第 " + late.join("、") + " 行的 test() 写在汇总之后，结果不会计入统计");
 });
 
+// ── R59：测试注册器拒绝 async 用例 + 汇总与退出码一致（2026-09-10 验收 R57d 发现的坑）──
+//
+// 坑本身：test() 同步调 fn() 不 await，一个 async 用例的断言在计数之后才跑 ——
+// 汇总照样「通过 N / 失败 0」，AssertionError 变成 unhandled rejection，只有
+// 进程退出码 1 看得出来；四方验收都只 grep 汇总行。守卫抽在共用注册器
+// scripts/test-harness.mjs 里（两套件共用一份）；这里的测试打的是它真会拒。
+
+/** 最小套件：真套件太重（1100+ 用例的注册时序也受不起），共用注册器配最小夹具在子进程里跑。 */
+const r59MiniSuite = (body) => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-r59-"));
+  const file = path.join(dir, "mini-" + crypto.randomBytes(4).toString("hex") + ".mjs");
+  fs.writeFileSync(file, [
+    "import assert from \"node:assert/strict\";",
+    "import { createTestHarness, installUnhandledRejectionGuard } from " +
+      JSON.stringify(path.resolve("scripts", "test-harness.mjs")) + ";",
+    "installUnhandledRejectionGuard();",
+    "const h = createTestHarness({ onFail: (name, err) => console.error(\"FAIL \" + name + \"\\n\" + (err.stack ?? err)) });",
+    body,
+    "h.sealSummary();",
+    "h.printSummary({});",
+  ].join("\n") + "\n", { mode: 0o600 });
+  return file;
+};
+
+test("R59 注册器拒绝 async 用例（行为，子进程）：async 声明与 thenable 返回值都点名并 exit 1；同步用例照常绿", () => {
+  // ① async 声明：改前汇总报「通过 1 / 失败 0」且 exit 0 —— 正是 R57d 验收踩的假绿
+  const p1 = spawnSync(process.execPath, [r59MiniSuite(
+    'h.test("x", async () => { throw new Error("不会被计数"); });')], { encoding: "utf-8" });
+  assert.equal(p1.status, 1, "async 用例必须 exit 1（改前 exit 0 假绿）：" +
+    JSON.stringify({ status: p1.status, stdout: p1.stdout, stderr: p1.stderr?.slice(0, 400) }));
+  assert.match(p1.stderr, /async/u, "stderr 点名 async：" + p1.stderr);
+  assert.match(p1.stderr, /「x」/u, "点名用例名：" + p1.stderr);
+  assert.doesNotMatch(p1.stdout, /通过/u, "用例根本不该执行、不该出汇总：" + p1.stdout);
+  // ② 同步函数返回 thenable（如 () => Promise.all(...)）：同样拒绝 —— ① 拦的是声明，② 拦的是返回值
+  const p2 = spawnSync(process.execPath, [r59MiniSuite(
+    'h.test("y", () => Promise.reject(new Error("不会被计数")));')], { encoding: "utf-8" });
+  assert.equal(p2.status, 1, "thenable 返回值必须 exit 1：" +
+    JSON.stringify({ status: p2.status, stdout: p2.stdout, stderr: p2.stderr?.slice(0, 400) }));
+  assert.match(p2.stderr, /async/u, "stderr 点名 async：" + p2.stderr);
+  assert.match(p2.stderr, /「y」/u, "点名用例名：" + p2.stderr);
+  // ③ 同步用例照常：绿 → exit 0（守卫不许伤及正常路径）
+  const p3 = spawnSync(process.execPath, [r59MiniSuite(
+    'h.test("ok", () => { assert.equal(1, 1); });')], { encoding: "utf-8" });
+  assert.equal(p3.status, 0, "同步绿用例 exit 0：" +
+    JSON.stringify({ status: p3.status, stdout: p3.stdout, stderr: p3.stderr?.slice(0, 400) }));
+  assert.match(p3.stdout, /通过 1 \/ 失败 0/u, "同步路径汇总不变：" + p3.stdout);
+});
+
+test("R59 汇总与退出码一致（行为，子进程）：红用例汇总「通过 0 / 失败 1」且 exit 1；未处理 rejection 点名原因并 exit 1", () => {
+  // ④ 同步红用例：汇总行与退出码必须说同一件事 —— 验收除了 grep 汇总行，必须看退出码
+  const p4 = spawnSync(process.execPath, [r59MiniSuite(
+    'h.test("bad", () => { assert.equal(1, 2); });')], { encoding: "utf-8" });
+  assert.equal(p4.status, 1, "同步红用例 exit 1：" +
+    JSON.stringify({ status: p4.status, stdout: p4.stdout, stderr: p4.stderr?.slice(0, 400) }));
+  assert.match(p4.stdout, /通过 0 \/ 失败 1/u, "红用例汇总如实计数：" + p4.stdout);
+  // ⑤ 绕过注册器的 async（fire-and-forget 的 rejection）：注册器两道闸都拦不到，
+  //    unhandledRejection 兑底接住 —— 把原因说清（多半是 async 用例）并 exit 1
+  const p5 = spawnSync(process.execPath, [r59MiniSuite(
+    'h.test("z", () => { Promise.reject(new Error("绕过注册器的 async")); });')], { encoding: "utf-8" });
+  assert.equal(p5.status, 1, "未处理 rejection → exit 1：" +
+    JSON.stringify({ status: p5.status, stdout: p5.stdout, stderr: p5.stderr?.slice(0, 400) }));
+  assert.match(p5.stderr, /未处理的 rejection/u, "stderr 把原因说清：" + p5.stderr);
+});
+
+test("R59 两套件都接共用注册器：源码 import test-harness，且 TEST_FILTER 无命中时各自 exit 2（套件带新注册器照常启动）", () => {
+  // 行为测试 A/B 证明的是**共用注册器**会拒 async；这条钉住两套件**真的用的是它** ——
+  // 谁把注册器抄回本地、async 拒绝就只剩半边，必须当场点破。结构上只认 import 行，
+  // 拒绝行为本身由 A/B 在子进程里验（不打真套件的全量时序）。
+  for (const rel of ["test.mjs", path.join("codex", "test.mjs")]) {
+    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    assert.match(src, /from "\.\.?\/?test-harness\.mjs";/u,
+      rel + " 必须从 scripts/test-harness.mjs 取共用注册器");
+  }
+  // 真套件带着新注册器照常启动：过滤器无命中 → 各自退出码 2（既有约定），不是崩、不是假绿
+  for (const [rel, tag] of [["test.mjs", "Claude"], [path.join("codex", "test.mjs"), "Codex"]]) {
+    const p = spawnSync(process.execPath, [path.resolve("scripts", rel)], {
+      encoding: "utf-8", env: { ...process.env, TEST_FILTER: "r59-no-such-test-xyz" },
+    });
+    assert.equal(p.status, 2, tag + " 套件 TEST_FILTER 无命中 → exit 2：" +
+      JSON.stringify({ status: p.status, stdout: p.stdout?.slice(-300), stderr: p.stderr?.slice(0, 400) }));
+    assert.match(p.stdout, /TEST_FILTER 命中 0/u, tag + " 套件报过滤器命中数：" + p.stdout);
+  }
+});
+
 test("入站崩溃回执只出脱敏引用码，不把堆栈写进模型可见通道", () => {
   // Aily 会把进程输出带回模型可见通道，所以 stdout/stderr 写什么等于对外发布什么。
   // 上一版直接写 err.stack —— 本机绝对路径和内部调用栈一起送出去。

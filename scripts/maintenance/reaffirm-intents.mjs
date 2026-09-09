@@ -110,11 +110,15 @@ export function readReaffirmIntents({ endpointDir }) {
 
 function cleanupTmp(tmp, _inject) {
   if (_inject?.cleanupFail) return { residue: tmp };
+  // P1-3：禁用 existsSync 先判缺席——它会把非 ENOENT 异常（EACCES/EIO…）折成「无残骸」。
+  //   直接 unlink，只有 ENOENT（真已缺席）算无残骸；其它异常 → residue 点名（带原因）。
   try {
-    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    if (_inject?.unlinkEACCES) { const e = new Error("EACCES: permission denied"); e.code = "EACCES"; throw e; }
+    fs.unlinkSync(tmp);
     return { residue: null };
   } catch (err) {
-    return { residue: tmp };
+    if (err?.code === "ENOENT") return { residue: null };
+    return { residue: tmp, why: errCode(err) };
   }
 }
 
@@ -187,14 +191,15 @@ function writeIntentsFile(dir, doc, { _inject = null } = {}) {
     return { ok: false, commit: "committed_durability_uncertain", reason: "dir_fsync_failed", why: "目录 fsync 失败: " + errCode(err) };
   }
 
-  // 受验读回逐字节等
-  try {
-    const rb = fs.readFileSync(targetPath);
-    if (Buffer.compare(rb, bytes) !== 0) {
-      return { ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: "读回字节与写入字节不一致" };
-    }
-  } catch (err) {
-    return { ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: "读回失败: " + errCode(err) };
+  // 受验读回：不复用裸 fs.readFileSync(targetPath)——它不核 0600 / 链接数 / schema（chmod 0644 仍报 committed_clean）。
+  // P1-3：复用 fd 绑定读取器（同 readReaffirmIntents：O_NOFOLLOW|O_NONBLOCK 打开 → fstat 普通文件/单硬链接/0600/大小上限 → 逐字节等 → schema 核）。
+  if (typeof _inject?.beforeReadback === "function") _inject.beforeReadback();
+  const rb = readReaffirmIntents({ endpointDir: dir });
+  if (!rb.ok) {
+    return { ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: "受验读回未通过（" + (rb.problem ?? "?") + "）" };
+  }
+  if (rb.sha256 !== sha256(bytes)) {
+    return { ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: "读回字节与写入字节不一致" };
   }
 
   return { ok: true, commit: "committed_clean" };

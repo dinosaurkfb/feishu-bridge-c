@@ -42266,6 +42266,53 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(rFsync.reason, "dir_fsync_failed", "reason 为 dir_fsync_failed");
   }));
 
+  test("R57b 返修二 P1-3：受验读回不复用裸 readFileSync——读回前把最终文件 chmod 0644 必拒（readback_failed + durability_uncertain）；cleanupTmp 只吞 ENOENT——非 ENOENT 异常 residue 点名", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p13", 41, "sess-b-41");
+
+    // ① 反例：读回前 chmod 0644 → 旧实现仍报 committed_clean，改后拒（readback_failed + durability_uncertain）。
+    const rChmod = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: {
+        beforeReadback: () => { fs.chmodSync(path.join(dir, "reaffirm-intents.json"), 0o644); },
+      },
+    });
+    assert.equal(rChmod.ok, false, "读回前 0644 必须拒，不再报 committed_clean");
+    assert.equal(rChmod.commit, "committed_durability_uncertain", "外显 durability_uncertain 语义");
+    assert.equal(rChmod.reason, "readback_failed", "reason 为 readback_failed");
+    assert.match(rChmod.why, /0600|mode/u, "点名 mode 核验失败");
+    fs.chmodSync(path.join(dir, "reaffirm-intents.json"), 0o600); // 修复现场，不影响后续
+
+    // ② 受验读回其余检查：读回文件硬链接数 >1 → 同样拒（fd 绑定读取器全核）。
+    const b3b = seedB3B(dir, "r57b_p13b", 43, "sess-b-43");
+    const rHardlink = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeReadback: () => { fs.linkSync(path.join(dir, "reaffirm-intents.json"), path.join(dir, "reaffirm-intents.x.json")); } },
+    });
+    assert.equal(rHardlink.ok, false, "读回时硬链接数 >1 必拒");
+    assert.equal(rHardlink.reason, "readback_failed", "reason 为 readback_failed");
+    fs.unlinkSync(path.join(dir, "reaffirm-intents.x.json"));
+
+    // ③ 正例：无注入 → 签发成功 committed_clean（读回全核通过）。
+    const rOk = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: seedB3B(dir, "r57b_p13_ok", 42, "sess-b-42"), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue P1-3 ok");
+    assert.equal(rOk.commit, "committed_clean", "正常签发 committed_clean");
+
+    // ④ 反例：cleanupTmp 只吞 ENOENT——rename 前注入失败产生 tmp；再让 unlinkSync 对 tmp 抛非 ENOENT（EACCES）→ residue 点名且带原因。
+    const b3d = seedB3B(dir, "r57b_p13d", 44, "sess-b-44");
+    const rCleanup = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3d, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: {
+        beforeRename: () => { throw new Error("crash_before_rename"); },
+        unlinkEACCES: true,
+      },
+    });
+    assert.equal(rCleanup.ok, false, "rename 前失败必须拒");
+    assert.equal(rCleanup.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rCleanup.residue) && rCleanup.residue.length > 0, "residue 包含残骸路径");
+    for (const f of fs.readdirSync(dir)) {
+      if (f.startsWith(".reaffirm-intents.tmp.")) fs.unlinkSync(path.join(dir, f));
+    }
+  }));
+
   test("R57b 返修一 P1-4：已提交未收净——注入 committed_with_residue 报 committed-unclean 且非绿；repair 收尾后转 consumed；清 intent 失败保持可恢复且 intent 仍在", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_p1_4", 39, "sess-b-39");
     const rIss = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });

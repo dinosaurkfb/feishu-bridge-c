@@ -90,6 +90,17 @@ function writePlanFileOExcl(file, bytes) {
   return { ok: true };
 }
 
+/** step id → 无碰撞备份文件名（R53 返修五 P1-1）：id 里非 [A-Za-z0-9._-] 的字符按 %XX 编码（唯一算法、可逆）。 */
+const stepIdEncoded = (id) => id.replace(/[^A-Za-z0-9._-]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"));
+const backupPathFor = (stagedDir, stepId) => path.join(stagedDir, "backup-" + stepIdEncoded(stepId) + ".json");
+
+/** R53 返修五 P1-1：备份/验收失败 → 拒进段并清 staged；清理失败不得报「干净拒绝」（外显残骸）。 */
+function failWithStagedClean(stagedDir, reason, why) {
+  try { fs.rmSync(stagedDir, { recursive: true, force: true }); }
+  catch (err) { return { ok: false, reason: "staged_residue", why: "拒进段后清 staged 失败：" + errText(err) + "（staged 残骸保留）" }; }
+  return { ok: false, reason, why };
+}
+
 /** 备份字节落本 operation 私有 staged/ 目录。P1-4 (c)：文件已在场 → readStagedVerified 核其 sha ===
  *  预期字节 sha 则复用（去掉一律 O_EXCL），不符 → fail-closed；缺席 → O_EXCL 0600 fd 写 + fsync。返回 {sha256, bytes}。 */
 function copyBackup(dest, bytes) {
@@ -990,28 +1001,43 @@ function osmPrepareForwardB(ctx, { token, env, frozen, cid, digest }) {
   const campaignBefore = { exists: true, sha256: cs.sha256, state: cs.state, campaign_id: cs.campaign_id, endpoints: cs.endpoints, endpoints_digest: cs.endpoints_digest };
   const sealAfter = { exists: true, sha256: shaHex(serializeLedger(sealDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
   const completeAfter = { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
-  // 备份（用读取器 raw，同 A；copyBackup 复用分支已 sealReusedFile）
-  const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), cs.raw);
-  if (!cb.ok) return { ok: false, reason: cb.reason, why: "campaign 备份" };
-  const wb = copyBackup(path.join(stagedDir, "backup-writer-state.json"), ws.raw);
-  if (!wb.ok) return { ok: false, reason: wb.reason, why: "writer-state 备份" };
-  try { fsyncDir(stagedDir); }
-  catch (err) { return { ok: false, reason: "backup_dir_fsync_failed", why: "fsync staged 目录：" + errText(err) }; }
+  // R53 返修五 P1-1（#138 五轮 P1）——WAL 备份与盘上事实一致：只给有状态变更的 step 独立备份，
+  //   文件名 = backup-<stepIdEncoded>.json（%XX 编码非 [A-Za-z0-9._-]，唯一可逆）；before 出处：首个改该文件的
+  //   step 取受验 fd 原始字节、后继 step（seal→complete）取前驱确定性 intended 字节（预算序列化）；逐份核 SHA/长度后才进段。
+  const sealStepId = "campaign:" + cid + ":seal";
+  const completeStepId = "campaign:" + cid + ":complete";
+  const writerOnStepId = "writer_state:" + cid + ":on";
+  const sealBackup = copyBackup(backupPathFor(stagedDir, sealStepId), cs.raw);
+  if (!sealBackup.ok) return failWithStagedClean(stagedDir, sealBackup.reason, "seal 备份：" + sealBackup.why);
+  if (sealBackup.sha256 !== campaignBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "seal 备份 sha ≠ before.sha256");
+  const completeBackup = copyBackup(backupPathFor(stagedDir, completeStepId), serializeLedger(sealDoc));
+  if (!completeBackup.ok) return failWithStagedClean(stagedDir, completeBackup.reason, "complete 备份：" + completeBackup.why);
+  if (completeBackup.sha256 !== sealAfter.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "complete 备份 sha ≠ before.sha256（前驱 seal intended 字节）");
+  const writerOnBackup = copyBackup(backupPathFor(stagedDir, writerOnStepId), ws.raw);
+  if (!writerOnBackup.ok) return failWithStagedClean(stagedDir, writerOnBackup.reason, "writer 备份：" + writerOnBackup.why);
+  if (writerOnBackup.sha256 !== writerBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "writer 备份 sha ≠ before.sha256");
   const writerAfter = { exists: true, sha256: shaHex(serializeLedger(buildOsmWriterDoc({ token, cid, digest, expectedRevision: ws.revision + 1, state: "on" }))), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 };
   const at = new Date(ctx.now()).toISOString();
   const steps = [];
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: sealAfter, backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: cb.sha256, backup_bytes: cb.bytes });
+  steps.push({ kind: "campaign", id: sealStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: sealAfter, backup: backupPathFor(stagedDir, sealStepId), backup_sha256: sealBackup.sha256, backup_bytes: sealBackup.bytes });
   for (const ep of frozen) {
     const d = resolveEndpointDir(ep, { env });
     const L = loadLedger(d.dir, { endpointId: ep });
     const inv = migrationInventory(L.doc);
     steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, backup: null, backup_sha256: null, backup_bytes: null });
+    // schema_endpoint 的独立备份（copyBackup 现在真的写盘——改前只登记 backup-ledger-<ep>.json 而从未 copyBackup）。
+    const schemaStepId = "schema_endpoint:" + ep + ":strict";
+    const sbk = copyBackup(backupPathFor(stagedDir, schemaStepId), L.bytes);
+    if (!sbk.ok) return failWithStagedClean(stagedDir, sbk.reason, "schema 备份：" + sbk.why + " ep=" + ep);
+    if (sbk.sha256 !== L.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", ep + " schema 备份 sha ≠ before.ledger_sha256");
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.1-transition", to_schema: "1.1" });
-    steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":strict", state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { schema_version: "1.1-transition", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) }, backup: path.join(stagedDir, "backup-ledger-" + ep + ".json"), backup_sha256: L.sha256, backup_bytes: L.bytes.length });
+    steps.push({ kind: "schema_endpoint", id: schemaStepId, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { schema_version: "1.1-transition", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) }, backup: backupPathFor(stagedDir, schemaStepId), backup_sha256: sbk.sha256, backup_bytes: sbk.bytes });
   }
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: sealAfter, intended_after: completeAfter, backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: sealAfter.sha256, backup_bytes: cb.bytes });
-  steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, backup: path.join(stagedDir, "backup-writer-state.json"), backup_sha256: wb.sha256, backup_bytes: wb.bytes });
+  steps.push({ kind: "campaign", id: completeStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: sealAfter, intended_after: completeAfter, backup: backupPathFor(stagedDir, completeStepId), backup_sha256: completeBackup.sha256, backup_bytes: completeBackup.bytes });
+  steps.push({ kind: "writer_state", id: writerOnStepId, state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, backup: backupPathFor(stagedDir, writerOnStepId), backup_sha256: writerOnBackup.sha256, backup_bytes: writerOnBackup.bytes });
+  try { fsyncDir(stagedDir); }
+  catch (err) { return failWithStagedClean(stagedDir, "backup_dir_fsync_failed", "fsync staged 目录：" + errText(err)); }
   return { ok: true, steps, phase: "osm_b_strictening" };
 }
 
@@ -1041,32 +1067,57 @@ function osmPrepareForwardDirect(ctx, { token, env, frozen }) {
     if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
     return { ok: false, reason: "io_error", why: "建 staged 目录：" + errText(err) };
   }
-  let campaignBackup = { backup: null, backup_sha256: null, backup_bytes: null };
-  if (cs.exists) {
-    const cb = copyBackup(path.join(stagedDir, "backup-campaign.json"), cs.raw);
-    if (!cb.ok) return { ok: false, reason: cb.reason, why: "campaign 备份" };
-    campaignBackup = { backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: cb.sha256, backup_bytes: cb.bytes };
+  // R53 返修五 P1-1（#138 五轮 P1）——WAL 备份与盘上事实一致：只给有状态变更的 step 独立备份，
+  //   文件名 = backup-<stepIdEncoded>.json（%XX 编码非 [A-Za-z0-9._-]，唯一可逆）；before 出处：首个改该文件的
+  //   step 取受验 fd 原始字节、后继 step（open→seal→complete）取前驱确定性 intended 字节（预算序列化）；逐份核 SHA/长度后才进段。
+  const openStepId = "campaign:" + cid + ":open";
+  const sealStepId = "campaign:" + cid + ":seal";
+  const completeStepId = "campaign:" + cid + ":complete";
+  const writerOnStepId = "writer_state:" + cid + ":on";
+  let openBackup = { backup: null, backup_sha256: null, backup_bytes: null };
+  if (campaignBefore.exists) {
+    const cb = copyBackup(backupPathFor(stagedDir, openStepId), cs.raw);
+    if (!cb.ok) return failWithStagedClean(stagedDir, cb.reason, "open 备份：" + cb.why);
+    if (cb.sha256 !== campaignBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "open 备份 sha ≠ before.sha256");
+    openBackup = { backup: backupPathFor(stagedDir, openStepId), backup_sha256: cb.sha256, backup_bytes: cb.bytes };
   }
-  try { fsyncDir(stagedDir); }
-  catch (err) { return { ok: false, reason: "backup_dir_fsync_failed", why: "fsync staged 目录：" + errText(err) }; }
+  const openBytes = serializeLedger(openDoc.doc);
+  const sealDocBytes = serializeLedger(sealDoc);
+  const sealBk = copyBackup(backupPathFor(stagedDir, sealStepId), openBytes);
+  if (!sealBk.ok) return failWithStagedClean(stagedDir, sealBk.reason, "seal 备份：" + sealBk.why);
+  if (sealBk.sha256 !== openAfter.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "seal 备份 sha ≠ before.sha256（前驱 open intended 字节）");
+  const completeBk = copyBackup(backupPathFor(stagedDir, completeStepId), sealDocBytes);
+  if (!completeBk.ok) return failWithStagedClean(stagedDir, completeBk.reason, "complete 备份：" + completeBk.why);
+  if (completeBk.sha256 !== sealAfter.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "complete 备份 sha ≠ before.sha256");
+  let writerOnBackup = { backup: null, backup_sha256: null, backup_bytes: null };
+  if (writerBefore.exists) {
+    const wb = copyBackup(backupPathFor(stagedDir, writerOnStepId), ws.raw);
+    if (!wb.ok) return failWithStagedClean(stagedDir, wb.reason, "writer 备份：" + wb.why);
+    if (wb.sha256 !== writerBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "writer 备份 sha ≠ before.sha256");
+    writerOnBackup = { backup: backupPathFor(stagedDir, writerOnStepId), backup_sha256: wb.sha256, backup_bytes: wb.bytes };
+  }
   const at = new Date(ctx.now()).toISOString();
   const steps = [];
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":open", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: openAfter, ...campaignBackup });
+  steps.push({ kind: "campaign", id: openStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: openAfter, ...openBackup });
   for (const ep of frozen) {
     const d = resolveEndpointDir(ep, { env });
     const L = loadLedger(d.dir, { endpointId: ep });
     const inv = migrationInventory(L.doc);
     steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, backup: null, backup_sha256: null, backup_bytes: null });
+    // schema_endpoint 的独立备份（copyBackup 现在真的写盘——改前只登记 backup-ledger-<ep>.json 而从未 copyBackup）。
+    const schemaStepId = "schema_endpoint:" + ep + ":direct";
+    const sbk = copyBackup(backupPathFor(stagedDir, schemaStepId), L.bytes);
+    if (!sbk.ok) return failWithStagedClean(stagedDir, sbk.reason, "schema 备份：" + sbk.why + " ep=" + ep);
+    if (sbk.sha256 !== L.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", ep + " schema 备份 sha ≠ before.ledger_sha256");
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1" });
-    steps.push({ kind: "schema_endpoint", id: "schema_endpoint:" + ep + ":direct", state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { schema_version: "1.0", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) }, backup: path.join(stagedDir, "backup-ledger-" + ep + ".json"), backup_sha256: L.sha256, backup_bytes: L.bytes.length });
+    steps.push({ kind: "schema_endpoint", id: schemaStepId, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { schema_version: "1.0", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) }, backup: backupPathFor(stagedDir, schemaStepId), backup_sha256: sbk.sha256, backup_bytes: sbk.bytes });
   }
-  const openBackupBytes = serializeLedger(openDoc.doc);
-  const sealBackup = { backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: openAfter.sha256, backup_bytes: openBackupBytes.length };
-  const completeBackup = { backup: path.join(stagedDir, "backup-campaign.json"), backup_sha256: sealAfter.sha256, backup_bytes: serializeLedger(sealDoc).length };
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":seal", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: openAfter, intended_after: sealAfter, ...sealBackup });
-  steps.push({ kind: "campaign", id: "campaign:" + cid + ":complete", state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: sealAfter, intended_after: completeAfter, ...completeBackup });
-  steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":on", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, backup: null, backup_sha256: null, backup_bytes: null });
+  steps.push({ kind: "campaign", id: sealStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: openAfter, intended_after: sealAfter, backup: backupPathFor(stagedDir, sealStepId), backup_sha256: sealBk.sha256, backup_bytes: sealBk.bytes });
+  steps.push({ kind: "campaign", id: completeStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: sealAfter, intended_after: completeAfter, backup: backupPathFor(stagedDir, completeStepId), backup_sha256: completeBk.sha256, backup_bytes: completeBk.bytes });
+  steps.push({ kind: "writer_state", id: writerOnStepId, state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, ...writerOnBackup });
+  try { fsyncDir(stagedDir); }
+  catch (err) { return failWithStagedClean(stagedDir, "backup_dir_fsync_failed", "fsync staged 目录：" + errText(err)); }
   return { ok: true, steps, phase: "osm_direct" };
 }
 

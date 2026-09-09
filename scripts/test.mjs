@@ -38470,6 +38470,73 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 返修五 P1-1：B/direct 进段后逐 step 核「备份存在 ∧ sha===before.sha256 ∧ 长度相符」，precheck 三字段恒 null（改前 schema 备份文件缺席 / campaign:complete 备份字节不符）", () => {
+    const verifySteps = (fx, phase) => {
+      const tok = readActive({ dir: fx.dir }).token;
+      const j = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j.state, "valid", "journal 有效");
+      assert.equal(j.doc.phase, phase, "phase=" + phase);
+      const OSM_KINDS = ["campaign", "schema_endpoint", "precheck", "writer_state"];
+      let statefulCount = 0;
+      for (const st of j.doc.steps) {
+        if (!OSM_KINDS.includes(st.kind)) continue;
+        if (st.kind === "precheck") {
+          assert.equal(st.backup, null, st.id + " precheck backup null");
+          assert.equal(st.backup_sha256, null, st.id + " precheck backup_sha256 null");
+          assert.equal(st.backup_bytes, null, st.id + " precheck backup_bytes null");
+          continue;
+        }
+        // 有状态变更的 step：备份在场 ∧ sha===before.sha256（或 before.ledger_sha256）× 长度相符；
+        //   schema_endpoint 恒有备份；campaign/writer_state 按 before.exists 有则必有、无则必无。
+        if (st.kind === "schema_endpoint" || st.before.exists) {
+          statefulCount += 1;
+          assert.notEqual(st.backup, null, st.id + " 必须有备份");
+          assert.notEqual(st.backup_sha256, null, st.id + " backup_sha256 非 null");
+          assert.ok(fs.existsSync(st.backup), st.id + " 备份文件存在：" + st.backup);
+          const bytes = fs.readFileSync(st.backup, "utf-8");
+          const sha = crypto.createHash("sha256").update(bytes).digest("hex");
+          const expectSha = st.kind === "schema_endpoint" ? st.before.ledger_sha256 : st.before.sha256;
+          assert.equal(sha, expectSha, st.id + " 备份 sha === before sha");
+          assert.equal(Buffer.byteLength(bytes, "utf-8"), st.backup_bytes, st.id + " 备份长度相符");
+        } else {
+          statefulCount += 1;
+          assert.equal(st.backup, null, st.id + " before.exists=false 不该有备份");
+          assert.equal(st.backup_sha256, null, st.id + " backup_sha256 应为 null");
+          assert.equal(st.backup_bytes, null, st.id + " backup_bytes 应为 null");
+        }
+      }
+      assert.ok(statefulCount >= 4, "至少 4 个有状态变更 step（campaign/seal/complete + schema + writer）");
+    };
+    // B：crashAfter 8（osm:forward-entered 之后）
+    {
+      const fx = r53SetupB({ crashAfter: 8 });
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "B 进段后崩");
+        verifySteps(fx, "osm_b_strictening");
+      } finally { fx.cleanup(); }
+    }
+    // direct：crashAfter 8（osm:forward-entered 之后）
+    {
+      const fx = r52Setup({ twoEps: false, crashAfter: 8 });
+      try {
+        for (const ep of fx.eps) {
+          const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+          const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+          dd.records = {};
+          const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+          seedOp.result = { seeded_ids: [] };
+          fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+        }
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "direct 进段后崩");
+        verifySteps(fx, "osm_direct");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R53 ②-② B 崩溃恢复矩阵：seal/precheck/strict/complete/on 每步后崩溃 → --exit 只向前收敛", () => {
     // afterStep 序列：enter 7 次 + forward：8=进段后 9=seal 10=precheck A 11=precheck B 12=strict A 13=strict B 14=complete 15=on
     for (const crashAfter of [8, 9, 11, 13, 15]) {

@@ -157,7 +157,10 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
   catch (err) { return { ok: false, why: "readdir：" + errText(err) }; }
   for (const n of names) {
     let st = null;
-    try { st = fs.lstatSync(path.join(targetDir, n)); }
+    try {
+      if (inject?.lstatThrows === n) throw Object.assign(new Error("注入 lstat 异常"), { code: "EACCES" });
+      st = fs.lstatSync(path.join(targetDir, n));
+    }
     catch (err) { if (err?.code === "ENOENT") continue; return { ok: false, why: "lstat：" + errText(err) }; }
     if (residueAllowed === null || !residueAllowed(n)) return { ok: false, why: "残骸：" + n + (st.isDirectory() ? "（目录）" : "") };
   }
@@ -580,6 +583,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
           const sc = stepCommitCheck(w, "state");
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点：写后读回前
         }
         // 返修三：writer 首次（写后）与恢复支（现场===intended）统一 sealAndVerifyStep。
         const s = sealAndVerifyStep({

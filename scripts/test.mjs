@@ -38150,6 +38150,88 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R52 返修四 N1：残骸 lstat 非 ENOENT 异常 fail-closed——目标目录注入 lstatThrows → 屏障 ok:false 以「lstat：」开头、step 保持 prepared", () => {
+    // schema 恢复窗（写后崩）+ 注入 lstatThrows 到目标目录某名字 → 残骸盘点 fail-closed。
+    const fx = r52Setup({ twoEps: false });
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@schema"), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "schema 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      fx.ctx.afterWrite = null;
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env, _inject: { lstatThrows: "ledger.json" } });
+      assert.ok(r.ok === false, "lstat 异常必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "recovery_seal_failed", "lstat 异常 → recovery_seal_failed");
+      assert.match(String(r.why), /^lstat：/, "why 以 lstat：开头：" + r.why);
+      const j = readJournal({ dir: fx.dir, token: act.token });
+      assert.equal(j.doc.steps.find((s) => s.kind === "schema_endpoint").state, "prepared", "schema step 保持 prepared（lstat 异常）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修四 N2：mint 步 ledger.lock 残骸 fail-closed + campaign/writer 步未知文件残骸阻断——多入口都不得放过", () => {
+    // N2a mint：already 恢复窗 + ep 目录 ledger.lock 在场 → 不记 done、recovery_seal_failed、why 含「残骸：ledger.lock」。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("mint:")) throw Object.assign(new Error("crash@mint"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "mint 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const ep = fx.eps[0];
+        fs.writeFileSync(path.join(fx.ledgerRoot, ep, "ledger.lock"), "stuck", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "mint ledger.lock 残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "mint ledger.lock → recovery_seal_failed");
+        assert.match(String(r.why), /残骸：ledger\.lock/, "why 点名残骸：ledger.lock：" + r.why);
+        const j = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(j.doc.steps.find((s) => s.kind === "mint" && s.state !== "done").state, "prepared", "mint step 不记 done");
+      } finally { fx.cleanup(); }
+    }
+    // N2b campaign：恢复窗 + ledger 根多一个未知文件 → 残骸阻断。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.endsWith(":open")) throw Object.assign(new Error("crash@campaign"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "campaign 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fs.writeFileSync(path.join(fx.ledgerRoot, "owner-select-junk.tmp"), "x", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "campaign 未知文件残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "campaign 未知文件 → recovery_seal_failed");
+      } finally { fx.cleanup(); }
+    }
+    // N2c writer：恢复窗 + ledger 根多一个未知文件 → 残骸阻断。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("writer_state:")) throw Object.assign(new Error("crash@writer"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "writer 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fs.writeFileSync(path.join(fx.ledgerRoot, "owner-select-junk.tmp"), "x", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "writer 未知文件残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "writer 未知文件 → recovery_seal_failed");
+      } finally { fx.cleanup(); }
+    }
+  });
+
   test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
     // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
     {

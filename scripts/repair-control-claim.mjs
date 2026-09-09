@@ -136,22 +136,37 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   const L = loadLedger(d.dir, { endpointId: sc.endpoint });
   if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: L.why ?? L.reason };
 
-  const priorOp = Object.values(L.doc.operations).find((op) =>
-    op.op_type === "owner_select_reaffirm" && (
-      op.request_key === "osr:" + op.result?.target_id + ":" + sc.handle ||
-      (typeof op.request_key === "string" && op.request_key.endsWith(":" + sc.handle)) ||
-      op.result?.new_link_proof?.selection_handle === sc.handle
-    )
+  // P1-4：逐字绑定本 claim 对应的唯一 op——精确 request_key = "osr:" + target_id + ":" + handle，
+  //   且 op 的 selection_message_id / target_id 与 uncleanRecord 一致；不像 P1-4 前用松散的后缀/selection_handle 搜索
+  //   （任一 request_key 以 :<handle> 结尾或 proof 带该 handle 就命中，伪做一笔同 handle 后缀但不同 message 的 op 也会通过）。
+  //   找不到或多于一笔 → 不转 consumed（fail-closed 点名）。
+  const unTarget = uncleanRecord?.detail?.result?.target_id;
+  const unMessage = uncleanRecord?.detail?.result?.selection_message_id ?? sc.message;
+  const exactKey = (t) => "osr:" + t + ":" + sc.handle;
+  const matches = Object.values(L.doc.operations).filter((op) =>
+    op.op_type === "owner_select_reaffirm" &&
+    op.result && typeof op.result.target_id === "string" &&
+    op.request_key === exactKey(op.result.target_id) &&
+    op.result.selection_message_id === unMessage &&
+    (unTarget == null || op.result.target_id === unTarget)
   );
-
-  if (!priorOp) {
-    return { ok: false, reason: "ledger_commit_unverifiable", why: "账本中核不出 handle " + sc.handle + " 的提交记录，保持 control-committed-unclean" };
+  if (matches.length !== 1) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "账本中核不出 handle " + sc.handle + " 的唯一提交记录（命中 " + matches.length + " 笔），保持 control-committed-unclean" };
   }
+  const priorOp = matches[0];
 
   // 2. 只做清理/释放收尾
   const cl = cleanReaffirmIntent({ endpointDir: d.dir, reaffirmHandle: sc.handle, env, _inject });
-  if (!cl.ok) {
-    return { ok: false, reason: cl.reason ?? "intent_cleanup_failed", why: cl.why ?? "清理 intent 失败，保持可恢复" };
+  // P1-4：cleanReaffirmIntent 可返回 ok:true 但 lock_state: residue | unclear（intent 锁释放不净）；
+  //   repair 不能只看 cl.ok 就转 consumed——要求清理提交 + 锁释放全部干净才转，否则保持 committed-unclean 并点名。
+  const cleanupClean = cl.ok && cl.lock_state === "released" && !cl.lockUncleared && !cl.lockResidue;
+  if (!cleanupClean) {
+    return {
+      ok: false,
+      reason: cl.reason ?? "intent_cleanup_unclean",
+      why: cl.why ?? ("清理 intent 收口不干净（ok=" + String(cl.ok) + "，lock_state=" + String(cl.lock_state ?? "?") + "），保持 control-committed-unclean"),
+      lock_state: cl.lock_state ?? null,
+    };
   }
 
   return { ok: true, changed: true };

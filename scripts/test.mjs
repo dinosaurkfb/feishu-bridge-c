@@ -42421,6 +42421,64 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(diskIntents.doc.entries[handle], undefined, "repair 成功后 intent 被清");
   }));
 
+  test("R57b 返修二 P1-4：repair 收尾判据禁假绿——cleanReaffirmIntent 返回 residue/unclear 不得转 consumed（保持 committed-unclean 点名）；同 handle 但不同 message 的伪 op 不得被 loose 绑定", () => withLedgerB((root, dir) => {
+    const claimsDir = path.join(root, "claims_p14");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const messageId = "om_p14";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14", handle, kind: "rfh" });
+    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+
+    // ① 反例：cleanReaffirmIntent 返回 residue/unclear（intent 锁释放不净）→ repair 必须判非绿、不转 consumed。
+    const b3 = seedB3B(dir, "r57b_p14", 45, "sess-b-45");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    // 构造一个真提交（ledger op 已完成）；再把账本锁释放制造成 residue 以便进入 unclean 判定。
+    SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    const uncleanRecord = { schema_version: "1.0", claim_key: "f", state: "control-committed-unclean", recorded_at: ISO0B, detail: { control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean" } };
+    const repOK = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle),
+      claimsDir,
+      key: "f",
+      uncleanRecord,
+      env: process.env,
+      _inject: { beforeRename: () => { try { fs.rmSync(path.join(dir, "reaffirm-intents.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    assert.equal(repOK.ok, false, "清理返回 residue/unclear 不得转 consumed，也不得报 ok:true");
+    assert.equal(repOK.reason, "intent_cleanup_unclean", "reason 为 intent_cleanup_unclean");
+    // 修复现场（删掉 intent lock 目录后由后续正常操作重建；先把它删干净）
+    try { fs.rmSync(path.join(dir, "reaffirm-intents.lock"), { recursive: true, force: true }); } catch {}
+
+    // ② 反例：同 handle 但不同 message 的 op——loose 搜索（任一 request_key 以 :handle 结尾 / proof 带该 handle）会命中它，
+    //    精确绑定（request_key = osr:<target>:<handle> 且 selection_message_id 一致）必须拒。
+    const b3b = seedB3B(dir, "r57b_p14b", 46, "sess-b-46");
+    const intentB = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
+    SA.executeSelectControl({ control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    // 把唯一 owner_select_reaffirm op 的 selection_message_id 改成与 claim/uncleanRecord 期望（messageId）不同的值。
+    const doc = loadOkB(dir);
+    const realOpId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "owner_select_reaffirm" && doc.operations[k].request_key === "osr:" + b3b + ":" + intentB.reaffirm_handle);
+    assert.ok(realOpId, "真实 op 在场");
+    doc.operations[realOpId].result = { ...doc.operations[realOpId].result, selection_message_id: "om_forged999" };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    // uncleanRecord 认为本次选择的消息 = messageId；op 却是 om_forged999 → 精确绑定必须拒（不转 consumed）。
+    const uncleanB = { schema_version: "1.0", claim_key: "g", state: "control-committed-unclean", recorded_at: ISO0B, detail: { control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3b, selection_message_id: messageId } } };
+    const repForged = repairControlCommittedUnclean({
+      claim: mkClaim(intentB.reaffirm_handle),
+      claimsDir,
+      key: "g",
+      uncleanRecord: uncleanB,
+      env: process.env,
+    });
+    assert.equal(repForged.ok, false, "同 handle 但不同 message 的 op 不得被 loose 绑定转 consumed：" + JSON.stringify(repForged));
+    assert.equal(repForged.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+  }));
+
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {
     // 手工 transition 账本：activate 增量 op 产 owner_select 双证 + tombstone（owner_select_merge_v1）。
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-os-")));

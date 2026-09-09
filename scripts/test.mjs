@@ -39979,7 +39979,7 @@ test("R54 doctor ⑯ 入站转发结果：一红一绿 + 孤儿 jsonl → warn �
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
   const now = Date.now();
   // R54 返修一：result 夹具用封闭全字段（读端走 readVerifiedDoc + forwardResultProblem），0600 落盘
-  const fullResult = (key, over = {}) => ({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: new Date(now - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over });
+  const fullResult = (key, over = {}) => ({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: new Date(now - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", outbox_dir: null, ...over });
   const writeResult = (key, doc, mtimeMs) => {
     const f = path.join(runsDir, key + ".forward.result.json");
     fs.writeFileSync(f, JSON.stringify(doc) + "\n", { mode: 0o600 });
@@ -40026,7 +40026,7 @@ const r54FullResult = (key, over = {}) => ({
   schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0,
   is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234,
   claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT,
-  finished_at: new Date(Date.now() - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", ...over,
+  finished_at: new Date(Date.now() - 3600e3).toISOString(), claude_path: "/usr/local/bin/claude", outbox_dir: null, ...over,
 });
 
 test("R54 返修一 P1-1：runs 盘点认识 forward 制品——全套制品 → inventoryRuns 零问题、doctor ⑥ 与 ⑯ 同时绿", () => {
@@ -40247,7 +40247,7 @@ test("R54 返修二 P1-2：⑯ 按 key 聚合——完整转发只计一个桶�
   fs.writeFileSync(path.join(runsDir, key + ".forward.jsonl"), "{}\n", { mode: 0o600 });
   fs.utimesSync(path.join(runsDir, key + ".forward.jsonl"), new Date(now - 11 * 60e3), new Date(now - 11 * 60e3));
   fs.writeFileSync(path.join(runsDir, key + ".forward.started.json"), JSON.stringify({ schema: FORWARD_STARTED_SCHEMA, key, runner_pid: 4242, claude_pid: 4243, started_at: ago11m }) + "\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: ago11m, claude_path: "/x" }) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), JSON.stringify({ schema: FORWARD_RESULT_SCHEMA, key, target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, final_text_sha256: FORWARD_SHA_SENT, finished_at: ago11m, claude_path: "/x", outbox_dir: null }) + "\n", { mode: 0o600 });
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, true, c.detail);
   assert.match(c.detail, /共 1 条：绿 1/u, "恰一个桶（红：绿 1 + 结果缺失 1）：" + c.detail);
@@ -40388,7 +40388,7 @@ test("R54 返修三 P1-3：PID 存活不算实例证明——runner_start_at 与
 
 test("R54 返修三 P1-4：不可能组合拒——sent=true 配 reason=failed / 错 final_text_sha256 / is_error=true 配 sent=true 都 problem", () => {
   const now = Date.now();
-  const base = { schema: FORWARD_RESULT_SCHEMA, key: r54Key(34), target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, finished_at: new Date(now).toISOString(), claude_path: "/x", final_text_sha256: FORWARD_SHA_SENT };
+  const base = { schema: FORWARD_RESULT_SCHEMA, key: r54Key(34), target_name: "现场会话", pid: 4242, exit_code: 0, is_error: false, subtype: "success", num_turns: 2, duration_ms: 1234, claude_code_version: "9.9.9", model: "fake-model", reason_first_line: "sent", sent: true, finished_at: new Date(now).toISOString(), claude_path: "/x", final_text_sha256: FORWARD_SHA_SENT, outbox_dir: null };
   assert.equal(FORWARD_RESULT_PROBLEM({ ...base }, { now }), null);
   assert.match(FORWARD_RESULT_PROBLEM({ ...base, reason_first_line: "failed" }, { now }), /sent=true/u, "sent=true + reason=failed 拒");
   assert.match(FORWARD_RESULT_PROBLEM({ ...base, final_text_sha256: "f".repeat(64) }, { now }), /final_text_sha256/u, "sent=true + 错 SHA 拒");
@@ -40825,22 +40825,22 @@ test("R58 doctor ⑯：失败但回执缺失 → 子计数点名 key；回执在
   m.writeTables({ projects: [{ id: "r58doc", root, root_message_id: "om_r58doc", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
   const now = Date.now();
-  const failedResult = (key, why) => JSON.stringify(r54FullResult(key, {
-    is_error: true, sent: false, exit_code: 0, reason_first_line: why, finished_at: new Date(now - 120e3).toISOString(),
+  const failedResult = (key, why, outboxDir) => JSON.stringify(r54FullResult(key, {
+    is_error: true, sent: false, exit_code: 0, reason_first_line: why, finished_at: new Date(now - 120e3).toISOString(), outbox_dir: outboxDir,
   })) + "\n";
-  fs.writeFileSync(path.join(runsDir, r54Key(31) + ".forward.result.json"), failedResult(r54Key(31), "API Error: 400 a"), { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, r54Key(32) + ".forward.result.json"), failedResult(r54Key(32), "API Error: 400 b"), { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, r54Key(34) + ".forward.result.json"), failedResult(r54Key(34), "API Error: 400 c"), { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, r54Key(33) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(33), { finished_at: new Date(now - 120e3).toISOString() })) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(31) + ".forward.result.json"), failedResult(r54Key(31), "API Error: 400 a", ".runtime-data/outbound/outbox"), { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(32) + ".forward.result.json"), failedResult(r54Key(32), "API Error: 400 b", null), { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(34) + ".forward.result.json"), failedResult(r54Key(34), "API Error: 400 c", ".runtime-data/outbound/outbox-11111111-2222-3333-4444-555555555555"), { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(33) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(33), { finished_at: new Date(now - 120e3).toISOString(), outbox_dir: null })) + "\n", { mode: 0o600 });
   // 31：回执在项目级 outbox（已发布形状，不给 ⑥ 制造待发积压）；34：回执在会话级 outbox-<sid>；32：无回执；33：成功
   const receiptDoc = (key) => {
     const createdAt = new Date(now - 90e3).toISOString();
     return JSON.stringify({
       schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal",
-      id: "forward-failed-" + key, kind: "forward_failed", text: "转发失败：x；本条未送达，请重发或在终端查看 doctor ⑯",
+      id: "forward-failed-" + key, kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.session_error,
       event_key: "forward-failed:" + key, source: "forward-runner", input_origin: null, input_text: null,
-      target_channel_generation_id: null, run_id: null, forward_key: key, message_id: "om",
-      created_at: createdAt, publish_eligible_at: createdAt, published_at: new Date(now - 60e3).toISOString(),
+      target_channel_generation_id: "gen-1", run_id: null, forward_key: key, message_id: "om_m1",
+      created_at: createdAt, publish_eligible_at: createdAt, published_at: new Date(now - 60e3).toISOString(), result_sha256: R58_SHA,
     }, null, 2) + "\n";
   };
   const obProj = path.join(root, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(obProj, { recursive: true });

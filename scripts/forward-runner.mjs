@@ -43,7 +43,7 @@ export const FORWARD_KEY_RE = /^[0-9a-f]{64}$/u;
 const RUNNER_STARTED_AT = new Date().toISOString();
 
 /** result.json 键集（封闭）：写端投影与读端校验共用这一份。 */
-const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,final_text_sha256,finished_at,is_error,key,model,num_turns,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
+const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,final_text_sha256,finished_at,is_error,key,model,num_turns,outbox_dir,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
 const STARTED_KEYS = "claude_pid,key,runner_pid,runner_start_at,started_at,schema".split(",").sort().join(",");
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -96,6 +96,8 @@ export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null
   if (!isCanonicalIso(doc.finished_at)) return "finished_at 不是规范化 ISO";
   if (Date.parse(doc.finished_at) > now + 60_000) return "finished_at 晚于写入时刻 +60s";
   if (doc.claude_path !== null && typeof doc.claude_path !== "string") return "claude_path 形状不对";
+  // P1-5：outbox_dir —— 回执所在 outbox 目录（相对 projectRoot 的相对路径，可含 ../），doc 读端据此精确核回执；null 合法。
+  if (doc.outbox_dir !== null && (typeof doc.outbox_dir !== "string" || doc.outbox_dir.length === 0 || doc.outbox_dir.startsWith("/"))) return "outbox_dir 形状不对（须相对路径或 null）";
   return null;
 }
 
@@ -176,6 +178,7 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     final_text_sha256: sha256Hex(resultText), // 源最终文本的 SHA（#141 三轮 P1-4：sent=true 时必须 === sha256("sent")）
     finished_at: new Date(finishedAt).toISOString(),
     claude_path: claudePath,
+    outbox_dir: (typeof spec.outboxDir === "string" && typeof spec.projectRoot === "string") ? path.relative(spec.projectRoot, spec.outboxDir) : null,
   };
 }
 

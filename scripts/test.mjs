@@ -38259,6 +38259,28 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     run((fx) => { fs.symlinkSync("/nonexistent", path.join(fx.ledgerRoot, nonFrozen)); });
     // ③ 冻结集外的 endpoint 目录（是目录但非本 operation 冻结集成员）→ 残骸。
     run((fx) => { fs.mkdirSync(path.join(fx.ledgerRoot, "endpoint_" + "b".repeat(24)), { recursive: true, mode: 0o700 }); });
+    // ④ 冻结集内名字的 symlink 目录（名字 ∈ 冻结集，但是 symlink → 非目录）→ 残骸。
+    run((fx) => { const p = path.join(fx.ledgerRoot, "endpoint_" + "a".repeat(24)); fs.rmSync(p, { recursive: true, force: true }); fs.symlinkSync("/tmp", p); });
+  });
+
+  test("R52 返修五追加（续）：恰为 owner-select-campaign.json 的 symlink → campaignAllowedFor 拒（writer 屏障恢复窗）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("writer_state:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "writer 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // 恰为 owner-select-campaign.json 的 symlink（非普通文件）→ 残骸。
+      const cp = path.join(fx.ledgerRoot, "owner-select-campaign.json");
+      fs.rmSync(cp, { force: true });
+      fs.symlinkSync("/nonexistent", cp);
+      fx.ctx.afterWrite = null;
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "campaign.json symlink 残骸停门：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    } finally { fx.cleanup(); }
   });
 
   test("R52 返修五追加：ledger 允许清单核（普通文件 ∧ 非 symlink）——ledger 目录放同名 symlink → 屏障拒、step 不记 done", () => {

@@ -255,17 +255,38 @@ function withIntentsLock(dir, fn, { env = process.env } = {}) {
  * 内层函数持 outer 的受验 capability。
  */
 export function issueReaffirmIntent({ endpointId, targetId, authorizedOwner, chatId, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+  let innerRes;
+  let outerRel = { ok: true }; // 未在本层新取 outer（调用方持有）→ 视为外层已受验释放干净
   if (!outerCapability) {
     const acq = acquireOrderLock(endpointId, env);
     if (!acq.ok) return { ok: false, reason: acq.reason ?? "binding_busy", why: acq.why ?? null, gate: acq.gate ?? null, text: acq.text ?? null };
+    const cap = Object.freeze({ kind: "m1a_order_lock", token: acq.token, endpointId });
     try {
-      const cap = Object.freeze({ kind: "m1a_order_lock", token: acq.token, endpointId });
-      return issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now, clock, env, outerCapability: cap, _inject });
+      innerRes = issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now, clock, env, outerCapability: cap, _inject });
     } finally {
-      acq.release();
+      try { outerRel = acq.release(); } catch (err) { outerRel = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
     }
+  } else {
+    innerRes = issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now, clock, env, outerCapability, _inject });
   }
-  return issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now, clock, env, outerCapability, _inject });
+  // R57b 返修二 P1-2：签发出口像消费出口一样**联合 outer / intent 两层释放结果**——
+  //   任一 residue/unclear → 非绿（结构化 reason，CLI 退出码非 0）。
+  const outerLockState = foldLockReleaseState(outerRel);
+  const intentLockState = innerRes?.lock_state ?? "released";
+  if (outerLockState !== "released" || intentLockState !== "released") {
+    return {
+      ...innerRes,
+      ok: false,
+      reason: "issue_lock_release_unclean",
+      why: "签发出口两侧锁释放不干净（outer=" + outerLockState + ", intent=" + intentLockState + "）",
+      locks: { outer: outerLockState, intent: intentLockState },
+      lockUncleared: {
+        outer: outerLockState !== "released" ? { reason: outerRel?.reason ?? "outer_lock_release", why: outerRel?.why ?? null, path: outerRel?.path ?? null } : null,
+        intent: innerRes?.lockUncleared ?? null,
+      },
+    };
+  }
+  return innerRes;
 }
 
 export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner, chatId, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
@@ -279,6 +300,13 @@ export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner
   if (!d.ok) return { ok: false, reason: d.reason ?? "endpoint_dir_unresolvable", why: d.why ?? null };
 
   return withIntentsLock(d.dir, (intentToken) => {
+    // R57b 返修二 P1-2：签发默认且强制用真实准入读取器，outer + intent 锁内要求精确 partial；
+    //   只能替换不能省略关闭——之前签发路径完全没调 readOwnerSelectAdmission（准入可绕过）。
+    const admFn = _inject?.selectAdmissionFn ?? readOwnerSelectAdmission;
+    const lockAdm = admFn(env);
+    if (!lockAdm || lockAdm.state !== "partial") {
+      return { ok: false, reason: lockAdm?.state === "off" ? "select_off" : "select_not_partial", why: "签发准入锁内重核未通过（state=" + (lockAdm?.state ?? "null") + "）" };
+    }
     const cur = readReaffirmIntents({ endpointDir: d.dir });
     if (!cur.ok) return { ok: false, reason: "reaffirm_intents_unreadable", why: cur.problem };
     const doc = cur.doc;
@@ -395,13 +423,11 @@ export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender,
   if (!d.ok) return { ok: false, status: "failed", reason: d.reason ?? "endpoint_dir_unresolvable", why: d.why ?? null };
 
   return withIntentsLock(d.dir, (intentToken) => {
-    // admission === partial 在 outer + intent 锁内重核（不只在入口看一眼）
-    if (typeof selectAdmissionFn === "function") {
-      const lockAdm = selectAdmissionFn(env);
-      if (!lockAdm || lockAdm.state !== "partial") {
-        const reason = lockAdm?.state === "off" ? "select_off" : "select_not_partial";
-        return { ok: false, status: "failed", reason, why: "准入锁内重核未通过（state=" + (lockAdm?.state ?? "null") + "）" };
-      }
+    // R57b 返修二 P1-2：消费默认且强制用真实准入读取器（省略 selectAdmissionFn 不再跳过）；注入只能替换不能省略关闭。
+    const admFn = selectAdmissionFn ?? readOwnerSelectAdmission;
+    const lockAdm = admFn(env);
+    if (!lockAdm || lockAdm.state !== "partial") {
+      return { ok: false, status: "failed", reason: lockAdm?.state === "off" ? "select_off" : "select_not_partial", why: "准入锁内重核未通过（state=" + (lockAdm?.state ?? "null") + "）" };
     }
 
     const cur = readReaffirmIntents({ endpointDir: d.dir });

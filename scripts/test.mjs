@@ -41856,12 +41856,22 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   const talOkB = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
 
   // 真账本夹具：init(rev1) + schema_upgrade(rev2)；之后走执行器。返回 { root, dir }。
+  // P1-2：签发/消费默认强制用真实准入读取器（readOwnerSelectAdmission），夹具必须给 partial 准入。
+  const writePartialAdmission = (root) => {
+    const cid = "osc_" + "4".repeat(32);
+    const dig = endpointsDigest([EP57B]);
+    const cDoc = { schema_version: "owner-select-campaign-1", campaign_id: cid, state: "open", endpoints: [EP57B], endpoints_digest: dig, pending_joins: [], members: { [EP57B]: { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 1 } }, revision: 1, origin_operation_id: "00000000-0000-4000-8000-00000000aa01" };
+    const wDoc = { schema_version: "owner-select-writer-state-1", state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1, origin_operation_id: "00000000-0000-4000-8000-00000000aa01" };
+    fs.writeFileSync(path.join(root, CAMPAIGN_FILE), JSON.stringify(cDoc, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(root, WRITER_STATE_FILE), JSON.stringify(wDoc, null, 2) + "\n", { mode: 0o600 });
+  };
   const withLedgerB = (fn) => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-")));
     const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
     process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
     const dir = path.join(root, EP57B);
     try {
+      writePartialAdmission(root);
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57B, chain: "claude", authority_mode: "shadow", revision: 2, operations: {
         "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57b_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57B, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
@@ -41994,6 +42004,50 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b3 = seedB3B(dir, "r57b_5", 37, "sess-b-37");
     r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_other", clock: () => T0B });
     assert.equal(r.reason, "chat_mismatch", "chatId 与记录不符");
+  }));
+
+  test("R57b 返修二 P1-2：签发/消费默认且强制真实准入读取器（省略 selectAdmissionFn 不得绕过）；签发出口联合 outer/intent 两层锁释放——任一 residue/unclear 非绿", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p12", 38, "sess-b-38");
+    const rmAdmission = () => {
+      fs.rmSync(path.join(root, CAMPAIGN_FILE), { force: true });
+      fs.rmSync(path.join(root, WRITER_STATE_FILE), { force: true });
+    };
+
+    // ① 无 writer state（admission off）签发 → 拒（默认强制真读取器；省略注入不得关闭）
+    rmAdmission();
+    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.ok, false, "无 writer state 签发必须拒");
+    assert.equal(r.reason, "select_off", "reason 为 select_off");
+    writePartialAdmission(root); // 恢复 partial 供后续
+
+    // ② 消费不传 verifier（省略 selectAdmissionFn）→ 走默认读取器 → off 拒
+    const issued = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue P1-2");
+    rmAdmission();
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: issued.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(r.ok, false, "消费省略 verifier 不得绕过准入");
+    assert.equal(r.reason, "select_off", "消费走默认读取器 → off 拒");
+    assert.ok(readIntentsB(dir)?.entries[issued.reaffirm_handle], "拒不清 intent（可等 partial 后重发）");
+    writePartialAdmission(root);
+
+    // ③ 提交段删 outer 锁 → 签发非绿（locks.outer=unclear）
+    const b3c = seedB3B(dir, "r57b_p12c", 39, "sess-b-39");
+    r = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3c, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeRename: () => { fs.rmSync(path.join(dir, "m1a-order.lock"), { recursive: true, force: true }); } },
+    });
+    assert.equal(r.ok, false, "提交段删 outer 锁 → 签发非绿");
+    assert.equal(r.reason, "issue_lock_release_unclean");
+    assert.equal(r.locks.outer, "unclear", "outer 锁释放不干净");
+
+    // ④ intent 锁释放异常 → 签发非绿（locks.intent=unclear）
+    const b3d = seedB3B(dir, "r57b_p12d", 40, "sess-b-40");
+    r = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3d, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeRename: () => { fs.rmSync(path.join(dir, "reaffirm-intents.lock"), { recursive: true, force: true }); } },
+    });
+    assert.equal(r.ok, false, "intent 锁释放异常 → 签发非绿");
+    assert.equal(r.reason, "issue_lock_release_unclean");
+    assert.equal(r.locks.intent, "unclear", "intent 锁释放不干净");
   }));
 
   // ── B. owner_select_reaffirm（ledger op）+ 消费编排（intent 锁 → ledger 锁）──
@@ -42327,6 +42381,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
     const dir = path.join(root, EP57B);
     try {
+      writePartialAdmission(root); // P1-2：默认强制真实准入读取器，夹具需给 partial 准入
       const b3 = "ta_" + "1".repeat(32), a1t = "ta_" + "2".repeat(32);
       const actOp = "00000000-0000-4000-8000-0000000002a1";
       const osh = "osh_" + "a".repeat(32);

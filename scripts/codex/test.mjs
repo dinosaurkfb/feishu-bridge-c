@@ -10294,7 +10294,7 @@ test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim
 
   const paths = taskPaths(task, home);
   const h = "osh_" + "b".repeat(32);
-  const msgId = "msg_sel_inflight";
+  const msgId = "om_selinflight";
   const key = claimKey(msgId, task.logical_task_key);
 
   const acquired = acquireClaim({

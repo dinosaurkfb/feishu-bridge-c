@@ -27,6 +27,8 @@ import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
 export { canonKey, sha256 };
+// R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
+import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./shapes.mjs";
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -37,7 +39,6 @@ const MAX_FILE_BYTES = 1 << 20;
 const MAX_LIVE = 512;
 const MAX_OPERATIONS = 4096;
 
-const ID_SHAPE = /^ta_[0-9a-f]{32}$/u;
 export { ID_SHAPE }; // 只读导出（policy-store 派生 policy_subject_id 复用同一判据，#R33 P2-1）
 const OP_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
@@ -64,10 +65,8 @@ const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
 // R48：owner_select 账本地基 schema 与 handle 前缀形状
 // P1-3：导出 SCHEMA_VERSIONS——过渡 runtime 前置要核已装 runtime 的账本模块认 1.1-transition/1.1。
 export const SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
-const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;
-const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
-const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;
-export { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE }; // R52a: 单一出处导出供控制命令解析
+export { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE }; // R52a: 单一出处导出供控制命令解析（定义住叶子 shapes.mjs）
+export { SHA_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE }; // R57b: reaffirm intent store 封闭 schema 复用同一形状（不另写一份；ENDPOINT_SHAPE/ID_SHAPE 已有专行导出）
 const ANY_HANDLE_SHAPE = /^(osh|orh|rfh)_[0-9a-f]{32}$/u;
 const ALLOWED_PRODUCE_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);
 
@@ -830,13 +829,6 @@ const RESULT_SHAPE = Object.freeze({
       return isId(r.target_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.target_id
         && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.target_id && r.proof_effects[0].binding_effect === "produced" && r.proof_effects[0].link_effect === "produced"
         && bindingProofProblem(r.new_binding_proof, { schemaVersion: "1.1" }) === null && r.new_binding_proof.kind === "owner_select_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_binding_proof.selection_handle)
-        && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
-        && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
-        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
-    }
-    if (keysOf(r) === "affected_live_ids_after_commit,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") {
-      return isId(r.target_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.target_id
-        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.target_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"
         && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
         && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
         && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
@@ -2264,6 +2256,9 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
 /** 迁移期 selection_handle 有效期：唯一常量（owner-select-route.md §4 P2-2 拍定），编排与校验共用。 */
 export const OWNER_SELECT_HANDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+// R57b §8.1：reaffirm intent 有效期（迁移期专用 store）。TTL 拍板（P2-2 同款纪律）：唯一常量，签发与消费两侧共用。
+export const OWNER_SELECT_REAFFIRM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 export function buildMintPlan({ doc, token, campaignId, endpointId, requestKey, now, ttlMs }) {
   const frozen = isCanonicalMs(now) ? canonicalIso(now) : null;
   if (frozen === null || (ttlMs !== undefined && ttlMs !== OWNER_SELECT_HANDLE_TTL_MS)) return null;
@@ -3228,4 +3223,110 @@ export function expireRebindHandle({ endpointId, requestKey, targetId, expectedH
 
 export function cancelRebind({ endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   return rebindClearTx({ opType: "cancel_rebind", requireExpired: false, endpointId, requestKey, targetId, expectedHandle, expectedExpiresAt, now, clock, env, _inject });
+}
+
+/* ─────────────────────────── owner_select_reaffirm（R57b §6 行；消费 reaffirm intent） ─────────────────────────── */
+
+/** §8.1 证明闭包摘要（可直译公式，八轮 P1-4）：domain + endpoint + target + **family** + 双 proof + 关联 tombstone
+ *  （forwards_to === target 的全部 forwarding_tombstone，按 topic_agent_id 排序）。family 在摘要内：
+ *  签发后 unbind/restore 使 proof 不变而 family 已变 → 旧 intent 必失效。target 非 live → null（签发侧拒）。 */
+export function ownerSelectReaffirmClosureDigest(doc, targetId) {
+  const rec = doc?.records?.[targetId];
+  if (!rec || rec.kind !== "live") return null;
+  const tombstones = Object.values(doc.records)
+    .filter((r) => r.kind === "forwarding_tombstone" && r.forwards_to === targetId)
+    .map((r) => ({ topic_agent_id: r.topic_agent_id, forwards_to: r.forwards_to, proof_ref: r.proof_ref }))
+    .sort((a, b) => (a.topic_agent_id < b.topic_agent_id ? -1 : 1));
+  return sha256(Buffer.from(canonKey({
+    domain: "owner_select_reaffirm_closure_v1",
+    endpoint_id: doc.endpoint_id,
+    topic_agent_id: targetId,
+    family: familyOf(rec.facts),
+    binding_proof: rec.binding_proof,
+    locator_link_proof_ref: rec.locator_link_proof_ref,
+    tombstones,
+  }), "utf-8"));
+}
+
+// reaffirm 可签发的族（§4：reaffirm_handle 落 sidecar，合法族 = 待 reaffirm 的 B3/B3'/B4/A3/A4）。
+const REAFFIRM_TARGET_FAMILIES = Object.freeze(["B3", "B3'", "B4", "A3", "A4"]);
+
+/** owner_select_reaffirm 的 request_key（§8.1：entity=target_id、ext=reaffirm_handle）——唯一派生函数，两侧共用（R57b 返修三 P2）。 */
+export function ownerSelectReaffirmRequestKey({ target, handle }) {
+  return "osr:" + String(target) + ":" + String(handle);
+}
+
+/** owner_select_reaffirm（§6 reaffirm 行；gated ledger op——intent 的消费编排方在 intent 锁内调本函数）。
+ *  fp = {request_key, target_id, reaffirm_handle, expected_old_proof_closure_digest, selected_session_id,
+ *  selected_root_om, selection_message_id}；request_key = "osr:" + target_id + ":" + reaffirm_handle
+ *  （§8.1：entity=target_id、ext=reaffirm_handle）。digest/family 等在**账本锁内**对现账重核（单一原子 CAS）。
+ *  按 origin binding 分支：owner_select_v1 → 重签双证（produced），否则保留原 binding（preserved）；
+ *  link 一律重签 owner_selected_route_v1（selection_handle = rfh_ 消费值）；关联 owner_select_merge_v1
+ *  tombstone 同笔 remap（按 old_tomb_id 排序）。**不复用 migrate_repair；不批量；不后台。** */
+export function ownerSelectReaffirm({ endpointId, targetId, targetFamily, expectedOldProofClosureDigest, reaffirmHandle, authorizedBy, chatId, selectedSessionId, selectedRootOm, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
+  const requestKey = ownerSelectReaffirmRequestKey({ target: targetId, handle: reaffirmHandle });
+  const inputs = { request_key: requestKey, target_id: targetId, reaffirm_handle: reaffirmHandle, expected_old_proof_closure_digest: expectedOldProofClosureDigest, selected_session_id: selectedSessionId, selected_root_om: selectedRootOm, selection_message_id: selectionMessageId };
+  return gatedTx({
+    endpointId, requestKey, env, _inject, replay: () => [{ opType: "owner_select_reaffirm", inputs }],
+    mutate: (doc) => {
+      if (doc === null) return { ok: false, reason: "absent" };
+      if (!is11Schema(doc)) return { ok: false, reason: "schema_not_11", why: "reaffirm 只住 1.1-transition/1.1" };
+      if (!isId(targetId)) return { ok: false, reason: "bad_target_id" };
+      if (typeof reaffirmHandle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(reaffirmHandle)) return { ok: false, reason: "bad_reaffirm_handle" };
+      if (typeof expectedOldProofClosureDigest !== "string" || !SHA_SHAPE.test(expectedOldProofClosureDigest)) return { ok: false, reason: "bad_digest" };
+      if (typeof selectionMessageId !== "string" || !OM_SHAPE.test(selectionMessageId)) return { ok: false, reason: "bad_selection_message_id" };
+      if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_authorized_by" };
+      const rec = doc.records[targetId];
+      if (!rec || rec.kind !== "live") return { ok: false, reason: "reaffirm_target_missing" };
+      const fam = familyOf(rec.facts);
+      if (fam !== targetFamily) return { ok: false, reason: "family_changed", why: "current=" + String(fam) + " intent=" + String(targetFamily) + "（签发后 unbind/restore 过）" };
+      if (rec.chat_id !== chatId) return { ok: false, reason: "chat_mismatch", why: "事件 chat 与 target live 的 chat_id 不符" };
+      // digest CAS：锁内对现账重算（intent 锁内读出的 expected 是调用方不可变证据）
+      const curDigest = ownerSelectReaffirmClosureDigest(doc, targetId);
+      if (curDigest !== expectedOldProofClosureDigest) return { ok: false, reason: "digest_cas_mismatch", why: "现闭包摘要 ≠ intent 签发摘要（签发后记录变动过）" };
+      if (rec.aliases.session_id !== selectedSessionId || rec.aliases.root_om !== selectedRootOm) {
+        return { ok: false, reason: "selection_mismatch", why: "selected_* 与记录当前别名不符" };
+      }
+      if (rec.binding_proof === null || rec.locator_link_proof_ref === null) return { ok: false, reason: "reaffirm_scope", why: "无证记录不可 reaffirm" };
+      const nowMs = Number.isFinite(now) ? now : clock(); // 事件记账时间
+      const iso = isoOrNull(nowMs); if (iso === null) return BAD_TIME;
+      // R57b 返修一 P1-1：reaffirm 必须让迁移收敛——pairing binding 也要换成 owner_select_v1
+      // 检查关联 tombstone 的 proof kind：未知 kind → 整笔拒
+      const relatedTombstones = Object.values(doc.records)
+        .filter((r) => r.kind === "forwarding_tombstone" && r.forwards_to === targetId);
+      for (const t of relatedTombstones) {
+        const pk = t.proof_ref?.kind;
+        if (pk !== "pairing" && pk !== "owner_select_merge_v1") {
+          return { ok: false, reason: "bad_input", why: "tombstone " + t.topic_agent_id + " 的 proof kind " + String(pk) + " 不在 {pairing, owner_select_merge_v1}，reaffirm 无法收敛" };
+        }
+      }
+      const opIdRef = { id: null };
+      const newLink = () => ({ kind: "owner_selected_route_v1", authorized_by: authorizedBy, authorized_at: iso, by_identity: "owner_authorization", selected_root_om: rec.aliases.root_om, selected_session_id: rec.aliases.session_id, selection_handle: reaffirmHandle, selection_operation_id: null });
+      // remap：关联 owner_select_merge_v1 tombstone（按 old_tomb_id 排序），换到本笔新闭包
+      const remap = relatedTombstones
+        .filter((r) => r.proof_ref?.kind === "pairing" || r.proof_ref?.kind === "owner_select_merge_v1")
+        .map((r) => ({ old_tomb_id: r.topic_agent_id, new_proof_ref: { kind: "owner_select_merge_v1", selection_operation_id: null, selected_root_om: rec.aliases.root_om, selection_handle: reaffirmHandle } }))
+        .sort((a, b) => (a.old_tomb_id < b.old_tomb_id ? -1 : 1));
+      const result = { target_id: targetId, affected_live_ids_after_commit: [targetId], proof_effects: [{ topic_agent_id: targetId, binding_effect: "produced", link_effect: "produced" }], new_binding_proof: { kind: "owner_select_v1", authorized_by: authorizedBy, authorized_at: iso, selected_session_id: rec.aliases.session_id, selected_root_om: rec.aliases.root_om, selection_handle: reaffirmHandle, selection_operation_id: null }, new_link_proof: newLink(), tombstone_remap: remap, selection_message_id: selectionMessageId };
+      return { ok: true, next: stampAndBuild(doc, {
+        opType: "owner_select_reaffirm", inputs, result,
+        mutateRecords: (n, opId) => {
+          opIdRef.id = opId;
+          // selection_operation_id = 本 op 自己的 map key（§6 通则；opId 由 stampAndBuild 生成）
+          result.new_link_proof.selection_operation_id = opId;
+          result.new_binding_proof.selection_operation_id = opId;
+          for (const m of result.tombstone_remap) m.new_proof_ref.selection_operation_id = opId;
+          const r = n.records[targetId];
+          r.locator_link_proof_ref = result.new_link_proof;
+          r.binding_proof = result.new_binding_proof;
+          r.updated_at = iso; r.origin_operation_id = opId;
+          for (const m of result.tombstone_remap) {
+            const t = n.records[m.old_tomb_id];
+            t.proof_ref = { ...m.new_proof_ref };
+            t.origin_operation_id = opId;
+          }
+        },
+      }) };
+    },
+  });
 }

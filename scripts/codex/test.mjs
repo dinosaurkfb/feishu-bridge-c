@@ -99,6 +99,7 @@ import {
 } from "./state.mjs";
 import { collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
+import { selectionContextDigestV1 } from "../select-admission.mjs";
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
 import * as TAL from "../topic-agent-ledger.mjs";
 import {
@@ -10293,7 +10294,7 @@ test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim
 
   const paths = taskPaths(task, home);
   const h = "osh_" + "b".repeat(32);
-  const msgId = "msg_sel_inflight";
+  const msgId = "om_selinflight";
   const key = claimKey(msgId, task.logical_task_key);
 
   const acquired = acquireClaim({
@@ -10308,6 +10309,24 @@ test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim
       policy_version: "1.0",
       local_target_id: "lt_test",
       origin_channel_generation_id: "ch_test",
+      selection_context: {
+        endpoint: legacyEndpointId({ runtime: "codex", agentUid: TEMPLATE.agent_uid }),
+        chat: TEMPLATE.chat_id,
+        session: "aily_session_a",
+        message: msgId,
+        sender: TEMPLATE.frank_sender_id,
+        handle: h,
+        kind: "osh",
+      },
+      selection_context_digest_v1: selectionContextDigestV1({
+        endpoint: legacyEndpointId({ runtime: "codex", agentUid: TEMPLATE.agent_uid }),
+        chat: TEMPLATE.chat_id,
+        session: "aily_session_a",
+        message: msgId,
+        sender: TEMPLATE.frank_sender_id,
+        handle: h,
+        kind: "osh",
+      }),
     },
   });
   assert.equal(acquired.ok, true);

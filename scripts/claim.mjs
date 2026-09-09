@@ -15,6 +15,8 @@ import { DIALOGUE_POLICY_ID, DIALOGUE_POLICY_VERSION } from "./interaction-polic
 import { MAPPING_POLICY_ID, MAPPING_POLICY_VERSION } from "./mapping-policy.mjs";
 import { effectiveBindingId, usableGeneration } from "./topic-generation.mjs";
 import path from "node:path";
+import { CLAIM_KEY_SHAPE } from "./shapes.mjs";
+export { CLAIM_KEY_SHAPE }; // R57b 返修六 P2：同一形状住叶子 shapes.mjs，此处只读导出
 
 export const CLAIM_STATE = {
   CLAIMED: "claimed",
@@ -30,7 +32,6 @@ export const CLAIM_STATE = {
  * **全仓唯一的判据** —— 恢复标记文件名、run 制品文件名、退出回执里的 claim_key、
  * watcher 的入参都用它验；各写一份正则就会有一份漏掉。
  */
-export const CLAIM_KEY_SHAPE = /^[0-9a-f]{64}$/u;
 
 export function claimKey(messageId, logicalTaskKey) {
   return createHash("sha256")

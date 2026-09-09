@@ -29,6 +29,9 @@ import { SENDER_ROLES, roleCounts, roleCountsText, senderRole, senderRolesProble
 import { parseRegisterSenderArgs, planSenderChange, applySenderChange } from "./register-sender.mjs";
 import { parseRegisterP2pArgs, planP2pChange, applyP2pChange } from "./register-p2p-chat.mjs";
 import * as TAL from "./topic-agent-ledger.mjs";
+import * as RI from "./maintenance/reaffirm-intents.mjs"; // R57b：reaffirm intent store（sidecar 读写事务）
+import * as SA from "./select-admission.mjs"; // R57b：/feishu-select 执行器（rfh 支）
+import * as SP from "./selection-plan.mjs"; // R57b 返修五：selection plan sidecar 叶子（写/读）
 import { executeSelectControl, selectAdmission, selectReject } from "./select-admission.mjs";
 import * as DW from "./m1a/dual-write.mjs";
 import * as WIRE from "./m1a/wiring.mjs";
@@ -90,7 +93,7 @@ import {
   runRouteSha256, markPublished, readPublishLedger, writePublishLedger, publishHold } from "./outbound.mjs";
 import { parseRunOutcome } from "./handoff.mjs";
 import { repairRunClaims } from "./repair-run-claim.mjs";
-import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair, dispatchControlRepair } from "./repair-control-claim.mjs";
+import { claudeClaimExpectation, controlRepairPrecondition, repairExitCode, expectationFromMapping, describeControlRepair, dispatchControlRepair, repairControlCommittedUnclean } from "./repair-control-claim.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
 import {
   describeDrainOutcome, drainProject, inspectRunChannel, outboxDirOf, suppressCmd, watcherActive, inventoryUnroutedReplies } from "./drain-outbox.mjs";
@@ -18852,6 +18855,17 @@ test("R52a item 三：selectReject 四支（off/partial/on/unreadable + rfh 放�
   }
 });
 
+test("R53 返修六 P2（select-outcome 叶子模块）：classifySelectOutcome 对 committed_durability_uncertain / committed_with_residue 判 unclean（control-committed-unclean，不是 clean/consumed）——验收那边把刀存活", () => {
+  const base = { intentCleanup: "cleared", locks: { outer: "released", intent: "released" } };
+  const dur = SA.classifySelectOutcome({ ...base, ledger: { ok: true, commit: "committed_durability_uncertain" } });
+  assert.equal(dur.ok, false, "durability_uncertain 必非绿：" + JSON.stringify(dur));
+  assert.equal(dur.status, "control-committed-unclean", "durability_uncertain → control-committed-unclean：" + JSON.stringify(dur));
+  assert.equal(dur.ledger, "unclean", "ledger 分量 unclean");
+  const res = SA.classifySelectOutcome({ ...base, ledger: { ok: true, commit: "committed_with_residue", residue: [{ reap: ".reaped-x" }] } });
+  assert.equal(res.ok, false, "committed_with_residue 必非绿");
+  assert.equal(res.status, "control-committed-unclean", "committed_with_residue 同构 → unclean：" + JSON.stringify(res));
+});
+
 test("R52a 返修一：claim meta 按 kind 投影（select 经 controlIntentProblem 合法）/ /feishu-select R3 / 大小写变体 malformed", () => {
   const h = "osh_" + "a".repeat(32);
   assert.equal(controlIntentProblem({ control: "select", handle: h, handle_kind: "osh" }), null, "select claim meta 合法（P1 修后）");
@@ -19056,7 +19070,7 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   assert.equal(executorCalls, 1, "执行器总调用次数保持为 1");
 });
 
-test("R55：/feishu-select 准入默认接真状态 —— writer_state off/partial/on/坏文件 × 真入口，四种文案与终态（放行仍 select_executor_absent）", () => {
+test("R55：/feishu-select 准入默认接真状态 —— writer_state off/partial/on/坏文件 × 真入口，四种文案与终态（osh 仍 absent；R57b 起 rfh 接真执行器）", () => {
   const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r55-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
   const ledgerDir = path.join(fs.realpathSync(local), "ledger"); fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerDir, 0o700);
@@ -19114,10 +19128,10 @@ test("R55：/feishu-select 准入默认接真状态 —— writer_state off/part
   assert.match(r.stdout, /已拒绝 · 迁移期间只接受 rfh_ 重确认 handle/u, r.stdout);
   assert.equal(failedError("msg_r55_partial"), "select_partial_not_rfh");
 
-  // ③ partial + rfh → 放行 → 执行器未接入 → failed(select_executor_absent) 终态
+  // ③ partial + rfh → 放行 → R57b 真执行器：夹具没签过 intent → failed(reaffirm_handle_unknown) 终态（重做须重新签发/新消息）
   r = run("/feishu-select rfh_" + "b".repeat(32), "msg_r55_partial_rfh");
-  assert.match(r.stdout, /已收到选择，执行器尚未接入，本条未消费；执行器接入后请重新发送/u, r.stdout);
-  assert.equal(failedError("msg_r55_partial_rfh"), "select_executor_absent");
+  assert.match(r.stdout, /已拒绝 · 重确认 handle 不存在或已被消费/u, r.stdout);
+  assert.equal(failedError("msg_r55_partial_rfh"), "reaffirm_handle_unknown");
 
   // ④ on（campaign complete strict + writer on）→ 放行 → 同样 select_executor_absent
   rmBoth(); writeWriter("on"); writeCampaign("complete");
@@ -19155,7 +19169,7 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
   const { expect } = expectation;
   const logicalTaskKey = expect.logicalTaskKey;
   const h = "osh_" + "c".repeat(32);
-  const msgId = "msg_sel_inflight_claude";
+  const msgId = "om_selinflightclaude";
   const key = claimKey(msgId, logicalTaskKey);
 
   const acquired = acquireClaim({
@@ -19164,6 +19178,24 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
     logicalTaskKey,
     meta: {
       control: { control: "select", handle: h, handle_kind: "osh" },
+      selection_context: {
+        endpoint: legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid }),
+        chat: TPL.chat_id,
+        session: "aily_claude_ctl",
+        message: msgId,
+        sender: "ou_user_1",
+        handle: h,
+        kind: "osh",
+      },
+      selection_context_digest_v1: SA.selectionContextDigestV1({
+        endpoint: legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid }),
+        chat: TPL.chat_id,
+        session: "aily_claude_ctl",
+        message: msgId,
+        sender: "ou_user_1",
+        handle: h,
+        kind: "osh",
+      }),
       session_id: "aily_claude_ctl",
       binding_id: expect.bindingId,
       policy_id: MAPPING_POLICY_ID,
@@ -19896,7 +19928,7 @@ test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进
       assert.deepEqual([ro.ok, ro.reason, executed], [false, "control_lock_unavailable", 0], "目录不可写：连事务锁都建不了，不执行：" + JSON.stringify(ro));
     } finally { fs.chmodSync(claimsDir, 0o700); }
   }
-  assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "failed_unreadable", "in_flight"]);
+  assert.deepEqual([...RESUMABLE_CONTROL_STATES].sort(), ["consumed_unreadable", "control-committed-unclean", "failed_unreadable", "in_flight"]);
   // ── 事务锁协议（评审第 6 轮）──
   // ① 锁内状态对所有调用者权威：重复投递先闭合，原持有者晚到（自称首次）也不再执行、不覆写记录
   const lateKey = acquireClaim({ claimsDir, messageId: "msg_late", logicalTaskKey: "t",
@@ -33358,7 +33390,7 @@ test("R48 owner_select 账本地基：schema 三值域 / 记录四 handle 字段
         old_session_id: "00000000-0000-4000-8000-000000000001", new_session_id: "00000000-0000-4000-8000-000000000002",
         selected_root_om: "om_root1", selected_session_id: "00000000-0000-4000-8000-000000000002",
         selection_basis: "rebind", selection_handle: hORH1, selection_message_id: "om_msg1", tombstoned_a1_id: null,
-        proof_effects: [{ topic_agent_id: taId1, binding_effect: "preserved", link_effect: "produced" }]
+        proof_effects: [{ topic_agent_id: taId1, binding_effect: "produced", link_effect: "produced" }]
       }
     };
     assert.equal(TAL.validateLedger(dRebNoOpId, { endpointId: EP }).ok, false, "rebind_session_alias 缺 selection_operation_id 必拒");
@@ -41814,6 +41846,1819 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
 }
 
+// ─────────────────────────── R57b：reaffirm intent store + owner_select_reaffirm（§8.1 / §6 / §12） ───────────────────────────
+
+{
+  const EP57B = legacyEndpointId({ runtime: "claude", agentUid: "agent_b" });
+  const T0B = Date.parse("2026-09-11T09:00:00.000Z");
+  const ISO0B = "2026-09-11T09:00:00.000Z";
+  const TGTB = (n) => ({ runtime: "claude", project_root: "/p/r57b", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
+  const CLAIMB = (c) => c.repeat(64);
+  const talOkB = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
+
+  // 真账本夹具：init(rev1) + schema_upgrade(rev2)；之后走执行器。返回 { root, dir }。
+  // P1-2：签发/消费默认强制用真实准入读取器（readOwnerSelectAdmission），夹具必须给 partial 准入。
+  const writePartialAdmission = (root) => {
+    const cid = "osc_" + "4".repeat(32);
+    const dig = endpointsDigest([EP57B]);
+    const cDoc = { schema_version: "owner-select-campaign-1", campaign_id: cid, state: "open", endpoints: [EP57B], endpoints_digest: dig, pending_joins: [], members: { [EP57B]: { schema_version: "1.0", legacy_proof_count: 1, null_b1_count: 1 } }, revision: 1, origin_operation_id: "00000000-0000-4000-8000-00000000aa01" };
+    const wDoc = { schema_version: "owner-select-writer-state-1", state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 1, origin_operation_id: "00000000-0000-4000-8000-00000000aa01" };
+    fs.writeFileSync(path.join(root, CAMPAIGN_FILE), JSON.stringify(cDoc, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(root, WRITER_STATE_FILE), JSON.stringify(wDoc, null, 2) + "\n", { mode: 0o600 });
+  };
+  const withLedgerB = (fn) => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EP57B);
+    try {
+      writePartialAdmission(root);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57B, chain: "claude", authority_mode: "shadow", revision: 2, operations: {
+        "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57b_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57B, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+        "00000000-0000-4000-8000-0000000001a2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57b_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57b_up", endpoint: EP57B, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57B, from_schema: "1.0", to_schema: "1.1-transition" } }
+      }, records: {} };
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const v = TAL.validateLedger(doc, { endpointId: EP57B });
+      assert.equal(v.ok, true, "R57b 夹具账本自洽：" + JSON.stringify(v));
+      return fn(root, dir);
+    } finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const loadOkB = (dir) => {
+    const l = TAL.loadLedger(dir, { endpointId: EP57B });
+    assert.ok(l.ok, "读回：" + JSON.stringify(l));
+    const v = TAL.validateLedger(l.doc, { endpointId: EP57B });
+    assert.equal(v.ok, true, "产物过 validateLedger：" + JSON.stringify(v.why ?? null));
+    return l.doc;
+  };
+  // 真执行器造一个可 reaffirm 的 B3（B1+A1→activate，pairing binding）。
+  const seedB3B = (dir, rk, n, sessionId) => {
+    const b1 = talOkB(TAL.createB1({ endpointId: EP57B, requestKey: rk + "_b1", chatId: "oc_r57b", rootOm: "om_rb" + n, lineageId: "lin_rb" + n, bindingTarget: TGTB(n), now: T0B }), "createB1");
+    const a1 = talOkB(TAL.createA1({ endpointId: EP57B, requestKey: rk + "_a1", chatId: "oc_r57b", sessionId, now: T0B }), "createA1");
+    talOkB(TAL.activate({ endpointId: EP57B, requestKey: rk + "_act", b1Id: b1.result.created_id, a1Id: a1.result.created_id, f4: { matched_om: "om_rb" + n, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, authorizedBy: "ou_r57b", now: T0B }), "activate");
+    return b1.result.created_id;
+  };
+  const readIntentsB = (dir) => fs.existsSync(path.join(dir, "reaffirm-intents.json"))
+    ? JSON.parse(fs.readFileSync(path.join(dir, "reaffirm-intents.json"), "utf-8"))
+    : null;
+  // R57b 返修五：真实 claim 写方在账本提交前把 selection plan 落盘到 claims/<key>.selection-plan.json；
+  //   测试手写 plan 用同一叶子函数（writeSelectionPlan），与真实链路同源。
+  const writePlanB = (claimsDir, key, handle, target, expiresAt = "2026-09-18T09:00:00.000Z") => {
+    const wp = SP.writeSelectionPlan({ claimsDir, key, plan: {
+      schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: target, basis: "reaffirm", handle, kind: "rfh", claim_key: key,
+      cas: { intent_id: handle, expected_expires_at: expiresAt },
+    } });
+    assert.equal(wp.ok, true, "writeSelectionPlan：" + JSON.stringify(wp));
+  };
+  // R57b 返修六 P1-1：rfh 消费需强制 claimsDir+key——给定一个临时 claims 目录 + 64hex 主键，供直接消费测试用。
+  const mkPlanCtx = (root, msgId, msgSeed) => {
+    const claimsDir = path.join(root, "claims_plan_" + crypto.createHash("sha256").update(String(msgSeed)).digest("hex").slice(0, 16));
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const key = crypto.createHash("sha256").update(String(msgId) + ":" + String(msgSeed)).digest("hex");
+    return { claimsDir, key };
+  };
+
+  // ── A. sidecar 读写（§8.1 文件合同 + request_reaffirm CAS）──
+
+  test("R57b 签发：issueReaffirmIntent 签 rfh_（entry 封闭九键、expires_at=issued_at+TTL、digest 按 §8.1 公式、family 入摘要）", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_1", 31, "sess-b-31");
+    const issued = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    assert.match(issued.reaffirm_handle, /^rfh_[0-9a-f]{32}$/u, "rfh_ 形状");
+    const doc = readIntentsB(dir);
+    assert.ok(doc, "intent 文件已写");
+    const keys = Object.keys(doc.entries);
+    assert.deepEqual(keys, [issued.reaffirm_handle], "reaffirm_handle 即 intent 主键");
+    const e = doc.entries[issued.reaffirm_handle];
+    assert.equal(Object.keys(e).sort().join(","), "authorized_owner,chat_id,endpoint,expected_old_proof_closure_digest,expires_at,issued_at,reaffirm_handle,target_family,target_id", "entry 封闭九键");
+    assert.equal(e.target_id, b3);
+    assert.equal(e.target_family, "B3");
+    assert.equal(e.authorized_owner, "ou_owner57b");
+    assert.equal(e.endpoint, EP57B);
+    assert.equal(e.chat_id, "oc_r57b");
+    assert.equal(e.issued_at, ISO0B);
+    assert.equal(e.expires_at, "2026-09-18T09:00:00.000Z", "expires_at = issued_at + 7 天 TTL");
+    // digest 公式：手工按 §8.1 重算并比对（family、双 proof、关联 tombstone 全在摘要内）
+    const l = loadOkB(dir);
+    const rec = l.records[b3];
+    const tbs = Object.values(l.records).filter((r) => r.kind === "forwarding_tombstone" && r.forwards_to === b3)
+      .map((r) => ({ topic_agent_id: r.topic_agent_id, forwards_to: r.forwards_to, proof_ref: r.proof_ref }))
+      .sort((a, b) => (a.topic_agent_id < b.topic_agent_id ? -1 : 1));
+    const manual = TAL.sha256(Buffer.from(TAL.canonKey({ domain: "owner_select_reaffirm_closure_v1", endpoint_id: EP57B, topic_agent_id: b3, family: TAL.familyOf(rec.facts), binding_proof: rec.binding_proof, locator_link_proof_ref: rec.locator_link_proof_ref, tombstones: tbs }), "utf-8"));
+    assert.equal(e.expected_old_proof_closure_digest, manual, "digest = §8.1 公式（canonKey + sha256，family 在内）");
+    assert.equal(e.expected_old_proof_closure_digest, TAL.ownerSelectReaffirmClosureDigest(l, b3), "模块内同源");
+  }));
+
+  test("R57b digest：同 doc 同摘要（确定性）；unbind 后 proof 不变而 family 变 → 摘要变（旧 intent 必失效）", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_2", 32, "sess-b-32");
+    const l = loadOkB(dir);
+    const d1 = TAL.ownerSelectReaffirmClosureDigest(l, b3);
+    const d2 = TAL.ownerSelectReaffirmClosureDigest(l, b3);
+    assert.equal(d1, d2, "同 doc 同摘要");
+    talOkB(TAL.unbind({ endpointId: EP57B, requestKey: "r57b_unb", id: b3, now: T0B }), "unbind");
+    const l2 = loadOkB(dir);
+    const d3 = TAL.ownerSelectReaffirmClosureDigest(l2, b3);
+    assert.notEqual(d3, d1, "family 变（B3→B3'）→ 摘要变");
+  }));
+
+  test("R57b 签发 CAS：同 target 已有未清 intent → 拒（reaffirm_intent_exists）；同锁内先受验清理该 target 过期项再签", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_3", 33, "sess-b-33");
+    const first = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#1");
+    const second = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B + 1000 });
+    assert.equal(second.ok, false, "已有未清 intent → 拒");
+    assert.equal(second.reason, "reaffirm_intent_exists");
+    const doc1 = readIntentsB(dir);
+    assert.deepEqual(Object.keys(doc1.entries), [first.reaffirm_handle], "拒时不新增");
+    // 过期后重签：旧项受验清理、新 handle 签发
+    const later = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B + 7 * 86400e3 + 1 }), "过期后重签");
+    assert.notEqual(later.reaffirm_handle, first.reaffirm_handle);
+    const doc2 = readIntentsB(dir);
+    assert.deepEqual(Object.keys(doc2.entries), [later.reaffirm_handle], "过期旧项已清、恰一新项");
+    assert.equal(later.cleaned.length, 1, "清理清单点名旧 handle");
+    // 别的 target 不受影响（清理只动本 target）
+    const b3b = seedB3B(dir, "r57b_3b", 34, "sess-b-34");
+    talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#其他target");
+    const before = readIntentsB(dir);
+    const staleHandle = Object.keys(before.entries).find((h) => before.entries[h].target_id === b3b);
+    const later2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B + 7 * 86400e3 + 1 }), "过期后重签#其他");
+    const doc3 = readIntentsB(dir);
+    assert.equal(Object.keys(doc3.entries).length, 2, "另一 target 的未过期 intent 不动");
+    assert.ok(Object.keys(doc3.entries).includes(later.reaffirm_handle), "前一 target 的 intent 仍在");
+    assert.deepEqual(later2.cleaned, [staleHandle], "清理只点名本 target 的旧项");
+  }));
+
+  test("R57b 签发：unreadable intent 一律阻断（坏 JSON / 非 0600 / 硬链接）——不折成「无 intent」", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_4", 35, "sess-b-35");
+    const f = path.join(dir, "reaffirm-intents.json");
+    fs.writeFileSync(f, "{ 坏", { mode: 0o600 });
+    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.ok, false, "坏 JSON 拒");
+    assert.equal(r.reason, "reaffirm_intents_unreadable");
+    fs.unlinkSync(f);
+    fs.writeFileSync(f, JSON.stringify({ schema_version: "reaffirm-intents-1", entries: {} }), { mode: 0o644 });
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.ok, false, "非 0600 拒");
+    assert.equal(r.reason, "reaffirm_intents_unreadable", "非 0600 拒");
+    fs.chmodSync(f, 0o600);
+    fs.linkSync(f, path.join(dir, "reaffirm-intents.alias.json"));
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.reason, "reaffirm_intents_unreadable", "硬链接数 >1 拒");
+    fs.unlinkSync(path.join(dir, "reaffirm-intents.alias.json"));
+    // 可读其余条目自洽 → 仍可签发（之前存在的合法 entry 不丢）
+    fs.writeFileSync(f, JSON.stringify({ schema_version: "reaffirm-intents-1", entries: {} }), { mode: 0o600 });
+    talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "恢复后可签");
+  }));
+
+  test("R57b 签发范围与输入：B1 不可 reaffirm（reaffirm_scope）；target 非 live；chatId 与记录不符 → 拒", () => withLedgerB((root, dir) => {
+    const b1 = talOkB(TAL.createB1({ endpointId: EP57B, requestKey: "r57b_scope_b1", chatId: "oc_r57b", rootOm: "om_scope", lineageId: "lin_scope", bindingTarget: TGTB(36), now: T0B }), "createB1");
+    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b1.result.created_id, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "reaffirm_scope", "B1 不在 reaffirm 族");
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: "ta_" + "f".repeat(32), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.reason, "target_not_live", "不在账本");
+    const b3 = seedB3B(dir, "r57b_5", 37, "sess-b-37");
+    r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_other", clock: () => T0B });
+    assert.equal(r.reason, "chat_mismatch", "chatId 与记录不符");
+  }));
+
+  test("R57b 返修二 P1-2：签发/消费默认且强制真实准入读取器（省略 selectAdmissionFn 不得绕过）；签发出口联合 outer/intent 两层锁释放——任一 residue/unclear 非绿", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p12", 38, "sess-b-38");
+    const rmAdmission = () => {
+      fs.rmSync(path.join(root, CAMPAIGN_FILE), { force: true });
+      fs.rmSync(path.join(root, WRITER_STATE_FILE), { force: true });
+    };
+
+    // ① 无 writer state（admission off）签发 → 拒（默认强制真读取器；省略注入不得关闭）
+    rmAdmission();
+    let r = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(r.ok, false, "无 writer state 签发必须拒");
+    assert.equal(r.reason, "select_off", "reason 为 select_off");
+    writePartialAdmission(root); // 恢复 partial 供后续
+
+    // ② 消费不传 verifier（省略 selectAdmissionFn）→ 走默认读取器 → off 拒
+    const issued = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue P1-2");
+    rmAdmission();
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: issued.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(r.ok, false, "消费省略 verifier 不得绕过准入");
+    assert.equal(r.reason, "select_off", "消费走默认读取器 → off 拒");
+    assert.ok(readIntentsB(dir)?.entries[issued.reaffirm_handle], "拒不清 intent（可等 partial 后重发）");
+    writePartialAdmission(root);
+
+    // ③ 提交段删 outer 锁 → 签发非绿（locks.outer=unclear）
+    const b3c = seedB3B(dir, "r57b_p12c", 39, "sess-b-39");
+    r = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3c, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeRename: () => { fs.rmSync(path.join(dir, "m1a-order.lock"), { recursive: true, force: true }); } },
+    });
+    assert.equal(r.ok, false, "提交段删 outer 锁 → 签发非绿");
+    assert.equal(r.reason, "issue_lock_release_unclean");
+    assert.equal(r.locks.outer, "unclear", "outer 锁释放不干净");
+
+    // ④ intent 锁释放异常 → 签发非绿（locks.intent=unclear）
+    const b3d = seedB3B(dir, "r57b_p12d", 40, "sess-b-40");
+    r = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3d, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeRename: () => { fs.rmSync(path.join(dir, "reaffirm-intents.lock"), { recursive: true, force: true }); } },
+    });
+    assert.equal(r.ok, false, "intent 锁释放异常 → 签发非绿");
+    assert.equal(r.reason, "issue_lock_release_unclean");
+    assert.equal(r.locks.intent, "unclear", "intent 锁释放不干净");
+  }));
+
+  // ── B. owner_select_reaffirm（ledger op）+ 消费编排（intent 锁 → ledger 锁）──
+
+  test("R57b 消费五核反例：sender / chat / handle（unknown）/ family（签发后 unbind）/ digest（签发后 retarget）各一 → 封闭 reason 且 intent 不清（可重跑）", () => withLedgerB((root, dir) => {
+    // 五个独立 target，各签一个 intent，逐一触发一种拒。
+    const tSender = seedB3B(dir, "r57b_c1", 41, "sess-b-41");
+    const tChat = seedB3B(dir, "r57b_c2", 42, "sess-b-42");
+    const tFam = seedB3B(dir, "r57b_c3", 43, "sess-b-43");
+    const tDig = seedB3B(dir, "r57b_c4", 44, "sess-b-44");
+    const iSender = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tSender, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue sender");
+    const iChat = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tChat, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue chat");
+    const iFam = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tFam, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue family");
+    const iDig = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tDig, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue digest");
+    const consume = (handle, over = {}) => RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "wc" + handle), ...over });
+    // ① sender ≠ intent.authorized_owner
+    let r = consume(iSender.reaffirm_handle, { sender: "ou_stranger" });
+    assert.equal(r.ok, false); assert.equal(r.reason, "sender_mismatch", "sender 核");
+    // ② chat ≠ 记录 chat_id
+    r = consume(iChat.reaffirm_handle, { chatId: "oc_elsewhere" });
+    assert.equal(r.ok, false); assert.equal(r.reason, "chat_mismatch", "chat 核");
+    // ③ handle 不存在（unknown）
+    r = consume("rfh_" + "0".repeat(32));
+    assert.equal(r.ok, false); assert.equal(r.reason, "reaffirm_handle_unknown", "handle 主键核");
+    // ④ family：签发后 unbind → family 变
+    talOkB(TAL.unbind({ endpointId: EP57B, requestKey: "r57b_cfam", id: tFam, now: T0B + 1000 }), "unbind");
+    r = consume(iFam.reaffirm_handle);
+    assert.equal(r.ok, false); assert.equal(r.reason, "family_changed", "family 核");
+    // ⑤ digest：签发后 retarget 改了 proof 闭包
+    talOkB(TAL.retarget({ endpointId: EP57B, requestKey: "r57b_cdig", id: tDig, expectedOldTarget: TGTB(44), newTarget: TGTB(45), authorizedBy: "ou_r57b", now: T0B + 1000 }), "retarget");
+    r = consume(iDig.reaffirm_handle);
+    assert.equal(r.ok, false); assert.equal(r.reason, "digest_cas_mismatch", "digest CAS");
+    // 五个 intent 全部仍在场（拒不清 intent——可重跑或重新签发）
+    const doc = readIntentsB(dir);
+    assert.deepEqual(Object.keys(doc.entries).sort(), [iSender.reaffirm_handle, iChat.reaffirm_handle, iFam.reaffirm_handle, iDig.reaffirm_handle].sort(), "拒不清 intent");
+  }));
+
+  test("R57b 消费（produced 支）：B3(pairing) 重签——binding 保留、link 重签 owner_selected_route_v1、§6 preserved 键集、intent 清除、产物过 validateLedger", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p", 46, "sess-b-46");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const revBefore = loadOkB(dir).revision;
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "produced") }), "consume");
+    assert.equal(res.cleared, true, "intent 已清");
+    const doc = loadOkB(dir);
+    assert.equal(doc.revision, revBefore + 1, "恰一笔 ledger op");
+    const rec = doc.records[b3];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1", "pairing binding 换 owner_select_v1（P1-1）");
+    assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1", "link 重签");
+    const opEntry = Object.values(doc.operations).find((o) => o.op_type === "owner_select_reaffirm");
+    const opId = Object.keys(doc.operations).find((k) => doc.operations[k] === opEntry);
+    assert.equal(rec.locator_link_proof_ref.selection_operation_id, opId, "link 指向本 op");
+    assert.equal(rec.origin_operation_id, opId, "origin 指向本 op");
+    const r = opEntry.result;
+    assert.equal(Object.keys(r).sort().join(","), "affected_live_ids_after_commit,new_binding_proof,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap", "§6 produced 支精确键集（P1-1）");
+    assert.equal(r.target_id, b3);
+    assert.deepEqual(r.affected_live_ids_after_commit, [b3]);
+    assert.deepEqual(r.proof_effects, [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }]);
+    // P1-1：pairing tombstone 也 remap（该 B3 的 activate 旧形 tombstone proof_ref.kind = "pairing"）
+    assert.equal(r.tombstone_remap.length, 1, "pairing tombstone 也 remap（P1-1）");
+    assert.equal(r.tombstone_remap[0].new_proof_ref.kind, "owner_select_merge_v1");
+    assert.equal(r.selection_message_id, "om_sel57b");
+    // new_link_proof 与记录上 link 逐字相等（G13′）
+    assert.equal(TAL.canonKey(r.new_link_proof), TAL.canonKey(rec.locator_link_proof_ref));
+    assert.equal(r.new_link_proof.selection_handle, intent.reaffirm_handle, "证明里的 selection_handle = rfh_ 消费值");
+    // fp 恰为 §6 六输入 + request_key（entity=target、ext=handle）
+    assert.equal(opEntry.fingerprint, TAL.fingerprintOf("owner_select_reaffirm", { request_key: "osr:" + b3 + ":" + intent.reaffirm_handle, target_id: b3, reaffirm_handle: intent.reaffirm_handle, expected_old_proof_closure_digest: intent.entry.expected_old_proof_closure_digest, selected_session_id: "sess-b-46", selected_root_om: "om_rb46", selection_message_id: "om_sel57b" }));
+    const afterDoc = readIntentsB(dir);
+    assert.ok(afterDoc === null || Object.keys(afterDoc.entries).length === 0, "消费后 intent 清空收尾（删文件或空 entries）");
+  }));
+
+  test("R57b 返修一 P1-1：reaffirm 让迁移收敛（pairing binding 换 owner_select_v1 + pairing tombstone 换 owner_select_merge_v1），migrationInventory legacy 归零；未知 proof kind tombstone 拒", () => withLedgerB((root, dir) => {
+    // 1. 构造含 pairing binding 的 B3 以及关联的 pairing tombstone
+    const b3 = seedB3B(dir, "r57b_p1_1", 33, "sess-b-33");
+    const beforeDoc = loadOkB(dir);
+    const beforeInv = TAL.migrationInventory(beforeDoc);
+    assert.ok(beforeInv.legacy_proof_count >= 2, "reaffirm 前 legacy proof count > 0");
+
+    // 2. 正常 reaffirm 消费
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "p11") }), "consume");
+    assert.equal(res.ok, true);
+
+    // 3. reaffirm 之后：migrationInventory legacy 归零
+    const afterDoc = loadOkB(dir);
+    const afterInv = TAL.migrationInventory(afterDoc);
+    assert.equal(afterInv.legacy_proof_count, 0, "reaffirm 后 migrationInventory legacy 计数必须为 0（完全收敛）");
+    const rec = afterDoc.records[b3];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1", "binding 换成 owner_select_v1");
+    assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1", "link 换成 owner_selected_route_v1");
+
+    // 4. 反例：关联 tombstone 包含未知 proof kind → 整笔拒
+    const b3_bad = seedB3B(dir, "r57b_p1_1_bad", 34, "sess-b-34");
+    const intentBad = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3_bad, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue bad");
+    const badDoc = loadOkB(dir);
+    const badTombId = "ta_" + "9".repeat(32);
+    badDoc.records[badTombId] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: badTombId,
+      forwards_to: b3_bad,
+      merged_at: ISO0B,
+      origin_operation_id: badDoc.records[b3_bad].origin_operation_id,
+      proof_ref: { kind: "wat_unknown", om: "om_wat", matched_fields: ["chat_id", "sender", "body"], pending_token_state: "present" }
+    };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(badDoc, null, 2) + "\n", { mode: 0o600 });
+    const rBad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intentBad.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "p11bad") });
+    assert.equal(rBad.ok, false, "未知 proof kind tombstone 必须拒");
+  }));
+
+  test("R57b 返修一 P1-2：锁序与维护门——门内签发拒；内层无 capability 直调拒；锁内 admission 变成 on/off 拒", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p1_2", 36, "sess-b-36");
+
+    // 1. 反例：门内签发 → 拒（maintenance）
+    const gateFile = path.join(root, "maintenance.gate");
+    fs.symlinkSync(JSON.stringify({ schema_version: "1.0", pid: process.pid, at: ISO0B, token: "00000000-0000-0000-0000-000000000001", reason: "test" }), gateFile);
+    const maintEnv = { ...process.env, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+    const rGate = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B, env: maintEnv });
+    assert.equal(rGate.ok, false, "门内签发必须拒");
+    assert.equal(rGate.reason, "maintenance", "reason 为 maintenance");
+
+    // 2. 反例：内层无 capability 直调 → 拒（outer_lock_required）
+    const rNoCap = RI.issueReaffirmIntentInner({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(rNoCap.ok, false, "内层无 capability 签发必须拒");
+    assert.equal(rNoCap.reason, "outer_lock_required", "reason 为 outer_lock_required");
+
+    const rNoCapConsume = RI.consumeReaffirmIntentInner({ endpointId: EP57B, reaffirmHandle: "rfh_" + "a".repeat(32), sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(rNoCapConsume.ok, false, "内层无 capability 消费必须拒");
+    assert.equal(rNoCapConsume.reason, "outer_lock_required", "reason 为 outer_lock_required");
+
+    // 3. 反例：锁内 admission 变成 on/off → 拒
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+
+    // 锁内变成 off → 拒
+    let admCalls = 0;
+    const changingAdmOff = () => {
+      admCalls++;
+      if (admCalls === 1) return { state: "partial" };
+      return { state: "off" };
+    };
+    const rOff = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_sel57b",
+      selectAdmissionFn: changingAdmOff,
+      ...mkPlanCtx(root, "om_sel57b", "p12_off"),
+    });
+    assert.equal(rOff.ok, false, "锁内变 off 必须拒");
+    assert.equal(rOff.reason, "select_off");
+
+    // 锁内变成 on → 拒
+    admCalls = 0;
+    const changingAdmOn = () => {
+      admCalls++;
+      if (admCalls === 1) return { state: "partial" };
+      return { state: "on" };
+    };
+    const rOn = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_sel57b",
+      selectAdmissionFn: changingAdmOn,
+      ...mkPlanCtx(root, "om_sel57b", "p12_on"),
+    });
+    assert.equal(rOn.ok, false, "锁内变 on 必须拒");
+    assert.equal(rOn.reason, "select_not_partial");
+  }));
+
+  test("R57b 返修一 P1-3：intent 写原语——超限拒且盘上无变化；rename 前注入失败+清理失败 residue 点名 tmp；rename 后目录 fsync 失败 durability_uncertain", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p1_3", 38, "sess-b-38");
+
+    // 1. 反例：超限 → 拒且盘上无变化
+    const initialDoc = { schema_version: "reaffirm-intents-1", entries: {} };
+    for (let i = 0; i < 493; i++) {
+      const h = "rfh_" + i.toString(16).padStart(32, "0");
+      initialDoc.entries[h] = {
+        reaffirm_handle: h,
+        target_id: "ta_" + i.toString(16).padStart(32, "0"),
+        target_family: "B3",
+        authorized_owner: "ou_owner",
+        endpoint: EP57B,
+        chat_id: "oc_chat",
+        issued_at: ISO0B,
+        expires_at: "2026-09-18T09:00:00.000Z",
+        expected_old_proof_closure_digest: "0".repeat(64),
+      };
+    }
+    const intentsPath = path.join(dir, "reaffirm-intents.json");
+    fs.writeFileSync(intentsPath, JSON.stringify(initialDoc, null, 2) + "\n", { mode: 0o600 });
+    const bytesBefore = fs.statSync(intentsPath).size;
+    assert.ok(bytesBefore <= 262144, "初始文件在 256 KiB 以内可读: " + bytesBefore);
+    const diskBefore = fs.readFileSync(intentsPath, "utf-8");
+
+    // 签发第 494 笔（总数 494 <= 512 过 entries schema 检查，但序列化 262,378 > 262,144）
+    const rOver = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(rOver.ok, false, "超限写必须拒");
+    assert.equal(rOver.reason, "over_capacity", "reason 为 over_capacity");
+    assert.equal(fs.readFileSync(intentsPath, "utf-8"), diskBefore, "盘上内容保持不变");
+
+    // 恢复空 intent 文件进行后续测试
+    fs.writeFileSync(intentsPath, JSON.stringify({ schema_version: "reaffirm-intents-1", entries: {} }, null, 2) + "\n", { mode: 0o600 });
+
+    // 2. 反例：rename 前注入失败 + 清理失败 → residue 点名 tmp
+    const rResidue = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeRename: () => { throw new Error("crash_before_rename"); }, cleanupFail: true }
+    });
+    assert.equal(rResidue.ok, false, "rename 前注入失败必须拒");
+    assert.equal(rResidue.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rResidue.residue) && rResidue.residue.length > 0, "residue 包含残骸路径");
+    assert.match(rResidue.residue[0], /\.reaffirm-intents\.tmp\./u, "点名 tmp 路径");
+    // 清理遗留 tmp 以免影响后续
+    for (const f of fs.readdirSync(dir)) {
+      if (f.startsWith(".reaffirm-intents.tmp.")) fs.unlinkSync(path.join(dir, f));
+    }
+
+    // 3. 反例：rename 后目录 fsync 失败 → committed_durability_uncertain
+    const rFsync = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { failDirFsync: true }
+    });
+    assert.equal(rFsync.ok, false, "目录 fsync 失败必须报 durability_uncertain");
+    assert.equal(rFsync.commit, "committed_durability_uncertain", "commit 为 committed_durability_uncertain");
+    assert.equal(rFsync.reason, "dir_fsync_failed", "reason 为 dir_fsync_failed");
+  }));
+
+  test("R57b 返修二 P1-3：受验读回不复用裸 readFileSync——读回前把最终文件 chmod 0644 必拒（readback_failed + durability_uncertain）；cleanupTmp 只吞 ENOENT——非 ENOENT 异常 residue 点名", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p13", 41, "sess-b-41");
+
+    // ① 反例：读回前 chmod 0644 → 旧实现仍报 committed_clean，改后拒（readback_failed + durability_uncertain）。
+    const rChmod = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: {
+        beforeReadback: () => { fs.chmodSync(path.join(dir, "reaffirm-intents.json"), 0o644); },
+      },
+    });
+    assert.equal(rChmod.ok, false, "读回前 0644 必须拒，不再报 committed_clean");
+    assert.equal(rChmod.commit, "committed_durability_uncertain", "外显 durability_uncertain 语义");
+    assert.equal(rChmod.reason, "readback_failed", "reason 为 readback_failed");
+    assert.match(rChmod.why, /0600|mode/u, "点名 mode 核验失败");
+    fs.chmodSync(path.join(dir, "reaffirm-intents.json"), 0o600); // 修复现场，不影响后续
+
+    // ② 受验读回其余检查：读回文件硬链接数 >1 → 同样拒（fd 绑定读取器全核）。
+    const b3b = seedB3B(dir, "r57b_p13b", 43, "sess-b-43");
+    const rHardlink = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeReadback: () => { fs.linkSync(path.join(dir, "reaffirm-intents.json"), path.join(dir, "reaffirm-intents.x.json")); } },
+    });
+    assert.equal(rHardlink.ok, false, "读回时硬链接数 >1 必拒");
+    assert.equal(rHardlink.reason, "readback_failed", "reason 为 readback_failed");
+    fs.unlinkSync(path.join(dir, "reaffirm-intents.x.json"));
+
+    // ③ 正例：无注入 → 签发成功 committed_clean（读回全核通过）。
+    const rOk = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: seedB3B(dir, "r57b_p13_ok", 42, "sess-b-42"), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue P1-3 ok");
+    assert.equal(rOk.commit, "committed_clean", "正常签发 committed_clean");
+
+    // ④ 反例：cleanupTmp 只吞 ENOENT——rename 前注入失败产生 tmp；再让 unlinkSync 对 tmp 抛非 ENOENT（EACCES）→ residue 点名且带原因。
+    const b3d = seedB3B(dir, "r57b_p13d", 44, "sess-b-44");
+    const rCleanup = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3d, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: {
+        beforeRename: () => { throw new Error("crash_before_rename"); },
+        unlinkEACCES: true,
+      },
+    });
+    assert.equal(rCleanup.ok, false, "rename 前失败必须拒");
+    assert.equal(rCleanup.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rCleanup.residue) && rCleanup.residue.length > 0, "residue 包含残骸路径");
+    for (const f of fs.readdirSync(dir)) {
+      if (f.startsWith(".reaffirm-intents.tmp.")) fs.unlinkSync(path.join(dir, f));
+    }
+  }));
+
+  test("R57b 返修一 P1-4：已提交未收净——注入 committed_with_residue 报 committed-unclean 且非绿；repair 收尾后转 consumed；清 intent 失败保持可恢复且 intent 仍在", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p1_4", 39, "sess-b-39");
+    const rIss = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(rIss.ok, true, "签发成功");
+    const handle = rIss.reaffirm_handle;
+
+    // 1. 反例：注入 committed_with_residue → executeSelectControl 报 control-committed-unclean + 非绿
+    const rUnclean = SA.executeSelectControl({ control: "select", handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_sel57b",
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...mkPlanCtx(root, "om_sel57b", "p14_uc"),
+      _inject: {
+        afterLedgerRename: () => {
+          // 删掉账本锁让 release 报 absent，从而 foldRelease 出 committed_with_residue
+          const lockDir = path.join(dir, "ledger.lock");
+          try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+        }
+      }
+    });
+
+    assert.equal(rUnclean.ok, false, "未收净不得 ok:true");
+    assert.equal(rUnclean.status, "control-committed-unclean", "status 必须为 control-committed-unclean");
+    assert.match(rUnclean.text, /已写入但收口不干净/u, "文案提示已写入但收口不干净（非绿）");
+    assert.doesNotMatch(rUnclean.text, /已按你的确认重签/u, "不得出现绿色成功文案");
+
+    // 盘上 intent 不得被清理（因为账本未干净收口）
+    let diskIntents = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.equal(diskIntents.ok, true);
+    assert.ok(diskIntents.doc.entries[handle], "未收净时 intent 不得被清");
+
+    // 2. 模拟控制事务环境：写入带有选择上下文的新形 claim
+    const claimsDir = path.join(root, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const messageId = "om_sel57b";
+    const logicalTaskKey = "task_sel57b";
+    const selCtx = {
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      sender: "ou_owner57b",
+      message: messageId,
+      session: "sess-b-39",
+      handle,
+      kind: "rfh",
+    };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const cAcq = acquireClaim({
+      claimsDir,
+      messageId,
+      logicalTaskKey,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle, handle_kind: "rfh" },
+        selection_context: selCtx,
+        selection_context_digest_v1: digest,
+      }
+    });
+    assert.equal(cAcq.ok, true);
+    const key = cAcq.key;
+    // R57b 返修五：真实 claim 写方在账本提交前把 plan 落盘；这里手工补上（与真实链路同源 writeSelectionPlan）。
+    writePlanB(claimsDir, key, handle, b3);
+
+    // 跑控制事务，执行器返回 control-committed-unclean，事务落盘 .control-committed-unclean.json 而非 failed/consumed
+    const txUnclean = runControlTransaction({
+      claimsDir,
+      key,
+      intent: { control: "select", handle, handle_kind: "rfh" },
+      execute: () => rUnclean,
+    });
+    assert.equal(txUnclean.ok, false);
+    assert.equal(txUnclean.status, "control-committed-unclean");
+
+    const inspected = inspectControlClaim({ claimsDir, key });
+    assert.equal(inspected.state, "control-committed-unclean", "inspectControlClaim 识别 control-committed-unclean");
+
+    // 3. 反例：清 intent 失败 → 保持可恢复、intent 仍在
+    const failRepair = resumeControlClaim({
+      claimsDir,
+      key,
+      execute: (target, ctx) => dispatchControlRepair(target, {
+        onSelect: (t, c) => repairControlCommittedUnclean({
+          claim: c.claim,
+          claimsDir,
+          key,
+          uncleanRecord: c.uncleanRecord,
+          env: process.env,
+          _inject: { failIntentCleanup: true },
+        })
+      }, { claim: readClaimState({ claimsDir, key }).claim, claimsDir, key })
+    });
+    assert.equal(failRepair.ok, false, "清理 intent 失败 repair 不得成功");
+    const inspectedAfterFail = inspectControlClaim({ claimsDir, key });
+    assert.equal(inspectedAfterFail.state, "control-committed-unclean", "清理失败状态保持可恢复");
+    diskIntents = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.ok(diskIntents.doc.entries[handle], "清理失败 intent 仍在");
+
+    // 4. 正例：repair 收尾后转 consumed，intent 从盘上清理
+    const okRepair = resumeControlClaim({
+      claimsDir,
+      key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx)
+    });
+    assert.equal(okRepair.ok, true, "repair 收尾成功");
+    const inspectedAfterOk = inspectControlClaim({ claimsDir, key });
+    assert.equal(inspectedAfterOk.state, "consumed", "repair 后转 consumed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key + ".control-committed-unclean.json")), false, "unclean 记录被移除");
+    diskIntents = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.equal(diskIntents.doc.entries[handle], undefined, "repair 成功后 intent 被清");
+  }));
+
+  test("R57b 返修二 P1-4：repair 收尾判据禁假绿——cleanReaffirmIntent 返回 residue/unclear 不得转 consumed（保持 committed-unclean 点名）；同 handle 但不同 message 的伪 op 不得被 loose 绑定", () => withLedgerB((root, dir) => {
+    const claimsDir = path.join(root, "claims_p14");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const messageId = "om_p14";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14", handle, kind: "rfh" });
+    const mkClaim = (handle, target) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+
+    // ① 反例：cleanReaffirmIntent 返回 residue/unclear（intent 锁释放不净）→ repair 必须判非绿、不转 consumed。
+    const b3 = seedB3B(dir, "r57b_p14", 45, "sess-b-45");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    // 构造一个真提交（ledger op 已完成）；再把账本锁释放制造成 residue 以便进入 unclean 判定。
+    SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...mkPlanCtx(root, messageId, "p14_x"),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    const uncleanRecord = { schema_version: "1.0", claim_key: "a".repeat(64), state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3, selection_message_id: messageId } };
+    writePlanB(claimsDir, "a".repeat(64), intent.reaffirm_handle, b3);
+    const repOK = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, b3),
+      claimsDir,
+      key: "a".repeat(64),
+      uncleanRecord,
+      env: process.env,
+      _inject: { beforeRename: () => { try { fs.rmSync(path.join(dir, "reaffirm-intents.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    assert.equal(repOK.ok, false, "清理返回 residue/unclear 不得转 consumed，也不得报 ok:true");
+    assert.equal(repOK.reason, "intent_cleanup_unclean", "reason 为 intent_cleanup_unclean");
+    // 修复现场（删掉 intent lock 目录后由后续正常操作重建；先把它删干净）
+    try { fs.rmSync(path.join(dir, "reaffirm-intents.lock"), { recursive: true, force: true }); } catch {}
+
+    // ② 反例：同 handle 但不同 message 的 op——loose 搜索（任一 request_key 以 :handle 结尾 / proof 带该 handle）会命中它，
+    //    精确绑定（request_key = osr:<target>:<handle> 且 selection_message_id 一致）必须拒。
+    const b3b = seedB3B(dir, "r57b_p14b", 46, "sess-b-46");
+    const intentB = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
+    SA.executeSelectControl({ control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...mkPlanCtx(root, messageId, "p14_y"),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    // 把唯一 owner_select_reaffirm op 的 selection_message_id 改成与 claim/uncleanRecord 期望（messageId）不同的值。
+    const doc = loadOkB(dir);
+    const realOpId = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "owner_select_reaffirm" && doc.operations[k].request_key === "osr:" + b3b + ":" + intentB.reaffirm_handle);
+    assert.ok(realOpId, "真实 op 在场");
+    doc.operations[realOpId].result = { ...doc.operations[realOpId].result, selection_message_id: "om_forged999" };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    // uncleanRecord 认为本次选择的消息 = messageId；op 却是 om_forged999 → 精确绑定必须拒（不转 consumed）。
+    const uncleanB = { schema_version: "1.0", claim_key: "b".repeat(64), state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intentB.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3b, selection_message_id: messageId } };
+    writePlanB(claimsDir, "b".repeat(64), intentB.reaffirm_handle, b3b);
+    const repForged = repairControlCommittedUnclean({
+      claim: mkClaim(intentB.reaffirm_handle, b3b),
+      claimsDir,
+      key: "b".repeat(64),
+      uncleanRecord: uncleanB,
+      env: process.env,
+    });
+    assert.equal(repForged.ok, false, "同 handle 但不同 message 的 op 不得被 loose 绑定转 consumed：" + JSON.stringify(repForged));
+    assert.equal(repForged.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+  }));
+
+  test("R57b 返修三 P1-4a：repair 也走 outer → intent 锁序——outer 忙/残骸/释放失败 → 非绿、保持 committed-unclean 点名", () => withLedgerB((root, dir) => {
+    const messageId = "om_p14a";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14a", handle, kind: "rfh" });
+    const mkClaim = (handle, target) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+    const mkUnclean = (handle, target) => ({ schema_version: "1.0", claim_key: "c".repeat(64), state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: target, selection_message_id: messageId } });
+
+    const mkCommitted = (handle, target, claimsDir, key) => {
+      const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: target, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+      SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+        endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+        selectAdmissionFn: () => ({ state: "partial" }),
+        claimsDir, key,
+        _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+      });
+      return intent.reaffirm_handle;
+    };
+
+    // ① outer 忙：预占 m1a-order.lock（持锁不释放）→ repair 必须拒、保持 committed-unclean 点名。
+    const b3 = seedB3B(dir, "r57b_p14a", 47, "sess-b-47");
+    const h1 = mkCommitted(b3, b3, path.join(root, "claims_p14a"), "c".repeat(64));
+    const orderLock = DW.acquireOrderLock(EP57B, process.env);
+    assert.equal(orderLock.ok, true, "预占 outer 锁");
+    const repBusy = repairControlCommittedUnclean({
+      claim: mkClaim(h1, b3),
+      claimsDir: path.join(root, "claims_p14a"),
+      key: "c".repeat(64),
+      uncleanRecord: mkUnclean(h1, b3),
+      env: process.env,
+    });
+    assert.equal(repBusy.ok, false, "outer 忙 repair 必须拒");
+    assert.equal(repBusy.reason, "binding_busy", "reason 为 binding_busy");
+    assert.match(repBusy.why, /外层排序锁取不到/u, "点名外层锁取不到");
+    orderLock.release();
+
+    // ② outer 残骸：隔离树放一个 m1a-order.lock 残骸（目录）再跑 repair → 仍拒（旧行为：仍成功转 consumed）。
+    const b3b = seedB3B(dir, "r57b_p14ab", 48, "sess-b-48");
+    const h2 = mkCommitted(b3b, b3b, path.join(root, "claims_p14ab"), "c".repeat(64));
+    fs.mkdirSync(path.join(dir, "m1a-order.lock"), { recursive: true });
+    const repResidue = repairControlCommittedUnclean({
+      claim: mkClaim(h2, b3b),
+      claimsDir: path.join(root, "claims_p14ab"),
+      key: "c".repeat(64),
+      uncleanRecord: mkUnclean(h2, b3b),
+      env: process.env,
+    });
+    assert.equal(repResidue.ok, false, "outer 锁残骸（目录）repair 必须拒");
+    fs.rmSync(path.join(dir, "m1a-order.lock"), { recursive: true, force: true });
+
+    // ③ outer 释放失败：内层走完、外层释放时删 m1a-order.lock → 释放报 lock_lost → 非绿。
+    const b3c = seedB3B(dir, "r57b_p14ac", 49, "sess-b-49");
+    const h3 = mkCommitted(b3c, b3c, path.join(root, "claims_p14ac"), "c".repeat(64));
+    const repReleaseFail = repairControlCommittedUnclean({
+      claim: mkClaim(h3, b3c),
+      claimsDir: path.join(root, "claims_p14ac"),
+      key: "c".repeat(64),
+      uncleanRecord: mkUnclean(h3, b3c),
+      env: process.env,
+      _inject: { beforeRename: () => { try { fs.rmSync(path.join(dir, "m1a-order.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    assert.equal(repReleaseFail.ok, false, "outer 释放失败 repair 必须拒");
+    assert.equal(repReleaseFail.reason, "repair_outer_lock_release_unclean", "reason 为 repair_outer_lock_release_unclean");
+  }));
+
+  test("R57b 返修三 P1-4b：逐字绑定不许降级——缺 detail.result / message 不等 → ledger_commit_unverifiable；P2 两侧 request_key 派生逐字相等", () => withLedgerB((root, dir) => {
+    const messageId = "om_p14b";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p14b", handle, kind: "rfh" });
+    const mkClaim = (handle, target) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+
+    // P2：request_key 两侧共用同一派生函数——写入侧（ownerSelectReaffirm）与 repair 侧（ownerSelectReaffirmRequestKey）逐字相等。
+    const tgt = "ta_" + "1".repeat(32);
+    const hndl = "rfh_" + "2".repeat(32);
+    assert.equal(TAL.ownerSelectReaffirmRequestKey({ target: tgt, handle: hndl }), "osr:" + tgt + ":" + hndl, "P2 派生逐字相等（repair 侧）");
+    // 写入侧内部也走同一函数：下面消费成功后核对 op.request_key === ownerSelectReaffirmRequestKey(...)。
+
+    const b3 = seedB3B(dir, "r57b_p14b", 50, "sess-b-50");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    // 真实的 unclean record（runControlTransaction 落盘形状：result 在顶层）。
+    const realUnclean = { schema_version: "1.0", claim_key: "c".repeat(64), state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3, selection_message_id: messageId } };
+
+    // ① 反例：uncleanRecord 缺 result（旧代码「用缺 detail.result 越过」）→ 拒。
+    writePlanB(path.join(root, "claims_p14b"), "c".repeat(64), intent.reaffirm_handle, b3);
+    const repNoResult = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, b3),
+      claimsDir: path.join(root, "claims_p14b"),
+      key: "c".repeat(64),
+      uncleanRecord: { ...realUnclean, result: undefined },
+      env: process.env,
+    });
+    assert.equal(repNoResult.ok, false, "缺 result 必须拒");
+    assert.equal(repNoResult.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repNoResult.why, /target_id.*selection_message_id/u, "点名缺字段");
+
+    // ② 反例：selection_message_id 与 claim 的 message 不等 → 拒。
+    writePlanB(path.join(root, "claims_p14b2"), "c".repeat(64), intent.reaffirm_handle, b3);
+    const repMsgMismatch = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, b3),
+      claimsDir: path.join(root, "claims_p14b2"),
+      key: "c".repeat(64),
+      uncleanRecord: { ...realUnclean, result: { target_id: b3, selection_message_id: "om_othermsg" } },
+      env: process.env,
+    });
+    assert.equal(repMsgMismatch.ok, false, "message 不等必须拒");
+    assert.equal(repMsgMismatch.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repMsgMismatch.why, /selection_message_id 与 claim 的 message 不一致/u, "点名 message 不一致");
+
+    // ③ 正例：完整顶层的 unclean record（账户本侧真实提交在场）→ 转 consumed。
+    SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...mkPlanCtx(root, messageId, "p14_x"),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    // P2 写侧同源：账本上那笔 op 的 request_key === ownerSelectReaffirmRequestKey（写入侧走同一函数）。
+    const docAfter = loadOkB(dir);
+    const writeOp = Object.values(docAfter.operations).find((o) => o.op_type === "owner_select_reaffirm" && o.request_key === "osr:" + b3 + ":" + intent.reaffirm_handle);
+    assert.ok(writeOp, "写入侧 op 在场");
+    assert.equal(writeOp.request_key, TAL.ownerSelectReaffirmRequestKey({ target: b3, handle: intent.reaffirm_handle }), "写入侧 request_key 与共享派生函数逐字相等");
+    writePlanB(path.join(root, "claims_p14b3"), "c".repeat(64), intent.reaffirm_handle, b3);
+    const repOk = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, b3),
+      claimsDir: path.join(root, "claims_p14b3"),
+      key: "c".repeat(64),
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repOk.ok, true, "完整顶层 unclean record 转 consumed：" + JSON.stringify(repOk));
+
+    // ④ P1-4b（续）反例：selection plan.target_id 指向另一 target（unclean/op 自洽）→ 拒。
+    writePlanB(path.join(root, "claims_p14b4"), "c".repeat(64), intent.reaffirm_handle, "ta_" + "9".repeat(32));
+    const repPlanMismatch = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, "ta_" + "9".repeat(32)),
+      claimsDir: path.join(root, "claims_p14b4"),
+      key: "c".repeat(64),
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repPlanMismatch.ok, false, "plan 指向另一 target 必须拒");
+    assert.equal(repPlanMismatch.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repPlanMismatch.why, /selection plan.target_id.*不一致/u, "点名 plan 不一致");
+
+    // ⑤ P1-4b（续）反例：selection plan 缺席 → 拒。
+    const repPlanAbsent = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle, b3),
+      claimsDir: path.join(root, "claims_p14b5"),
+      key: "c".repeat(64),
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repPlanAbsent.ok, false, "plan 缺席必须拒");
+    assert.equal(repPlanAbsent.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repPlanAbsent.why, /selection plan 缺席/u, "点名 plan 缺席");
+  }));
+
+  test("R57b 返修四 P2：foldLockReleaseState 认不出规范化 reap_uncleared reason——应折成 residue 并点名路径", () => {
+    const ri = RI;
+    // ① 反例：带 reapUncleared 字段（原始形状）→ residue（已有支持）。
+    assert.equal(ri.foldLockReleaseState({ ok: false, reason: "reap_uncleared", reapUncleared: { path: "/x/.reaped-1", error: "EIO" } }), "residue");
+    // ② 反例：规范化 {ok:false, reason:"reap_uncleared", path, error}（不带 reapUncleared 字段）→ 旧的 fold 判 unclear；改后必须 residue。
+    assert.equal(ri.foldLockReleaseState({ ok: false, reason: "reap_uncleared", path: "/y/m1a-order.lock", error: "EIO" }), "residue", "规范化 reap_uncleared reason 折成 residue");
+    // 正例：clean → released；unknown → unclear。
+    assert.equal(ri.foldLockReleaseState({ ok: true }), "released");
+    assert.equal(ri.foldLockReleaseState({ ok: false, reason: "release_failed" }), "unclear");
+  });
+
+  test("R57b 返修五：真实 acquireClaim→rfh 消费（注入 committed_with_residue）→控制事务落 unclean→resumeControlClaim repair 转 consumed；篡改盘上 plan 的 target_id → repair 拒", () => withLedgerB((root, dir) => {
+    const claimsDir = path.join(root, "claims_p15");
+    const logicalTaskKey = "task_p15";
+    let msgSeq = 0;
+
+    // 真实流程：acquireClaim（写 selection_context + digest）→ 真正执行 rfh 消费（能核出唯一 op）。
+    const setupClaimAndClean = () => {
+      const b3 = seedB3B(dir, "r57b_p15", 51, "sess-b-51");
+      const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+      const messageId = "om_p15" + (++msgSeq);
+      const selCtx = { endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-b-51", handle: intent.reaffirm_handle, kind: "rfh" };
+      const cAcq = acquireClaim({ claimsDir, messageId, logicalTaskKey, meta: {
+        policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" },
+        selection_context: selCtx, selection_context_digest_v1: SA.selectionContextDigestV1(selCtx),
+      } });
+      assert.equal(cAcq.ok, true, "acquireClaim");
+      // 真正执行 rfh 消费（带 claimsDir/key → 账本提交前落盘 selection plan）；注入账本锁释放失败 → committed_with_residue。
+      const r = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+        endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+        selectAdmissionFn: () => ({ state: "partial" }),
+        claimsDir, key: cAcq.key,
+        _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+      });
+      assert.equal(r.ok, false, "rfh 消费应报 committed-unclean");
+      assert.equal(r.status, "control-committed-unclean", "status 为 control-committed-unclean");
+      // 与真实链路一致：控制事务把 unclean 落盘（runControlTransaction 写入 .control-committed-unclean.json）。
+      const tx = runControlTransaction({
+        claimsDir, key: cAcq.key,
+        intent: { control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" },
+        execute: () => r,
+      });
+      assert.equal(tx.ok, false);
+      assert.equal(tx.status, "control-committed-unclean");
+      assert.equal(inspectControlClaim({ claimsDir, key: cAcq.key }).state, "control-committed-unclean", "控制事务已落 unclean");
+      // 断言 plan 已被真实链路落盘（非手工拼）。
+      const pr = SP.readSelectionPlan({ claimsDir, key: cAcq.key });
+      assert.equal(pr.ok, true, "真实链路落盘 plan：" + JSON.stringify(pr));
+      assert.equal(pr.plan.target_id, b3, "plan.target_id = 目标");
+      assert.equal(pr.plan.handle, intent.reaffirm_handle, "plan.handle = rfh_");
+      return { b3, key: cAcq.key };
+    };
+
+    // ① 正例：真实链路产生的 unclean → resumeControlClaim repair 转 consumed。
+    const c1 = setupClaimAndClean();
+    const okRepair = resumeControlClaim({
+      claimsDir, key: c1.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(okRepair.ok, true, "真实链路 unclean repair 转 consumed：" + JSON.stringify(okRepair));
+    const insp1 = inspectControlClaim({ claimsDir, key: c1.key });
+    assert.equal(insp1.state, "consumed", "转 consumed");
+    assert.equal(fs.existsSync(path.join(claimsDir, c1.key + ".control-committed-unclean.json")), false, "unclean 记录被移除");
+
+    // ② 反例：篡改盘上 plan 的 target_id（指向另一 target）→ repair 拒 ledger_commit_unverifiable。
+    const c2 = setupClaimAndClean();
+    const plan2 = SP.readSelectionPlan({ claimsDir, key: c2.key });
+    assert.equal(plan2.ok, true);
+    plan2.plan.target_id = "ta_" + "8".repeat(32);
+    fs.writeFileSync(path.join(claimsDir, c2.key + ".selection-plan.json"), JSON.stringify(plan2.plan, null, 2) + "\n", { mode: 0o600 });
+    const tamperRepair = resumeControlClaim({
+      claimsDir, key: c2.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(tamperRepair.ok, false, "篡改 plan target_id 必须拒");
+    assert.equal(tamperRepair.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(tamperRepair.why, /selection plan.target_id.*不一致/u, "点名 plan 不一致");
+  }));
+
+  test("R57b 返修六：selection-plan 叶子——claim_key 绑定、不可变（conflict/reused）、路径型 key 拒、schema 真校验、写失败 fail-closed", () => {
+    const claimsDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-plan-")));
+    const key = "a".repeat(64);
+    const handle = "rfh_" + "1".repeat(32);
+    const target = "ta_" + "2".repeat(32);
+    const mkPlan = (over = {}) => ({ schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: target, basis: "reaffirm", handle, kind: "rfh", claim_key: key, cas: { intent_id: handle, expected_expires_at: "2026-09-18T09:00:00.000Z" }, ...over });
+
+    // ① 反例：路径型 key 拒（非 64hex）。
+    assert.equal(SP.writeSelectionPlan({ claimsDir, key: "../evil", plan: mkPlan() }).reason, "selection_plan_key_invalid", "路径型 key 拒");
+    assert.equal(SP.readSelectionPlan({ claimsDir, key: "../evil" }).ok, false, "路径型 key 读拒");
+
+    // ② 正例：写 → 读回逐字等；schema_version 真正进键集并校验。
+    const w = SP.writeSelectionPlan({ claimsDir, key, plan: mkPlan() });
+    assert.equal(w.ok, true, "writeSelectionPlan：" + JSON.stringify(w));
+    assert.equal(w.created, true);
+    const r = SP.readSelectionPlan({ claimsDir, key });
+    assert.equal(r.ok, true, "readSelectionPlan：" + JSON.stringify(r));
+    assert.equal(r.plan.target_id, target);
+    assert.equal(r.plan.handle, handle);
+    assert.equal(r.plan.claim_key, key);
+    assert.equal(r.plan.schema_version, SP.SELECTION_PLAN_SCHEMA);
+
+    // ③ 反例：同 key 二次写不同 target → conflict（不可覆盖）。
+    const w2 = SP.writeSelectionPlan({ claimsDir, key, plan: mkPlan({ target_id: "ta_" + "9".repeat(32) }) });
+    assert.equal(w2.ok, false, "同 key 不同 plan → 拒");
+    assert.equal(w2.reason, "selection_plan_conflict", "reason 为 selection_plan_conflict");
+
+    // ④ 正例：同 key 逐字全符重写 → 幂等 ok, reused:true。
+    const w3 = SP.writeSelectionPlan({ claimsDir, key, plan: mkPlan() });
+    assert.equal(w3.ok, true, "同 plan 幂等");
+    assert.equal(w3.reused, true, "reused:true");
+
+    // ⑤ 反例：claim_key 与文件名不一致（复制到另一 key）→ key_mismatch 拒。
+    const otherKey = "b".repeat(64);
+    const wOther = SP.writeSelectionPlan({ claimsDir, key: otherKey, plan: mkPlan() });
+    assert.equal(wOther.ok, false, "复制到另一 key 必须拒");
+    assert.equal(wOther.reason, "selection_plan_invalid", "reason 为 selection_plan_invalid");
+    assert.match(wOther.why, /claim_key 与文件名不一致/u, "点名字符不一致");
+
+    // ⑥ 反例：schema 真校验（schema_version 缺失/错 → 拒；claim_key 形状不对 → 拒）。
+    assert.equal(SP.selectionPlanProblem(mkPlan({ schema_version: "bogus" }), key), "schema_version 不是 " + SP.SELECTION_PLAN_SCHEMA, "schema 拒");
+    assert.equal(SP.selectionPlanProblem(mkPlan({ claim_key: "nothex" }), key), "claim_key 形状不对", "claim_key 形状拒");
+    assert.equal(SP.selectionPlanProblem({ ...mkPlan(), extra: 1 }, key), "plan 键集不对（须 action,basis,cas,claim_key,handle,kind,schema_version,target_id）", "键集不对拒");
+
+    // ⑦ 反例：chmod 0644 后读回 → 权限核验拒。
+    const key2 = "d".repeat(64);
+    SP.writeSelectionPlan({ claimsDir, key: key2, plan: mkPlan({ claim_key: key2 }) });
+    fs.chmodSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(key2)), 0o644);
+    const r2 = SP.readSelectionPlan({ claimsDir, key: key2 });
+    assert.equal(r2.ok, false, "0644 读回拒");
+    assert.match(r2.problem, /0600/u, "点名 mode");
+
+    // ⑧ 反例：写失败 → fail-closed（注入 beforeRename 抛错验证，不进账本提交）。
+    const key3 = "e".repeat(64);
+    const wFail = SP.writeSelectionPlan({ claimsDir, key: key3, plan: mkPlan({ claim_key: key3 }), _inject: { beforeLink: () => { throw new Error("boom"); } } });
+    assert.equal(wFail.ok, false, "link 前注入失败 → fail-closed");
+    assert.equal(wFail.reason, "tmp_write_failed", "reason 为 tmp_write_failed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key3 + ".selection-plan.json")), false, "失败后无截断目标");
+
+    // ⑨ 反例：成功后目录里无遗留 tmp（原子发布、不原地写、不 rename 覆盖）。
+    const key4 = "f".repeat(64);
+    const wOk4 = SP.writeSelectionPlan({ claimsDir, key: key4, plan: mkPlan({ claim_key: key4 }) });
+    assert.equal(wOk4.ok, true, "key4 写成功");
+    const tmps = fs.readdirSync(claimsDir).filter((n) => n.includes(".selection-plan.json.tmp."));
+    assert.equal(tmps.length, 0, "成功后目录无遗留 tmp");
+
+    // ⑩ 反例：link 后目录 fsync 失败 → durability_uncertain（提交不确定，非普通失败）。
+    const key5 = "b".repeat(64);
+    const dup = SP.writeSelectionPlan({ claimsDir, key: key5, plan: mkPlan({ claim_key: key5 }), _inject: { failDirFsync: true } });
+    assert.equal(dup.ok, false, "目录 fsync 失败必须非绿");
+    assert.equal(dup.commit, "committed_durability_uncertain", "commit 为 committed_durability_uncertain");
+    assert.equal(dup.reason, "dir_fsync_failed", "reason 为 dir_fsync_failed");
+
+    // P2 反例：同内容不同键序（嵌套 cas 键序不同）→ 深层全符 → reused，不 conflict。
+    const key6 = "c".repeat(64);
+    const w6 = SP.writeSelectionPlan({ claimsDir, key: key6, plan: mkPlan({ claim_key: key6 }) });
+    assert.equal(w6.ok, true, "key6 写成");
+    const reordered = { ...mkPlan({ claim_key: key6 }), cas: { expected_expires_at: "2026-09-18T09:00:00.000Z", intent_id: handle } };
+    const w6r = SP.writeSelectionPlan({ claimsDir, key: key6, plan: reordered });
+    assert.equal(w6r.ok, true, "同内容不同键序 → reused");
+    assert.equal(w6r.reused, true, "reused:true（canonKey 深层全符）");
+
+    // ── R57b 返修八：link 发布残骸窗口 ──
+    // 封闭形状：.<key>.selection-plan.json.tmp.<正整数 pid>.<v4 uuid>。夹具一律用合法名（<pid>.<uuid>），
+    // 不用 .stale/.mismatch——那两种后缀不匹配封闭形状 → 既不算候选也不算 residue（叶子层面没有「未知文件」
+    // 口径，就不点名、也不删；见「非法后缀」反例）。
+    const legalTmp = (k, uuid) => path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(k) + "4242." + uuid);
+    const U9 = "11111111-2222-4333-8444-555555555555";
+    const UA = "22222222-3333-4444-8555-666666666666";
+    const UB = "33333333-4444-4555-8666-777777777777";
+    const UC = "44444444-5555-4666-8777-888888888888";
+
+    // 【规则 2/5】纯 readSelectionPlan 面对合法 linked tmp（同 inode nlink=2）→ fail-closed 报 residue，
+    //   tmp 仍在（readSelectionPlan 不删任何文件）；经 recoverSelectionPlanTmp 恢复后 → nlink=1、tmp 被清。
+    const key9 = "9".repeat(64);
+    SP.writeSelectionPlan({ claimsDir, key: key9, plan: mkPlan({ claim_key: key9 }) });
+    const final9 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(key9));
+    const tmp9 = legalTmp(key9, U9);
+    fs.linkSync(final9, tmp9);
+    assert.equal(fs.lstatSync(final9).nlink, 2, "预造同 inode nlink=2（link 后未 unlink）");
+    const r9 = SP.readSelectionPlan({ claimsDir, key: key9 });
+    assert.equal(r9.ok, false, "纯 read 面对合法 linked tmp → fail-closed：" + JSON.stringify(r9));
+    assert.equal(r9.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(r9.residue) && r9.residue.includes(tmp9), "residue 点名 tmp：" + JSON.stringify(r9.residue));
+    assert.equal(fs.existsSync(tmp9), true, "纯 read 不删 tmp");
+    assert.equal(fs.lstatSync(final9).nlink, 2, "纯 read 不恢复（nlink 仍 2）");
+    // 经恢复入口 → 恢复、nlink=1、tmp 被清、final 可读。
+    const rec9 = SP.recoverSelectionPlanTmp({ claimsDir, key: key9 });
+    assert.equal(rec9.ok, true, "recoverSelectionPlanTmp：" + JSON.stringify(rec9));
+    assert.equal(rec9.recovered, tmp9, "recovered 点名 tmp");
+    assert.equal(fs.lstatSync(final9).nlink, 1, "恢复后 nlink=1");
+    assert.equal(fs.existsSync(tmp9), false, "恢复后 tmp 被清");
+    assert.equal(SP.readSelectionPlan({ claimsDir, key: key9 }).ok, true, "恢复后 final 可读");
+
+    // 【gap1 反例】合法 linked tmp + 异 inode 残骸同在 → 非绿（规则 1），两者都不删，residue 列出两条。
+    const keyA2 = "aa" + "0".repeat(62);
+    SP.writeSelectionPlan({ claimsDir, key: keyA2, plan: mkPlan({ claim_key: keyA2 }) });
+    const finalA2 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyA2));
+    const linkedA = legalTmp(keyA2, UA);
+    const diffA = legalTmp(keyA2, UB);
+    fs.linkSync(finalA2, linkedA);
+    fs.writeFileSync(diffA, JSON.stringify(mkPlan({ claim_key: keyA2, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    const rA = SP.readSelectionPlan({ claimsDir, key: keyA2 });
+    assert.equal(rA.ok, false, "合法+异 inode 同在 → 非绿：" + JSON.stringify(rA));
+    assert.equal(rA.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rA.residue) && rA.residue.length === 2 && rA.residue.includes(linkedA) && rA.residue.includes(diffA), "residue 列出两条：" + JSON.stringify(rA.residue));
+    assert.equal(fs.existsSync(linkedA), true, "合法 linked tmp 不删");
+    assert.equal(fs.existsSync(diffA), true, "异 inode 残骸不删");
+    assert.equal(fs.lstatSync(finalA2).nlink, 2, "两者都不删（final nlink 仍 2，linked 与 final 同 inode）");
+
+    // 【gap3 反例】注入 readdir EIO（_inject.readdir）→ 非绿带错误码，不删。
+    const keyR = "d1" + "0".repeat(62);
+    const rdTmp = legalTmp(keyR, UC);
+    fs.writeFileSync(rdTmp, JSON.stringify(mkPlan({ claim_key: keyR }), null, 2) + "\n", { mode: 0o600 });
+    const rEIO = SP.readSelectionPlan({ claimsDir, key: keyR, _inject: { readdir: () => { const e = new Error("EIO: i/o error"); e.code = "EIO"; throw e; } } });
+    assert.equal(rEIO.ok, false, "readdir EIO → 非绿：" + JSON.stringify(rEIO));
+    assert.equal(rEIO.reason, "residue", "reason 为 residue");
+    assert.match(rEIO.problem ?? "", /EIO/u, "错误码带出");
+    assert.equal(fs.existsSync(rdTmp), true, "readdir 失败不删");
+
+    // 【gap1/规则 1 反例】多于一个合法候选（两个都同 inode）→ 非绿，不删（recoverSelectionPlanTmp 要求唯一候选）。
+    const keyC2 = "e1" + "0".repeat(62);
+    SP.writeSelectionPlan({ claimsDir, key: keyC2, plan: mkPlan({ claim_key: keyC2 }) });
+    const finalC2 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyC2));
+    const c2a = legalTmp(keyC2, UA);
+    const c2b = legalTmp(keyC2, UB);
+    fs.linkSync(finalC2, c2a);
+    fs.linkSync(finalC2, c2b);
+    const recC2 = SP.recoverSelectionPlanTmp({ claimsDir, key: keyC2 });
+    assert.equal(recC2.ok, false, "多于一个候选（同 inode）→ 非绿：" + JSON.stringify(recC2));
+    assert.equal(recC2.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(recC2.residue) && recC2.residue.length === 2, "residue 列出两条：" + JSON.stringify(recC2.residue));
+    assert.equal(fs.existsSync(c2a), true, "候选不删");
+    assert.equal(fs.existsSync(c2b), true, "候选不删");
+
+    // 【规则 3 反例】final 缺席 + 精确候选在场 → residue 点名（不是「无窗口」）。
+    const keyD = "f1" + "0".repeat(62);
+    const dTmp = legalTmp(keyD, UC);
+    fs.writeFileSync(dTmp, JSON.stringify(mkPlan({ claim_key: keyD }), null, 2) + "\n", { mode: 0o600 });
+    const rD = SP.readSelectionPlan({ claimsDir, key: keyD });
+    assert.equal(rD.ok, false, "final 缺席 + 候选在场 → 非绿：" + JSON.stringify(rD));
+    assert.equal(rD.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rD.residue) && rD.residue.includes(dTmp), "residue 点名 tmp：" + JSON.stringify(rD.residue));
+    assert.equal(fs.existsSync(dTmp), true, "候选不删");
+
+    // 【gap4 反例】EEXIST（并发写）后重读发现异 inode 残骸 → 写返回 reason:residue 且 residue 含路径，tmp 仍在（不折成 conflict）。
+    const keyE = "12" + "0".repeat(62);
+    const ePlan = mkPlan({ claim_key: keyE });
+    const eResidue = legalTmp(keyE, UB);
+    const wE = SP.writeSelectionPlan({ claimsDir, key: keyE, plan: ePlan, _inject: { beforeLink: () => {
+      fs.writeFileSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyE)), JSON.stringify(ePlan, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(eResidue, JSON.stringify(mkPlan({ claim_key: keyE, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wE.ok, false, "EEXIST 后遇 residue → 非绿：" + JSON.stringify(wE));
+    assert.equal(wE.reason, "residue", "reason 为 residue（不折成 selection_plan_conflict）");
+    assert.ok(Array.isArray(wE.residue) && wE.residue.includes(eResidue), "residue 含残骸路径：" + JSON.stringify(wE.residue));
+    assert.equal(fs.existsSync(eResidue), true, "异 inode 残骸 tmp 仍在（不自动清）");
+
+    // 【非法后缀】.stale / .mismatch 不匹配封闭形状 → 不算候选：既不删也不算 residue（叶子层面无「未知文件」口径，就不点名）。
+    const keyF = "34" + "0".repeat(62);
+    SP.writeSelectionPlan({ claimsDir, key: keyF, plan: mkPlan({ claim_key: keyF }) });
+    const staleTmp = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(keyF) + "4242.stale");
+    const mismTmp = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(keyF) + ".mismatch");
+    fs.writeFileSync(staleTmp, JSON.stringify(mkPlan({ claim_key: keyF }), null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(mismTmp, JSON.stringify(mkPlan({ claim_key: keyF }), null, 2) + "\n", { mode: 0o600 });
+    const rF = SP.readSelectionPlan({ claimsDir, key: keyF });
+    assert.equal(rF.ok, true, "非法后缀不算候选，final 正常读：" + JSON.stringify(rF));
+    assert.equal(fs.existsSync(staleTmp), true, ".stale 不被删");
+    assert.equal(fs.existsSync(mismTmp), true, ".mismatch 不被删");
+
+    // 窗口①：EEXIST（并发写）后 reused / conflict 都不留本次 tmp。用 beforeLink 注入并发写 final。
+    const keyB = "b" + "0".repeat(63);
+    const planB = mkPlan({ claim_key: keyB });
+    const wB = SP.writeSelectionPlan({ claimsDir, key: keyB, plan: planB, _inject: { beforeLink: () => {
+      fs.writeFileSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyB)), JSON.stringify(planB, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wB.ok, true, "并发写同 plan → reused：" + JSON.stringify(wB));
+    assert.equal(wB.reused, true, "reused:true");
+    assert.equal(fs.readdirSync(claimsDir).filter((n) => n.startsWith(SP.SELECTION_PLAN_TMP_PREFIX(keyB))).length, 0, "reused 不留 tmp（窗口①）");
+
+    const keyC = "c" + "0".repeat(63);
+    const planC = mkPlan({ claim_key: keyC });
+    const wC = SP.writeSelectionPlan({ claimsDir, key: keyC, plan: mkPlan({ claim_key: keyC, target_id: "ta_" + "9".repeat(32) }), _inject: { beforeLink: () => {
+      fs.writeFileSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyC)), JSON.stringify(planC, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wC.ok, false, "并发写不同 plan → conflict");
+    assert.equal(wC.reason, "selection_plan_conflict", "reason 为 selection_plan_conflict");
+    assert.equal(fs.readdirSync(claimsDir).filter((n) => n.startsWith(SP.SELECTION_PLAN_TMP_PREFIX(keyC))).length, 0, "conflict 不留 tmp（窗口①）");
+
+    // ── R57b 返修十：Codex 十轮 1 P1 + 2 P2 ──
+
+    // P1：link 发布成功后最终受验读回盘点出精确 tmp 候选（residue）→ 保留 reason:residue + residue 数组 +
+    //     commit:committed_durability_uncertain（link 已成功事实不变），不折 readback_failed、不丢路径。
+    const keyP1 = "48" + "0".repeat(62);
+    const p1Plan = mkPlan({ claim_key: keyP1 });
+    const p1Residue = legalTmp(keyP1, U9);
+    const wP1 = SP.writeSelectionPlan({ claimsDir, key: keyP1, plan: p1Plan, _inject: { beforeReadback: () => {
+      fs.writeFileSync(p1Residue, JSON.stringify(mkPlan({ claim_key: keyP1, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wP1.ok, false, "P1 最终读回遇 residue → 非绿：" + JSON.stringify(wP1));
+    assert.equal(wP1.reason, "residue", "P1 reason 为 residue（不折 readback_failed）");
+    assert.ok(Array.isArray(wP1.residue) && wP1.residue.includes(p1Residue), "P1 residue 含路径：" + JSON.stringify(wP1.residue));
+    assert.equal(wP1.commit, "committed_durability_uncertain", "P1 commit 为 durability_uncertain（link 已成功事实不变）");
+    assert.equal(fs.existsSync(p1Residue), true, "P1 tmp 仍在（不自动清）");
+
+    // P2-1：final 缺席 + 唯一精确候选 → recoverSelectionPlanTmp 与 readSelectionPlan 都返回 residue 含路径、文件仍在。
+    const keyP21 = "56" + "0".repeat(62);
+    const p21Tmp = legalTmp(keyP21, U9);
+    fs.writeFileSync(p21Tmp, JSON.stringify(mkPlan({ claim_key: keyP21 }), null, 2) + "\n", { mode: 0o600 });
+    const rP21 = SP.readSelectionPlan({ claimsDir, key: keyP21 });
+    assert.equal(rP21.ok, false, "P2-1 readSelectionPlan final 缺席 + 候选 → 非绿：" + JSON.stringify(rP21));
+    assert.equal(rP21.reason, "residue", "P2-1 read reason 为 residue");
+    assert.ok(Array.isArray(rP21.residue) && rP21.residue.includes(p21Tmp), "P2-1 read residue 含路径");
+    assert.equal(fs.existsSync(p21Tmp), true, "P2-1 read 不删");
+    const recP21 = SP.recoverSelectionPlanTmp({ claimsDir, key: keyP21 });
+    assert.equal(recP21.ok, false, "P2-1 recoverSelectionPlanTmp → 非绿：" + JSON.stringify(recP21));
+    assert.equal(recP21.reason, "residue", "P2-1 recover reason 为 residue");
+    assert.ok(Array.isArray(recP21.residue) && recP21.residue.includes(p21Tmp), "P2-1 recover residue 含路径");
+    assert.equal(fs.existsSync(p21Tmp), true, "P2-1 recover 不删");
+
+    // P2-2：recoverSelectionPlanTmp 非法 key / 缺失目录 → fail-closed（原来返回 ok:true）；目录本身 ENOENT 仍「无候选」ok。
+    const badKey = SP.recoverSelectionPlanTmp({ claimsDir, key: "../x" });
+    assert.equal(badKey.ok, false, "P2-2 非法 key → 拒：" + JSON.stringify(badKey));
+    assert.equal(badKey.reason, "key_shape", "P2-2 reason 为 key_shape");
+    const badDir = SP.recoverSelectionPlanTmp({ claimsDir: "", key: "a".repeat(64) });
+    assert.equal(badDir.ok, false, "P2-2 空 claimsDir → 拒：" + JSON.stringify(badDir));
+    assert.equal(badDir.reason, "claims_dir_missing", "P2-2 reason 为 claims_dir_missing");
+    const badDir2 = SP.recoverSelectionPlanTmp({ claimsDir: null, key: "a".repeat(64) });
+    assert.equal(badDir2.ok, false, "P2-2 非字符串 claimsDir → 拒");
+    assert.equal(badDir2.reason, "claims_dir_missing", "P2-2 reason 为 claims_dir_missing");
+
+
+    fs.rmSync(claimsDir, { recursive: true, force: true });
+  });
+
+  test("R57b 返修六 P1-1：执行器强制 plan 上下文——不传 claimsDir/key 直接消费 → selection_plan_context_missing 拒；repair 透传后 E2E 通过", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p16", 56, "sess-b-56");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const rev0 = loadOkB(dir).revision;
+    // 反例①：执行器（executeSelectControl）不传 claimsDir/key → 结构化拒，不进账本提交。
+    const noCtx = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_p16",
+      selectAdmissionFn: () => ({ state: "partial" }),
+    });
+    assert.equal(noCtx.ok, false, "不传 claimsDir/key 直接消费必须拒");
+    assert.equal(noCtx.reason, "selection_plan_context_missing", "reason 为 selection_plan_context_missing");
+    assert.equal(readIntentsB(dir)?.entries[intent.reaffirm_handle] != null, true, "拒时 intent 未消费");
+    // 反例②：公开 consumeReaffirmIntent 直调不传上下文 → 拒且账本 revision 不变（mutation 层强制）。
+    const noCtxDirect = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_p16", clock: () => T0B + 1000 });
+    assert.equal(noCtxDirect.ok, false, "直调 consumeReaffirmIntent 不传上下文必须拒");
+    assert.equal(noCtxDirect.reason, "selection_plan_context_missing", "reason 为 selection_plan_context_missing");
+    assert.equal(loadOkB(dir).revision, rev0, "拒时账本 revision 不变");
+    // 正例：传 claimsDir/key → 正常消费成功，plan 落盘。
+    const pc = mkPlanCtx(root, "om_p16", "p16_ok");
+    const ok = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_p16",
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...pc,
+    });
+    assert.equal(ok.ok, true, "传上下文后消费成功：" + JSON.stringify(ok));
+    assert.equal(SP.readSelectionPlan({ claimsDir: pc.claimsDir, key: pc.key }).ok, true, "plan 已落盘");
+  }));
+
+  test("R57b 返修六 P1-2：repair 比对 plan.handle / plan.kind 与 claim 逐字一致——不等 → ledger_commit_unverifiable", () => withLedgerB((root, dir) => {
+    const messageId = "om_p17";
+    const selCtx = (handle) => ({ endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-p17", handle, kind: "rfh" });
+    const mkClaim = (handle) => ({ control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx(handle), selection_context_digest_v1: SA.selectionContextDigestV1(selCtx(handle)) });
+    const b3 = seedB3B(dir, "r57b_p17", 57, "sess-b-57");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...mkPlanCtx(root, messageId, "p17_ok"),
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    const ck = mkPlanCtx(root, messageId, "p17_ok");
+    const realUnclean = { schema_version: "1.0", claim_key: ck.key, state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3, selection_message_id: messageId } };
+
+    // ① 反例：plan.handle ≠ claim.handle（同 key 写 plan 手改 handle）→ 拒。
+    //   writeSelectionPlan 不可覆盖——先删掉真实 plan 再写 handle 不同的 plan。
+    fs.rmSync(path.join(ck.claimsDir, ck.key + ".selection-plan.json"), { force: true });
+    const wp = SP.writeSelectionPlan({ claimsDir: ck.claimsDir, key: ck.key, plan: { schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: b3, basis: "reaffirm", handle: "rfh_" + "9".repeat(32), kind: "rfh", claim_key: ck.key, cas: { intent_id: "rfh_" + "9".repeat(32), expected_expires_at: "2026-09-18T09:00:00.000Z" } } });
+    assert.equal(wp.ok, true, "写入 handle 不同的 plan：" + JSON.stringify(wp));
+    const repHandle = repairControlCommittedUnclean({
+      claim: mkClaim(intent.reaffirm_handle),
+      claimsDir: ck.claimsDir,
+      key: ck.key,
+      uncleanRecord: realUnclean,
+      env: process.env,
+    });
+    assert.equal(repHandle.ok, false, "plan.handle ≠ claim.handle 必须拒");
+    assert.equal(repHandle.reason, "ledger_commit_unverifiable", "reason 为 ledger_commit_unverifiable");
+    assert.match(repHandle.why, /plan.handle.*claim.handle 不一致/u, "点名 handle 不一致");
+
+    // ② 正例：plan.handle/kind 与 claim 一致（真实链路写的 plan）→ repair 转 consumed。
+    const ck2 = mkPlanCtx(root, messageId, "p17_ok2");
+    const b3b = seedB3B(dir, "r57b_p17b", 58, "sess-b-58");
+    const intent2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    SA.executeSelectControl({ control: "select", handle: intent2.reaffirm_handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...ck2,
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    const realUnclean2 = { schema_version: "1.0", claim_key: ck2.key, state: "control-committed-unclean", recorded_at: ISO0B, control: "select", handle: intent2.reaffirm_handle, handle_kind: "rfh", reason: "control_committed_unclean", result: { target_id: b3b, selection_message_id: messageId } };
+    const repOk = repairControlCommittedUnclean({
+      claim: mkClaim(intent2.reaffirm_handle),
+      claimsDir: ck2.claimsDir,
+      key: ck2.key,
+      uncleanRecord: realUnclean2,
+      env: process.env,
+    });
+    assert.equal(repOk.ok, true, "plan.handle/kind 一致 → repair 转 consumed：" + JSON.stringify(repOk));
+  }));
+
+  test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {
+    // 手工 transition 账本：activate 增量 op 产 owner_select 双证 + tombstone（owner_select_merge_v1）。
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-os-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = root;
+    const dir = path.join(root, EP57B);
+    try {
+      writePartialAdmission(root); // P1-2：默认强制真实准入读取器，夹具需给 partial 准入
+      const b3 = "ta_" + "1".repeat(32), a1t = "ta_" + "2".repeat(32);
+      const actOp = "00000000-0000-4000-8000-0000000002a1";
+      const osh = "osh_" + "a".repeat(32);
+      const six = { authorized_by: "ou_b57b", authorized_at: ISO0B, selected_session_id: "sess-os-46", selected_root_om: "om_os46" };
+      const sess46 = "sess-os-46";
+      const activateResult = { surviving_id: b3, tombstoned_id: a1t, demoted_historical_id: null, authorized_by: six.authorized_by, authorized_at: six.authorized_at, selected_session_id: six.selected_session_id, selected_root_om: six.selected_root_om, selection_handle: osh, selection_operation_id: actOp, selection_basis: "explicit_handle", selection_message_id: "om_act57b", affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }] };
+      const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57B, chain: "claude", authority_mode: "shadow", revision: 3, operations: {
+        "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57b_os_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57B, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+        "00000000-0000-4000-8000-0000000001a2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57b_os_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57b_os_up", endpoint: EP57B, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57B, from_schema: "1.0", to_schema: "1.1-transition" } },
+        [actOp]: { op_type: "activate", terminal_kind: "activate", request_key: "r57b_os_act", fingerprint: TAL.fingerprintOf("activate", { request_key: "r57b_os_act", b1_id: b3, a1_id: a1t, matched_om: six.selected_root_om }), result_revision: 3, result: activateResult }
+      }, records: {
+        [b3]: { kind: "live", topic_agent_id: b3, chat_id: "oc_r57b", aliases: { session_id: sess46, root_om: "om_os46" }, facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, binding_target: TGTB(46), binding_proof: { kind: "owner_select_v1", ...six, selection_handle: osh, selection_operation_id: actOp }, locator_link_proof_ref: { kind: "owner_selected_route_v1", ...six, by_identity: "owner_authorization", selection_handle: osh, selection_operation_id: actOp }, generation_lineage_id: "lin_os46", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: actOp, created_at: ISO0B, updated_at: ISO0B },
+        [a1t]: { kind: "forwarding_tombstone", topic_agent_id: a1t, forwards_to: b3, merged_at: ISO0B, proof_ref: { kind: "owner_select_merge_v1", selection_operation_id: actOp, selected_root_om: "om_os46", selection_handle: osh }, origin_operation_id: actOp }
+      } };
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const v0 = TAL.validateLedger(doc, { endpointId: EP57B });
+      assert.equal(v0.ok, true, "owner_select 夹具自洽：" + JSON.stringify(v0));
+      const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+      const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "remap") }), "consume");
+      const doc2 = loadOkB(dir);
+      const opEntry = Object.values(doc2.operations).find((o) => o.op_type === "owner_select_reaffirm");
+      const r = opEntry.result;
+      assert.equal(Object.keys(r).sort().join(","), "affected_live_ids_after_commit,new_binding_proof,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap", "§6 produced 支精确键集");
+      assert.deepEqual(r.proof_effects, [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }]);
+      assert.equal(r.new_binding_proof.kind, "owner_select_v1");
+      assert.equal(r.new_binding_proof.selection_handle, intent.reaffirm_handle, "重签用 rfh_");
+      assert.equal(r.new_binding_proof.selected_session_id, "sess-os-46");
+      // G11′ 六字段等式：新 binding 与新 link 逐字
+      for (const k of ["authorized_by", "authorized_at", "selected_session_id", "selected_root_om", "selection_handle", "selection_operation_id"]) {
+        assert.equal(r.new_binding_proof[k], r.new_link_proof[k], "六字段等式：" + k);
+      }
+      // tombstone 同笔 remap：旧 tomb 的 proof_ref 换成新闭包（rfh_）
+      assert.deepEqual(r.tombstone_remap.map((m) => m.old_tomb_id), [a1t], "remap 点名关联 tombstone");
+      const t2 = doc2.records[a1t];
+      assert.equal(t2.proof_ref.kind, "owner_select_merge_v1");
+      assert.equal(t2.proof_ref.selection_handle, intent.reaffirm_handle, "remap 到新闭包");
+      assert.equal(t2.proof_ref.selection_operation_id, Object.keys(doc2.operations).find((k) => doc2.operations[k] === opEntry), "remap 指向本 op");
+      assert.equal(TAL.canonKey(t2.proof_ref), TAL.canonKey(r.tombstone_remap[0].new_proof_ref), "remap 与落盘逐字等");
+    } finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("R57b 崩溃恢复两支：①ledger 已提交 + intent 未清 → 同 handle 重发幂等返原 result、只清 intent、账本不再变；②ledger 未提交 + intent 在 → 清后可安全重跑", () => withLedgerB((root, dir) => {
+    // ①：直接调 ledger op（绕过消费编排的清 intent 步）模拟「提交后、清前崩」。
+    const b3 = seedB3B(dir, "r57b_r1", 47, "sess-b-47");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const direct = talOkB(TAL.ownerSelectReaffirm({ endpointId: EP57B, targetId: b3, targetFamily: "B3", expectedOldProofClosureDigest: intent.entry.expected_old_proof_closure_digest, reaffirmHandle: intent.reaffirm_handle, authorizedBy: "ou_owner57b", chatId: "oc_r57b", selectedSessionId: "sess-b-47", selectedRootOm: "om_rb47", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "直接 ledger op");
+    assert.ok(readIntentsB(dir), "intent 未清（崩溃现场）");
+    const rev = loadOkB(dir).revision;
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 2000, ...mkPlanCtx(root, "om_sel57b", "crash1") }), "恢复重发");
+    assert.equal(res.idempotent, true, "按 request_key 判已完成（幂等重放，不再写账本）");
+    assert.equal(res.result.new_link_proof.selection_handle, intent.reaffirm_handle, "返存量证明（rfh_ 在重签 link 里）");
+    assert.equal(loadOkB(dir).revision, rev, "账本不再变");
+    assert.equal(res.cleared, true, "只清 intent");
+    const afterDoc = readIntentsB(dir);
+    assert.ok(afterDoc === null || Object.keys(afterDoc.entries).length === 0, "恢复后 intent 清干净");
+    // ②：签发 → 消费被拒（sender 不符）→ intent 仍在 → 改对后同一 intent 消费成功。
+    const b3b = seedB3B(dir, "r57b_r2", 48, "sess-b-48");
+    const intent2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
+    const bad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_stranger", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "crash2b") });
+    assert.equal(bad.ok, false);
+    assert.ok(readIntentsB(dir), "失败后 intent 仍在（可重跑）");
+    const ok2 = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "crash2") }), "重跑成功");
+    assert.equal(ok2.cleared, true);
+    assert.equal(loadOkB(dir).records[b3b].locator_link_proof_ref.kind, "owner_selected_route_v1");
+  }));
+
+  test("R57b ledger op 直调防错：intent 缺席的 handle 拒（reaffirm_handle_unknown）、过期 intent 拒（reaffirm_intent_expired）、schema 1.0 拒", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_d1", 49, "sess-b-49");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    let r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 7 * 86400e3 + 1 });
+    assert.equal(r.ok, false, "过期拒");
+    assert.equal(r.reason, "reaffirm_intent_expired");
+    // 同一 seam 的 clock 注入形态（P1-5）：不传 now，时钟已跨过到期 → 同拒
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 7 * 86400e3 + 1 });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "reaffirm_intent_expired", "clock seam 同判");
+    assert.ok(readIntentsB(dir), "过期拒不清 intent（等签发侧受验清理）");
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: "rfh_" + "1".repeat(32), sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(r.reason, "reaffirm_handle_unknown", "无此 intent");
+    // 消费成功后同 handle 再发 → unknown（一个 handle 恰消费一次）
+    talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "ledgerop") }), "首次消费");
+    r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(r.reason, "reaffirm_handle_unknown", "已消费再发 → unknown（要重做请重新签发）");
+  }));
+
+  test("R57b 返修一 P1-7：TTL/过期判据一律 intent 锁内 clock()——锁外 now 未到期但锁内 clock 已到期判到期；TTL 采样自锁内 clock", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p17", 61, "sess-b-61");
+    const TTL = TAL.OWNER_SELECT_REAFFIRM_TTL_MS;
+    // 签发：clock 采样在锁内，issued_at 与 expires_at 严格基于锁内 clock
+    let clockSampled = false;
+    const issued = talOkB(RI.issueReaffirmIntent({
+      endpointId: EP57B,
+      targetId: b3,
+      authorizedOwner: "ou_owner57b",
+      chatId: "oc_r57b",
+      clock: () => { clockSampled = true; return T0B; },
+    }), "issue with lock clock");
+    assert.ok(clockSampled, "锁内采样 clock()");
+    assert.equal(Date.parse(issued.entry.issued_at), T0B, "issued_at 采样自锁内 clock");
+    assert.equal(Date.parse(issued.entry.expires_at), T0B + TTL, "expires_at 严格基于锁内 clock 采样加 TTL");
+
+    // 反例：消费时锁外 now 未到期（T0B + 1000），但锁内 clock() 已到期（T0B + TTL + 1）→ 判到期
+    const rExpired = RI.consumeReaffirmIntent({
+      endpointId: EP57B,
+      reaffirmHandle: issued.reaffirm_handle,
+      sender: "ou_owner57b",
+      chatId: "oc_r57b",
+      selectionMessageId: "om_sel57b",
+      now: T0B + 1000, // 锁外 now 看起来没到期
+      clock: () => T0B + TTL + 1, // 锁内 clock 已到期
+    });
+    assert.equal(rExpired.ok, false, "锁内 clock 已到期必拒");
+    assert.equal(rExpired.reason, "reaffirm_intent_expired", "判到期");
+    assert.ok(readIntentsB(dir), "过期核拒不清 intent");
+
+    // 反向：锁外 now 看起来超时（T0B + 30 * 86400e3），但锁内 clock() 未到期（T0B + 1000）→ 判未到期，消费成功
+    const rOk = talOkB(RI.consumeReaffirmIntent({
+      endpointId: EP57B,
+      reaffirmHandle: issued.reaffirm_handle,
+      sender: "ou_owner57b",
+      chatId: "oc_r57b",
+      selectionMessageId: "om_sel57b",
+      ...mkPlanCtx(root, "om_sel57b", "p17ok"),
+      now: T0B + 30 * 86400e3, // 锁外 now
+      clock: () => T0B + 1000, // 锁内 clock 未到期
+    }), "消费成功");
+    assert.equal(rOk.cleared, true, "成功消费并清理 intent");
+  }));
+
+  // ── C. /feishu-select 接真执行器（仅 rfh 支；§12 三态准入不变）──
+
+  test("R57b /feishu-select rfh 支：partial 准入下真执行器成功（changed=true）；osh 支仍 select_executor_absent 终态；准入 off 仍拒", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_s1", 51, "sess-b-51");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const ctx = { senderId: "ou_owner57b", chatId: "oc_r57b", endpointId: EP57B, messageId: "om_sel57b", env: process.env, now: T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "osh_rfh") };
+    // osh 支：partial 准入先拒（§12 partial 只放 rfh）；on 准入下才轮到执行器——仍 absent 终态（另单）
+    let out = SA.executeSelectControl({ control: "select", handle: "osh_" + "2".repeat(32), handle_kind: "osh" }, { selectAdmissionFn: () => ({ state: "partial" }), ...ctx });
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, "select_partial_not_rfh", "partial 只放 rfh");
+    out = SA.executeSelectControl({ control: "select", handle: "osh_" + "2".repeat(32), handle_kind: "osh" }, { selectAdmissionFn: () => ({ state: "on" }), ...ctx });
+    assert.equal(out.reason, "select_executor_absent", "osh 支执行器仍缺席（on 准入下）");
+    // rfh 支：真执行器（真 intent store + 真账本）→ 成功
+    out = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, { selectAdmissionFn: () => ({ state: "partial" }), ...ctx });
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.changed, true);
+    assert.match(out.text, /已按你的确认重签/u, "成功文案");
+    assert.equal(loadOkB(dir).records[b3].locator_link_proof_ref.kind, "owner_selected_route_v1", "真执行器改了账本");
+    // 准入 off → 仍拒（rfh 也不越过三态准入）
+    const i2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: seedB3B(dir, "r57b_s2", 52, "sess-b-52"), authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
+    out = SA.executeSelectControl({ control: "select", handle: i2.reaffirm_handle, handle_kind: "rfh" }, { selectAdmissionFn: () => ({ state: "off" }), ...ctx });
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, "select_off", "off 拒");
+  }));
+
+  test("R57b rfh 失败文案封闭映射：unknown / expired / sender_mismatch / family_changed / digest_cas_mismatch / unreadable 各有文案（重放从记录恢复时同源）", () => {
+    for (const reason of ["reaffirm_handle_unknown", "reaffirm_intent_expired", "sender_mismatch", "chat_mismatch", "family_changed", "digest_cas_mismatch", "selection_mismatch", "reaffirm_intents_unreadable", "reaffirm_intents_busy"]) {
+      const t = SA.selectRejectTextByReason(reason);
+      assert.ok(t && t !== "控制执行失败（" + reason + "）", reason + " 有封闭文案：" + t);
+    }
+  });
+
+  test("R57b 返修一 P1-5：Codex 真入口与两条 repair 路径接通 rfh 上下文（新形 claim 续做同一 intent，旧形/缺上下文 fail-closed 点名）", () => withLedgerB((root, dir) => {
+    // 1. 旧形/缺项 claim fail-closed 点名
+    const claimsDir = path.join(root, "claims_p15");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const msgId = "msg_p15_fail";
+    const ltk = "task_p15_fail";
+    const h = "rfh_" + "5".repeat(32);
+
+    // 1a. 缺 selection_context（旧形 claim）
+    const oldClaim = acquireClaim({
+      claimsDir,
+      messageId: msgId,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: h, handle_kind: "rfh" },
+      }
+    });
+    const oldKey = oldClaim.key;
+    const oldDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: oldKey }).claim });
+    assert.equal(oldDirect.ok, false);
+    assert.equal(oldDirect.reason, "selection_context_missing", "旧形 claim 报 selection_context_missing");
+    assert.match(oldDirect.why, /旧形/u, "点名旧形 claim");
+
+    const oldRes = resumeControlClaim({
+      claimsDir,
+      key: oldKey,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(oldRes.ok, false);
+    assert.equal(oldRes.why, "selection_context_missing", "resumeControlClaim 归约到 selection_context_missing");
+
+    // 1b. 缺必需字段（例如缺 endpoint）——键集完整，endpoint 置 null（形状不对）→ 点名缺/形状 endpoint
+    const msgIdIncomplete = "om_p15incomp";
+    const incompCtx = {
+      endpoint: null,
+      chat: "oc_r57b",
+      session: "sess-p15",
+      sender: "ou_owner57b",
+      message: msgIdIncomplete,
+      handle: h,
+      kind: "rfh",
+    };
+    const incompDigest = SA.selectionContextDigestV1(incompCtx);
+    const incompClaim = acquireClaim({
+      claimsDir,
+      messageId: msgIdIncomplete,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: h, handle_kind: "rfh" },
+        selection_context: incompCtx,
+        selection_context_digest_v1: incompDigest,
+      }
+    });
+    const incompDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: incompClaim.key }).claim });
+    assert.equal(incompDirect.ok, false);
+    assert.equal(incompDirect.reason, "selection_context_incomplete");
+    assert.match(incompDirect.why, /endpoint/u, "点名 endpoint");
+
+    const incompRes = resumeControlClaim({
+      claimsDir,
+      key: incompClaim.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(incompRes.ok, false);
+    assert.equal(incompRes.why, "selection_context_incomplete");
+
+    // 1c. digest 不一致（键集/形状都合法，只 digest 错）
+    const msgIdBadDigest = "om_p15baddig";
+    const fullCtx = {
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      session: "sess-p15",
+      sender: "ou_owner57b",
+      message: msgIdBadDigest,
+      handle: h,
+      kind: "rfh",
+    };
+    const badDigestClaim = acquireClaim({
+      claimsDir,
+      messageId: msgIdBadDigest,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: h, handle_kind: "rfh" },
+        selection_context: fullCtx,
+        selection_context_digest_v1: "0".repeat(64),
+      }
+    });
+    const badDigestDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: badDigestClaim.key }).claim });
+    assert.equal(badDigestDirect.ok, false);
+    assert.equal(badDigestDirect.reason, "select_context_conflict");
+    assert.match(badDigestDirect.why, /digest_v1 与内容不一致/u);
+
+    const badDigestRes = resumeControlClaim({
+      claimsDir,
+      key: badDigestClaim.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {}, ctx),
+    });
+    assert.equal(badDigestRes.ok, false);
+    assert.equal(badDigestRes.why, "select_context_conflict");
+
+    // 2. 新形 claim 崩溃后（in_flight 态）repair 续做同一 intent → 成功转 consumed 并清 intent
+    const b3 = seedB3B(dir, "r57b_p15", 55, "sess-b-55");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const msgIdRepair = "om_repair55";
+    const repairCtx = {
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      sender: "ou_owner57b",
+      message: msgIdRepair,
+      session: "sess-b-55",
+      handle: intent.reaffirm_handle,
+      kind: "rfh",
+    };
+    const repairDigest = SA.selectionContextDigestV1(repairCtx);
+    const inFlightClaim = acquireClaim({
+      claimsDir,
+      messageId: msgIdRepair,
+      logicalTaskKey: ltk,
+      meta: {
+        policy_id: MAPPING_POLICY_ID,
+        policy_version: "1.0",
+        origin_channel_generation_id: "gen_001",
+        control: { control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" },
+        selection_context: repairCtx,
+        selection_context_digest_v1: repairDigest,
+      }
+    });
+    assert.equal(inFlightClaim.ok, true);
+    const insp = inspectControlClaim({ claimsDir, key: inFlightClaim.key });
+    assert.equal(insp.state, "in_flight");
+
+    const repairRes = resumeControlClaim({
+      claimsDir,
+      key: inFlightClaim.key,
+      execute: (target, ctx) => dispatchControlRepair(target, {
+        onSelect: (t, c) => {
+          const v = SA.verifySelectionContext(c.claim);
+          if (!v.ok) return { ok: false, reason: v.reason, why: v.why };
+          return SA.executeSelectControl(t, {
+            endpointId: v.context.endpoint,
+            chatId: v.context.chat,
+            senderId: v.context.sender,
+            messageId: v.context.message,
+            selectAdmissionFn: () => ({ state: "partial" }),
+            claimsDir,
+            key: inFlightClaim.key,
+          });
+        }
+      }, ctx),
+    });
+    assert.equal(repairRes.ok, true, "repair 续做成功：" + JSON.stringify(repairRes));
+    const inspAfter = inspectControlClaim({ claimsDir, key: inFlightClaim.key });
+    assert.equal(inspAfter.state, "consumed", "转 consumed");
+    const intentsAfter = RI.readReaffirmIntents({ endpointDir: dir });
+    assert.equal(intentsAfter.doc.entries[intent.reaffirm_handle], undefined, "intent 被清");
+
+    // 3. Codex 真入口事实传参：调用 executeSelectControl 传入从 template 与 event 派生的上下文 → partial 准入下成功
+    const codexEndpoint = legacyEndpointId({ runtime: "codex", agentUid: "agent_m5codex" });
+    const codexDir = path.join(root, codexEndpoint);
+    fs.mkdirSync(codexDir, { recursive: true, mode: 0o700 });
+    const docCodex = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: codexEndpoint, chain: "codex", authority_mode: "shadow", revision: 2, operations: {
+      "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57b_init_c", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: codexEndpoint, chain: "codex" }), result_revision: 1, result: { revision: 1 } },
+      "00000000-0000-4000-8000-0000000001a2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57b_up_c", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57b_up_c", endpoint: codexEndpoint, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: codexEndpoint, from_schema: "1.0", to_schema: "1.1-transition" } }
+    }, records: {} };
+    fs.writeFileSync(path.join(codexDir, "ledger.json"), JSON.stringify(docCodex, null, 2) + "\n", { mode: 0o600 });
+    const b1C = talOkB(TAL.createB1({ endpointId: codexEndpoint, requestKey: "r57b_c_b1", chatId: "oc_codexchat", rootOm: "om_codexroot", lineageId: "lin_codex", bindingTarget: { runtime: "codex", project_root: "/p/codex", codex_task_id: "tsk_codex99", codex_thread_id: "th_codex99" }, now: T0B }), "createB1");
+    const a1C = talOkB(TAL.createA1({ endpointId: codexEndpoint, requestKey: "r57b_c_a1", chatId: "oc_codexchat", sessionId: "sess-codex-99", now: T0B }), "createA1");
+    talOkB(TAL.activate({ endpointId: codexEndpoint, requestKey: "r57b_c_act", b1Id: b1C.result.created_id, a1Id: a1C.result.created_id, f4: { matched_om: "om_codexroot", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, authorizedBy: "ou_codex_owner", now: T0B }), "activate");
+    const codexTarget = b1C.result.created_id;
+    const codexIntent = talOkB(RI.issueReaffirmIntent({ endpointId: codexEndpoint, targetId: codexTarget, authorizedOwner: "ou_codex_owner", chatId: "oc_codexchat", clock: () => T0B }), "codex issue");
+
+    const codexInboundRes = SA.executeSelectControl({
+      control: "select",
+      handle: codexIntent.reaffirm_handle,
+      handle_kind: "rfh",
+    }, {
+      selectAdmissionFn: () => ({ state: "partial" }),
+      senderId: "ou_codex_owner",
+      chatId: "oc_codexchat",
+      endpointId: codexEndpoint,
+      messageId: "om_codexmsg1",
+      ...mkPlanCtx(root, "om_codexmsg1", "p15_codex"),
+    });
+    assert.equal(codexInboundRes.ok, true, "Codex 入口 partial+rfh 成功");
+    assert.equal(codexInboundRes.status, "consumed");
+    assert.match(codexInboundRes.text, /已按你的确认重签/u);
+  }));
+
+  test("R57b 返修二 P1-5：claim 上下文缺 session 仍放行——封闭精确键集 + 各字段形状，session 必填；session null 配自洽 digest → 拒", () => withLedgerB((root, dir) => {
+    const h = "rfh_" + "c".repeat(32);
+    const mkCtx = (over = {}) => ({
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      session: "sess-p15",
+      message: "om_p15sess",
+      sender: "ou_owner57b",
+      handle: h,
+      kind: "rfh",
+      ...over,
+    });
+    const mkClaim = (ctx, digest = SA.selectionContextDigestV1(ctx)) => ({
+      control: { control: "select", handle: h, handle_kind: "rfh" },
+      selection_context: ctx,
+      selection_context_digest_v1: digest,
+    });
+
+    // ① 反例：session 置 null（自洽 digest）→ 拒（P1-5 前 verifySelectionContext 放行）。
+    const ctxNullSession = mkCtx({ session: null });
+    const vNull = SA.verifySelectionContext(mkClaim(ctxNullSession));
+    assert.equal(vNull.ok, false, "session:null 必须拒");
+    assert.equal(vNull.reason, "selection_context_incomplete", "reason 为 selection_context_incomplete");
+    assert.match(vNull.why, /session/u, "点名 session");
+
+    // ② 反例：session 缺键（键集不完整）→ 拒。
+    const ctxNoSession = { ...mkCtx(), session: undefined };
+    delete ctxNoSession.session;
+    const vNo = SA.verifySelectionContext(mkClaim(ctxNoSession));
+    assert.equal(vNo.ok, false, "缺 session 键必须拒");
+    assert.equal(vNo.reason, "selection_context_incomplete", "键集不对→拒");
+
+    // ③ 反例：多出非白名单键（如 extra）→ 拒。
+    const ctxExtra = { ...mkCtx(), extra: "x" };
+    const vExtra = SA.verifySelectionContext(mkClaim(ctxExtra));
+    assert.equal(vExtra.ok, false, "多出白名单外键必须拒");
+    assert.equal(vExtra.reason, "selection_context_incomplete", "键集不对→拒");
+
+    // ④ 反例：kind=rfh 但 handle 是 osh_ 前缀（kind/handle 不一致）→ 拒。
+    const ctxBadHandle = mkCtx({ handle: "osh_" + "d".repeat(32) });
+    const vBad = SA.verifySelectionContext(mkClaim(ctxBadHandle));
+    assert.equal(vBad.ok, false, "kind/handle 不一致必须拒");
+    assert.equal(vBad.reason, "selection_context_incomplete");
+    assert.match(vBad.why, /handle/u, "点名 handle");
+
+    // ⑤ 正例：完整合法上下文 → 放行（同源 digest）。
+    const vOk = SA.verifySelectionContext(mkClaim(mkCtx()));
+    assert.equal(vOk.ok, true, "完整合法上下文放行：" + JSON.stringify(vOk));
+  }));
+
+  // ── D. 终端签发命令 scripts/feishu-reaffirm-issue.mjs（预览零写；--apply 才写）──
+
+  test("R57b 返修一 P1-6/P2 终端命令：收据聚合+模板四核+CLI矩阵封闭+最小披露；--apply 写 intent 并打印 rfh_", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_cli", 53, "sess-b-53");
+    const maintDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "maint-r57b-")));
+    const tplFile = path.join(root, "chain.json");
+    const writeTpl = (over = {}) => {
+      fs.writeFileSync(tplFile, JSON.stringify({
+        chain: "claude",
+        transport_agent_name: "T",
+        transport_app_id: "cli_x",
+        transport_open_id: "ou_t",
+        outbound_agent_name: "O",
+        outbound_app_id: "cli_y",
+        outbound_open_id: "ou_o",
+        lark_cli_profile: "claude",
+        lark_cli_bin: "/bin/lark",
+        lark_cli_home: "/home/lark",
+        frank_sender_id: "5730000000000000001",
+        chat_name: "群",
+        chat_id: "oc_r57b",
+        default_freshness_ms: 900000,
+        agent_uid: "agent_b",
+        ...over,
+      }));
+    };
+    writeTpl();
+
+    const mkDoneInitJournal = (tok, ep) => {
+      const ats = "2026-09-11T09:00:00.000Z";
+      const sha = "b".repeat(64);
+      const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+      const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+      const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+      const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at: ats, chain: null });
+      const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at: ats, chain: null });
+      const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+      const lStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+      return {
+        schema_version: "1.2",
+        operation_kind: "ledger_init",
+        token: tok,
+        reason: "test init",
+        started_at: ats,
+        updated_at: ats,
+        phase: "done",
+        steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep],
+        notes: [],
+      };
+    };
+
+    const tok1 = "00000000-0000-4000-8000-000000000001";
+    fs.writeFileSync(path.join(maintDir, tok1 + ".json"), JSON.stringify(mkDoneInitJournal(tok1, EP57B)));
+
+    const run = (args, envOver = {}) => spawnSync(process.execPath, [path.resolve("scripts", "feishu-reaffirm-issue.mjs"), ...args], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        FEISHU_BRIDGE_LEDGER_DIR: root,
+        FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+        FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile,
+        ...envOver,
+      },
+    });
+
+    try {
+      // 1. 预览：退出 0、零写、最小披露（不泄露 session / root_om / chat_id / digest）
+      let r = run([b3]);
+      assert.equal(r.status, 0, "预览退出 0：" + r.stdout + r.stderr);
+      assert.equal(readIntentsB(dir), null, "预览零写");
+      assert.match(r.stdout, /B3/u, "打印族");
+      assert.match(r.stdout, /7 天/u, "打印有效期");
+      assert.doesNotMatch(r.stdout, /[0-9a-f]{64}/u, "最小披露：不泄露 digest");
+      assert.doesNotMatch(r.stdout, /sess-b-53/u, "最小披露：不泄露 session_id");
+      assert.doesNotMatch(r.stdout, /om_rb53/u, "最小披露：不泄露 root_om");
+      assert.doesNotMatch(r.stdout, /oc_r57b/u, "最小披露：不泄露 chat_id");
+
+      // 2. --apply：写 intent、打印 rfh_ 与下一步
+      r = run([b3, "--apply"]);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+      const doc = readIntentsB(dir);
+      assert.ok(doc, "--apply 落 intent 文件");
+      const handle = Object.keys(doc.entries)[0];
+      assert.match(handle, /^rfh_[0-9a-f]{32}$/u);
+      assert.match(r.stdout, new RegExp(handle, "u"), "打印 rfh_ 供 owner 在话题里 /feishu-select");
+      assert.match(r.stdout, /feishu-select/u, "打印下一步");
+
+      // 3. 已有未清 intent 再 --apply → 干净拒绝（退出 1）
+      r = run([b3, "--apply"]);
+      assert.equal(r.status, 1, "已有未清 intent → 退出 1");
+      assert.match(r.stderr || r.stdout, /reaffirm_intent_exists|未清/u);
+
+      // 4. 未知 target → 退出 1
+      r = run(["ta_" + "e".repeat(32)]);
+      assert.equal(r.status, 1, "未知 target 退出 1");
+      assert.match(r.stderr, /找不到 live 记录/u);
+
+      // 5. P2 CLI 参数矩阵封闭：退出码 2
+      r = run([b3, "--apply", "--apply"]);
+      assert.equal(r.status, 2, "重复 --apply 退出 2");
+      assert.match(r.stderr, /重复的 --apply/u);
+
+      r = run([b3, "--bogus"]);
+      assert.equal(r.status, 2, "未知参数退出 2");
+      assert.match(r.stderr, /未知参数/u);
+
+      r = run(["bad_target_id"]);
+      assert.equal(r.status, 2, "非法 target_id 形状退出 2");
+      assert.match(r.stderr, /target_id 形状不对/u);
+
+      r = run([]);
+      assert.equal(r.status, 2, "缺参退出 2");
+      assert.match(r.stderr, /用法：/u);
+
+      // 6. P1-6 模板四核反例（chain / chat / endpoint / bad owner）→ 退出 1
+      writeTpl({ chain: "codex" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "chain 不符 → 退出 1");
+      assert.match(r.stderr, /chain.*不一致/u);
+
+      writeTpl({ chat_id: "oc_mismatch" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "chat_id 不符 → 退出 1");
+      assert.match(r.stderr, /chat_id.*不一致/u);
+
+      writeTpl({ agent_uid: "agent_wrong" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "endpoint 不符 → 退出 1");
+      assert.match(r.stderr, /endpoint.*不一致/u);
+
+      writeTpl({ frank_sender_id: "not_a_number" });
+      r = run([b3]);
+      assert.equal(r.status, 1, "bad frank_sender_id → 退出 1");
+      assert.match(r.stderr, /frank_sender_id|链路模板/u);
+
+      writeTpl(); // 恢复正确模板
+
+      // 7. P1-6 收据矛盾（duplicate init）→ 退出 1 fail-closed
+      const dupTok = "00000000-0000-4000-8000-000000000002";
+      fs.writeFileSync(path.join(maintDir, dupTok + ".json"), JSON.stringify(mkDoneInitJournal(dupTok, EP57B)));
+      r = run([b3]);
+      assert.equal(r.status, 1, "收据矛盾 → 退出 1");
+      assert.match(r.stderr, /收据矛盾/u);
+      fs.unlinkSync(path.join(maintDir, dupTok + ".json"));
+
+      // 8. P1-6 目标在多个账本中命中 → 退出 1，只报数量
+      const EP57B_2 = legacyEndpointId({ runtime: "claude", agentUid: "agent_b2" });
+      const dir2 = path.join(root, EP57B_2);
+      fs.mkdirSync(dir2, { recursive: true, mode: 0o700 });
+      // 复制一份含相同 target b3 的 live 账本
+      const doc2 = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+      doc2.endpoint_id = EP57B_2;
+      fs.writeFileSync(path.join(dir2, "ledger.json"), JSON.stringify(doc2, null, 2) + "\n", { mode: 0o600 });
+      const tok2 = "00000000-0000-4000-8000-000000000003";
+      fs.writeFileSync(path.join(maintDir, tok2 + ".json"), JSON.stringify(mkDoneInitJournal(tok2, EP57B_2)));
+
+      r = run([b3]);
+      assert.equal(r.status, 1, "多账本命中 → 退出 1");
+      assert.match(r.stderr, /多个账本中命中.*数量：2/u);
+      assert.doesNotMatch(r.stderr, new RegExp(EP57B_2, "u"), "只报数量不泄露其他账本 endpoint 详情");
+    } finally {
+      fs.rmSync(maintDir, { recursive: true, force: true });
+    }
+  }));
+
+}
 
 summarySealed = true;
 

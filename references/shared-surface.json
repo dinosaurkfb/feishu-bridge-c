@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-09T03:27:59.015Z",
+  "generated_at": "2026-09-09T15:31:05.307Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -132,6 +132,7 @@
       "consumedRecordProblem",
       "consumedResidue",
       "controlAckText",
+      "controlCommittedUncleanRecordProblem",
       "controlFailedRecordProblem",
       "controlIntentProblem",
       "inspectControlClaim",
@@ -141,6 +142,7 @@
       "parseControlCommand",
       "quarantinedFailed",
       "readConsumedRecord",
+      "readControlCommittedUncleanRecord",
       "readControlFailedRecord",
       "resumeControlClaim",
       "runControlTransaction",
@@ -554,6 +556,7 @@
       "dispatchControlRepair",
       "expectationFromMapping",
       "parseRepairControlArgs",
+      "repairControlCommittedUnclean",
       "repairExitCode"
     ],
     "risk-class.mjs": [
@@ -579,10 +582,15 @@
       "versionFromFiles"
     ],
     "select-admission.mjs": [
+      "SELECTION_CONTEXT_KEYS",
+      "classifySelectOutcome",
       "executeSelectControl",
       "selectAdmission",
+      "selectReaffirmSuccessText",
       "selectReject",
-      "selectRejectTextByReason"
+      "selectRejectTextByReason",
+      "selectionContextDigestV1",
+      "verifySelectionContext"
     ],
     "selector.mjs": [
       "BINDING_TOKEN_RE",
@@ -686,18 +694,24 @@
       "usableGeneration"
     ],
     "topic-agent-ledger.mjs": [
+      "AILY_SESSION_SHAPE",
       "ARTIFACT_TYPE",
+      "AUTHORIZED_BY_SHAPE",
+      "CHAT_SHAPE",
       "ENDPOINT_SHAPE",
       "ID_SHAPE",
       "LEDGER_DIR_ENV",
       "LINEAGE_SHAPE",
+      "OM_SHAPE",
       "OWNER_SELECT_HANDLE_TTL_MS",
+      "OWNER_SELECT_REAFFIRM_TTL_MS",
       "REAFFIRM_HANDLE_SHAPE",
       "REBIND_HANDLE_SHAPE",
       "REQUEST_KEY_SHAPE",
       "SCHEMA_VERSION",
       "SCHEMA_VERSIONS",
       "SELECTION_HANDLE_SHAPE",
+      "SHA_SHAPE",
       "activate",
       "anchor",
       "applyMintPlan",
@@ -731,6 +745,9 @@
       "mintPlanProblem",
       "mintSelectionHandles",
       "newTopicAgentId",
+      "ownerSelectReaffirm",
+      "ownerSelectReaffirmClosureDigest",
+      "ownerSelectReaffirmRequestKey",
       "ownerSelectSchemaUpgradeOpId",
       "readLedger",
       "rebindSessionAlias",

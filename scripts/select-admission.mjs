@@ -258,4 +258,3 @@ export function executeSelectControl(intent, {
   }
   return { ok: true, status: "consumed", changed: res.idempotent === true ? false : true, text: selectReaffirmSuccessText(res.result) };
 }
-

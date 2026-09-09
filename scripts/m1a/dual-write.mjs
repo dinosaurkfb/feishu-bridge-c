@@ -113,4 +113,3 @@ export function verifyOrderLockCapability(endpointId, capability, env = process.
   }
   return { ok: true };
 }
-

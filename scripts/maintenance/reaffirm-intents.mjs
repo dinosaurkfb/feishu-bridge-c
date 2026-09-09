@@ -104,34 +104,118 @@ export function readReaffirmIntents({ endpointDir }) {
   }
 }
 
-/** tmp + rename + fsync 落盘（0600、O_EXCL|O_NOFOLLOW、写端 fd 复核 nlink，目录 fsync）。返回 { ok } 或 { ok:false, problem }。 */
-function writeIntentsFile(dir, doc) {
+function cleanupTmp(tmp, _inject) {
+  if (_inject?.cleanupFail) return { residue: tmp };
+  try {
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    return { residue: null };
+  } catch (err) {
+    return { residue: tmp };
+  }
+}
+
+/**
+ * tmp + rename + fsync 落盘（复用 m1a sidecar 原语）：
+ * 写前核 ≤ 256 KiB；0600、O_EXCL|O_NOFOLLOW、写端 fd 复核 nlink；
+ * rename 前失败清理 tmp，清不掉才 residue 点名 tmp；
+ * rename 后目录 fsync 失败 → committed_durability_uncertain；
+ * 写后受验读回逐字节等。
+ */
+function writeIntentsFile(dir, doc, { _inject = null } = {}) {
   const bytes = Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
-  const tmp = path.join(dir, ".reaffirm-intents.tmp." + process.pid + "." + Date.now());
+  if (bytes.length > REAFFIRM_INTENTS_MAX_BYTES) {
+    return { ok: false, commit: "not_committed", reason: "over_capacity", why: "序列化长度 " + bytes.length + " 超出上限 " + REAFFIRM_INTENTS_MAX_BYTES };
+  }
+  const targetPath = path.join(dir, REAFFIRM_INTENTS_FILE);
+  const tmp = path.join(dir, ".reaffirm-intents.tmp." + process.pid + "." + crypto.randomUUID());
   let fd = null;
+  let renameLanded = false;
   try {
     fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
     const st = fs.fstatSync(fd);
-    if (!st.isFile() || st.nlink !== 1) return { ok: false, problem: "tmp 不是单硬链接普通文件" };
+    if (!st.isFile() || st.nlink !== 1 || (st.mode & 0o777) !== 0o600) {
+      try { fs.closeSync(fd); fd = null; } catch {}
+      const cl = cleanupTmp(tmp, _inject);
+      const out = { ok: false, commit: "not_committed", reason: "tmp_file_invalid", why: "tmp 文件属性异常" };
+      if (cl.residue) { out.reason = "residue"; out.residue = [cl.residue]; }
+      return out;
+    }
     let off = 0;
-    while (off < bytes.length) { const n = fs.writeSync(fd, bytes, off, bytes.length - off); if (n <= 0) return { ok: false, problem: "short write" }; off += n; }
+    while (off < bytes.length) {
+      const n = fs.writeSync(fd, bytes, off, bytes.length - off);
+      if (n <= 0) break;
+      off += n;
+    }
     fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+
+    if (typeof _inject?.beforeRename === "function") _inject.beforeRename();
+
+    fs.renameSync(tmp, targetPath);
+    renameLanded = true;
   } catch (err) {
-    return { ok: false, problem: errCode(err) };
-  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
-  try {
-    fs.renameSync(tmp, path.join(dir, REAFFIRM_INTENTS_FILE));
-  } catch (err) {
-    try { fs.unlinkSync(tmp); } catch { /* 尽力清理 */ }
-    return { ok: false, problem: "rename 失败: " + errCode(err) };
+    if (fd !== null) { try { fs.closeSync(fd); fd = null; } catch {} }
+    if (!renameLanded) {
+      const cl = cleanupTmp(tmp, _inject);
+      if (cl.residue) {
+        return { ok: false, commit: "not_committed", reason: "residue", residue: [cl.residue], why: "rename 前失败且 tmp 残留: " + errCode(err) };
+      }
+      return { ok: false, commit: "not_committed", reason: "tmp_write_failed", why: errCode(err) };
+    }
   }
-  let dfd = null;
+
+  // rename 后目录 fsync（不吞异常）
   try {
-    dfd = fs.openSync(dir, fs.constants.O_RDONLY);
-    fs.fsyncSync(dfd);
-  } catch { /* 目录 fsync 不支持的平台：尽力 */ }
-  finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch { /* 已关 */ } } }
-  return { ok: true };
+    if (_inject?.failDirFsync) {
+      const err = new Error("EIO: i/o error, fsync");
+      err.code = "EIO";
+      throw err;
+    }
+    let dfd = null;
+    try {
+      dfd = fs.openSync(dir, fs.constants.O_RDONLY);
+      fs.fsyncSync(dfd);
+    } finally {
+      if (dfd !== null) { try { fs.closeSync(dfd); } catch {} }
+    }
+  } catch (err) {
+    return { ok: false, commit: "committed_durability_uncertain", reason: "dir_fsync_failed", why: "目录 fsync 失败: " + errCode(err) };
+  }
+
+  // 受验读回逐字节等
+  try {
+    const rb = fs.readFileSync(targetPath);
+    if (Buffer.compare(rb, bytes) !== 0) {
+      return { ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: "读回字节与写入字节不一致" };
+    }
+  } catch (err) {
+    return { ok: false, commit: "committed_durability_uncertain", reason: "readback_failed", why: "读回失败: " + errCode(err) };
+  }
+
+  return { ok: true, commit: "committed_clean" };
+}
+
+/** 把 intent 锁释放结果折进返回值（released | residue | unclear 三态外显）。 */
+function foldIntentsLockRelease(result, rel, lockDir) {
+  const clean = rel?.ok === true && !rel.absent && !rel.reapUncleared;
+  if (clean) {
+    return { ...result, lock_state: "released" };
+  }
+  const isResidue = Boolean(rel?.reapUncleared);
+  const lock_state = isResidue ? "residue" : "unclear";
+  const lockResidue = isResidue ? (rel.reapUncleared?.path ?? lockDir) : null;
+  const lockUncleared = {
+    reason: rel?.reason ?? (rel?.absent ? "lock_absent_on_release" : isResidue ? "reap_residue_uncleared" : "release_failed"),
+    why: rel?.why ?? (isResidue ? String(rel.reapUncleared?.error ?? "") : null),
+    path: rel?.reapUncleared?.path ?? rel?.path ?? lockDir
+  };
+  return {
+    ...result,
+    lock_state,
+    lockUncleared,
+    ...(lockResidue ? { lockResidue } : {}),
+  };
 }
 
 /** intent 文件锁（普通 gated）：acquire → fn(token) → release（释放失败折进结果，不静默吞）。 */
@@ -140,10 +224,16 @@ function withIntentsLock(dir, fn, { env = process.env } = {}) {
   const acq = acquirePublishLock(lockDir, { reapUnrecognized: false, env });
   if (!acq.ok) return { ok: false, reason: acq.reason === "maintenance" ? "maintenance" : acq.reason === "publisher_busy" ? "reaffirm_intents_busy" : (acq.reason ?? "reaffirm_intents_lock"), why: acq.error ?? acq.reason ?? null, gate: acq.gate ?? null, text: acq.text ?? null, path: acq.path ?? null };
   let out;
-  try { out = fn(acq.token); }
-  finally {
-    const rel = releasePublishLock(lockDir, { expectedToken: acq.token });
-    if (!rel.ok) out = { ...out, lockUncleared: rel.reason ?? "release_failed" };
+  let rel;
+  try {
+    out = fn(acq.token);
+  } finally {
+    try {
+      rel = releasePublishLock(lockDir, { expectedToken: acq.token });
+    } catch (err) {
+      rel = { ok: false, reason: "release_exception", why: errCode(err) };
+    }
+    out = foldIntentsLockRelease(out, rel, lockDir);
   }
   return out;
 }
@@ -216,10 +306,18 @@ export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner
       issued_at: iso, expires_at: expires, expected_old_proof_closure_digest: digest,
     };
     const p = reaffirmIntentsProblem(doc);
-    if (p !== null) return { ok: false, reason: "reaffirm_intents_unwritable", why: "产物不过封闭 schema：" + p };
-    const w = writeIntentsFile(d.dir, doc);
-    if (!w.ok) return { ok: false, reason: "reaffirm_intents_unwritable", why: w.problem };
-    return { ok: true, reaffirm_handle: handle, entry: doc.entries[handle], cleaned, cleaned_count: cleaned.length };
+    if (p !== null) return { ok: false, commit: "not_committed", reason: "reaffirm_intents_unwritable", why: "产物不过封闭 schema：" + p };
+    const w = writeIntentsFile(d.dir, doc, { _inject });
+    if (!w.ok) {
+      return {
+        ok: false,
+        commit: w.commit ?? "not_committed",
+        reason: w.reason ?? "reaffirm_intents_unwritable",
+        why: w.why ?? w.problem ?? null,
+        ...(w.residue ? { residue: w.residue } : {})
+      };
+    }
+    return { ok: true, commit: w.commit, reaffirm_handle: handle, entry: doc.entries[handle], cleaned, cleaned_count: cleaned.length };
   }, { env });
 }
 

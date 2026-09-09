@@ -42125,6 +42125,64 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(rOn.reason, "select_not_partial");
   }));
 
+  test("R57b 返修一 P1-3：intent 写原语——超限拒且盘上无变化；rename 前注入失败+清理失败 residue 点名 tmp；rename 后目录 fsync 失败 durability_uncertain", () => withLedgerB((root, dir) => {
+    const b3 = seedB3B(dir, "r57b_p1_3", 38, "sess-b-38");
+
+    // 1. 反例：超限 → 拒且盘上无变化
+    const initialDoc = { schema_version: "reaffirm-intents-1", entries: {} };
+    for (let i = 0; i < 493; i++) {
+      const h = "rfh_" + i.toString(16).padStart(32, "0");
+      initialDoc.entries[h] = {
+        reaffirm_handle: h,
+        target_id: "ta_" + i.toString(16).padStart(32, "0"),
+        target_family: "B3",
+        authorized_owner: "ou_owner",
+        endpoint: EP57B,
+        chat_id: "oc_chat",
+        issued_at: ISO0B,
+        expires_at: "2026-09-18T09:00:00.000Z",
+        expected_old_proof_closure_digest: "0".repeat(64),
+      };
+    }
+    const intentsPath = path.join(dir, "reaffirm-intents.json");
+    fs.writeFileSync(intentsPath, JSON.stringify(initialDoc, null, 2) + "\n", { mode: 0o600 });
+    const bytesBefore = fs.statSync(intentsPath).size;
+    assert.ok(bytesBefore <= 262144, "初始文件在 256 KiB 以内可读: " + bytesBefore);
+    const diskBefore = fs.readFileSync(intentsPath, "utf-8");
+
+    // 签发第 494 笔（总数 494 <= 512 过 entries schema 检查，但序列化 262,378 > 262,144）
+    const rOver = RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner", chatId: "oc_r57b", clock: () => T0B });
+    assert.equal(rOver.ok, false, "超限写必须拒");
+    assert.equal(rOver.reason, "over_capacity", "reason 为 over_capacity");
+    assert.equal(fs.readFileSync(intentsPath, "utf-8"), diskBefore, "盘上内容保持不变");
+
+    // 恢复空 intent 文件进行后续测试
+    fs.writeFileSync(intentsPath, JSON.stringify({ schema_version: "reaffirm-intents-1", entries: {} }, null, 2) + "\n", { mode: 0o600 });
+
+    // 2. 反例：rename 前注入失败 + 清理失败 → residue 点名 tmp
+    const rResidue = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { beforeRename: () => { throw new Error("crash_before_rename"); }, cleanupFail: true }
+    });
+    assert.equal(rResidue.ok, false, "rename 前注入失败必须拒");
+    assert.equal(rResidue.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rResidue.residue) && rResidue.residue.length > 0, "residue 包含残骸路径");
+    assert.match(rResidue.residue[0], /\.reaffirm-intents\.tmp\./u, "点名 tmp 路径");
+    // 清理遗留 tmp 以免影响后续
+    for (const f of fs.readdirSync(dir)) {
+      if (f.startsWith(".reaffirm-intents.tmp.")) fs.unlinkSync(path.join(dir, f));
+    }
+
+    // 3. 反例：rename 后目录 fsync 失败 → committed_durability_uncertain
+    const rFsync = RI.issueReaffirmIntent({
+      endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B,
+      _inject: { failDirFsync: true }
+    });
+    assert.equal(rFsync.ok, false, "目录 fsync 失败必须报 durability_uncertain");
+    assert.equal(rFsync.commit, "committed_durability_uncertain", "commit 为 committed_durability_uncertain");
+    assert.equal(rFsync.reason, "dir_fsync_failed", "reason 为 dir_fsync_failed");
+  }));
+
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {
     // 手工 transition 账本：activate 增量 op 产 owner_select 双证 + tombstone（owner_select_merge_v1）。
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-os-")));

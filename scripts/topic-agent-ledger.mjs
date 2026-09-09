@@ -2665,7 +2665,7 @@ export function attach({ endpointId, requestKey, id, bindingTarget, claimKey, au
   const a2Inputs = (doc) => (is11Schema(doc) ? { ...baseInputs, expected_anchor_candidate: anchorCandidate ?? null } : baseInputs);
   return gatedTx({
     // R57a 返修一 P1-4：跨 schema 重放——按 prior 相对升级边界二选一（attach_a3 历史描述符归 legacy 侧，不旁路）。
-    endpointId, requestKey, env, replay: (doc, prior) => replayDescriptorsAcrossUpgrade({ doc, prior, legacy: [{ opType: "attach_a2", inputs: baseInputs }, { opType: "attach_a3", inputs: baseInputs }], current: [{ opType: "attach_a2", inputs: a2Inputs(doc) }] }), _inject,
+    endpointId, requestKey, env, replay: (doc, prior) => replayDescriptorsAcrossUpgrade({ doc, prior, legacy: [{ opType: "attach_a2", inputs: baseInputs }, { opType: "attach_a3", inputs: baseInputs }], current: [{ opType: "attach_a2", inputs: a2Inputs(doc) }, { opType: "attach_a3", inputs: baseInputs }] }), _inject,
     mutate: (doc) => {
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(id)) return { ok: false, reason: "bad_id" };
@@ -2689,9 +2689,13 @@ export function attach({ endpointId, requestKey, id, bindingTarget, claimKey, au
         handle = mintOsh();
       }
       const inputs = signing ? a2Inputs(doc) : baseInputs;
+      // R57a 返修六 P1-2：边界后（1.1+）attach_a3 也写 §6 新形 result（affected_live_ids_after_commit + proof_effects preserved）；
+      //   1.0 保持旧两键。attach_a2 的 increment 形已在 signing 分支。
       const result = signing
         ? { affected_id: id, terminal_family: "A2", anchor_candidate: anchorCandidate, selection_handle: handle, handle_expires_at: expires, affected_live_ids_after_commit: [id], proof_effects: [{ topic_agent_id: id, binding_effect: "produced", link_effect: "none" }] }
-        : { affected_id: id, terminal_family: keepLink ? "A3" : "A2" };
+        : keepLink && is11Schema(doc)
+          ? { affected_id: id, terminal_family: "A3", affected_live_ids_after_commit: [id], proof_effects: [{ topic_agent_id: id, binding_effect: "produced", link_effect: "preserved" }] }
+          : { affected_id: id, terminal_family: keepLink ? "A3" : "A2" };
       return { ok: true, next: stampAndBuild(doc, { opType, inputs, result, mutateRecords: (n, opId) => {
         const r = n.records[id];
         r.facts.binding = "active";

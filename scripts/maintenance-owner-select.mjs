@@ -119,7 +119,7 @@ export function runMaintenanceOwnerSelect(argv, { ctx = null, out = (s) => proce
     const previewByKind = {
       a: "[预览] owner_select 迁移 A：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出 → drained 前置盘点（冻结集 = 全部 initDone 收据 endpoint）→ 原子进段（campaign open + 每 ep schema/mint + writer partial）→ transition + 复合 mint + writer_state=partial → 重开撤门。加 --apply 执行。",
       b: "[预览] owner_select 迁移 B：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出 → drained 前置盘点（campaign open 且 pending_joins 空、writer partial 同 id、冻结集 = campaign endpoints、每 ep transition 且当场盘点两计数皆 0）→ 原子进段（campaign seal + 每 ep precheck/strict + campaign complete + writer on）→ strict + campaign complete + writer_state=on（准入投影 on）→ 重开撤门。加 --apply 执行。",
-      direct: "[预览] owner_select 迁移 direct：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出 → drained 前置盘点（冻结集 = 全部 initDone 收据 endpoint、每 ep 1.0 且当场盘点两计数皆 0、campaign absent|complete、writer off|on）→ 原子进段（campaign open + 每 ep precheck/直升 + campaign seal + campaign complete + writer on，on 的 before=off）→ 直升 1.1 + writer_state=on（准入投影 on）→ 重开撤门。加 --apply 执行。",
+      direct: "[预览] owner_select 迁移 direct：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出 → drained 前置盘点（冻结集 = 全部 initDone 收据 endpoint、每 ep 1.0 且当场盘点两计数皆 0、campaign absent|complete、writer off → on）→ 原子进段（campaign open + 每 ep precheck/直升 + campaign seal + campaign complete + writer on，on 的 before=off）→ 直升 1.1 + writer_state=on（准入投影 on）→ 重开撤门。加 --apply 执行。",
     };
     out(previewByKind[kind]);
     return 0;

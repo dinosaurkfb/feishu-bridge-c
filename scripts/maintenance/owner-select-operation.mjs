@@ -4,7 +4,7 @@
  *   · 结构逐段对齐 ledger-operation.mjs（osmEnter / osmForward / osmReopening / osmExit），不自起第二套骨架；
  *   · 设计依据 owner-select-route.md §8（operation A 段、"mint plan"段、"pre-forward 状态矩阵"段）+ §8.2
  *     五行表（状态链闭合 / 写原语合同 / schema_upgrade 确定性）+ maintenance-gate.md §B/B-4；
- *   · operation B / direct / 门外 reaffirm 不在本单；
+ *   · operation B / direct / 门外 reaffirm 均有实现（B/direct 属 R53，门外 reaffirm 属既有）；
  *   · 账本写全部经 R51 的窄事务入口（schemaUpgrade / mintSelectionHandles，capability 由本模块读实文件核），
  *     状态文件写全部经 R50 的 writeCampaignState / writeWriterState（同款 capability 工艺）；
  *   · journal 一切提交走 journal.mjs 的通用原语（updateJournal / markStepDone / setPhase），进段（drained →

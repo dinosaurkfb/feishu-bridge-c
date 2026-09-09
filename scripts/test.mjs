@@ -38553,7 +38553,6 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       const fx = r52Setup({ twoEps: false });
       try {
         const r = osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env });
-        process.stderr.write("R53D direct-1=" + JSON.stringify(r) + "\n");
         assert.equal(r.ok, false);
         assert.equal(r.reason, "precheck_failed", "direct 计数非零拒：" + r.reason);
         assert.ok(r.rollback && r.rollback.ok === true, "回退清场");

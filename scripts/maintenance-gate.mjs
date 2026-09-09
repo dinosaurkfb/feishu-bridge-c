@@ -96,7 +96,7 @@ function runMaintenanceGateLocked(parsed, c, out, surface, env = process.env) {
       }
     }
   }
-  const r = exitMaintenance(c, { apply: parsed.apply, surface });
+  const r = exitMaintenance(c, { apply: parsed.apply, env, surface });
   if (r.dryRun) { out("[预览] operation " + r.token.slice(0, 8) + " 阶段 " + r.phase + " → 动作：" + r.action + (r.executor ? "（执行者 pid " + r.executor + " 正在跑，此刻 --apply 会被拒）" : "") + "。加 --apply 执行。"); return 0; }
   if (!r.ok && !r.phase && r.reason === "journal_write_failed" && /lease_reap_uncleared/u.test(String(r.why))) { out("出门中途停下（租约的归属转换锁交不还）—— operation 保留，清掉残骸后再跑 --exit --apply" + (r.why ? "：" + r.why : "")); return 3; }
   if (!r.ok && !r.phase) { out("出门做不了（" + r.reason + (r.why ? "：" + r.why : "") + (r.path ? "，" + r.path : "") + "）"); return 1; }

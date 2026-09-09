@@ -4,7 +4,7 @@
  *   · 结构逐段对齐 ledger-operation.mjs（osmEnter / osmForward / osmReopening / osmExit），不自起第二套骨架；
  *   · 设计依据 owner-select-route.md §8（operation A 段、"mint plan"段、"pre-forward 状态矩阵"段）+ §8.2
  *     五行表（状态链闭合 / 写原语合同 / schema_upgrade 确定性）+ maintenance-gate.md §B/B-4；
- *   · operation B / direct / 门外 reaffirm 不在本单；
+ *   · operation B / direct / 门外 reaffirm 均有实现（B/direct 属 R53，门外 reaffirm 属既有）；
  *   · 账本写全部经 R51 的窄事务入口（schemaUpgrade / mintSelectionHandles，capability 由本模块读实文件核），
  *     状态文件写全部经 R50 的 writeCampaignState / writeWriterState（同款 capability 工艺）；
  *   · journal 一切提交走 journal.mjs 的通用原语（updateJournal / markStepDone / setPhase），进段（drained →
@@ -34,8 +34,14 @@ import { aggregateEndpointReceipts, endpointReceipt } from "./ledger-receipt.mjs
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const CHAINS = ["claude", "codex"];
 
+/** R53：三种 kind 的参数化映射（journal operation_kind + 预览文案）；handle TTL 唯一出处为账本模块 OWNER_SELECT_HANDLE_TTL_MS（P2-1）。 */
+const OSM_KIND_TO_OPERATION = Object.freeze({ a: "owner_select_migration_a", b: "owner_select_migration_b", direct: "owner_select_migration_direct" });
+const OSM_KIND_TO_REASON = Object.freeze({ a: "old→transition + mint + writer partial", b: "transition→strict + writer on", direct: "old→strict 直升 + writer on" });
+const OSM_KIND_TO_PHASE = Object.freeze({ a: "osm_a_upgrading", b: "osm_b_strictening", direct: "osm_direct" });
+const PHASE_TO_KIND = Object.freeze({ osm_a_upgrading: "a", osm_b_strictening: "b", osm_direct: "direct" });
 /** forward-only 的 osm 段 + 复用 ledger 的重开族（journal.mjs 的 FORWARD_ONLY_PHASES 已含全部）。 */
-const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "ledger_reopening", "reopening_incomplete"]);
+import { OSM_FORWARD_PHASES } from "./exit-code.mjs";
+export { OSM_FORWARD_PHASES };
 
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
@@ -84,6 +90,17 @@ function writePlanFileOExcl(file, bytes) {
   return { ok: true };
 }
 
+/** step id → 无碰撞备份文件名（R53 返修五 P1-1）：id 里非 [A-Za-z0-9._-] 的字符按 %XX 编码（唯一算法、可逆）。 */
+const stepIdEncoded = (id) => id.replace(/[^A-Za-z0-9._-]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"));
+const backupPathFor = (stagedDir, stepId) => path.join(stagedDir, "backup-" + stepIdEncoded(stepId) + ".json");
+
+/** R53 返修五 P1-1：备份/验收失败 → 拒进段并清 staged；清理失败不得报「干净拒绝」（外显残骸）。 */
+function failWithStagedClean(stagedDir, reason, why) {
+  try { fs.rmSync(stagedDir, { recursive: true, force: true }); }
+  catch (err) { return { ok: false, reason: "staged_residue", why: "拒进段后清 staged 失败：" + errText(err) + "（staged 残骸保留）" }; }
+  return { ok: false, reason, why };
+}
+
 /** 备份字节落本 operation 私有 staged/ 目录。P1-4 (c)：文件已在场 → readStagedVerified 核其 sha ===
  *  预期字节 sha 则复用（去掉一律 O_EXCL），不符 → fail-closed；缺席 → O_EXCL 0600 fd 写 + fsync。返回 {sha256, bytes}。 */
 function copyBackup(dest, bytes) {
@@ -99,7 +116,15 @@ function copyBackup(dest, bytes) {
     if (!s.ok) return { ok: false, reason: "backup_seal_failed", why: "复用备份重新 seal 失败（" + s.why + "）" };
     return { ok: true, sha256: sha, bytes: bytes.length };
   }
-  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+  // R53 返修六 P1-1：新建分支异常结构化（write/fsync/close 不裸抛）+ 写后受验读回；任一步失败→结构化拒（调用方走 failWithStagedClean），
+  //   不再让异常冒泡成泛化 osm_forward_failed 且留 .staged 残留。
+  let werr = null;
+  try { fs.writeFileSync(fd, bytes); } catch (err) { werr = err; }
+  if (werr === null) { try { fs.fsyncSync(fd); } catch (err) { werr = err; } }
+  try { fs.closeSync(fd); } catch (err) { if (werr === null) werr = err; }
+  if (werr !== null) return { ok: false, reason: "backup_write_failed", why: "新备份写/刷盘异常：" + errText(werr) };
+  const v = readStagedVerified(dest, { sha256: sha, bytes: bytes.length });
+  if (!v.ok) return { ok: false, reason: "backup_verify_failed", why: "新备份写后受验读回不符（" + (v.why ?? "") + "）" };
   return { ok: true, sha256: sha, bytes: bytes.length };
 }
 
@@ -176,6 +201,11 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
   }
   return { ok: true };
 }
+
+/** 受验投影构造器：读回目标现场，返回 { ok, projection }（供 sealAndVerifyStep 逐字段比对 intended）。 */
+const campaignProj = (env) => { const a = readCampaignState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints: a.endpoints, endpoints_digest: a.endpoints_digest } }; };
+const writerProj = (env) => { const a = readWriterState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints_digest: a.endpoints_digest, revision: a.revision } }; };
+const ledgerProj = (ep, dir) => { const a = loadLedger(dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { schema_version: a.doc.schema_version, revision: a.doc.revision, ledger_sha256: a.sha256 } : {} }; };
 
 /** P1-3（返修二 P1-1）：核**两条链**的已装 runtime 是否支持过渡（§8 进门前置）。
  *  目标从**受验 journal** 的 `current:<chain>.before` 取（绝不读桩 manifest 的 original_current——
@@ -420,7 +450,7 @@ function osmPrepareForward(ctx, { token, frozen, env }) {
   }
   steps.push({ kind: "writer_state", id: "writer_state:" + cid + ":partial", state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, ...writerBackup });
 
-  return { ok: true, steps, campaignDoc, writerDoc, cid, digest, frozen };
+  return { ok: true, steps, phase: "osm_a_upgrading", campaignDoc, writerDoc, cid, digest, frozen };
 }
 
 /** staged plan 的受验读（0600 / 单硬链接 / 普通文件），返回字节（无外部锚——锚由身份+重演算核承担）。 */
@@ -451,22 +481,25 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
   if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
   let doc = j.doc;
   let phase = doc.phase;
-  if (doc.operation_kind !== "owner_select_migration_a") return { ok: false, reason: "bad_operation_kind", phase };
+  const kind = doc.operation_kind === "owner_select_migration_a" ? "a" : doc.operation_kind === "owner_select_migration_b" ? "b" : doc.operation_kind === "owner_select_migration_direct" ? "direct" : null;
+  if (!kind) return { ok: false, reason: "bad_operation_kind", phase };
 
   if (phase === "drained") {
-    const pre = osmPrecheck(ctx, { token, env, j: doc });
+    const pre = kind === "b" ? osmPrecheckB(ctx, { env, j: doc }) : kind === "direct" ? osmPrecheckDirect(ctx, { env, j: doc }) : osmPrecheck(ctx, { token, env, j: doc });
     if (!pre.ok) return { ok: false, reason: pre.reason, why: pre.why ?? null, phase, rollbackSafe: true };
-    const body = osmPrepareForward(ctx, { token, frozen: pre.frozen, env });
+    const body = kind === "b" ? osmPrepareForwardB(ctx, { token, env, frozen: pre.frozen, cid: pre.cid, digest: pre.digest })
+      : kind === "direct" ? osmPrepareForwardDirect(ctx, { token, env, frozen: pre.frozen })
+      : osmPrepareForward(ctx, { token, frozen: pre.frozen, env });
     if (!body.ok) return { ok: false, reason: body.reason, why: body.why ?? null, phase, rollbackSafe: body.rollbackSafe === true };
     // 原子进段：phase 翻转 + 全部 prepared step 同一次 journal 提交（§二.4；进段后 journal 必 journalProblem===null）
     const pw = updateJournal({ dir: ctx.dir, token, lease, expectPhase: "drained", now: ctx.now(), mutate: (d) => {
-      d.phase = "osm_a_upgrading";
+      d.phase = body.phase;
       for (const st of body.steps) d.steps.push(st);
       return d;
     } });
     if (!pw.ok) return { ok: false, reason: pw.reason, why: pw.why ?? null, phase };
     doc = pw.doc;
-    phase = "osm_a_upgrading";
+    phase = body.phase;
     afterStep(ctx, "osm:forward-entered");
   }
 
@@ -616,8 +649,534 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
     phase = "ledger_reopening";
   }
 
+  if (phase === "osm_b_strictening") {
+    const cid = doc.steps.find((s) => s.kind === "campaign").id.split(":")[1];
+    const stepDone = (id, after) => { const m = markStepDone({ dir: ctx.dir, token, lease, id, after, now: ctx.now() }); if (!m.ok) return m; return null; };
+    // a seal
+    {
+      const st = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":seal"));
+      if (st.state !== "done") {
+        const cs = readCampaignState(env);
+        const intended = st.intended_after;
+        const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "sealed";
+        if (!atIntended) {
+          let openFull;
+          try { openFull = JSON.parse(cs.raw.toString("utf-8")); }
+          catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
+          if (openFull.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "seal 前现场非 open（" + openFull.state + "）", phase };
+          const sealDoc = { ...openFull, state: "sealed", pending_joins: [], revision: openFull.revision + 1 };
+          if (shaHex(serializeLedger(sealDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "seal 预算漂移", phase };
+          const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: sealDoc, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 返修三 测试注入点：写后读回前
+        }
+        // 返修三：B/direct 首次 clean 提交与恢复支统一 sealAndVerifyStep。
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // b 每 ep precheck：当场再盘，非零 → 停门不记 done
+    for (const st of doc.steps.filter((s) => s.kind === "precheck")) {
+      if (st.state !== "done") {
+        const ep = st.id.slice("precheck:".length);
+        const d = resolveEndpointDir(ep, { env });
+        const L = loadLedger(d.dir, { endpointId: ep });
+        const inv = migrationInventory(L.doc);
+        // R53 返修五 P1-4（#138 五轮）：precheck 做四字段完整投影等式（revision/ledger_sha256/两计数），不只核两计数——否则可记假 after。
+        if (!L.ok || inv.legacy_proof_count !== st.intended_after.legacy_proof_count || inv.null_b1_count !== st.intended_after.null_b1_count
+          || L.doc.revision !== st.intended_after.revision || L.sha256 !== st.intended_after.ledger_sha256) {
+          return { ok: false, reason: "precheck_failed", why: ep + " 前置投影与预算不符（revision=" + String(L.doc?.revision ?? "?") + " 预期 " + st.intended_after.revision + "）", phase };
+        }
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // c 每 ep schemaUpgrade(strict)
+    for (const st of doc.steps.filter((s) => s.kind === "schema_endpoint")) {
+      const ep = st.id.slice("schema_endpoint:".length).split(":")[0];
+      if (st.state !== "done") {
+        const d = resolveEndpointDir(ep, { env });
+        if (!d.ok) return { ok: false, reason: d.reason, why: ep, phase };
+        const L = loadLedger(d.dir, { endpointId: ep });
+        const atIntended = L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1";
+        if (!atIntended) {
+          const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.1-transition", toSchema: "1.1", env, _inject });
+          const sc = stepCommitCheck(r, "ledger");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id);
+        }
+        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: ledgerAllowed, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // d complete：前置 = 全部 strict step done
+    {
+      const st = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
+      if (st.state !== "done") {
+        const jNow = readJournal({ dir: ctx.dir, token });
+        if (!jNow.doc.steps.filter((s) => s.kind === "schema_endpoint").every((s) => s.state === "done")) return { ok: false, reason: "strict_not_converged", phase };
+        const cs = readCampaignState(env);
+        const intended = st.intended_after;
+        const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "complete";
+        if (atIntended) {
+          // R53 返修五 P1-4：complete 恢复支逐 endpoint 复核——仍 strict(1.1) 且计数 0，现场被改 → 拒。
+          const members = frozenMembersOf(ctx, { env, frozen: intended.endpoints });
+          if (members?.why) return { ok: false, reason: "complete_members_unreadable", why: members.why, phase };
+          for (const ep of intended.endpoints) {
+            const m = members[ep];
+            if (!m || m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
+              return { ok: false, reason: "complete_members_drift", why: ep + " 恢复支现场不符（schema=" + String(m?.schema_version ?? "?") + "）", phase };
+            }
+          }
+        } else {
+          let sealedFull;
+          try { sealedFull = JSON.parse(cs.raw.toString("utf-8")); }
+          catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
+          if (sealedFull.state !== "sealed") return { ok: false, reason: "campaign_state_bad", why: "complete 前现场非 sealed", phase };
+          const completeDoc = { ...sealedFull, state: "complete", members: frozenMembersOf(ctx, { env, frozen: intended.endpoints }), revision: sealedFull.revision + 1 };
+          if (shaHex(serializeLedger(completeDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "complete 预算漂移", phase };
+          const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: completeDoc, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
+        }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // e on：前置 = complete step done；写后准入投影必 on
+    {
+      const stNow = readJournal({ dir: ctx.dir, token }).doc.steps.find((s) => s.kind === "writer_state");
+      if (stNow.state !== "done") {
+        const jNow = readJournal({ dir: ctx.dir, token });
+        const completeStep = jNow.doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
+        if (!completeStep || completeStep.state !== "done") return { ok: false, reason: "complete_not_done", why: "on 的前置：campaign complete 未 done", phase };
+        const st = jNow.doc.steps.find((s) => s.kind === "writer_state");
+        const ws = readWriterState(env);
+        const intended = st.intended_after;
+        const atIntended = ws.exists && ws.sha256 === intended.sha256 && ws.state === "on";
+        if (!atIntended) {
+          const rebuild = buildOsmWriterDoc({ token, cid, digest: intended.endpoints_digest, expectedRevision: intended.revision, state: "on" });
+          if (shaHex(serializeLedger(rebuild)) !== intended.sha256) return { ok: false, reason: "writer_budget_drift", why: "on 预算漂移", phase };
+          const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
+        }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: campaignAllowedFor(doc.steps.find((x) => x.kind === "campaign")?.intended_after.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const adm = readOwnerSelectAdmission(env);
+        if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: "osm_b_strictening", now: ctx.now() });
+    if (!np.ok) return { ok: false, reason: np.reason, why: np.why ?? null, phase };
+    phase = "ledger_reopening";
+  }
+
+  if (phase === "osm_direct") {
+    const cid = doc.steps.find((s) => s.kind === "campaign").id.split(":")[1];
+    const stepDone = (id, after) => { const m = markStepDone({ dir: ctx.dir, token, lease, id, after, now: ctx.now() }); if (!m.ok) return m; return null; };
+    // a open
+    {
+      const st = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":open"));
+      if (st.state !== "done") {
+        const cs = readCampaignState(env);
+        const intended = st.intended_after;
+        const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "open";
+        if (!atIntended) {
+          const rebuild = buildOsmCampaignDoc({ env, frozen: intended.endpoints, cid, token, expectedRevision: (cs.exists ? cs.revision : 0) + 1 });
+          if (!rebuild.ok) return { ok: false, reason: "campaign_member_unreadable", why: rebuild.why, phase };
+          if (shaHex(serializeLedger(rebuild.doc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "open 预算漂移", phase };
+          const w = writeCampaignState({ env, expectedSha256: cs.exists ? cs.sha256 : null, doc: rebuild.doc, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          // R53 返修六 P1-1：删掉旧的、未锚定的 backup-campaign.json 遗留写（返回值此前被忽略）——direct 的 campaign 备份已由
+          //   P1-1（返修五）的 step-id 编码备份覆盖，这里不再按旧名写。
+        }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // b precheck（当场再盘）
+    for (const st of doc.steps.filter((s) => s.kind === "precheck")) {
+      if (st.state !== "done") {
+        const ep = st.id.slice("precheck:".length);
+        const d = resolveEndpointDir(ep, { env });
+        const L = loadLedger(d.dir, { endpointId: ep });
+        const inv = migrationInventory(L.doc);
+        // R53 返修五 P1-4：precheck 做四字段完整投影等式（revision/ledger_sha256/两计数），不只核两计数——否则可记假 after。
+        if (!L.ok || inv.legacy_proof_count !== st.intended_after.legacy_proof_count || inv.null_b1_count !== st.intended_after.null_b1_count
+          || L.doc.revision !== st.intended_after.revision || L.sha256 !== st.intended_after.ledger_sha256) {
+          return { ok: false, reason: "precheck_failed", why: ep + " 前置投影与预算不符（revision=" + String(L.doc?.revision ?? "?") + " 预期 " + st.intended_after.revision + "）", phase };
+        }
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // c schema direct（1.0→1.1）
+    for (const st of doc.steps.filter((s) => s.kind === "schema_endpoint")) {
+      const ep = st.id.slice("schema_endpoint:".length).split(":")[0];
+      if (st.state !== "done") {
+        const d = resolveEndpointDir(ep, { env });
+        const L = loadLedger(d.dir, { endpointId: ep });
+        const atIntended = L.ok && L.sha256 === st.intended_after.ledger_sha256 && L.doc.schema_version === "1.1";
+        if (!atIntended) {
+          const r = schemaUpgrade({ endpointId: ep, capability: { kind: "schema_upgrade", token }, requestKey: token + ":schema:" + ep, fromSchema: "1.0", toSchema: "1.1", env, _inject });
+          const sc = stepCommitCheck(r, "ledger");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: r?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
+        }
+        const s = sealAndVerifyStep({ targetDir: d.dir, readVerified: () => ledgerProj(ep, d.dir), intended: st.intended_after, residueAllowed: ledgerAllowed, inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // d seal
+    {
+      const st = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":seal"));
+      if (st.state !== "done") {
+        const cs = readCampaignState(env);
+        const intended = st.intended_after;
+        const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "sealed";
+        if (!atIntended) {
+          let openFull;
+          try { openFull = JSON.parse(cs.raw.toString("utf-8")); }
+          catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
+          if (openFull.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "seal 前现场非 open", phase };
+          const sealDoc = { ...openFull, state: "sealed", pending_joins: [], revision: openFull.revision + 1 };
+          if (shaHex(serializeLedger(sealDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "seal 预算漂移", phase };
+          const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: sealDoc, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
+        }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // e complete
+    {
+      const stNow = readJournal({ dir: ctx.dir, token }).doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
+      const st = stNow;
+      if (st.state !== "done") {
+        const cs = readCampaignState(env);
+        const intended = st.intended_after;
+        const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "complete";
+        if (atIntended) {
+          // R53 返修五 P1-4：complete 恢复支逐 endpoint 复核——仍 strict(1.1) 且计数 0，现场被改 → 拒。
+          const members = frozenMembersOf(ctx, { env, frozen: intended.endpoints });
+          if (members?.why) return { ok: false, reason: "complete_members_unreadable", why: members.why, phase };
+          for (const ep of intended.endpoints) {
+            const m = members[ep];
+            if (!m || m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
+              return { ok: false, reason: "complete_members_drift", why: ep + " 恢复支现场不符（schema=" + String(m?.schema_version ?? "?") + "）", phase };
+            }
+          }
+        } else {
+          let sealedFull;
+          try { sealedFull = JSON.parse(cs.raw.toString("utf-8")); }
+          catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
+          if (sealedFull.state !== "sealed") return { ok: false, reason: "campaign_state_bad", why: "complete 前现场非 sealed", phase };
+          const completeDoc = { ...sealedFull, state: "complete", members: frozenMembersOf(ctx, { env, frozen: intended.endpoints }), revision: sealedFull.revision + 1 };
+          if (shaHex(serializeLedger(completeDoc)) !== intended.sha256) return { ok: false, reason: "campaign_budget_drift", why: "complete 预算漂移", phase };
+          const w = writeCampaignState({ env, expectedSha256: cs.sha256, doc: completeDoc, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
+        }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    // f on：前置 = complete step done
+    {
+      const jOn = readJournal({ dir: ctx.dir, token });
+      const st = jOn.doc.steps.find((s) => s.kind === "writer_state");
+      if (st.state !== "done") {
+        const completeStep = jOn.doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(":complete"));
+        if (!completeStep || completeStep.state !== "done") return { ok: false, reason: "complete_not_done", why: "on 的前置：campaign complete 未 done", phase };
+        const ws = readWriterState(env);
+        const intended = st.intended_after;
+        const atIntended = ws.exists && ws.sha256 === intended.sha256 && ws.state === "on";
+        if (!atIntended) {
+          const rebuild = buildOsmWriterDoc({ token, cid, digest: intended.endpoints_digest, expectedRevision: intended.revision, state: "on" });
+          if (shaHex(serializeLedger(rebuild)) !== intended.sha256) return { ok: false, reason: "writer_budget_drift", why: "on 预算漂移", phase };
+          const w = writeWriterState({ env, expectedSha256: ws.exists ? ws.sha256 : null, doc: rebuild, capability: { token, stepId: st.id } });
+          if (!w.ok) return { ok: false, reason: w.reason, why: w.why ?? null, phase, commit: w.commit ?? "not_committed" };
+          const sc = stepCommitCheck(w, "state");
+          if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
+          if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
+        }
+        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: campaignAllowedFor(doc.steps.find((x) => x.kind === "campaign")?.intended_after.endpoints), inject: _inject });
+        if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
+        const adm = readOwnerSelectAdmission(env);
+        if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
+        const m = stepDone(st.id, st.intended_after);
+        if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
+        afterStep(ctx, st.id);
+      }
+    }
+    const np = setPhase({ dir: ctx.dir, token, lease, phase: "ledger_reopening", expectPhase: "osm_direct", now: ctx.now() });
+    if (!np.ok) return { ok: false, reason: np.reason, why: np.why ?? null, phase };
+    phase = "ledger_reopening";
+  }
+
   if (phase === "ledger_reopening" || phase === "reopening_incomplete") return osmReopening(ctx, token, lease, env);
   return { ok: false, reason: "unexpected_phase", phase };
+}
+
+/** ── B 前置（§二.1）：campaign open（cid 取自文件）+ pending_joins 空 + writer partial 同 id + 每 ep transition 计数 0 ── */
+function osmPrecheckB(ctx, { env, j }) {
+  // 返修二 P1-1 复用：两链 runtime 必已受验支持过渡（非仅 A）。
+  const rtB = runtimeTransitionCapable({ env, j });
+  if (!rtB.ok) return { ok: false, reason: "precheck_failed", why: "runtime_not_transition_capable" + (rtB.why ? "：" + rtB.why : "") };
+  const cs = readCampaignState(env);
+  if (cs.state === "unreadable") return { ok: false, reason: "campaign_unreadable", why: cs.problem };
+  if (!cs.exists) return { ok: false, reason: "campaign_absent", why: "B 前置要求 campaign open（文件缺席）" };
+  if (cs.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "campaign state=" + cs.state + "（B 要求 open）" };
+  let pending = [];
+  try { pending = JSON.parse(cs.raw.toString("utf-8")).pending_joins ?? []; }
+  catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err) }; }
+  if (pending.length !== 0) return { ok: false, reason: "pending_joins_pending", why: "campaign 有未落地的加入：" + pending.length + " 项（B 开始前必须清空）" };
+  const ws = readWriterState(env);
+  if (ws.state === "unreadable") return { ok: false, reason: "writer_state_unreadable", why: ws.problem };
+  if (!ws.exists || ws.state !== "partial") return { ok: false, reason: "writer_state_not_partial", why: "B 前置要求 writer partial（现 " + (ws.exists ? ws.state : "off") + "）" };
+  if (ws.campaign_id !== cs.campaign_id) return { ok: false, reason: "writer_state_foreign", why: "writer partial 属别的 campaign：" + ws.campaign_id };
+  // R53 返修五 P1-3（#138 五轮）：B 前置核**完整** partial 联合——不只 campaign_id，还核 endpoints_digest 跨文件一致，
+  //   且 readOwnerSelectAdmission 投影必须为同 campaign 的 partial（post_js：不自洽 partial 会被静默改写成 on）。
+  if (ws.endpoints_digest !== cs.endpoints_digest) return { ok: false, reason: "writer_state_foreign", why: "writer partial endpoints_digest 与 campaign 不一致" };
+  const adm = readOwnerSelectAdmission(env);
+  if (adm.state === "unreadable") return { ok: false, reason: "admission_unreadable", why: adm.problem };
+  if (adm.state !== "partial" || adm.campaign_id !== ws.campaign_id) return { ok: false, reason: "admission_not_partial", why: "admission 非 partial 或属别的 campaign（现 " + adm.state + "）" };
+  const frozen = [...(cs.endpoints ?? [])].sort();
+  if (frozen.length === 0) return { ok: false, reason: "frozen_set_empty", why: "campaign endpoints 为空" };
+  for (const ep of frozen) {
+    const d = resolveEndpointDir(ep, { env });
+    if (!d.ok) return { ok: false, reason: d.reason, why: ep, ep };
+    const L = loadLedger(d.dir, { endpointId: ep });
+    if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: ep + "：" + (L.why ?? L.reason), ep };
+    if (L.doc.schema_version !== "1.1-transition") return { ok: false, reason: "schema_not_transition", why: ep + " schema_version=" + L.doc.schema_version + "（B 要求 1.1-transition）", ep };
+    const inv = migrationInventory(L.doc);
+    if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: ep + " 当场盘点 legacy=" + inv.legacy_proof_count + " nullB1=" + inv.null_b1_count + "（门外 reaffirm 未完成的信号）", ep };
+  }
+  return { ok: true, frozen, cid: cs.campaign_id, digest: cs.endpoints_digest };
+}
+
+/** ── direct 前置（§三.1）：冻结集 = initDone 收据；每 ep 1.0 且两计数 0；campaign absent|complete；writer off|on ── */
+function osmPrecheckDirect(ctx, { env, j }) {
+  // 返修二 P1-1 复用：两链 runtime 必已受验支持过渡（非仅 A）。
+  const rtD = runtimeTransitionCapable({ env, j });
+  if (!rtD.ok) return { ok: false, reason: "precheck_failed", why: "runtime_not_transition_capable" + (rtD.why ? "：" + rtD.why : "") };
+  // P1-2（R52 返修一）：用唯一聚合 aggregateEndpointReceipts——任一端点收据 conflict/in-flight/duplicate/unreadable
+  //   → 整体 precheck_failed（why 点名），绝不拿剩余子集（自建 aggregateInitDone 已废）；R53 direct 天然继承。
+  const agg = aggregateEndpointReceipts({ dir: ctx.dir });
+  if (!agg.ok) return { ok: false, reason: "precheck_failed", why: agg.why ?? null };
+  const frozen = [...new Set(agg.endpoints.filter((e) => e.initDone === true).map((e) => e.endpointId))].sort();
+  if (frozen.length === 0) return { ok: false, reason: "frozen_set_empty", why: "无任何 initDone 收据的 endpoint，冻结集为空" };
+  for (const ep of frozen) {
+    const d = resolveEndpointDir(ep, { env });
+    if (!d.ok) return { ok: false, reason: d.reason, why: ep, ep };
+    const L = loadLedger(d.dir, { endpointId: ep });
+    if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: ep + "：" + (L.why ?? L.reason), ep };
+    if (L.doc.schema_version !== "1.0") return { ok: false, reason: "schema_not_old", why: ep + " schema_version=" + L.doc.schema_version + "（direct 要求 1.0）", ep };
+    const inv = migrationInventory(L.doc);
+    if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: ep + " 计数非零（legacy=" + inv.legacy_proof_count + " nullB1=" + inv.null_b1_count + "）—— 改走 A", ep };
+  }
+  const cs = readCampaignState(env);
+  if (cs.state === "unreadable") return { ok: false, reason: "campaign_unreadable", why: cs.problem };
+  if (cs.exists && cs.state !== "complete") return { ok: false, reason: "campaign_state_bad", why: "campaign state=" + cs.state + "（direct 要求 absent 或 complete）" };
+  const ws = readWriterState(env);
+  if (ws.state === "unreadable") return { ok: false, reason: "writer_state_unreadable", why: ws.problem };
+  // R53 返修五 P1-3：direct 前置要求 writer **精确为 off**（缺席或 off）；既有 partial 或 on 一律拒，否则进段后
+  //   journal 的 writer_state:on before=on（非 partial/off）shape 拒、operation 留在 drained 不回退（staged 已备好）。
+  if (ws.exists && ws.state !== "off") return { ok: false, reason: "writer_state_not_off", why: "writer state=" + ws.state + "（direct 要求 off，即 absent 或 off，在准备任何制品前）" };
+  return { ok: true, frozen };
+}
+
+/** ── B 进段准备（§二.2）：seal + 每 ep precheck/strict + complete + writer on，全部 prepared ── */
+function osmPrepareForwardB(ctx, { token, env, frozen, cid, digest }) {
+  const stagedDir = path.join(ctx.dir, token + ".staged");
+  try { mkdirDurable(stagedDir, ctx.dir); }
+  catch (err) {
+    if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
+    return { ok: false, reason: "io_error", why: "建 staged 目录：" + errText(err) };
+  }
+  const cs = readCampaignState(env);
+  if (!cs.exists || cs.state !== "open") return { ok: false, reason: "campaign_state_bad", why: "seal 前重读 campaign 非 open" };
+  const ws = readWriterState(env);
+  const writerBefore = { exists: true, sha256: ws.sha256, state: ws.state, campaign_id: ws.campaign_id, endpoints_digest: ws.endpoints_digest, revision: ws.revision };
+  // open 全量现场 → seal/complete doc（同一现场派生，预算可对）
+  const openFull = JSON.parse(cs.raw.toString("utf-8"));
+  const sealDoc = { ...openFull, state: "sealed", pending_joins: [], revision: openFull.revision + 1 };
+  const completeDoc = { ...sealDoc, state: "complete", members: Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: sealDoc.revision + 1 };
+  const campaignBefore = { exists: true, sha256: cs.sha256, state: cs.state, campaign_id: cs.campaign_id, endpoints: cs.endpoints, endpoints_digest: cs.endpoints_digest };
+  const sealAfter = { exists: true, sha256: shaHex(serializeLedger(sealDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  const completeAfter = { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  // R53 返修五 P1-1（#138 五轮 P1）——WAL 备份与盘上事实一致：只给有状态变更的 step 独立备份，
+  //   文件名 = backup-<stepIdEncoded>.json（%XX 编码非 [A-Za-z0-9._-]，唯一可逆）；before 出处：首个改该文件的
+  //   step 取受验 fd 原始字节、后继 step（seal→complete）取前驱确定性 intended 字节（预算序列化）；逐份核 SHA/长度后才进段。
+  const sealStepId = "campaign:" + cid + ":seal";
+  const completeStepId = "campaign:" + cid + ":complete";
+  const writerOnStepId = "writer_state:" + cid + ":on";
+  const sealBackup = copyBackup(backupPathFor(stagedDir, sealStepId), cs.raw);
+  if (!sealBackup.ok) return failWithStagedClean(stagedDir, sealBackup.reason, "seal 备份：" + sealBackup.why);
+  if (sealBackup.sha256 !== campaignBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "seal 备份 sha ≠ before.sha256");
+  const completeBackup = copyBackup(backupPathFor(stagedDir, completeStepId), serializeLedger(sealDoc));
+  if (!completeBackup.ok) return failWithStagedClean(stagedDir, completeBackup.reason, "complete 备份：" + completeBackup.why);
+  if (completeBackup.sha256 !== sealAfter.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "complete 备份 sha ≠ before.sha256（前驱 seal intended 字节）");
+  const writerOnBackup = copyBackup(backupPathFor(stagedDir, writerOnStepId), ws.raw);
+  if (!writerOnBackup.ok) return failWithStagedClean(stagedDir, writerOnBackup.reason, "writer 备份：" + writerOnBackup.why);
+  if (writerOnBackup.sha256 !== writerBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "writer 备份 sha ≠ before.sha256");
+  const writerAfter = { exists: true, sha256: shaHex(serializeLedger(buildOsmWriterDoc({ token, cid, digest, expectedRevision: ws.revision + 1, state: "on" }))), state: "on", campaign_id: cid, endpoints_digest: digest, revision: ws.revision + 1 };
+  const at = new Date(ctx.now()).toISOString();
+  const steps = [];
+  steps.push({ kind: "campaign", id: sealStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: sealAfter, backup: backupPathFor(stagedDir, sealStepId), backup_sha256: sealBackup.sha256, backup_bytes: sealBackup.bytes });
+  for (const ep of frozen) {
+    const d = resolveEndpointDir(ep, { env });
+    const L = loadLedger(d.dir, { endpointId: ep });
+    const inv = migrationInventory(L.doc);
+    steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, backup: null, backup_sha256: null, backup_bytes: null });
+    // schema_endpoint 的独立备份（copyBackup 现在真的写盘——改前只登记 backup-ledger-<ep>.json 而从未 copyBackup）。
+    const schemaStepId = "schema_endpoint:" + ep + ":strict";
+    const sbk = copyBackup(backupPathFor(stagedDir, schemaStepId), L.bytes);
+    if (!sbk.ok) return failWithStagedClean(stagedDir, sbk.reason, "schema 备份：" + sbk.why + " ep=" + ep);
+    if (sbk.sha256 !== L.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", ep + " schema 备份 sha ≠ before.ledger_sha256");
+    const opId = ownerSelectSchemaUpgradeOpId(token, ep);
+    const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.1-transition", to_schema: "1.1" });
+    steps.push({ kind: "schema_endpoint", id: schemaStepId, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { schema_version: "1.1-transition", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) }, backup: backupPathFor(stagedDir, schemaStepId), backup_sha256: sbk.sha256, backup_bytes: sbk.bytes });
+  }
+  steps.push({ kind: "campaign", id: completeStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: sealAfter, intended_after: completeAfter, backup: backupPathFor(stagedDir, completeStepId), backup_sha256: completeBackup.sha256, backup_bytes: completeBackup.bytes });
+  steps.push({ kind: "writer_state", id: writerOnStepId, state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, backup: backupPathFor(stagedDir, writerOnStepId), backup_sha256: writerOnBackup.sha256, backup_bytes: writerOnBackup.bytes });
+  try { fsyncDir(stagedDir); }
+  catch (err) { return failWithStagedClean(stagedDir, "backup_dir_fsync_failed", "fsync staged 目录：" + errText(err)); }
+  return { ok: true, steps, phase: "osm_b_strictening" };
+}
+
+/** ── direct 进段准备（§三.2）：open + 每 ep precheck/direct + seal + complete + writer on（before off）── */
+function osmPrepareForwardDirect(ctx, { token, env, frozen }) {
+  const cid = campaignIdFor(token);
+  const digest = endpointsDigest(frozen);
+  const cs = readCampaignState(env);
+  const campaignBefore = cs.exists
+    ? { exists: true, sha256: cs.sha256, state: cs.state, campaign_id: cs.campaign_id, endpoints: cs.endpoints, endpoints_digest: cs.endpoints_digest }
+    : { exists: false, sha256: null, state: "absent", campaign_id: null, endpoints: null, endpoints_digest: null };
+  const ws = readWriterState(env);
+  const writerBefore = ws.exists
+    ? { exists: true, sha256: ws.sha256, state: ws.state, campaign_id: ws.campaign_id, endpoints_digest: ws.endpoints_digest, revision: ws.revision }
+    : { exists: false, sha256: null, state: "off", campaign_id: null, endpoints_digest: null, revision: 0 };
+  const openDoc = buildOsmCampaignDoc({ env, frozen, cid, token, expectedRevision: (cs.exists ? cs.revision : 0) + 1 });
+  if (!openDoc.ok) return { ok: false, reason: "campaign_member_unreadable", why: openDoc.why };
+  const openAfter = { exists: true, sha256: shaHex(serializeLedger(openDoc.doc)), state: "open", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  const sealDoc = { ...openDoc.doc, state: "sealed", revision: openDoc.doc.revision + 1 };
+  const sealAfter = { exists: true, sha256: shaHex(serializeLedger(sealDoc)), state: "sealed", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  const completeDoc = { ...sealDoc, state: "complete", members: Object.fromEntries(frozen.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: sealDoc.revision + 1 };
+  const completeAfter = { exists: true, sha256: shaHex(serializeLedger(completeDoc)), state: "complete", campaign_id: cid, endpoints: frozen, endpoints_digest: digest };
+  const writerAfter = { exists: true, sha256: shaHex(serializeLedger(buildOsmWriterDoc({ token, cid, digest, expectedRevision: (ws.exists ? ws.revision : 0) + 1, state: "on" }))), state: "on", campaign_id: cid, endpoints_digest: digest, revision: (ws.exists ? ws.revision : 0) + 1 };
+  const stagedDir = path.join(ctx.dir, token + ".staged");
+  try { mkdirDurable(stagedDir, ctx.dir); }
+  catch (err) {
+    if (err?.code === "EPRIVMODE" || err?.code === "EPRIVLINK") return { ok: false, reason: "staged_residue", why: err.message };
+    return { ok: false, reason: "io_error", why: "建 staged 目录：" + errText(err) };
+  }
+  // R53 返修五 P1-1（#138 五轮 P1）——WAL 备份与盘上事实一致：只给有状态变更的 step 独立备份，
+  //   文件名 = backup-<stepIdEncoded>.json（%XX 编码非 [A-Za-z0-9._-]，唯一可逆）；before 出处：首个改该文件的
+  //   step 取受验 fd 原始字节、后继 step（open→seal→complete）取前驱确定性 intended 字节（预算序列化）；逐份核 SHA/长度后才进段。
+  const openStepId = "campaign:" + cid + ":open";
+  const sealStepId = "campaign:" + cid + ":seal";
+  const completeStepId = "campaign:" + cid + ":complete";
+  const writerOnStepId = "writer_state:" + cid + ":on";
+  let openBackup = { backup: null, backup_sha256: null, backup_bytes: null };
+  if (campaignBefore.exists) {
+    const cb = copyBackup(backupPathFor(stagedDir, openStepId), cs.raw);
+    if (!cb.ok) return failWithStagedClean(stagedDir, cb.reason, "open 备份：" + cb.why);
+    if (cb.sha256 !== campaignBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "open 备份 sha ≠ before.sha256");
+    openBackup = { backup: backupPathFor(stagedDir, openStepId), backup_sha256: cb.sha256, backup_bytes: cb.bytes };
+  }
+  const openBytes = serializeLedger(openDoc.doc);
+  const sealDocBytes = serializeLedger(sealDoc);
+  const sealBk = copyBackup(backupPathFor(stagedDir, sealStepId), openBytes);
+  if (!sealBk.ok) return failWithStagedClean(stagedDir, sealBk.reason, "seal 备份：" + sealBk.why);
+  if (sealBk.sha256 !== openAfter.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "seal 备份 sha ≠ before.sha256（前驱 open intended 字节）");
+  const completeBk = copyBackup(backupPathFor(stagedDir, completeStepId), sealDocBytes);
+  if (!completeBk.ok) return failWithStagedClean(stagedDir, completeBk.reason, "complete 备份：" + completeBk.why);
+  if (completeBk.sha256 !== sealAfter.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "complete 备份 sha ≠ before.sha256");
+  let writerOnBackup = { backup: null, backup_sha256: null, backup_bytes: null };
+  if (writerBefore.exists) {
+    const wb = copyBackup(backupPathFor(stagedDir, writerOnStepId), ws.raw);
+    if (!wb.ok) return failWithStagedClean(stagedDir, wb.reason, "writer 备份：" + wb.why);
+    if (wb.sha256 !== writerBefore.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", "writer 备份 sha ≠ before.sha256");
+    writerOnBackup = { backup: backupPathFor(stagedDir, writerOnStepId), backup_sha256: wb.sha256, backup_bytes: wb.bytes };
+  }
+  const at = new Date(ctx.now()).toISOString();
+  const steps = [];
+  steps.push({ kind: "campaign", id: openStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: campaignBefore, intended_after: openAfter, ...openBackup });
+  for (const ep of frozen) {
+    const d = resolveEndpointDir(ep, { env });
+    const L = loadLedger(d.dir, { endpointId: ep });
+    const inv = migrationInventory(L.doc);
+    steps.push({ kind: "precheck", id: "precheck:" + ep, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count, revision: L.doc.revision, ledger_sha256: L.sha256 }, backup: null, backup_sha256: null, backup_bytes: null });
+    // schema_endpoint 的独立备份（copyBackup 现在真的写盘——改前只登记 backup-ledger-<ep>.json 而从未 copyBackup）。
+    const schemaStepId = "schema_endpoint:" + ep + ":direct";
+    const sbk = copyBackup(backupPathFor(stagedDir, schemaStepId), L.bytes);
+    if (!sbk.ok) return failWithStagedClean(stagedDir, sbk.reason, "schema 备份：" + sbk.why + " ep=" + ep);
+    if (sbk.sha256 !== L.sha256) return failWithStagedClean(stagedDir, "backup_sha_mismatch", ep + " schema 备份 sha ≠ before.ledger_sha256");
+    const opId = ownerSelectSchemaUpgradeOpId(token, ep);
+    const next = applySchemaUpgrade(L.doc, { operation_id: opId, request_key: token + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1" });
+    steps.push({ kind: "schema_endpoint", id: schemaStepId, state: "prepared", at, target: "ledger/" + ep + "/ledger.json", chain: null, before: { schema_version: "1.0", revision: L.doc.revision, ledger_sha256: L.sha256 }, intended_after: { schema_version: "1.1", revision: L.doc.revision + 1, ledger_sha256: shaHex(serializeLedger(next)) }, backup: backupPathFor(stagedDir, schemaStepId), backup_sha256: sbk.sha256, backup_bytes: sbk.bytes });
+  }
+  steps.push({ kind: "campaign", id: sealStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: openAfter, intended_after: sealAfter, backup: backupPathFor(stagedDir, sealStepId), backup_sha256: sealBk.sha256, backup_bytes: sealBk.bytes });
+  steps.push({ kind: "campaign", id: completeStepId, state: "prepared", at, target: "ledger/owner-select-campaign.json", chain: null, before: sealAfter, intended_after: completeAfter, backup: backupPathFor(stagedDir, completeStepId), backup_sha256: completeBk.sha256, backup_bytes: completeBk.bytes });
+  steps.push({ kind: "writer_state", id: writerOnStepId, state: "prepared", at, target: "ledger/owner-select-writer-state.json", chain: null, before: writerBefore, intended_after: writerAfter, ...writerOnBackup });
+  try { fsyncDir(stagedDir); }
+  catch (err) { return failWithStagedClean(stagedDir, "backup_dir_fsync_failed", "fsync staged 目录：" + errText(err)); }
+  return { ok: true, steps, phase: "osm_direct" };
+}
+
+/** complete doc 的成员投影（§8.2 campaign 不变量：complete ⇒ 全 member strict ∧ 两计数 0——按"完成后的应有状态"投影）。 */
+function frozenMembersOf(ctx, { env, frozen }) {
+  const members = {};
+  for (const ep of frozen) {
+    const d = resolveEndpointDir(ep, { env });
+    if (!d.ok) return { ep, why: d.reason };
+    const L = loadLedger(d.dir, { endpointId: ep });
+    if (!L.ok) return { ep, why: L.why ?? L.reason };
+    const inv = migrationInventory(L.doc);
+    members[ep] = { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
+  }
+  return members;
 }
 
 /** campaign open 文档（进段与收敛 a 共用同一构造 → 同一字节 → intended_after.sha256 锚可对）。 */
@@ -637,10 +1196,10 @@ function buildOsmCampaignDoc({ env, frozen, cid, token, expectedRevision }) {
   } };
 }
 
-/** writer_state partial 文档（无账本依赖，纯确定性）。 */
-function buildOsmWriterDoc({ token, cid, digest, expectedRevision }) {
+/** writer_state 文档（无账本依赖，纯确定性；state 由调用方给：A=partial、B/direct=on）。 */
+function buildOsmWriterDoc({ token, cid, digest, expectedRevision, state = "partial" }) {
   return {
-    schema_version: WRITER_STATE_SCHEMA, state: "partial", campaign_id: cid, endpoints_digest: digest,
+    schema_version: WRITER_STATE_SCHEMA, state, campaign_id: cid, endpoints_digest: digest,
     revision: expectedRevision, origin_operation_id: token,
   };
 }
@@ -677,11 +1236,12 @@ export function osmReopening(ctx, token, lease, env = process.env) {
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const op = L.doc.operations[opId] ?? null;
     const mi = doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
-    // P1-7 (b)：撤门前逐 ep 核——当前账本 SHA === 最后（mint）step.after、schema op 的 from/to（在 op.result）、mint op 的 fingerprint/result。
+    // P1-7 (b)：撤门前逐 ep 核——当前账本 SHA === 最后（mint）step.after；B/direct 无 mint → 核最后 schema step.after（R53 返修五 P1-4）。
     if (mi && L.sha256 !== mi.after.ledger_sha256) incomplete.push({ id: mi.id, why: "当前账本 SHA ≠ 最后（mint）step.after（" + String(L.sha256).slice(0, 12) + " ≠ " + mi.after.ledger_sha256.slice(0, 12) + "）" });
+    else if (!mi && L.sha256 !== se.after?.ledger_sha256) incomplete.push({ id: se.id, why: "当前账本 SHA ≠ 最后 schema step.after（" + String(L.sha256).slice(0, 12) + " ≠ " + String(se.after?.ledger_sha256 ?? "?").slice(0, 12) + "）" });
     if (!op) incomplete.push({ id: se.id, why: "账本内不含本 operation 的 schema_upgrade op（" + opId.slice(0, 8) + "）" });
     else if (op.request_key !== token + ":schema:" + ep) incomplete.push({ id: se.id, why: "schema_upgrade 的 request_key 非本 operation 派生键" });
-    else if (op.result?.from_schema !== "1.0" || op.result?.to_schema !== se.after.schema_version) incomplete.push({ id: se.id, why: "schema_upgrade 的 from/to 与 step.after 不符（" + String(op.result?.from_schema) + "→" + String(op.result?.to_schema) + "）" });
+    else if (op.result?.from_schema !== se.before.schema_version || op.result?.to_schema !== se.after.schema_version) incomplete.push({ id: se.id, why: "schema_upgrade 的 from/to 与 step.before/after 不符（" + String(op.result?.from_schema) + "→" + String(op.result?.to_schema) + "，应 " + se.before.schema_version + "→" + se.after.schema_version + "）" });
     else if (op.result_revision < se.intended_after.revision) incomplete.push({ id: se.id, why: "schema_upgrade 的 result_revision（" + op.result_revision + "）早于 journal 意图（" + se.intended_after.revision + "）" });
     else if (L.doc.revision < op.result_revision) incomplete.push({ id: se.id, why: "账本当前 revision 早于本事务" });
     const mop = mi ? Object.values(L.doc.operations).find((o) => o.op_type === "mint_selection_handles" && o.request_key === token) : null;
@@ -699,8 +1259,10 @@ export function osmReopening(ctx, token, lease, env = process.env) {
   }
   {
     const cs = readCampaignState(env);
-    const cst = doc.steps.find((s) => s.kind === "campaign");
-    if (!cst || cst.state !== "done") incomplete.push({ id: "campaign", why: "campaign step 尚未 done" });
+    const kind = doc.operation_kind === "owner_select_migration_a" ? "a" : doc.operation_kind === "owner_select_migration_b" ? "b" : "direct";
+    const wantCampaignId = kind === "a" ? ":open" : ":complete";
+    const cst = doc.steps.find((s) => s.kind === "campaign" && s.id.endsWith(wantCampaignId));
+    if (!cst || cst.state !== "done") incomplete.push({ id: "campaign", why: "campaign " + wantCampaignId.slice(1) + " step 尚未 done" });
     else if (!cs.exists || cs.sha256 !== cst.after.sha256 || cs.state !== cst.after.state || cs.campaign_id !== cst.after.campaign_id) incomplete.push({ id: "campaign", why: "campaign 文件读回 ≠ step after" });
     const ws = readWriterState(env);
     const wst = doc.steps.find((s) => s.kind === "writer_state");
@@ -785,12 +1347,13 @@ export function osmReopening(ctx, token, lease, env = process.env) {
 
 /** osmEnter：owner_select_migration_a 进门（apply=false 只出 dry-run 计划）。 */
 export function osmEnter(ctx, { kind = "a", waitMs = 60000, apply = false, reason = null, env = process.env } = {}) {
-  if (kind !== "a") return { ok: false, reason: "bad_kind" };
-  const reasonText = reason ?? "owner_select 迁移 A：old→transition + mint + writer partial";
-  if (!apply) return enterMaintenance(ctx, { reason: reasonText, waitMs, apply: false, operationKind: "owner_select_migration_a" });
+  const operationKind = OSM_KIND_TO_OPERATION[kind];
+  if (!operationKind) return { ok: false, reason: "bad_kind" };
+  const reasonText = reason ?? ("owner_select 迁移 " + kind.toUpperCase() + "：" + OSM_KIND_TO_REASON[kind]);
+  if (!apply) return enterMaintenance(ctx, { reason: reasonText, waitMs, apply: false, operationKind });
   const surface = acquireInstallSurfaceLock({ home: ctx.home, env });
   if (!surface.ok) return { ok: false, reason: surface.reason, why: surface.why, path: surface.path };
-  const ent = enterMaintenance(ctx, { reason: reasonText, waitMs, apply: true, keepLease: true, operationKind: "owner_select_migration_a" });
+  const ent = enterMaintenance(ctx, { reason: reasonText, waitMs, apply: true, keepLease: true, operationKind });
   if (!ent.ok || !ent.lease) {
     const rel = releaseSurface(surface);
     return { ...ent, surfaceRelease: rel.ok ? null : { path: rel.path ?? null, why: rel.why ?? rel.reason } };
@@ -828,7 +1391,7 @@ export function osmExit(ctx, { apply = false, env = process.env, surface: held =
     const j = readJournal({ dir, token });
     if (j.state !== "valid") return { ok: false, reason: "journal_" + j.state, why: j.why ?? null, token };
     const phase = j.doc.phase;
-    if (j.doc.operation_kind !== "owner_select_migration_a") return { ok: false, reason: "not_osm_operation", why: "active 是 " + j.doc.operation_kind + "（走 maintenance-gate --exit 通用分派）", token, phase };
+    if (!["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"].includes(j.doc.operation_kind)) return { ok: false, reason: "not_osm_operation", why: "active 是 " + j.doc.operation_kind + "（走 maintenance-gate --exit 通用分派）", token, phase };
     const action = osmExitAction(phase);
     if (action === null) return { ok: false, reason: "unexpected_phase", why: phase, token, phase };
     return { ok: true, token, phase, action };

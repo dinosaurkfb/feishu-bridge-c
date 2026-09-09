@@ -20,6 +20,8 @@ import { readActive, readJournal } from "./maintenance/journal.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { loadByEndpoint, reconcileShadow, resolveEndpointDir } from "./topic-agent-ledger.mjs";
+import { exitCodeFor } from "./maintenance/exit-code.mjs";
+export { exitCodeFor };
 
 const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
 const LEDGER_KINDS = Object.freeze(["init", "cutover"]);
@@ -154,21 +156,7 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
   return code;
 }
 
-export function exitCodeFor(r) {
-  if (r.leaseRelease ?? r.surfaceRelease ?? null) return 3;
-  if (r.ok) return 0;
-  if (r.rollback && r.rollback.ok === true) return 1; // 回退清干净 → 干净拒绝（预检不过：reconciler_absent / gate_* / operation_active）
-  if (r.rollback && r.rollback.ok === false) return 3; // 回退没做全：动了没做完
-  // R45 三轮 P1-3：catch 折收据（不含 rollback / phase 可能缺失）——reason 本身就是「已动现场」的显式形状，
-  // 不许落到末尾的 1（与干净拒绝同码）。
-  if (r.reason === "ledger_forward_failed" || r.reason === "ledger_rollback_failed") return 3;
-  if (FORWARD_PHASES.includes(r.phase)) return 3; // 卡在 forward-only（动了但没做完：门拆了 / current 切了没恢复）
-  if (r.phase === "reopening_incomplete" || r.reason === "reopening_incomplete") return 3;
-  if (r.reason === "startup_source_unverified") return 1; // 进门就被拒，什么都没动
-  return 1;
-}
 
-const FORWARD_PHASES = ["drained", "ledger_initializing", "ledger_cutting_over", "ledger_reopening"];
 
 const fmtItems = (items) => items.map((i) => "  ✗ " + i.id + "：" + i.why).join("\n");
 

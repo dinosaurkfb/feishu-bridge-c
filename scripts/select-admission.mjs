@@ -167,6 +167,44 @@ export function selectExecutorSuccessText(action) {
   return "已按你的选择完成处理";
 }
 
+/* ── §13 多候选呈现（R57d 返修一 P1-8）────────────────────
+ * 回执只含 opaque handle + 稳定安全标签：标签 = 记录已持久的 created_at 以 Asia/Shanghai 渲染成
+ * MM-DD HH:mm，同一分钟并列按 topic_agent_id 字典序加后缀 ·a、·b…（只依赖持久字段，两次盘点相同，
+ * 绝不由每次盘点临时排序生成）；数量上限 5（≤5 全列；>5 只列按标签序前 5 并提示还有 N 个，
+ * 请带 handle 或先清理）；绝不含 locator / root_om / 精确本地目标 / 会话 id / chat_id / 记录 id；
+ * 限码点数与控制字符。 */
+const AMBIGUITY_CAP = 5;
+const SH_LABEL_FMT = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+const safeCell = (s) => String(s).replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 80);
+function shanghaiLabel(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "时间未知";
+  const part = {};
+  for (const p of SH_LABEL_FMT.formatToParts(new Date(t))) part[p.type] = p.value;
+  return part.month + "-" + part.day + " " + part.hour + ":" + part.minute;
+}
+const suffixLetters = (i) => { let s = "", n = i + 1; while (n > 0) { s = String.fromCharCode(97 + ((n - 1) % 26)) + s; n = Math.floor((n - 1) / 26); } return s; };
+
+/** 歧义回执正文（§13）：candidateIds = 解析层给出的候选记录 id（封闭有序）。 */
+export function selectAmbiguityReceipt(doc, candidateIds) {
+  const rows = (Array.isArray(candidateIds) ? candidateIds : []).map((id) => {
+    const rec = doc?.records?.[id];
+    return { id, label: shanghaiLabel(rec?.created_at), handle: rec?.selection_handle ?? rec?.rebind_handle ?? null };
+  }).filter((r) => typeof r.handle === "string" && r.handle.length > 0);
+  rows.sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  // 同一分钟（同标签）并列：按 topic_agent_id 字典序（上排同序）加后缀 ·a、·b…
+  let i = 0;
+  while (i < rows.length) {
+    let j = i;
+    while (j + 1 < rows.length && rows[j + 1].label === rows[i].label) j += 1;
+    if (j > i) for (let k = i; k <= j; k += 1) rows[k].label = rows[k].label + "·" + suffixLetters(k - i);
+    i = j + 1;
+  }
+  const lines = rows.slice(0, AMBIGUITY_CAP).map((r) => safeCell(r.label) + " " + safeCell(r.handle));
+  const tail = rows.length > AMBIGUITY_CAP ? ["（还有 " + (rows.length - AMBIGUITY_CAP) + " 个未列出，请带 handle 或先清理）"] : [];
+  return ["选择不唯一（" + rows.length + " 个候选），请带对应 handle 重新发送 /feishu-select：", ...lines, ...tail].join("\n");
+}
+
 /** owner-select f4（无 token 三项 + absent）：owner-select 的配对证据是 owner 授权本身，不声称 token 核验。 */
 const ownerSelectF4 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" });
 
@@ -290,8 +328,8 @@ export function executeSelectControl(intent, {
   }
   if (!res.ok) {
     if (res.reason === "ambiguous") {
-      const ids = (res.candidates ?? []).map((x) => String(x).slice(0, 40)).join("、");
-      return { ok: false, reason: "ambiguous_selection", text: "选择不唯一（" + (res.candidates?.length ?? 0) + " 个候选）：" + ids + " —— 请带上对应 handle 重新发送 /feishu-select" };
+      // R57d 返修一 P1-8（§13）：只列 opaque handle + 稳定安全标签，上限 5；不回记录 id
+      return { ok: false, reason: "ambiguous_selection", text: selectAmbiguityReceipt(doc, res.candidates ?? []) };
     }
     return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }

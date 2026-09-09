@@ -45894,6 +45894,24 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].facts.binding, "pending", "handle 未被消费");
   }));
 
+  test("R57d 返修一 P1-8：歧义回执上限 5——6 个候选只列标签序前 5 + 提示还有 N 个；≤5 全列", () => withLedgerD((root, dir, ids) => {
+    // 追加 5 个可锚 A2（各自独立 A1 前身 + 独立 anchor_candidate；夹具原有 1 个 → 省略分支歧义集合 = 6）
+    for (let i = 0; i < 5; i += 1) {
+      const a1 = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_p" + i, chatId: CHAT_D, sessionId: SESSION_D + "-p" + i, clock: () => T0D });
+      assert.ok(a1.ok, "A1 前身：" + JSON.stringify(a1));
+      const att = TAL.attach({ endpointId: EP57D, requestKey: "r57d_pa" + i, id: a1.result.created_id, bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000e" + i }, claimKey: ("f".repeat(63) + String(i)), authorizedBy: "ou_r57d", anchorCandidate: "om_p" + i, clock: () => T0D });
+      assert.ok(att.ok, "attach：" + JSON.stringify(att));
+    }
+    const r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "ambiguous_selection");
+    assert.match(r.text, /6 个候选/u, "计数：" + r.text);
+    const handles = r.text.match(/osh_[0-9a-f]{32}/gu) ?? [];
+    assert.equal(handles.length, 5, "只列 5 个 handle：" + r.text);
+    assert.match(r.text, /还有 1 个/u, "超限提示：" + r.text);
+    assert.doesNotMatch(r.text, /ta_|oc_|om_/u, "不含记录 id / locator / 会话 id / chat_id");
+  }));
+
   test("R57d 返修一 P1-5：root/session 来源——root=命中记录现场（B1.root_om / A2.anchor_candidate）、session=受验事件 session；不再收 transport 根", () => withLedgerD((root, dir, ids) => {
     // ① 显式 osh 命中 B1：事件根不再传（eventRootOm 已删），B1 的根（om_b1root）≠ 旧 mapping 根（ROOT_D）→ 仍成功，
     //    账本 selected_root_om === 该 B1 的根（反例：非当前 mapping 根的 B1 也能被选中）
@@ -45929,8 +45947,13 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(r.ok, false, "多集合候选 → 拒");
     assert.equal(r.reason, "ambiguous_selection");
     assert.match(r.text, /2 个候选/u, "回执列计数：" + r.text);
-    assert.match(r.text, /ta_[0-9a-f]{8}/u, "列 opaque id");
-    assert.doesNotMatch(r.text, /osh_[0-9a-f]{4}/u, "不回 handle 值");
+    // P1-8（§13）：只列 opaque handle + 稳定安全标签；绝不列记录 id / locator / 会话 id / chat_id
+    assert.match(r.text, /osh_[0-9a-f]{32}/u, "列 opaque handle：" + r.text);
+    assert.match(r.text, /[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}/u, "安全标签（MM-DD HH:mm）" + r.text);
+    assert.doesNotMatch(r.text, /ta_|oc_|om_/u, "不含记录 id / locator / 会话 id / chat_id");
+    const textAgain = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD()).text;
+    assert.equal(textAgain, r.text, "标签稳定：两次盘点相同（只依赖持久字段）");
+    assert.doesNotMatch(r.text, /还有/u, "≤5 全列，无超限提示");
     // 砍到唯一：先 activate 掉 B1（旧形基线），A2 独苗 → anchor 成功
     talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act2", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
     r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: SESSION_D + "-a2" }));

@@ -185,8 +185,8 @@ CAS）**：op_type↔terminal_kind 一一对应、每 op 单 result union（ledg
 - `reason=expired`：**必须额外带 `expected_handle, expected_expires_at`**，锁内核
   `now ≥ expected_expires_at ∧ expected_handle === 当前 selection_handle ∧ expected_expires_at === 当前
   handle_expires_at`（CAS——八轮 P1-2：否则同 handle 续期/异常重物化后，旧到期任务仍可作废新有效期）；
-- `reason=manual|superseded`：这两键**显式 null**（各走固定分支，不核时间）。
-result 仍 `{voided_id}`。**绝不保留 `selection_handle=null` 的 strict B1**（transition 见 §8）。
+- `reason=manual|superseded`：这两键**显式 null**（各走固定分支，不核时间；**也不据此要求当前 B1 的 handle 为 null**——带 handle 的 B1 同样可被 manual/superseded 清，只有 `expired` 做持久 handle/expiry 的 CAS，#144 五轮 P1-1 回带）。
+result：**1.0 / 升级边界前旧形 `{voided_id}`；边界后新形 `{voided_id, expected_handle, expected_expires_at}`**（把指纹输入固化进不可变 result，#144 四轮/五轮回带）。**整本校验器钉 reason 联合**（reason 从不可变 `voided_audit` 取）：`expired ⇔ 双键非空`、`manual|superseded ⇔ 双键 null`，不符 → `ledger_corrupt`——写入口守卫不能替代整本校验。**绝不保留 `selection_handle=null` 的 strict B1**（transition 见 §8）。
 
 **`migrate_seed(B1)` 不改（P1-3）**：其 result 保持 `{authorized_by, authorized_at, seeded:[...]}`
 （ledger §285），**seeded B1 的 `selection_handle` 初始为 null**（过渡 schema 合法）；handle 由

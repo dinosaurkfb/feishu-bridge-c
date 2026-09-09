@@ -483,6 +483,14 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
  *   · 都没有 → in_flight（可恢复）。
  * residue / quarantined：同 key 的临时残骸与隔离制品；目录枚举不了时两者为 null 且 listingProblem 说明原因（不折叠成 0）。
  */
+/**
+ * R57d 对齐 P1-5：unclean 与 consumed / failed 记录共存 = 状态机自相矛盾 —— 两个读取器
+ * （盘点 inspectControlClaim / 恢复 resumeControlClaim）共用这一份判据，不放行、不静默择一。
+ */
+function uncleanCoexistence(unclean, consumed, failed) {
+  return unclean.status === "valid" && (consumed.status !== "absent" || failed.status !== "absent");
+}
+
 export function inspectControlClaim({ claimsDir, key, expect = {} }) {
   const claim = readClaimState({ claimsDir, key, expect });
   if (claim.status !== "valid") return { state: "claim_" + claim.status, why: claim.why ?? null };
@@ -496,6 +504,10 @@ export function inspectControlClaim({ claimsDir, key, expect = {} }) {
     ? { residue: listed.residue, quarantined: listed.quarantined, listingProblem: null }
     : { residue: null, quarantined: null, listingProblem: listed.why };
   if (consumed.status !== "absent" && failed.status !== "absent") return { state: "conflict", intent, why: jointWhy(failed, consumed), ...extras };
+  // R57d 对齐 P1-5：unclean 与终态记录共存也是矛盾 —— 归入 conflict（why 点名 select_state_conflict），不静默择一。
+  if (uncleanCoexistence(unclean, consumed, failed)) {
+    return { state: "conflict", intent, why: "select_state_conflict：unclean 与 " + (consumed.status !== "absent" ? "consumed" : "failed") + " 记录共存 —— 状态机自相矛盾，人工核对", ...extras };
+  }
   if (consumed.status === "unreadable") return { state: "consumed_unreadable", intent, why: consumed.why, ...extras };
   if (consumed.status === "valid") {
     const cIntent = intentFromConsumedRecord(consumed.record);
@@ -530,6 +542,10 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
     const listed = listControlSidecars({ claimsDir, key });
     const quarantined = listed.status === "listed" ? listed.quarantined : [];
     if (consumed.status !== "absent" && failed.status !== "absent") return { ok: false, reason: "conflict", why: jointWhy(failed, consumed) };
+    // R57d 对齐 P1-5：unclean 与终态记录共存 → select_state_conflict 不放行（判据与盘点共用一份）。
+    if (uncleanCoexistence(unclean, consumed, failed)) {
+      return { ok: false, reason: "select_state_conflict", why: "unclean 与 " + (consumed.status !== "absent" ? "consumed" : "failed") + " 记录共存（状态机自相矛盾），不放行，人工核对" };
+    }
     if (consumed.status === "valid") {
       const cIntent = intentFromConsumedRecord(consumed.record);
       if (!sameControlIntent(intent, cIntent)) {

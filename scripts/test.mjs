@@ -46059,7 +46059,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     // (b) legacy 已提交、ledger 未提交（注入 rename 前抛出 → not_committed）：repair 在 outer 锁内按 sidecar plan 前向补 ledger，同 request_key，幂等 → consumed
     {
       const revBefore = TAL.loadLedger(path.join(dir), { endpointId: EP57D }).doc.revision;
-      const tx = mkScene("om_p15b", ids.a2Handle, SESSION_D + "-b", { beforeLedgerRename: () => { throw new Error("injected"); } });
+      // 注：anchor 的 CAS 核 selected_session_id === A2.session_id —— 用例会话须与夹具 A2 的 session 一致，
+      //   否则原始执行也会 cas_mismatch、前向补也永远补不上（那是 (c) 的场景，不是 (b) 的）。
+      const tx = mkScene("om_p15b", ids.a2Handle, SESSION_D + "-a2", { beforeLedgerRename: () => { throw new Error("injected"); } });
       assert.equal(tx.status, "control-committed-unclean", "(b) 前置 unclean：" + JSON.stringify(tx).slice(0, 220));
       const unRec = readControlCommittedUncleanRecord({ claimsDir, key: claimKey("om_p15b", ltk) });
       assert.equal(unRec.record?.detail?.ledger, "not_committed", "(b) detail.ledger=not_committed：" + JSON.stringify(unRec.record?.detail));
@@ -46071,15 +46073,12 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       // 共用派生钉：补上的 op 的 request_key === requestKeyFor（与 unclean detail.request_key 同一函数，不另抄公式）
       const op = Object.values(doc.operations).find((o) => o.op_type === "anchor" && o.result_revision === doc.revision);
       assert.ok(op, "(b) 补的是 anchor op");
-      assert.equal(op.request_key, requestKeyFor({ opType: "anchor", externalRequestId: "om_p15b", entityId: ids.a2Id }).request_key, "(b) request_key 与共用派生逐字等（detail 同源：" + String(unRec.record?.detail?.request_key) + "）");
+      assert.equal(op.request_key, DW.requestKeyFor({ opType: "anchor", externalRequestId: "om_p15b", entityId: ids.a2Id }).request_key, "(b) request_key 与共用派生逐字等（detail 同源：" + String(unRec.record?.detail?.request_key) + "）");
       assert.equal(op.request_key, unRec.record?.detail?.request_key, "(b) detail.request_key 与账本 op 一致");
       assert.equal(fs.existsSync(path.join(claimsDir, claimKey("om_p15b", ltk) + ".consumed.json")), true, "(b) 转 consumed");
     }
     // (c) 补不上（A1 已不在 → activate 无可归并对象）→ 保持 unclean 并点名，账本零改动
     {
-      const tx = mkScene("om_p15c", ids.b1Handle === ids.a2Handle ? ids.b1Handle : ids.a2Handle, SESSION_D + "-c", null);
-      // 上一段 (b) 已消费 a2；这里换新 B1 造第二个 unclean（legacy 删 A1 → ledger activate no_a1）
-      void tx;
       const b3 = TAL.createB1({ endpointId: EP57D, requestKey: "r57d_p15c", chatId: CHAT_D, rootOm: "om_p15c", lineageId: "lin_p15c", bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-0000000000f1" }, clock: () => T0D });
       assert.ok(b3.ok, "新 B1：" + JSON.stringify(b3));
       const a1c = TAL.createA1({ endpointId: EP57D, requestKey: "r57d_p15c_a1", chatId: CHAT_D, sessionId: SESSION_D + "-c", clock: () => T0D });
@@ -46105,19 +46104,21 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
     // (d) unclean 与 consumed / failed 共存 → select_state_conflict 不放行
     {
-      const tx = mkScene("om_p15d", ids.b1Handle, SESSION_D + "-d", { failDirFsync: true });
-      void tx; // b1 已在 (a) 消费——这里只需要一把 unclean 的 key；换用直接双写 sidecar 制造共存
       const coKey = claimKey("om_p15d", ltk);
+      const acqD = acquireClaim({ claimsDir, messageId: "om_p15d", logicalTaskKey: ltk, meta: { control: { control: "select", handle: null, handle_kind: null }, policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_p15" } });
+      assert.equal(acqD.ok, true, "(d) claim 取得：" + JSON.stringify(acqD));
       // 直接造 unclean + consumed 共存（不开账本：repair 的共存检查必须先于账本分支）
-      recordClaimState({ claimsDir, key: coKey, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: requestKeyFor({ opType: "activate", externalRequestId: "om_p15d", entityId: ids.b1Id }).request_key, plan_ref: null, ledger_reason: "x" } } });
+      recordClaimState({ claimsDir, key: coKey, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d", entityId: ids.b1Id }).request_key, plan_ref: null, ledger_reason: "x" } } });
       recordClaimState({ claimsDir, key: coKey, state: "consumed", detail: { control: "select", handle: null, handle_kind: "osh", changed: false } });
       const repaired = resumeControlClaim({ claimsDir, key: coKey, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
       assert.equal(repaired.ok, false, "(d) 共存拒：" + JSON.stringify(repaired).slice(0, 300));
       assert.equal(repaired.reason, "select_state_conflict", "(d) reason：" + repaired.reason);
       // failed 共存同款
       const coKey2 = claimKey("om_p15d2", ltk);
-      recordClaimState({ claimsDir, key: coKey2, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: requestKeyFor({ opType: "activate", externalRequestId: "om_p15d2", entityId: ids.b1Id }).request_key, plan_ref: null, ledger_reason: "x" } } });
-      recordClaimState({ claimsDir, key: coKey2, state: "failed", detail: { reason: "control_failed", control: "select", error: "x" } });
+      const acqD2 = acquireClaim({ claimsDir, messageId: "om_p15d2", logicalTaskKey: ltk, meta: { control: { control: "select", handle: null, handle_kind: null }, policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_p15" } });
+      assert.equal(acqD2.ok, true, "(d') claim 取得：" + JSON.stringify(acqD2));
+      recordClaimState({ claimsDir, key: coKey2, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d2", entityId: ids.b1Id }).request_key, plan_ref: null, ledger_reason: "x" } } });
+      recordClaimState({ claimsDir, key: coKey2, state: "failed", detail: { reason: "control_failed", control: "select", handle: null, handle_kind: null, error: "x" } });
       const repaired2 = resumeControlClaim({ claimsDir, key: coKey2, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
       assert.equal(repaired2.reason, "select_state_conflict", "(d') failed 共存同拒：" + repaired2.reason);
     }

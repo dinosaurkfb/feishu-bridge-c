@@ -9,7 +9,7 @@
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState } from "./claim.mjs";
-import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim } from "./control-command.mjs";
+import { RESUMABLE_CONTROL_STATES, inspectControlClaim, resumeControlClaim, readConsumedRecord, readControlFailedRecord } from "./control-command.mjs";
 import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, rejectRepairExitCode, resumeRejectedClaim } from "./reject-control.mjs";
 import { setClaudeInteractionMode } from "./interaction-policy-store.mjs";
 import { resolveProject } from "./project-resolve.mjs";
@@ -17,7 +17,7 @@ import { expectationFromMapping, claudeControlPrecondition } from "./control-ide
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext, mintSelectCapability } from "./select-admission.mjs";
 import { senderRole } from "./sender-roles.mjs";
-import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE } from "./topic-agent-ledger.mjs";
+import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias } from "./topic-agent-ledger.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
 import { readSelectionPlan, recoverSelectionPlanTmp } from "./selection-plan.mjs";
@@ -145,35 +145,14 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
  * 重读账本核已提交 → 只做清理/释放收尾 → 转 consumed；核不出 → 保持并点名。
  */
 export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRecord, env = process.env, _inject = undefined } = {}) {
-  // R57d 返修一 B 段 P1-7：kind 判别 —— rfh 走 intent 清理收尾；osh/orh 走「按 selection plan 核账本提交」收尾
-  //   （目标已消费，不重执行；核得出提交 → 转 consumed 交事务层闭合，核不出 → 保持并点名）。
+  // R57d 返修一 B 段 P1-7：kind 判别 —— rfh 走 intent 清理收尾；osh/orh 走「按 sidecar plan + detail 分支」收尾
+  //   （目标已消费，不重执行；补得上/核得出 → 转 consumed 交事务层闭合，否则保持并点名）。
   const vCtx = verifySelectionContext(claim);
   if (!vCtx.ok) return { ok: false, reason: vCtx.reason, why: vCtx.why };
   const sc = vCtx.context;
-  if (sc.kind !== "rfh") {
-    const d0 = resolveEndpointDir(sc.endpoint, { env });
-    if (!d0.ok) return { ok: false, reason: "endpoint_dir_unresolvable", why: d0.why };
-    const L0 = loadLedger(d0.dir, { endpointId: sc.endpoint });
-    if (!L0.ok) return { ok: false, reason: "ledger_unreadable", why: L0.why ?? L0.reason };
-    // R57d 对齐 P1-4：plan 读 sidecar（执行器 writeSelectionPlan 的产物；claim.json 不再内嵌）。
-    const planRead = readSelectionPlan({ claimsDir, key: claim?.claim_key ?? key });
-    if (!planRead.ok || planRead.absent || typeof planRead.plan?.target_id !== "string" || typeof planRead.plan?.action !== "string") {
-      return { ok: false, reason: "selection_plan_missing", why: "selection plan sidecar 缺席/读不出（" + (planRead.absent ? "absent" : (planRead.problem ?? "?")) + "），保持 control-committed-unclean" };
-    }
-    const plan = planRead.plan;
-    const opType = plan.action === "rebind" ? "rebind_session_alias" : plan.action;
-    const wantKey = requestKeyFor({ opType, externalRequestId: sc.message, entityId: plan.target_id });
-    if (!wantKey.ok) return { ok: false, reason: "select_plan_invalid", why: wantKey.why ?? "request key 派生失败" };
-    const op = Object.values(L0.doc.operations).find((o) => o.op_type === opType && o.request_key === wantKey.request_key);
-    if (!op || !op.result || typeof op.result_revision !== "number") {
-      return { ok: false, reason: "ledger_commit_unverifiable", why: "账本中核不出 " + opType + "（" + plan.target_id + "）的提交记录，保持 control-committed-unclean" };
-    }
-    return { ok: true, changed: true };
-  }
 
-  // R57b 返修三 P1-4a：repair 同样走 outer → intent 锁序（同 P1-2 签发/消费纪律）。
-  //   顶层取 instance-bound outer（m1a-order lock），内层持 outer 的受验 capability。
-  //   两层释放都干净才闭合；outer 取不到/残骸/释放失败 → 非绿、保持 committed-unclean 点名。
+  // R57d 对齐 P1-5：osh/orh 与 rfh 同一 outer 锁序（同 P1-2 签发/消费纪律）——
+  //   清理 / 前向补账本都在锁内；两层释放都干净才闭合；outer 取不到/残骸/释放失败 → 非绿、保持 committed-unclean 点名。
   const acq = acquireOrderLock(sc.endpoint, env);
   if (!acq.ok) {
     return { ok: false, reason: acq.reason ?? "outer_lock_unavailable", why: "repair 外层排序锁取不到（" + (acq.why ?? acq.reason ?? "?") + "），保持 control-committed-unclean", lock_state: "unclear" };
@@ -181,7 +160,9 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   let innerRes;
   let outerRel;
   try {
-    innerRes = repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanRecord, env, _inject, sc });
+    innerRes = sc.kind === "rfh"
+      ? repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanRecord, env, _inject, sc })
+      : repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, sc });
   } finally {
     try { outerRel = acq.release(); } catch (err) { outerRel = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }
@@ -203,6 +184,115 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
     };
   }
   return innerRes;
+}
+
+/**
+ * osh/orh 的 unclean 收尾（R57d 对齐 P1-5）。前提：verifySelectionContext 已过、outer 锁已持。
+ * 分支判据 = uncleanRecord.detail（P1-5a 结构化持久证据）+ sidecar plan（P1-4），不重执行选择：
+ *   · ledger 已提交 → 只做清理/锁释放收口转 consumed，不补写不重跑；
+ *   · ledger 未提交而 legacy 已提交 → 按 plan 前向补 ledger（同 request_key / 冻结 CAS，账本 op 幂等）。
+ *     依据写明：legacy 提交是对外事实（映射已改）不可逆，本仓库没有可证明安全的 legacy CAS 回滚原语；
+ *     plan 冻结了同一 request_key 与完整 CAS，账本 op 按 request_key 幂等 —— 二选一取前向补。
+ *     补不上（CAS 被现场漂移破掉 / 可归并对象不在）→ 保持 unclean 并点名。
+ *   · 其它组合（detail.legacy ≠ committed 等）→ 证据不够，保持 unclean 点名。
+ *   · unclean 与 consumed/failed 记录共存 → select_state_conflict（判据在 control-command.mjs，盘点/恢复共用）。
+ */
+function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, sc }) {
+  const detail = uncleanRecord?.detail;
+  if (!detail || typeof detail !== "object" || typeof detail.action !== "string") {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "unclean 记录没有结构化 detail（旧形 unclean），保持 control-committed-unclean" };
+  }
+  const consumed = readConsumedRecord({ claimsDir, key });
+  const failed = readControlFailedRecord({ claimsDir, key });
+  if (consumed.status !== "absent" || failed.status !== "absent") {
+    return { ok: false, reason: "select_state_conflict", why: "unclean 与 " + (consumed.status !== "absent" ? "consumed" : "failed") + " 记录共存（状态机自相矛盾），不放行，人工核对" };
+  }
+  const d = resolveEndpointDir(sc.endpoint, { env });
+  if (!d.ok) return { ok: false, reason: "endpoint_dir_unresolvable", why: d.why };
+  const L = loadLedger(d.dir, { endpointId: sc.endpoint });
+  if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: L.why ?? L.reason };
+  // sidecar plan（P1-4）：持锁入口先受验恢复 tmp，再读回；plan/target 与 unclean detail 逐字互证。
+  const rec = recoverSelectionPlanTmp({ claimsDir, key: claim?.claim_key ?? key });
+  if (rec && rec.ok === false) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan tmp 残骸待人工（" + (rec.why ?? "?") + "）" };
+  }
+  const planRead = readSelectionPlan({ claimsDir, key: claim?.claim_key ?? key });
+  if (!planRead.ok || planRead.absent) {
+    return { ok: false, reason: "selection_plan_missing", why: "selection plan sidecar 缺席/读不出（" + (planRead.absent ? "absent" : (planRead.problem ?? "?")) + "），保持 control-committed-unclean" };
+  }
+  const plan = planRead.plan;
+  if (typeof plan.target_id !== "string" || !ID_SHAPE.test(plan.target_id) || plan.target_id !== detail.target_id) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan.target_id（" + String(plan.target_id) + "）与 unclean detail.target_id（" + String(detail.target_id) + "）不一致，保持 control-committed-unclean" };
+  }
+  if (sc.kind !== null && plan.kind !== sc.kind) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan.kind（" + String(plan.kind) + "）与 claim.kind（" + String(sc.kind) + "）不一致，保持 control-committed-unclean" };
+  }
+  const opType = detail.action === "rebind" ? "rebind_session_alias" : detail.action;
+  // 共用派生：与执行器同一 requestKeyFor（不另抄公式）；detail 自报的 request_key 必须与之逐字等。
+  const wantKey = requestKeyFor({ opType, externalRequestId: sc.message, entityId: plan.target_id });
+  if (!wantKey.ok) return { ok: false, reason: "select_plan_invalid", why: wantKey.why ?? "request key 派生失败" };
+  if (detail.request_key !== wantKey.request_key) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "unclean detail.request_key（" + String(detail.request_key) + "）与共用派生（" + wantKey.request_key + "）不一致，保持 control-committed-unclean" };
+  }
+  const findCommitted = (doc) => Object.values(doc.operations).find((o) => o.op_type === opType && o.request_key === wantKey.request_key && o.result && typeof o.result_revision === "number");
+  // 提交记录与 plan 的逐字绑定：target 随 op type 取 surviving_id/affected_id，selection_message_id 与 CAS 逐字等。
+  // （activate 的 target 在 result.surviving_id；anchor/rebind 在 result.affected_id；anchor/rebind 的 expected CAS 在 op.inputs。）
+  const committedMismatch = (o) => {
+    const target = o.op_type === "activate" ? o.result?.surviving_id : o.result?.affected_id;
+    if (target !== plan.target_id) return "target（" + String(target) + "）与 plan.target_id 不一致";
+    if (o.result?.selection_message_id !== sc.message) return "selection_message_id（" + String(o.result?.selection_message_id) + "）与 claim message 不一致";
+    if (o.op_type === "activate") {
+      if (o.result?.selection_handle !== plan.cas.selection_handle) return "selection_handle 与 plan.cas 不一致";
+      if (o.result?.selected_session_id !== plan.cas.selected_session_id) return "selected_session_id 与 plan.cas 不一致";
+      if (o.result?.selected_root_om !== plan.cas.selected_root_om) return "selected_root_om 与 plan.cas 不一致";
+    }
+    if (o.op_type === "anchor") {
+      for (const k of ["expected_handle", "expected_expires_at", "expected_anchor_candidate"]) {
+        if (o.inputs?.[k] !== plan.cas[k]) return "inputs." + k + " 与 plan.cas 不一致";
+      }
+    }
+    if (o.op_type === "rebind_session_alias") {
+      if (o.result?.new_session_id !== plan.cas.new_session_id) return "new_session_id 与 plan.cas 不一致";
+      if (o.result?.old_session_id !== plan.cas.expected_old_session_id) return "old_session_id 与 plan.cas 不一致";
+      if (o.inputs?.expected_expires_at !== plan.cas.expected_expires_at) return "inputs.expected_expires_at 与 plan.cas 不一致";
+    }
+    return null;
+  };
+  // 分支一：账本已提交 → 只做清理/收口转 consumed（不重执行、不补写；target/message/CAS 与 plan 逐字一致才认）。
+  const committed = findCommitted(L.doc);
+  if (committed) {
+    const mismatch = committedMismatch(committed);
+    if (mismatch !== null) {
+      return { ok: false, reason: "ledger_commit_unverifiable", why: "账本 " + opType + " op 与 plan 逐字核不过：" + mismatch + "，保持 control-committed-unclean" };
+    }
+    return { ok: true, changed: true };
+  }
+  // 分支二：legacy 已提交、账本未提交 → outer 锁内按 plan 前向补 ledger（同 request_key / 冻结 CAS，幂等）。
+  if (detail.ledger === "not_committed" && detail.legacy === "committed") {
+    const clock = () => Date.now();
+    let r;
+    if (opType === "activate") {
+      const a1 = Object.values(L.doc.records).find((x) => x?.kind === "live" && familyOf(x.facts) === "A1" && x.chat_id === sc.chat && x.aliases.session_id === plan.cas.selected_session_id);
+      if (!a1) {
+        return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补 activate 失败：chat（" + sc.chat + "）会话（" + String(plan.cas.selected_session_id) + "）上无可归并 A1，保持 control-committed-unclean" };
+      }
+      r = activate({ endpointId: sc.endpoint, requestKey: wantKey.request_key, b1Id: plan.target_id, a1Id: a1.topic_agent_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.selection_handle, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env });
+    } else if (opType === "anchor") {
+      r = anchor({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.expected_handle, expectedExpiresAt: plan.cas.expected_expires_at, expectedAnchorCandidate: plan.cas.expected_anchor_candidate, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env });
+    } else {
+      r = rebindSessionAlias({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, expectedOldSessionId: plan.cas.expected_old_session_id, newSessionId: plan.cas.new_session_id, authorizedBy: sc.sender, rebindHandle: plan.cas.rebind_handle, expectedExpiresAt: plan.cas.expected_expires_at, selectionMessageId: sc.message, clock, env });
+    }
+    if (!r.ok) {
+      return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补 " + opType + " 失败（" + (r.reason ?? "?") + (r.why ? "：" + r.why : "") + "），保持 control-committed-unclean" };
+    }
+    const L2 = loadLedger(d.dir, { endpointId: sc.endpoint });
+    if (!L2.ok) return { ok: false, reason: "ledger_unreadable", why: L2.why ?? L2.reason };
+    if (!findCommitted(L2.doc)) {
+      return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补后仍核不出提交（request_key " + wantKey.request_key + "），保持 control-committed-unclean" };
+    }
+    return { ok: true, changed: true };
+  }
+  return { ok: false, reason: "ledger_commit_unverifiable", why: "detail.legacy/ledger=" + String(detail.legacy) + "/" + String(detail.ledger) + "，无安全收口路径，保持 control-committed-unclean" };
 }
 
 function repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanRecord, env = process.env, _inject = undefined, sc = undefined } = {}) {

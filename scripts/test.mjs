@@ -7575,15 +7575,21 @@ test("测试文件里没有写在汇总之后的 test()", () => {
 
 /** 最小套件：真套件太重（1100+ 用例的注册时序也受不起），共用注册器配最小夹具在子进程里跑。
  *  子进程显式清掉 TEST_FILTER：夹具用例名不该受外层定向击杀影响（环境继承是真坑，第①轮就踩过）。 */
-const r59MiniRun = (file) => spawnSync(process.execPath, [file],
-  { encoding: "utf-8", env: { ...process.env, TEST_FILTER: "" } });
+const r59MiniRun = (file) => {
+  // P2-1：子进程隔离 HOME（临时目录）+ 清掉 maintenance / ledger / 桥相关变量（不继承真 HOME / 桥环境）。
+  const isolatedHome = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-r59-home-"));
+  const env = { ...process.env, HOME: isolatedHome, TEST_FILTER: "" };
+  for (const k of Object.keys(env)) if (/(?:FEISHU_BRIDGE_|AILY_CLI_|M5CLAUDE_|FEISHU_|BRIDGE_)/.test(k)) delete env[k];
+  return spawnSync(process.execPath, [file], { encoding: "utf-8", env });
+};
 const r59MiniSuite = (body) => {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-r59-"));
   const file = path.join(dir, "mini-" + crypto.randomBytes(4).toString("hex") + ".mjs");
   fs.writeFileSync(file, [
     "import assert from \"node:assert/strict\";",
     "import { createTestHarness, installUnhandledRejectionGuard } from " +
-      JSON.stringify(path.resolve("scripts", "test-harness.mjs")) + ";",
+      // P2-1：用 import.meta.url 派生仓库根，不依赖调用 cwd。
+      JSON.stringify(path.join(moduleDir(import.meta.url), "test-harness.mjs")) + ";",
     "installUnhandledRejectionGuard();",
     "const h = createTestHarness({ onFail: (name, err) => console.error(\"FAIL \" + name + \"\\n\" + (err.stack ?? err)) });",
     body,
@@ -7630,7 +7636,15 @@ test("R59 汇总与退出码一致（行为，子进程）：红用例汇总「�
     'h.test("z", () => { Promise.reject(new Error("绕过注册器的 async")); });'));
   assert.equal(p5.status, 1, "未处理 rejection → exit 1：" +
     JSON.stringify({ status: p5.status, stdout: p5.stdout, stderr: p5.stderr?.slice(0, 400) }));
+  assert.match(p5.stderr, /汇总已作废/u, "stderr 点名汇总已作废（汇总后 unhandled）：" + p5.stderr);
   assert.match(p5.stderr, /未处理的 rejection/u, "stderr 把原因说清：" + p5.stderr);
+  // ⑦ 同步绿用例设 process.exitCode=1：汇总行必须点「进程已被标记失败」且 rc=1（退出码权威，投影到汇总行）。
+  const p6 = r59MiniRun(r59MiniSuite(
+    'h.test("green", () => { process.exitCode = 1; });'));
+  assert.equal(p6.status, 1, "同步绿但 exitCode=1 → rc=1：" +
+    JSON.stringify({ status: p6.status, stdout: p6.stdout, stderr: p6.stderr?.slice(0, 200) }));
+  assert.match(p6.stdout, /进程已被标记失败：exitCode=1/u, "汇总行点名进程已被标记失败：" + p6.stdout);
+  assert.match(p6.stdout, /通过 1 \/ 失败 0/u, "汇总行仍如实报绿：" + p6.stdout);
 });
 
 test("R59 两套件都接共用注册器：源码 import test-harness，且 TEST_FILTER 无命中时各自 exit 2（套件带新注册器照常启动）", () => {
@@ -7638,13 +7652,13 @@ test("R59 两套件都接共用注册器：源码 import test-harness，且 TEST
   // 谁把注册器抄回本地、async 拒绝就只剩半边，必须当场点破。结构上只认 import 行，
   // 拒绝行为本身由 A/B 在子进程里验（不打真套件的全量时序）。
   for (const rel of ["test.mjs", path.join("codex", "test.mjs")]) {
-    const src = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    const src = fs.readFileSync(path.join(moduleDir(import.meta.url), rel), "utf-8");
     assert.match(src, /from "\.\.?\/?test-harness\.mjs";/u,
       rel + " 必须从 scripts/test-harness.mjs 取共用注册器");
   }
   // 真套件带着新注册器照常启动：过滤器无命中 → 各自退出码 2（既有约定），不是崩、不是假绿
   for (const [rel, tag] of [["test.mjs", "Claude"], [path.join("codex", "test.mjs"), "Codex"]]) {
-    const p = spawnSync(process.execPath, [path.resolve("scripts", rel)], {
+    const p = spawnSync(process.execPath, [path.join(moduleDir(import.meta.url), rel)], {
       encoding: "utf-8", env: { ...process.env, TEST_FILTER: "r59-no-such-test-xyz" },
     });
     assert.equal(p.status, 2, tag + " 套件 TEST_FILTER 无命中 → exit 2：" +

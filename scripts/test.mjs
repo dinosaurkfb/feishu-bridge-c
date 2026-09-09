@@ -45987,36 +45987,48 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(fs.existsSync(path.join(claimsDir, key2 + ".control-committed-unclean.json")), false, "③ unclean 已清");
   }));
 
-  test("R57d 返修三 P1-1：shadow rebind 的 W2 复合——claude selectClaudeLegacyUpdate（W2 精确绑定 → promoteBinding 双写；无 pending / root 不符 → 结构化拒）", async () => {
+  test("R57d 返修三 P1-1：shadow rebind 的 W2 复合——claude selectClaudeLegacyUpdate（root+session 都相符 → promoteBinding 双写；root / session 任一不符、无 pending → 结构化拒）", async () => {
     const R = await import("./inbound.mjs");
     const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57d-w2-")));
+    const NOW = Date.parse("2026-09-13T10:00:00.000Z");
     try {
       const projectB = path.join(local, "project-b");
+      const mapFile = path.join(projectB, ".runtime-data", "inbound", "active-mapping.json");
       fs.mkdirSync(path.join(projectB, ".runtime-data", "inbound"), { recursive: true, mode: 0o700 });
-      const activeGen = { channel_generation_id: "lin_active", generation: 1, status: "active", root_message_id: "om_b3root", session_id: "aily_old", created_at: "2026-09-13T00:00:00.000Z", pending_token: null, claim_expires_at: null };
-      const pendingGen = { channel_generation_id: "lin_p2", generation: 2, status: "pending", root_message_id: "om_newroot", session_id: null, created_at: "2026-09-13T00:00:00.000Z", pending_token: "tok_w2", claim_expires_at: null };
-      const st = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: "b@project-files", binding_status: "active", active_generation_id: "lin_active", rotation: { operation_id: "rot_w2", status: "awaiting_claim", pending_generation_id: "lin_p2" }, generations: [activeGen, pendingGen] };
-      fs.writeFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "b@project-files", status: "active", root_message_id: "om_b3root", session_id: "aily_old", channel_generation_id: "lin_active", claude_session_id: "00000000-0000-4000-8000-0000000000d5", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: st }, null, 2) + "\n", { mode: 0o600 });
-      // ① W2 精确绑定：root 相符 → promoteBinding 激活新代际到事件会话
-      const r1 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new" }, { now: Date.parse("2026-09-13T10:00:00.000Z") });
+      // 每个用例用独立新鲜 fixture（避免上一个用例激活后 pending 消失、只钉到 no pending）。
+      const writeW2 = (flav) => {
+        const activeGen = { channel_generation_id: "lin_active", generation: 1, status: "active", root_message_id: "om_b3root", session_id: "aily_old", created_at: "2026-09-13T00:00:00.000Z", pending_token: null, claim_expires_at: null };
+        const pendingGen = { channel_generation_id: "lin_p2", generation: 2, status: "pending", root_message_id: "om_newroot", session_id: null, created_at: "2026-09-13T00:00:00.000Z", pending_token: "tok_w2", claim_expires_at: null };
+        const st = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: "b@project-files", binding_status: "active", active_generation_id: "lin_active", rotation: { operation_id: "rot_w2", status: "awaiting_claim", pending_generation_id: "lin_p2" }, generations: [activeGen, pendingGen] };
+        if (flav === "no-pending") { st.generations = st.generations.filter((g) => g.channel_generation_id !== "lin_p2"); st.rotation = null; }
+        fs.writeFileSync(mapFile, JSON.stringify({ binding_id: "b@project-files", status: "active", root_message_id: "om_b3root", session_id: "aily_old", channel_generation_id: "lin_active", claude_session_id: "00000000-0000-4000-8000-0000000000d5", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: st }, null, 2) + "\n", { mode: 0o600 });
+      };
+      // ① root + session 都相符 → W2 复合成功（正确激活新代际到事件会话）
+      writeW2();
+      const r1 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new", expectedOldSessionId: "aily_old" }, { now: NOW });
       assert.equal(r1.ok, true, "① W2 复合成功：" + JSON.stringify(r1));
-      const map = JSON.parse(fs.readFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), "utf-8"));
+      const map = JSON.parse(fs.readFileSync(mapFile, "utf-8"));
       const gens = map.topic_generation_state.generations;
       assert.equal(gens.find((g) => g.channel_generation_id === "lin_p2").status, "active", "新代际已激活");
       assert.equal(gens.find((g) => g.channel_generation_id === "lin_p2").session_id, "aily_new", "新代际会话 = 事件会话");
       assert.equal(gens.find((g) => g.channel_generation_id === "lin_active").status, "read-only", "旧代际 read_only：" + JSON.stringify(gens));
-      // ② root 不符（不是这个 B3 的 W2 继承）→ 结构化拒
-      const r2 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_other_b3", eventSessionId: "aily_x" }, { now: Date.parse("2026-09-13T10:00:00.000Z") });
+      // ② root 不符（pending 在场）→ select_rebind_legacy_root_mismatch
+      writeW2();
+      const r2 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_other_b3", eventSessionId: "aily_x", expectedOldSessionId: "aily_old" }, { now: NOW });
       assert.equal(r2.ok, false, "② root 不符拒：" + JSON.stringify(r2));
-      assert.equal(r2.reason, "select_rebind_legacy_unsupported", "② " + r2.reason);
-      // ③ 无 pending（ succession 对象不存在）→ 结构化拒
-      const st2 = JSON.parse(JSON.stringify(st));
-      st2.generations = st2.generations.filter((g) => g.channel_generation_id !== "lin_p2");
-      st2.rotation = null;
-      fs.writeFileSync(path.join(projectB, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "b@project-files", status: "active", root_message_id: "om_b3root", session_id: "aily_old", channel_generation_id: "lin_active", claude_session_id: "00000000-0000-4000-8000-0000000000d5", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: st2 }, null, 2) + "\n", { mode: 0o600 });
-      const r3 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new2" }, { now: Date.parse("2026-09-13T10:00:00.000Z") });
-      assert.equal(r3.ok, false, "③ 无 pending 拒：" + JSON.stringify(r3));
-      assert.equal(r3.reason, "select_rebind_legacy_unsupported", "③ " + r3.reason);
+      assert.equal(r2.reason, "select_rebind_legacy_root_mismatch", "② " + r2.reason);
+      assert.match(r2.why, /root/u, "② why 点名 root：" + r2.why);
+      // ③ old session 不符（root 相符、pending 在场）→ select_rebind_legacy_session_mismatch
+      writeW2();
+      const r3 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_x", expectedOldSessionId: "aily_other" }, { now: NOW });
+      assert.equal(r3.ok, false, "③ session 不符拒：" + JSON.stringify(r3));
+      assert.equal(r3.reason, "select_rebind_legacy_session_mismatch", "③ " + r3.reason);
+      assert.match(r3.why, /session/u, "③ why 点名 session：" + r3.why);
+      // ④ 无 pending（succession 对象不存在）→ 结构化拒 select_rebind_legacy_unsupported
+      writeW2("no-pending");
+      const r4 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new2", expectedOldSessionId: "aily_old" }, { now: NOW });
+      assert.equal(r4.ok, false, "④ 无 pending 拒：" + JSON.stringify(r4));
+      assert.equal(r4.reason, "select_rebind_legacy_unsupported", "④ " + r4.reason);
     } finally { fs.rmSync(local, { recursive: true, force: true }); }
   });
 

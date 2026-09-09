@@ -98,7 +98,10 @@ export function selectClaudeLegacyUpdate(u, { now = Date.now() } = {}) {
       : { ok: false, reason: "select_rebind_legacy_unsupported", why: "所选 B3 的项目没有 pending 新代际（无 W2 继承），shadow 期换绑拒" };
   }
   if (u.action === "rebind" && (idy.activeRootOm ?? null) !== (u.rootOm ?? null)) {
-    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "active 代际 root（" + (idy.activeRootOm ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+    return { ok: false, reason: "select_rebind_legacy_root_mismatch", why: "active 代际 root（" + (idy.activeRootOm ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+  }
+  if (u.action === "rebind" && (idy.activeSessionId ?? null) !== (u.expectedOldSessionId ?? null)) {
+    return { ok: false, reason: "select_rebind_legacy_session_mismatch", why: "active 代际 session（" + (idy.activeSessionId ?? "null") + "）与所选 B3 的 expectedOldSessionId（" + (u.expectedOldSessionId ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
   }
   const generationId = u.action === "activate" ? u.lineageId : idy.generationId;
   return promoteBinding({ root: u.projectRoot, generationId, operationId: idy.operationId, sessionId: u.eventSessionId, now });

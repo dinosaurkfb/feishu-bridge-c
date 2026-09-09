@@ -89,7 +89,10 @@ export function selectLegacyUpdate(u, { task, home = bridgeHome(), now = Date.no
   if (u.action === "rebind") {
     const active = activeGeneration(loaded.state);
     if ((active?.root_message_id ?? null) !== (u.rootOm ?? null)) {
-      return { ok: false, reason: "select_rebind_legacy_unsupported", why: "active 代际 root（" + (active?.root_message_id ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+      return { ok: false, reason: "select_rebind_legacy_root_mismatch", why: "active 代际 root（" + (active?.root_message_id ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+    }
+    if ((active?.session_id ?? null) !== (u.expectedOldSessionId ?? null)) {
+      return { ok: false, reason: "select_rebind_legacy_session_mismatch", why: "active 代际 session（" + (active?.session_id ?? "null") + "）与所选 B3 的 expectedOldSessionId（" + (u.expectedOldSessionId ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
     }
   }
   const generationId = u.action === "activate" ? u.lineageId : pending.channel_generation_id;

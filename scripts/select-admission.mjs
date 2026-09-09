@@ -205,7 +205,7 @@ export function executeSelectControl(intent, {
   selectAdmissionFn = selectAdmission,
   consumeReaffirm = consumeReaffirmIntent,
   senderId = null, chatId = null, endpointId = null, messageId = null,
-  eventSessionId = null, eventRootOm = null,
+  eventSessionId = null,
   mappingUpdate = null,
   now = undefined, clock = () => Date.now(), env = process.env, _inject = undefined,
   claimsDir = undefined, key = undefined,
@@ -303,9 +303,12 @@ export function executeSelectControl(intent, {
     : null;
   let w;
   if (action === "activate") {
-    w = wireSelectActivate({ endpointId, env, legacy, messageId, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
+    // R57d 返修一 P1-5（§12 ⑤）：root = 命中 B1 的 aliases.root_om（selected_root_om 与之 CAS）；
+    //   session = 受验入站事件 session。不收 transport 根（eventRootOm 已删，不声称验过 thread_root）。
+    w = wireSelectActivate({ endpointId, env, legacy, messageId, b1Id: res.target_id, chatId, eventSessionId, authorizedBy: senderId, selectedRootOm: target.aliases.root_om, selectionHandle: handle ?? target.selection_handle, selectionBasis: res.selection_basis, clock });
   } else if (action === "anchor") {
-    w = wireSelectAnchor({ endpointId, env, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: target.aliases.session_id, selectedRootOm: eventRootOm, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
+    // P1-5：root = A2 的 anchor_candidate；session = 事件 session（不再自填目标旧 session——那会让 CAS 变得恒真）
+    w = wireSelectAnchor({ endpointId, env, messageId, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
     w = wireSelectRebind({ endpointId, env, legacy, messageId, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }

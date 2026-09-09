@@ -610,12 +610,13 @@ const runSelect = (replay) => {
     // R57b/R57d：三支真执行器——事件事实按 §8.1 消费侧核验传入（sender/endpoint/chat/session/根 om）。
     execute: () => executeSelectControl(control, {
       selectAdmissionFn,
+      // R57b/R57d：三支真执行器——事件事实按 §8.1 消费侧核验传入（sender/endpoint/chat/session；
+      // R57d 返修一 P1-5：root 改由命中记录现场供给，不再传 mapping 的 transport 根）。
       senderId: event.sender_id ?? null,
       chatId: template.template?.chat_id ?? null,
       endpointId: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
       messageId: verdict.messageId,
       eventSessionId: event.session_id ?? null,
-      eventRootOm: routed.mapping?.feishu_root_message_id_reference ?? null,
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: paths.claims,

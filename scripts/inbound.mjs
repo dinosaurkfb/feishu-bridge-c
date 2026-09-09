@@ -749,13 +749,13 @@ const runSelect = (replay) => {
       selectAdmissionFn,
       // R57b/R57d §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；
       // chat=链路模板登记群（账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；
-      // messageId=本条命令消息；eventSessionId/eventRootOm=R57d osh/orh 执行支的选择五元输入。
+      // messageId=本条命令消息；eventSessionId=选择五元的 session 输入（R57d 返修一 P1-5：root 改由
+      // 命中记录现场供给，不再传 mapping 的 transport 根 eventRootOm）。
       senderId: event.sender_id ?? null,
       chatId: bootTpl.template?.chat_id ?? null,
       endpointId: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
       messageId: verdict.messageId,
       eventSessionId: event.session_id ?? null,
-      eventRootOm: mapping.feishu_root_message_id_reference ?? null, // routed mapping 的根 om 引用字段（root_message_id 不在映射上）
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: CLAIMS,

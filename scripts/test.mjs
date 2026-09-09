@@ -45757,7 +45757,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "r57d seed", started_at: at, updated_at: at, phase: "done", steps: [...steps, { id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null }, ledgerStep], notes: [] }), { mode: 0o600 });
     assert.equal(endpointReceipt(maintDir, ep).state, "ok", "seed 出的 ledger_init 收据应判 ok");
   };
-  const ctxD = (over = {}) => ({ selectAdmissionFn: () => ({ state: "on" }), senderId: "ou_owner57d", chatId: CHAT_D, endpointId: EP57D, messageId: "om_msgd1", eventSessionId: SESSION_D, eventRootOm: ROOT_D, env: process.env, ...over });
+  const ctxD = (over = {}) => ({ selectAdmissionFn: () => ({ state: "on" }), senderId: "ou_owner57d", chatId: CHAT_D, endpointId: EP57D, messageId: "om_msgd1", eventSessionId: SESSION_D, env: process.env, ...over });
   const mappingStub = (calls) => (ctx) => { calls.push(ctx); return { ok: true, legacyCommitted: true }; };
 
   test("R57d 返修一 P1-1（wiring 层）：wireSelect* 按 authority_mode 分派——shadow 复合双写（outer 锁 + legacy 回调；anchor 为显式 no-op）、busy 整笔拒不直写、authoritative ledger-only 不碰 legacy", () => withLedgerD((root, dir, ids) => {
@@ -45836,14 +45836,15 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(calls[0].eventSessionId, SESSION_D, "② 回调带事件会话");
     const rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id];
     assert.equal(rec.binding_proof.kind, "owner_select_v1", "② 账本双证落账");
-    // ③ anchor 免注入（legacy 显式 no-op）——成功
-    r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD());
+    // ③ anchor 免注入（legacy 显式 no-op）——成功（事件 session 取 A2 现场，见 P1-5）
+    const a2rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
+    r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ eventSessionId: a2rec.aliases.session_id }));
     assert.equal(r.ok, true, "③ anchor 免 mappingUpdate：" + JSON.stringify(r));
     assert.equal(r.action, "anchor");
   }));
 
   test("R57d on+osh(B1)：真执行器 activate——双证落账、B1 handle 消费、成功文案、select_executor_absent 不再出现", () => withLedgerD((root, dir, ids) => {
-    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventRootOm: "om_b1root", mappingUpdate: mappingStub([]) }));
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]) }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.match(r.text, /已按你的选择完成绑定/u, "activate 文案：" + r.text);
     assert.equal(r.action, "activate");
@@ -45857,13 +45858,31 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   }));
 
   test("R57d on+osh(A2)：anchor——expected 三件取自命中记录；成功后 anchor_candidate 保留", () => withLedgerD((root, dir, ids) => {
-    const r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD());
+    const a2rec0 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
+    const r = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ eventSessionId: a2rec0.aliases.session_id }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.action, "anchor");
     assert.match(r.text, /已按你的选择完成锚定/u);
     const doc = TAL.loadLedger(dir, { endpointId: EP57D });
     assert.equal(doc.doc.records[ids.a2Id].locator_link_proof_ref.kind, "owner_selected_route_v1");
     assert.equal(doc.doc.records[ids.a2Id].anchor_candidate, ROOT_D, "anchor_candidate 保留");
+  }));
+
+  test("R57d 返修一 P1-5：root/session 来源——root=命中记录现场（B1.root_om / A2.anchor_candidate）、session=受验事件 session；不再收 transport 根", () => withLedgerD((root, dir, ids) => {
+    // ① 显式 osh 命中 B1：事件根不再传（eventRootOm 已删），B1 的根（om_b1root）≠ 旧 mapping 根（ROOT_D）→ 仍成功，
+    //    账本 selected_root_om === 该 B1 的根（反例：非当前 mapping 根的 B1 也能被选中）
+    assert.notEqual("om_b1root", ROOT_D, "夹具前提：B1 根 ≠ 旧 mapping 根");
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]) }));
+    assert.equal(r.ok, true, "① 成功：" + JSON.stringify(r));
+    const b3 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id];
+    assert.equal(b3.binding_proof.selected_root_om, "om_b1root", "① root = 命中 B1 的 aliases.root_om");
+    assert.equal(b3.binding_proof.selected_root_om, b3.aliases.root_om, "① 六字段等式（G11′）");
+    // ② anchor：root = A2.anchor_candidate；session = 受验入站事件 session（不再自填目标旧 session）
+    const r2 = SA.executeSelectControl({ control: "select", handle: ids.a2Handle, handle_kind: "osh" }, ctxD({ eventSessionId: SESSION_D + "-a2" }));
+    assert.equal(r2.ok, true, "② 成功：" + JSON.stringify(r2));
+    const a3 = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
+    assert.equal(a3.locator_link_proof_ref.selected_root_om, a3.anchor_candidate, "② root = anchor_candidate");
+    assert.equal(a3.locator_link_proof_ref.selected_session_id, SESSION_D + "-a2", "② session = 事件 session");
   }));
 
   test("R57d on+orh：rebind——A1 占位同笔归并、tombstoned_a1_id 非 null", () => withLedgerD((root, dir, ids) => {
@@ -45888,7 +45907,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.doesNotMatch(r.text, /osh_[0-9a-f]{4}/u, "不回 handle 值");
     // 砍到唯一：先 activate 掉 B1（旧形基线），A2 独苗 → anchor 成功
     talTmp(TAL.activate({ endpointId: EP57D, requestKey: "r57d_act2", b1Id: ids.b1Id, a1Id: ids.a1Id, f4: { matched_om: "om_b1root", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }));
-    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD());
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: SESSION_D + "-a2" }));
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.action, "anchor", "省略按唯一候选的族决定");
     // 过期：A2 的 handle 到期改到过去（手术前先把账本拿稳）

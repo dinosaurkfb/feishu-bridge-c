@@ -116,6 +116,9 @@ import {
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
 import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
 import { FORWARD_RESULT_SCHEMA, FORWARD_STARTED_SCHEMA, forwardResultProblem as FORWARD_RESULT_PROBLEM, forwardStartedProblem as FORWARD_STARTED_PROBLEM, resultLineProblem as RESULT_LINE_PROBLEM } from "./forward-runner.mjs";
+// R57d 对齐：inbound.mjs 顶层无副作用（只有路径常量），一次导入全文件共用 ——
+// 取代用例内的 await import（async 用例注册器不 await，断言从不计数，见该用例的刀证）。
+const INBOUND_MOD = await import("./inbound.mjs");
 import { readProcessStartTime, parseAuxvClkTck } from "./process-start-time.mjs";
 import { extractReply } from "./stop-hook.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
@@ -46124,8 +46127,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
   }));
 
-  test("R57d 返修三 P1-1：shadow rebind 的 W2 复合——claude selectClaudeLegacyUpdate（root+session 都相符 → promoteBinding 双写；root / session 任一不符、无 pending → 结构化拒）", async () => {
-    const R = await import("./inbound.mjs");
+  test("R57d 返修三 P1-1：shadow rebind 的 W2 复合——claude selectClaudeLegacyUpdate（root+session 都相符 → promoteBinding 双写；root / session 任一不符、无 pending → 结构化拒）", () => {
+    const R = INBOUND_MOD;
     const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57d-w2-")));
     const NOW = Date.parse("2026-09-13T10:00:00.000Z");
     try {

@@ -186,7 +186,6 @@ function sealAndVerifyStep({ targetDir, readVerified, intended, residueAllowed =
 const campaignProj = (env) => { const a = readCampaignState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints: a.endpoints, endpoints_digest: a.endpoints_digest } }; };
 const writerProj = (env) => { const a = readWriterState(env); return { ok: a.state !== "unreadable", projection: a.state === "unreadable" ? {} : { exists: a.exists, sha256: a.sha256, state: a.state, campaign_id: a.campaign_id, endpoints_digest: a.endpoints_digest, revision: a.revision } }; };
 const ledgerProj = (ep, dir) => { const a = loadLedger(dir, { endpointId: ep }); return { ok: a.ok, projection: a.ok ? { schema_version: a.doc.schema_version, revision: a.doc.revision, ledger_sha256: a.sha256 } : {} }; };
-const CAMPAIGN_ALLOWED = (n) => ENDPOINT_SHAPE.test(n) || n === "owner-select-campaign.json" || n === "owner-select-writer-state.json";
 const LEDGER_ALLOWED = (n) => n === "ledger.json" || n === "ledger.json.prev";
 
 /** P1-3（返修二 P1-1）：核**两条链**的已装 runtime 是否支持过渡（§8 进门前置）。
@@ -655,7 +654,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 返修三 测试注入点：写后读回前
         }
         // 返修三：B/direct 首次 clean 提交与恢复支统一 sealAndVerifyStep。
-        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -718,7 +717,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
-        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -745,7 +744,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
-        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: campaignAllowedFor(doc.steps.find((x) => x.kind === "campaign")?.intended_after.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const adm = readOwnerSelectAdmission(env);
         if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };
@@ -779,7 +778,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           copyBackup(path.join(ctx.dir, token + ".staged", "backup-campaign.json"), serializeLedger(rebuild.doc)); // seal/complete 步备份合同
         }
-        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -839,7 +838,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
-        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -867,7 +866,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
-        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(campaignPath(env)), readVerified: () => campaignProj(env), intended, residueAllowed: campaignAllowedFor(intended?.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
@@ -893,7 +892,7 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
           if (sc) return { ok: false, reason: sc.reason, why: sc.why ?? null, phase, commit: w?.commit ?? "not_committed" };
           if (typeof ctx.afterWrite === "function") ctx.afterWrite(st.id); // 测试注入点
         }
-        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: CAMPAIGN_ALLOWED, inject: _inject });
+        const s = sealAndVerifyStep({ targetDir: path.dirname(writerStatePath(env)), readVerified: () => writerProj(env), intended, residueAllowed: campaignAllowedFor(doc.steps.find((x) => x.kind === "campaign")?.intended_after.endpoints), inject: _inject });
         if (!s.ok) return { ok: false, reason: atIntended ? "recovery_seal_failed" : "written_mismatch", why: s.why, phase };
         const adm = readOwnerSelectAdmission(env);
         if (adm.state !== "on") return { ok: false, reason: "written_mismatch", why: "on 写后准入投影 ≠ on（" + adm.state + "）", phase };

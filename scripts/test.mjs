@@ -39379,6 +39379,20 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
       } finally { fx.cleanup(); }
     }
   });
+
+  test("R53 返修五 P1-5：退出码叶子 exitCodeFor——forward-only 相（含 osm_b_strictening/osm_direct）→ 3，drained（rollback-safe）→ 1，ok → 0", () => {
+    assert.equal(MOS.exitCodeFor({ ok: true }), 0, "ok → 0");
+    for (const ph of ["osm_a_upgrading", "osm_b_strictening", "osm_direct", "ledger_reopening", "reopening_incomplete"]) {
+      assert.equal(MOS.exitCodeFor({ ok: false, phase: ph }), 3, ph + " → 3（forward-only 卡住实际已动现场）");
+    }
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "drained" }), 1, "drained → 1（rollback-safe 未动现场）");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "drained", reason: "precheck_failed" }), 1, "drained 预检失败 → 1（干净拒绝）");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "drained", rollback: { ok: true } }), 1, "drained 回退清干净 → 1");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "osm_b_strictening", reason: "osm_forward_failed" }), 3, "osm_forward_failed → 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: null, reason: "reopening_incomplete" }), 3, "reopening_incomplete reason → 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, leaseRelease: { path: "/p" } }), 3, "lease 交不还 → 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "drained", reason: "startup_source_unverified" }), 1, "startup_source_unverified → 1");
+  });
 }
 // ─────────── R54：转发结果落盘 + 回执措辞 + doctor 体检（issue #140） ───────────
 

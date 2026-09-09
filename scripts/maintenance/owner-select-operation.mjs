@@ -40,7 +40,8 @@ const OSM_KIND_TO_REASON = Object.freeze({ a: "old→transition + mint + writer 
 const OSM_KIND_TO_PHASE = Object.freeze({ a: "osm_a_upgrading", b: "osm_b_strictening", direct: "osm_direct" });
 const PHASE_TO_KIND = Object.freeze({ osm_a_upgrading: "a", osm_b_strictening: "b", osm_direct: "direct" });
 /** forward-only 的 osm 段 + 复用 ledger 的重开族（journal.mjs 的 FORWARD_ONLY_PHASES 已含全部）。 */
-const OSM_FORWARD_PHASES = Object.freeze(["osm_a_upgrading", "osm_b_strictening", "osm_direct", "ledger_reopening", "reopening_incomplete"]);
+import { OSM_FORWARD_PHASES } from "./exit-code.mjs";
+export { OSM_FORWARD_PHASES };
 
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };

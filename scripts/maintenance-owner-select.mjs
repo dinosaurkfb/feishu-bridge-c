@@ -19,6 +19,8 @@ import { campaignIdFor, readCampaignState, readOwnerSelectAdmission, readWriterS
 import { osmEnter, osmExit } from "./maintenance/owner-select-operation.mjs";
 import { loadLedger, migrationInventory, resolveEndpointDir } from "./topic-agent-ledger.mjs";
 import { aggregateEndpointReceipts, endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+import { exitCodeFor } from "./maintenance/exit-code.mjs";
+export { exitCodeFor };
 
 /** 参数封闭：--status 不带别的；--migrate-a 可选 --wait-ms / --apply；每 flag 至多一次。 */
 export function parseMaintenanceOwnerSelectArgs(argv) {
@@ -92,17 +94,7 @@ const releaseRows = (r) => {
   return rows;
 };
 
-const OSM_FORWARD_PHASES = ["drained", "osm_a_upgrading", "ledger_reopening"];
 
-export function exitCodeFor(r) {
-  if (r.leaseRelease ?? r.surfaceRelease ?? null) return 3;
-  if (r.ok) return 0;
-  if (r.rollback && r.rollback.ok === true) return 1;
-  if (r.rollback && r.rollback.ok === false) return 3;
-  if (r.reason === "osm_forward_failed" || r.reason === "osm_rollback_failed") return 3;
-  if (OSM_FORWARD_PHASES.includes(r.phase) || r.phase === "reopening_incomplete" || r.reason === "reopening_incomplete" || r.phase === "rollback_incomplete") return 3;
-  return 1;
-}
 
 export function runMaintenanceOwnerSelect(argv, { ctx = null, out = (s) => process.stdout.write(s + "\n"), env = process.env } = {}) {
   const parsed = parseMaintenanceOwnerSelectArgs(argv);

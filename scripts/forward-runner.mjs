@@ -256,13 +256,22 @@ function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expect
  * 未给 outboxDir 的调用方（旧 spec / 不想测回执的路径）跳过，由 doctor ⑯ 点名回执缺失。
  * 幂等靠回执原语里的 O_EXCL；写不成记一行 stderr.log，绝不抛（runner 纪律）。
  */
+/** 失败类别（P1-4）：结果投影 → 封闭四类之一。reason_first_line 只留在本地 result，不进回执正文。 */
+function failureCategory(doc) {
+  if (doc.sent === true) return null;
+  if (doc.reason_first_line === "claude_not_found") return "spawn_failed";
+  if (doc.is_error === true) return "session_error";
+  if (doc.exit_code !== null && doc.exit_code !== 0) return "exit_nonzero";
+  return "unknown";
+}
+
 function writeFailureReceipt({ spec, doc, errPath }) {
   if (doc.sent === true) return; // 成功不写；失败 = is_error / 非零退出 / 崩溃 / 起不来（sent 必为 false）
   if (typeof spec.outboxDir !== "string" || spec.outboxDir.length === 0) return;
   const r = appendForwardFailureReceipt({
     outboxDir: spec.outboxDir,
     forwardKey: spec.key,
-    reasonFirstLine: doc.reason_first_line,
+    category: failureCategory(doc),
     messageId: spec.messageId ?? null,
     targetGenerationId: spec.originGenerationId ?? null,
   });

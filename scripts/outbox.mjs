@@ -133,20 +133,20 @@ export function appendEvent({
   return { ok: true, id, file };
 }
 
-/**
- * 转发失败回执的正文（R58，issue #140 后半）：
- * 「转发失败：<原因首行>；本条未送达，请重发或在终端查看 doctor ⑯」。
- *
- * 「首行」在这里兑底（不信任调用方已切好）：先取第一行；再控制字符
- * （C0/DEL/C1）剥成空格；限 200 码点截断 —— Array.from 按码点切，
- * 增补平面字符（如 emoji）不许被从代理对中间劈开。
- * 净化后为空就说「原因不明」，不产出空正文（appendEvent 的 empty_text 纪律同源）。
+/** 转发失败回执的正文（R58 P1-4）：Frank 授权的是「失败回执」这一类，不是自动外发任意模型输出——正文只从
+ * 封闭失败类别生成固定文案。**原始 reason_first_line 一个字都不进正文**（只留本地 result / doctor）。
+ * 返回固定文案；传入类别不在四枚举里 → 拒（返回 null，不产出正文）。
  */
-export function forwardFailureText(reasonFirstLine) {
-  const firstLine = String(reasonFirstLine ?? "").split("\n", 1)[0];
-  const clean = Array.from(firstLine.replace(/\p{Cc}/gu, " ").trim())
-    .slice(0, 200).join("").trim();
-  return "转发失败：" + (clean || "原因不明") + "；本条未送达，请重发或在终端查看 doctor ⑯";
+export const FORWARD_FAILURE_CATEGORIES = Object.freeze(["session_error", "exit_nonzero", "spawn_failed", "unknown"]);
+export const FORWARD_FAILURE_TEXT = Object.freeze({
+  session_error: "转发失败：会话执行报错；本条未送达，请重发或在终端查看 doctor ⑯",
+  exit_nonzero: "转发失败：转发进程异常退出；本条未送达，请重发或在终端查看 doctor ⑯",
+  spawn_failed: "转发失败：转发进程无法启动；本条未送达，请重发或在终端查看 doctor ⑯",
+  unknown: "转发失败：原因见终端 doctor ⑯；本条未送达，请重发或在终端查看 doctor ⑯",
+});
+export function forwardFailureText(category) {
+  if (!FORWARD_FAILURE_CATEGORIES.includes(category)) return null;
+  return FORWARD_FAILURE_TEXT[category];
 }
 
 /** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
@@ -164,12 +164,14 @@ export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
  * 维护门同 appendEvent：门在或读不出 → 不写（调用方按「没记下」如实说）。
  */
 export function appendForwardFailureReceipt({
-  outboxDir, forwardKey, reasonFirstLine, messageId, targetGenerationId,
+  outboxDir, forwardKey, category, messageId, targetGenerationId,
   source = "forward-runner",
 }) {
   if (typeof outboxDir !== "string" || outboxDir.length === 0) return { ok: false, reason: "outbox_dir_missing" };
   if (typeof forwardKey !== "string" || !/^[0-9a-f]{64}$/u.test(forwardKey)) return { ok: false, reason: "key_shape" };
-  const text = forwardFailureText(reasonFirstLine);
+  // P1-4：正文封闭 —— 类别必须合法，reasonFirstLine 一个字不进正文。
+  const text = forwardFailureText(category);
+  if (text === null) return { ok: false, reason: "unknown_failure_category", why: "未知失败类别（不接受任意模型输出进正文）" };
   { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
   const createdAt = new Date().toISOString();
   const record = {

@@ -486,7 +486,9 @@
       "writePublishLedger"
     ],
     "outbox.mjs": [
+      "FORWARD_FAILURE_CATEGORIES",
       "FORWARD_FAILURE_RECEIPT_SUFFIX",
+      "FORWARD_FAILURE_TEXT",
       "KINDS",
       "KIND_LABEL",
       "MAX_AUTO_PUBLISH_ATTEMPTS",

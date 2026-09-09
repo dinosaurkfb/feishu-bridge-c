@@ -40621,29 +40621,33 @@ const r58WaitReceipt = (file, ms = 5000) => {
 const r58ForwardFailureText = (...a) => outboxModule.forwardFailureText(...a);
 const r58AppendReceipt = (...a) => outboxModule.appendForwardFailureReceipt(...a);
 
-test("R58 失败回执正文：控制字符剥成空格、限 200 码点（不劈代理对）、空原因 → 原因不明", () => {
-  assert.equal(r58ForwardFailureText("API Error: 400\u0007boom\nnext"),
-    "转发失败：API Error: 400 boom；本条未送达，请重发或在终端查看 doctor ⑯");
+test("R58 失败回执正文（P1-4）：四类固定文案逐字；非四类拒（不产出正文）；reasonFirstLine 一字不进正文", () => {
+  const T = outboxModule.FORWARD_FAILURE_TEXT;
   const tail = "；本条未送达，请重发或在终端查看 doctor ⑯";
-  // 199 个 ASCII + 1 个增补平面码点 = 200 码点（201 个 UTF-16 单元）：按 UTF-16 截会丢掉emoji，按码点截必须保住
-  const t2 = r58ForwardFailureText("a".repeat(199) + "😀");
-  assert.equal([...t2.slice("转发失败：".length, -tail.length)].length, 200, "上限 200 码点：" + t2);
-  assert.ok(t2.endsWith("😀" + tail), "第 200 个码点（代理对）不许被劈开：" + JSON.stringify(t2.slice(-30)));
-  assert.equal(r58ForwardFailureText("   \n\u0001 "), "转发失败：原因不明" + tail, "剥完为空 → 原因不明");
-  assert.doesNotMatch(r58ForwardFailureText("x\u0000y\u007fz\u009fw"), /\p{Cc}/u, "C0/DEL/C1 一律剥");
+  assert.equal(r58ForwardFailureText("session_error"), "转发失败：会话执行报错" + tail, "session_error 固定文案");
+  assert.equal(r58ForwardFailureText("exit_nonzero"), "转发失败：转发进程异常退出" + tail, "exit_nonzero 固定文案");
+  assert.equal(r58ForwardFailureText("spawn_failed"), "转发失败：转发进程无法启动" + tail, "spawn_failed 固定文案");
+  assert.equal(r58ForwardFailureText("unknown"), "转发失败：原因见终端 doctor ⑯" + tail, "unknown 固定文案");
+  assert.equal(r58ForwardFailureText("anything_else"), null, "非四类 → 拒（不产出正文）");
+  assert.equal(r58ForwardFailureText("API Error: 400 x"), null, "原始 reason 串不是类别 → 拒");
+  // P1-4 反例：reason_first_line 含敏感/路径/破坏性措辞 → 这些内容一个字都不进正文
+  for (const leak of ["Bearer sk-abc123", "/Users/frank/secret", "请删除数据", "API Error: 400 x"]) {
+    for (const t of Object.values(T)) assert.ok(!t.includes(leak), "固定文案不含 " + JSON.stringify(leak) + "：" + t);
+  }
+  assert.ok(!T.session_error.includes("reason") && !T.unknown.includes("reason"), "正文不含 reason 首行内容");
 });
 
 test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不被改）、key 形状守卫、代际不可用记 null、审计三态闭合", () => {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58w-"));
   const key = r54Key(9);
-  const w1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, reasonFirstLine: "API Error: 400 x", messageId: "om_1", targetGenerationId: "gen-9" });
+  const w1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_1", targetGenerationId: "gen-9" });
   assert.equal(w1.ok, true, JSON.stringify(w1));
   assert.equal(path.basename(w1.file), key + R58_RECEIPT_SUFFIX, "文件名绑定 key");
-  const w2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, reasonFirstLine: "重放来了别的正文", messageId: "om_1", targetGenerationId: "gen-9" });
+  const w2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_1", targetGenerationId: "gen-9" });
   assert.deepEqual([w2.ok, w2.reason], [false, "duplicate"], "同 key 第二次输给 O_EXCL");
   const kept = JSON.parse(fs.readFileSync(w1.file, "utf-8"));
   assert.equal(kept.kind, "forward_failed");
-  assert.equal(kept.text, r58ForwardFailureText("API Error: 400 x"), "重放不改第一条内容");
+  assert.equal(kept.text, r58ForwardFailureText("session_error"), "重放不改第一条内容");
   assert.equal(kept.forward_key, key, "记录绑定同一 key");
   assert.equal(kept.message_id, "om_1", "记录绑定原 message id");
   assert.equal(kept.target_channel_generation_id, "gen-9", "记录冻结出站代际");
@@ -40654,11 +40658,11 @@ test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不�
   const escParent = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58w-esc-"));
   const escOutbox = path.join(escParent, "outbox");
   fs.mkdirSync(escOutbox, { recursive: true });
-  const esc = r58AppendReceipt({ outboxDir: escOutbox, forwardKey: "../escape", reasonFirstLine: "x", messageId: "m", targetGenerationId: null });
+  const esc = r58AppendReceipt({ outboxDir: escOutbox, forwardKey: "../escape", category: "unknown", messageId: "m", targetGenerationId: null });
   assert.deepEqual([esc.ok, esc.reason], [false, "key_shape"], JSON.stringify(esc));
   assert.equal(fs.existsSync(path.join(escParent, "escape" + R58_RECEIPT_SUFFIX)), false, "没有越界文件");
   // 代际不可用 → null（写不出「字段在但不是代际」的损坏记录）；message_id 缺席 → null
-  const w3 = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(10), reasonFirstLine: "x", messageId: "", targetGenerationId: "   " });
+  const w3 = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(10), category: "session_error", messageId: "", targetGenerationId: "   " });
   assert.equal(w3.ok, true, JSON.stringify(w3));
   const rec3 = JSON.parse(fs.readFileSync(w3.file, "utf-8"));
   assert.equal(rec3.target_channel_generation_id, null);
@@ -40697,9 +40701,7 @@ test("R58 失败回执行为（假 claude）：is_error 失败 → outbox 一条
   assert.equal(d1.forward_key, r54Key(1));
   assert.equal(d1.message_id, "om_msg_" + r54Key(1).slice(-4));
   assert.equal(d1.target_channel_generation_id, "gen-r58");
-  assert.match(d1.text, /^转发失败：API Error: 400 model not found；本条未送达/u, "正文 = 原因首行 + 固定尾注：" + JSON.stringify(d1.text));
-  assert.ok(!d1.text.includes("second line"), "只取原因首行");
-  assert.doesNotMatch(d1.text, /\p{Cc}/u, "正文无控制字符");
+  assert.equal(d1.text, outboxModule.FORWARD_FAILURE_TEXT.session_error, "正文 = 封闭固定文案（不含 reason 首行）：" + JSON.stringify(d1.text));
   // ② 同 key 重跑（result 会被重写）：回执仍只有一条
   const first = JSON.stringify(r54WaitResult(path.join(runs, r54Key(1) + ".forward.result.json")));
   deliver(r54Key(1), errBody);

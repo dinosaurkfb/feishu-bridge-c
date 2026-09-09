@@ -614,6 +614,9 @@ const runSelect = (replay) => {
       endpointId: template.template?.agent_uid ? legacyEndpointId({ runtime: "codex", agentUid: template.template.agent_uid }) : null,
       messageId: verdict.messageId,
       env: process.env,
+      // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
+      claimsDir: paths.claims,
+      key: claim.key,
     }),
   });
   const lockNote = tx.lockUncleared ? "；另外这一笔的事务锁没有交还（" + tx.lockUncleared + "），之后同一笔会报 control_busy，请人工确认后处理" : "";

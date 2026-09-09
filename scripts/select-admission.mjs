@@ -154,6 +154,7 @@ export function executeSelectControl(intent, {
   consumeReaffirm = consumeReaffirmIntent,
   senderId = null, chatId = null, endpointId = null, messageId = null,
   now = Date.now(), env = process.env, _inject = undefined,
+  claimsDir = undefined, key = undefined,
 } = {}) {
   const adm = selectAdmissionFn(env);
   const ej = selectReject(adm, intent?.handle_kind);
@@ -164,7 +165,7 @@ export function executeSelectControl(intent, {
   if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
     return { ok: false, reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
   }
-  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env, _inject });
+  const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env, _inject, claimsDir, key });
   if (res.status === "control-committed-unclean") {
     return {
       ok: false,

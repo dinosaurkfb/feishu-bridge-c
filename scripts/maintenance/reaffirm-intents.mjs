@@ -33,6 +33,7 @@ import {
   ownerSelectReaffirmClosureDigest, ownerSelectReaffirm,
 } from "../topic-agent-ledger.mjs";
 import { classifySelectOutcome } from "../select-outcome.mjs";
+import { writeSelectionPlan } from "../selection-plan.mjs";
 
 export const REAFFIRM_INTENTS_FILE = "reaffirm-intents.json";
 export const REAFFIRM_INTENTS_LOCK = "reaffirm-intents.lock";
@@ -372,7 +373,8 @@ export function issueReaffirmIntentInner({ endpointId, targetId, authorizedOwner
  * 内层函数持 outer 的受验 capability。
  * admission === partial 在 outer + intent 锁内重核。
  */
-export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject, claimsDir = undefined, key = undefined } = {}) {
+  const innerArgs = { endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability: undefined, _inject, claimsDir, key };
   if (!outerCapability) {
     const acq = acquireOrderLock(endpointId, env);
     if (!acq.ok) return { ok: false, status: "failed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, gate: acq.gate ?? null, text: acq.text ?? null };
@@ -380,7 +382,7 @@ export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chat
     let outerRel;
     try {
       const cap = Object.freeze({ kind: "m1a_order_lock", token: acq.token, endpointId });
-      innerRes = consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability: cap, _inject });
+      innerRes = consumeReaffirmIntentInner({ ...innerArgs, outerCapability: cap });
     } finally {
       try {
         outerRel = acq.release();
@@ -404,7 +406,7 @@ export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chat
       locks,
     };
   }
-  const innerRes = consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn, now, clock, env, outerCapability, _inject });
+  const innerRes = consumeReaffirmIntentInner({ ...innerArgs, outerCapability });
   const locks = {
     outer: "released",
     intent: innerRes?.lock_state ?? "released",
@@ -421,7 +423,7 @@ export function consumeReaffirmIntent({ endpointId, reaffirmHandle, sender, chat
   };
 }
 
-export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject } = {}) {
+export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender, chatId, selectionMessageId, selectAdmissionFn = undefined, now = undefined, clock = () => Date.now(), env = process.env, outerCapability = undefined, _inject, claimsDir = undefined, key = undefined } = {}) {
   const vCap = verifyOrderLockCapability(endpointId, outerCapability, env);
   if (!vCap.ok) return { ok: false, status: "failed", reason: vCap.reason ?? "outer_lock_required", why: vCap.why ?? "outer 未持有" };
 
@@ -450,6 +452,21 @@ export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender,
     if (!L.ok) return { ok: false, status: "failed", reason: L.reason === "ledger_corrupt" ? "ledger_corrupt" : "ledger_unreadable", why: L.why ?? L.reason ?? null };
     const rec = L.doc.records[entry.target_id];
     if (!rec || rec.kind !== "live") return { ok: false, status: "failed", reason: "reaffirm_target_missing" };
+    // R57b 返修五：rfh 支在账本提交前原子持久化 selection plan（两链同一份代码，真实 claim 写方）。
+    //   plan = { action:"reaffirm", target_id, basis:"reaffirm", handle:reaffirmHandle, kind:"rfh", cas:{intent_id, expected_expires_at} }。
+    //   claimsDir+key 由调用方（executeSelectControl → inbound/codex-inbound）传入；写失败 → fail-closed，不进账本提交。
+    if (typeof claimsDir === "string" && claimsDir.length > 0 && typeof key === "string" && key.length > 0) {
+      const plan = {
+        action: "reaffirm",
+        target_id: entry.target_id,
+        basis: "reaffirm",
+        handle: reaffirmHandle,
+        kind: "rfh",
+        cas: { intent_id: reaffirmHandle, expected_expires_at: entry.expires_at },
+      };
+      const wp = writeSelectionPlan({ claimsDir, key, plan, _inject });
+      if (!wp.ok) return { ok: false, status: "failed", reason: "selection_plan_write_failed", why: (wp.why ?? wp.reason ?? "selection plan 写失败，不进账本提交"), plan_write: wp };
+    }
     const res = ownerSelectReaffirm({
       endpointId, targetId: entry.target_id, targetFamily: entry.target_family,
       expectedOldProofClosureDigest: entry.expected_old_proof_closure_digest,

@@ -40691,7 +40691,7 @@ test("R58 失败回执行为（假 claude）：is_error 失败 → outbox 一条
     fs.writeFileSync(path.join(bin, "claude"), r54Shim(null, claudeBody), { mode: 0o700 });
     return deliverToLiveSession({
       target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
-      instruction: "帮我改一下代码", messageId: "om_msg_" + key.slice(-4), createdAtMs: Date.now(),
+      instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
       projectRoot: proj, runsDir: runs, key,
       outboxDir: outbox, originGenerationId: "gen-r58",
       env: { PATH: bin + path.delimiter + process.env.PATH },
@@ -40705,7 +40705,7 @@ test("R58 失败回执行为（假 claude）：is_error 失败 → outbox 一条
   assert.ok(d1, "失败后 outbox 出现一条 forward_failed 回执");
   assert.equal(d1.kind, "forward_failed");
   assert.equal(d1.forward_key, r54Key(1));
-  assert.equal(d1.message_id, "om_msg_" + r54Key(1).slice(-4));
+  assert.equal(d1.message_id, "om_msg" + r54Key(1).slice(-4));
   assert.equal(d1.target_channel_generation_id, "gen-r58");
   assert.equal(d1.text, outboxModule.FORWARD_FAILURE_TEXT.session_error, "正文 = 封闭固定文案（不含 reason 首行）：" + JSON.stringify(d1.text));
   // ② 同 key 重跑（result 会被重写）：回执仍只有一条
@@ -40756,6 +40756,40 @@ test("R58 发布器 dry-run：forward_failed 走既有出站发布器按回执�
   assert.ok(card, "dry-run 出卡片");
   assert.match(JSON.stringify(card), /转发失败/u, "卡片正文含回执");
   assert.equal(listPending({ outboxDir: outbox }).length, 1, "dry-run 零改盘");
+});
+
+test("R58 返修一 P1-2：forward_failed 封闭校验器五处共用——伪造最小记录 / forward_key 与文件名不符 → audit unexplainable、发布 dry-run count=0", () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58p12-"));
+  const inbound = path.join(dir, ".runtime-data", "inbound");
+  const outbox = path.join(dir, ".runtime-data", "outbound", "outbox");
+  fs.mkdirSync(inbound, { recursive: true }); fs.mkdirSync(outbox, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({ task_display_name: "R58T", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({ status: "active", feishu_root_message_id_reference: "om_x", channel_generation_id: "gen-1" }));
+  const createdAt = new Date().toISOString();
+  // ① 伪造只含最小字段的记录 → audit unexplainable（整批 fail-closed）
+  fs.writeFileSync(path.join(outbox, r54Key(30) + R58_RECEIPT_SUFFIX), JSON.stringify({ forwarded: true, published_at: null }));
+  const audit1 = auditOutbox(outbox);
+  assert.ok(audit1.unexplainable.some((u) => u.file === r54Key(30) + R58_RECEIPT_SUFFIX), "伪造最小记录 → unexplainable：" + JSON.stringify(audit1.unexplainable));
+  const d1 = drainProject({ root: dir, dryRun: true });
+  assert.equal(d1.reason, "outbox_unexplainable", "发布 dry-run 整批 fail-closed：" + JSON.stringify(d1));
+  assert.equal(d1.runs?.published?.length ?? 0, 0, "伪造记录不进入发布队列");
+  fs.rmSync(path.join(outbox, r54Key(30) + R58_RECEIPT_SUFFIX), { force: true });
+  // ② 篡改 forward_key 与文件名不符 → 拒（unexplainable），发布 dry-run 不挑它
+  const goodRec = { schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal", id: "forward-failed-" + r54Key(31), kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.unknown, event_key: "forward-failed:" + r54Key(31), source: "forward-runner", input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null, forward_key: "0".repeat(63) + "f", message_id: "om_m1", created_at: createdAt, publish_eligible_at: createdAt, published_at: null };
+  fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(goodRec));
+  const audit2 = auditOutbox(outbox);
+  assert.ok(audit2.unexplainable.some((u) => u.file === r54Key(31) + R58_RECEIPT_SUFFIX), "forward_key 与文件名不符 → unexplainable：" + JSON.stringify(audit2.unexplainable));
+  const d2 = drainProject({ root: dir, dryRun: true });
+  assert.equal(d2.reason, "outbox_unexplainable", "② 发布 dry-run 整批 fail-closed：" + JSON.stringify(d2));
+  assert.equal(d2.runs?.published?.length ?? 0, 0, "② 不挑它");
+  fs.rmSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), { force: true });
+  // ③ 合法完整记录（forward_key 与文件名一致）→ audit 不 unexplainable、发布 count=1
+  const good2 = { ...goodRec, forward_key: r54Key(31) };
+  fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(good2));
+  const audit3 = auditOutbox(outbox);
+  assert.ok(!audit3.unexplainable.some((u) => u.file === r54Key(31) + R58_RECEIPT_SUFFIX), "合法记录不 unexplainable");
+  const d3 = drainProject({ root: dir, dryRun: true });
+  assert.equal(d3.count, 1, "合法记录进入发布 dry-run：" + JSON.stringify(d3));
 });
 
 test("R58 doctor ⑯：失败但回执缺失 → 子计数点名 key；回执在项目级 / 会话级 outbox → 不点名；桶之和不变", () => {

@@ -149,6 +149,40 @@ export function forwardFailureText(category) {
   return FORWARD_FAILURE_TEXT[category];
 }
 
+/** 回执 message_id 形状（与既有 OM_SHAPE 同源），或 null。 */
+const OM_BUILTIN = /^om_[A-Za-z0-9]{1,120}$/u;
+/** 回执的封闭键集（P1-2，多一个键也拒）。result_sha256 在 P1-5 加入后由 P1-5 更新此表。 */
+const FORWARD_RECEIPT_KEYS = "artifact_type,classification,created_at,event_key,forward_key,id,input_origin,input_text,kind,message_id,publish_eligible_at,published_at,run_id,schema_version,source,target_channel_generation_id,text,zone";
+
+/**
+ * forward_failed 回执的**唯一**封闭校验器（P1-2）：写前自证、outbox 快照读取、auditOutbox、发布器挑选、
+ * doctor 五处共用。不合法 → 返回问题短句；合法 → null。
+ * @param {object} record
+ * @param {object} opts
+ * @param {string|null} opts.expectedKey  由文件名 <key>.forward-failed.outbox.json 传入（核 forward_key）
+ */
+export function forwardFailureReceiptProblem(record, { expectedKey = null } = {}) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return "不是记录对象";
+  if (Object.keys(record).sort().join(",") !== FORWARD_RECEIPT_KEYS) return "键集不对（多一个/少一个都拒）";
+  if (record.schema_version !== "1.0") return "schema_version 不是 1.0";
+  if (record.artifact_type !== "codex_feishu_bridge_event") return "artifact_type 不是 codex_feishu_bridge_event";
+  if (record.zone !== "work") return "zone 不是 work";
+  if (record.classification !== "internal") return "classification 不是 internal";
+  if (record.kind !== "forward_failed") return "kind 不是 forward_failed";
+  if (typeof record.forward_key !== "string" || !/^[0-9a-f]{64}$/u.test(record.forward_key)) return "forward_key 不是 64hex";
+  if (expectedKey !== null && record.forward_key !== expectedKey) return "forward_key 与文件名不符";
+  if (record.id !== "forward-failed-" + record.forward_key) return "id 不是 forward-failed-<key>";
+  if (record.event_key !== "forward-failed:" + record.forward_key) return "event_key 不是 forward-failed:<key>";
+  if (record.message_id !== null && (typeof record.message_id !== "string" || !OM_BUILTIN.test(record.message_id))) return "message_id 不是 om_ 形状或 null";
+  if (record.source !== "forward-runner") return "source 不是 forward-runner";
+  if (!usableGeneration(record.target_channel_generation_id)) return "target_channel_generation_id 缺失或不可用（不许 null）";
+  if (!Object.values(FORWARD_FAILURE_TEXT).includes(record.text)) return "text 不是固定文案";
+  if (record.created_at !== record.publish_eligible_at || !isCanonicalIso(record.created_at)) return "created_at !== publish_eligible_at 或非法时间（born eligible）";
+  if (record.published_at !== null && !isCanonicalIso(record.published_at)) return "published_at 不是 null 或规范时间";
+  if (record.input_origin !== null || record.input_text !== null || record.run_id !== null) return "input_origin/input_text/run_id 必须为 null";
+  return null;
+}
+
 /** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
 export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
 
@@ -196,6 +230,9 @@ export function appendForwardFailureReceipt({
     publish_eligible_at: createdAt,
     published_at: null,
   };
+  // 写前自证（P1-2）：不合法不落盘。
+  const ip = forwardFailureReceiptProblem(record, { expectedKey: forwardKey });
+  if (ip !== null) return { ok: false, reason: "receipt_invalid", why: ip };
   fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
   const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
   let fd = null;
@@ -843,6 +880,12 @@ export function readOutboxSnapshot(outboxDir) {
     const verdict = classifyOutboxRecord(rec);
     if (verdict.unclassified) { unclassified.push({ file: name, why: verdict.why }); continue; }
     const gaps = explainabilityGaps(rec);
+    // P1-2：forward_failed 回执用唯一封闭校验器（写前自证同一份）；不合法 → unexplainable（整批 fail-closed）。
+    if (rec?.kind === "forward_failed") {
+      const expectedKey = name.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX) ? name.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length) : null;
+      const rp = forwardFailureReceiptProblem(rec, { expectedKey });
+      if (rp !== null) gaps.push("forward_failed 回执不合法：" + rp);
+    }
     if (gaps.length > 0) {
       unexplainable.push({ file: name, why: "缺少解释这条记录所必需的字段：" + gaps.join("、") });
     }
@@ -893,6 +936,12 @@ export function auditOutbox(outboxDir) {
     // 这里要的不是"字段齐全"，而是**足以解释它**：是什么、什么时候、哪一类。
     // 真实历史记录（含升级前那批）这四样都有，收紧不会误伤。
     const missing = explainabilityGaps(rec);
+    // P1-2：forward_failed 回执用唯一封闭校验器（写前自证同一份）；不合法 → unexplainable。
+    if (rec.kind === "forward_failed") {
+      const expectedKey = f.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX) ? f.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length) : null;
+      const rp = forwardFailureReceiptProblem(rec, { expectedKey });
+      if (rp !== null) missing.push("forward_failed 回执不合法：" + rp);
+    }
     // **分开报，不并进 unclassified。**
     // "三态判不出来"和"这条记录解释不了"是两个问题：前者是不知道它处于
     // 什么状态，后者是知道状态但不知道它是什么。混成一个字段，读的人

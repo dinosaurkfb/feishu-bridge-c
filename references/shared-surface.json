@@ -501,6 +501,7 @@
       "codexReplyEventKey",
       "composeDigest",
       "explainabilityGaps",
+      "forwardFailureReceiptProblem",
       "forwardFailureText",
       "hasPublishAuthorization",
       "isPermanentlyRejected",

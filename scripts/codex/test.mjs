@@ -10268,6 +10268,7 @@ test("R57d 返修三 P1-1：codex selectLegacyUpdate——rebind W2 复合（roo
   const r5 = selectLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_session_new", expectedOldSessionId: "aily_old" }, { task: taskA, home });
   assert.equal(r5.ok, false, "⑤ 无 pending 拒：" + JSON.stringify(r5));
   assert.equal(r5.reason, "select_rebind_legacy_unsupported", "⑤ " + r5.reason);
+  assert.match(r5.why, /pending|代际/u, "⑤ why 点名无 pending：" + r5.why);
 });
 
 test("R52a 返修三 P1-1: Codex 真入口 $feishu-select 全路径（claim meta 按 kind 投影、readClaimState 绝不 unreadable、默认 off 拒并落 failed、重放幂等）", () => {

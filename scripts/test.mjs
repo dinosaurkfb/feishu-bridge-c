@@ -46166,6 +46166,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const r4 = R.selectClaudeLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_new2", expectedOldSessionId: "aily_old" }, { now: NOW });
       assert.equal(r4.ok, false, "④ 无 pending 拒：" + JSON.stringify(r4));
       assert.equal(r4.reason, "select_rebind_legacy_unsupported", "④ " + r4.reason);
+      assert.match(r4.why, /pending|代际/u, "④ why 点名无 pending：" + r4.why);
     } finally { fs.rmSync(local, { recursive: true, force: true }); }
   });
 

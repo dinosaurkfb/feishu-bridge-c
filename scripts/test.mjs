@@ -40866,6 +40866,23 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.match(String(v.why), /void reason=manual 但 expected 双键非全 null/, "why 点名 reason=manual 判别：" + v.why);
   }, { schema: "1.1" }));
 
+  test("R57a 补钉（Codex #144 六轮建议转常驻）：void 新形 result reason=expired 但 expected 双 null（伪造）→ validateLedger 拒", () => withLedger57((dir) => {
+    // 夹具：manual void（新形、expected 双 null 合法）→ 审计 reason 改 expired + fingerprint 按 expired+双 null 重算
+    //   —— 除判别联合外自洽，唯一违例就是「expired ⇔ 双非空」这条（否则验收时改成 if(false) 套件仍绿）。
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "f8_a1", chatId: "oc_f8", rootOm: "om_f8a", lineageId: "lin_f8", bindingTarget: TGT57(25), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id;
+    talOk(TAL.voidPending({ endpointId: EP57, requestKey: "f8_va", b1Id, reason: "manual", expectedHandle: null, expectedExpiresAt: null, clock: () => T0 }), "manual void（双 null 形）");
+    const doc = loadOk57(dir);
+    const voidKey = Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "void");
+    assert.deepEqual([doc.operations[voidKey].result.expected_handle, doc.operations[voidKey].result.expected_expires_at], [null, null], "夹具前提：result expected 双 null");
+    const d1 = structuredClone(doc);
+    d1.records[b1Id].reason = "expired";
+    d1.operations[voidKey].fingerprint = TAL.fingerprintOf("void", { request_key: "f8_va", b1_id: b1Id, reason: "expired", expected_handle: null, expected_expires_at: null });
+    const v = TAL.validateLedger(d1, { endpointId: EP57 });
+    assert.equal(v.ok, false, "reason=expired 但 expected 双 null（伪造）必拒");
+    assert.match(String(v.why), /void reason=expired 但 expected 双键非全非空/, "why 点名 reason=expired 判别：" + v.why);
+  }, { schema: "1.1" }));
+
 }
 
 

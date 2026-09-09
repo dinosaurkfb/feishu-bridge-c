@@ -42947,6 +42947,48 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(wC.reason, "selection_plan_conflict", "reason 为 selection_plan_conflict");
     assert.equal(fs.readdirSync(claimsDir).filter((n) => n.startsWith(SP.SELECTION_PLAN_TMP_PREFIX(keyC))).length, 0, "conflict 不留 tmp（窗口①）");
 
+    // ── R57b 返修十：Codex 十轮 1 P1 + 2 P2 ──
+
+    // P1：link 发布成功后最终受验读回盘点出精确 tmp 候选（residue）→ 保留 reason:residue + residue 数组 +
+    //     commit:committed_durability_uncertain（link 已成功事实不变），不折 readback_failed、不丢路径。
+    const keyP1 = "48" + "0".repeat(62);
+    const p1Plan = mkPlan({ claim_key: keyP1 });
+    const p1Residue = legalTmp(keyP1, U9);
+    const wP1 = SP.writeSelectionPlan({ claimsDir, key: keyP1, plan: p1Plan, _inject: { beforeReadback: () => {
+      fs.writeFileSync(p1Residue, JSON.stringify(mkPlan({ claim_key: keyP1, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wP1.ok, false, "P1 最终读回遇 residue → 非绿：" + JSON.stringify(wP1));
+    assert.equal(wP1.reason, "residue", "P1 reason 为 residue（不折 readback_failed）");
+    assert.ok(Array.isArray(wP1.residue) && wP1.residue.includes(p1Residue), "P1 residue 含路径：" + JSON.stringify(wP1.residue));
+    assert.equal(wP1.commit, "committed_durability_uncertain", "P1 commit 为 durability_uncertain（link 已成功事实不变）");
+    assert.equal(fs.existsSync(p1Residue), true, "P1 tmp 仍在（不自动清）");
+
+    // P2-1：final 缺席 + 唯一精确候选 → recoverSelectionPlanTmp 与 readSelectionPlan 都返回 residue 含路径、文件仍在。
+    const keyP21 = "56" + "0".repeat(62);
+    const p21Tmp = legalTmp(keyP21, U9);
+    fs.writeFileSync(p21Tmp, JSON.stringify(mkPlan({ claim_key: keyP21 }), null, 2) + "\n", { mode: 0o600 });
+    const rP21 = SP.readSelectionPlan({ claimsDir, key: keyP21 });
+    assert.equal(rP21.ok, false, "P2-1 readSelectionPlan final 缺席 + 候选 → 非绿：" + JSON.stringify(rP21));
+    assert.equal(rP21.reason, "residue", "P2-1 read reason 为 residue");
+    assert.ok(Array.isArray(rP21.residue) && rP21.residue.includes(p21Tmp), "P2-1 read residue 含路径");
+    assert.equal(fs.existsSync(p21Tmp), true, "P2-1 read 不删");
+    const recP21 = SP.recoverSelectionPlanTmp({ claimsDir, key: keyP21 });
+    assert.equal(recP21.ok, false, "P2-1 recoverSelectionPlanTmp → 非绿：" + JSON.stringify(recP21));
+    assert.equal(recP21.reason, "residue", "P2-1 recover reason 为 residue");
+    assert.ok(Array.isArray(recP21.residue) && recP21.residue.includes(p21Tmp), "P2-1 recover residue 含路径");
+    assert.equal(fs.existsSync(p21Tmp), true, "P2-1 recover 不删");
+
+    // P2-2：recoverSelectionPlanTmp 非法 key / 缺失目录 → fail-closed（原来返回 ok:true）；目录本身 ENOENT 仍「无候选」ok。
+    const badKey = SP.recoverSelectionPlanTmp({ claimsDir, key: "../x" });
+    assert.equal(badKey.ok, false, "P2-2 非法 key → 拒：" + JSON.stringify(badKey));
+    assert.equal(badKey.reason, "key_shape", "P2-2 reason 为 key_shape");
+    const badDir = SP.recoverSelectionPlanTmp({ claimsDir: "", key: "a".repeat(64) });
+    assert.equal(badDir.ok, false, "P2-2 空 claimsDir → 拒：" + JSON.stringify(badDir));
+    assert.equal(badDir.reason, "claims_dir_missing", "P2-2 reason 为 claims_dir_missing");
+    const badDir2 = SP.recoverSelectionPlanTmp({ claimsDir: null, key: "a".repeat(64) });
+    assert.equal(badDir2.ok, false, "P2-2 非字符串 claimsDir → 拒");
+    assert.equal(badDir2.reason, "claims_dir_missing", "P2-2 reason 为 claims_dir_missing");
+
 
     fs.rmSync(claimsDir, { recursive: true, force: true });
   });

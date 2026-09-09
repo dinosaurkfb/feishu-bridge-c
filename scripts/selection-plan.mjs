@@ -168,9 +168,10 @@ function scanPlanTmpCandidates({ claimsDir, key, _inject }) {
  * 规则 1/3 fail-closed：返回 { ok:false, reason:"residue", residue:[...], why }，不改动任何文件。
  */
 export function recoverSelectionPlanTmp({ claimsDir, key, _inject = null } = {}) {
-  if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: true, recovered: null, residue: null };
+  // P2-2（返修十）：输入错误 fail-closed —— 判决目录缺失 / key 非法拒；目录本身 ENOENT 仍按「无候选」ok。
+  if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: false, reason: "claims_dir_missing", why: "claimsDir 缺失" };
   const kv = validateKey(key);
-  if (kv !== null) return { ok: true, recovered: null, residue: null };
+  if (kv !== null) return { ok: false, reason: "key_shape", why: kv };
   const scan = scanPlanTmpCandidates({ claimsDir, key, _inject });
   if (!scan.ok) return { ok: false, reason: "residue", residue: scan.residue, why: scan.why };
   if (scan.entries.length === 0) return { ok: true, recovered: null, residue: null };
@@ -359,7 +360,12 @@ export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}
   // 受验读回逐字节等
   if (typeof _inject?.beforeReadback === "function") _inject.beforeReadback();
   const rb = readSelectionPlan({ claimsDir, key });
-  if (!rb.ok) return { ok: false, reason: "readback_failed", why: "受验读回未通过（" + (rb.problem ?? "?") + "）", commit: "committed_durability_uncertain" };
+  if (!rb.ok) {
+    // P1（返修十）：最终受验读回盘点出精确 tmp 候选（residue）—— link 已成功这一事实不变，
+    //   保留 reason:"residue" + residue 数组 + commit:committed_durability_uncertain，不折 readback_failed、不丢路径。
+    if (rb.residue) return { ok: false, reason: "residue", why: rb.problem ?? "受验读回发现 tmp 残骸", residue: rb.residue, commit: "committed_durability_uncertain" };
+    return { ok: false, reason: "readback_failed", why: "受验读回未通过（" + (rb.problem ?? "?") + "）", commit: "committed_durability_uncertain" };
+  }
   if (rb.sha256 !== sha256(bytes)) return { ok: false, reason: "readback_failed", why: "读回字节与写入字节不一致", commit: "committed_durability_uncertain" };
   return { ok: true, created: true, reused: false };
 }

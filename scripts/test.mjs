@@ -39084,6 +39084,68 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     } finally { fx.cleanup(); }
   });
 
+  test("R53 返修七 P1-1：新建备份 close 后、受验读回前真篡改 mode → backup_verify_failed、phase 仍 drained、staged 已清（readStagedVerified 恒成功刀应转红）", () => {
+    const fx = r53SetupB({});
+    try {
+      // 真篡改（不 mock readStagedVerified）：钩 openSync 认 copyBackup 新建支（O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW），
+      //   钩 closeSync 在该 fd 真关闭后把文件 chmod 0644 —— 受验读回的 0600 检查必须真失败。
+      const _realOpen = fs.openSync, _realClose = fs.closeSync;
+      const fdPath = new Map();
+      fs.openSync = function (...a) {
+        const fd = _realOpen.apply(fs, a);
+        const flags = a[1] ?? 0;
+        if ((flags & fs.constants.O_WRONLY) && (flags & fs.constants.O_CREAT) && (flags & fs.constants.O_EXCL)) fdPath.set(fd, String(a[0]));
+        return fd;
+      };
+      fs.closeSync = function (fd) {
+        const p = fdPath.get(fd);
+        try { return _realClose.call(fs, fd); }
+        finally { if (p !== undefined) { fdPath.delete(fd); try { fs.chmodSync(p, 0o644); } catch { /* 篡改失败不该掩盖主流程 */ } } }
+      };
+      let r = null;
+      try { r = osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); }
+      finally { fs.openSync = _realOpen; fs.closeSync = _realClose; }
+      assert.ok(r.ok === false, "篡改必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "backup_verify_failed", "拒因：" + r.reason);
+      const tok = readActive({ dir: fx.dir })?.token ?? r.token;
+      assert.equal(readJournal({ dir: fx.dir, token: tok }).doc.phase, "drained", "未进 forward-only（phase 仍 drained）");
+      assert.equal(fs.existsSync(path.join(fx.dir, tok + ".staged")), false, "staged 已清");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R53 返修七 P1-2：direct 恢复窗把 ledger.json.prev 换成 symlink → 残骸拒、phase 停 osm_direct、不记 done（返修六只加了 B 的一条）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      for (const ep of fx.eps) {
+        const d = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const dd = JSON.parse(fs.readFileSync(d, "utf-8"));
+        dd.records = {};
+        const seedOp = Object.values(dd.operations).find((o) => o.op_type === "seed");
+        seedOp.result = { seeded_ids: [] };
+        fs.writeFileSync(d, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+      }
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "direct", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "direct schema 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      fx.ctx.afterWrite = null;
+      const ep = fx.eps[0];
+      const dirE = path.join(fx.ledgerRoot, ep);
+      const prevPath = path.join(dirE, "ledger.json.prev");
+      if (fs.existsSync(prevPath)) fs.rmSync(prevPath);
+      fs.symlinkSync(path.join(dirE, "ledger.json"), prevPath);
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "symlink 残骸必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.match(String(r.why ?? ""), /残骸|不是普通文件|symlink|引用/, "why 点名残骸：" + r.why);
+      const j = readJournal({ dir: fx.dir, token: act.token });
+      assert.equal(j.doc.phase, "osm_direct", "phase 停 osm_direct");
+      assert.equal(j.doc.steps.find((st) => st.kind === "schema_endpoint" && st.state !== "done")?.state, "prepared", "direct schema step 不记 done");
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 返修六 P2：B precheck 四字段等式——precheck 记 intended 后用真实 ledger op（合法账本）推进 revision/SHA → precheck_failed（why 点名 revision/SHA），删等式应红", () => {
     const fx = r53SetupB({ crashAfter: 8 }); // forward-entered，precheck prepared
     try {

@@ -257,7 +257,7 @@ frozen_at, handle_expires_at, **before_ledger_sha256**, expected_null_b1_ids:[�
 | B3(owner_select_v1) → `rebind_session_alias`（=`b3_id`） | 重签 | 重签 owner_select_v1（六字段全同步、handle=orh_） | 重签 owner_selected_route_v1 | B3 | 是 |
 | B3(binding≠owner_select_v1) → `rebind_session_alias` | 重签 link | 保持原 binding | 重签 owner_selected_route_v1 | B3 | 否 |
 | handle-only（`request_rebind`/`expire_*`/`cancel_*`/`reissue_*`）改 origin 的记录 | **保留**（P1-1） | 保持 | 保持 | 原族 | 保持 |
-| 存量 → `owner_select_reaffirm` | 重签（+关联 tombstone 同笔） | → owner_select_v1 或保留原 binding | → owner_selected_route_v1 | 原族 | binding=owner_select_v1 时是 |
+| 存量 → `owner_select_reaffirm` | 重签（+关联 tombstone 同笔） | **原 binding 是 pairing/legacy → 换成 owner_select_v1（`binding_effect:"produced"`）；原本已是 owner_select_v1 → 重签保留（`"preserved"`）**——「保留原 binding」只指后者，pairing 绝不保留，否则 `migrationInventory` 的 legacy 计数永不归零、operation B 无法收敛（#145 一轮 P1-1 回带） | → owner_selected_route_v1 | 原族 | 是（两支都产 owner_select 族 proof；关联 tombstone——含 pairing tombstone——同笔 remap 为 owner_select_merge_v1，`tombstone_remap` 有序封闭点名） |
 | `migrate_seed(B1)` / `(B3/B3′/B4)` | 产 | null / migrated | null / migrated | B1 / — | — |
 | owner_select proof 现于 A1/B1 | — | — | — | ✘ | — |
 

@@ -68,7 +68,7 @@ const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;
 const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
 const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;
 export { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE }; // R52a: 单一出处导出供控制命令解析
-export { SHA_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE }; // R57b: reaffirm intent store 封闭 schema 复用同一形状（不另写一份；ENDPOINT_SHAPE/ID_SHAPE 已有专行导出）
+export { SHA_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE }; // R57b: reaffirm intent store 封闭 schema 复用同一形状（不另写一份；ENDPOINT_SHAPE/ID_SHAPE 已有专行导出）
 const ANY_HANDLE_SHAPE = /^(osh|orh|rfh)_[0-9a-f]{32}$/u;
 const ALLOWED_PRODUCE_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);
 

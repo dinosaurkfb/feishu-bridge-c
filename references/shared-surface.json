@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-09T04:37:57.661Z",
+  "generated_at": "2026-09-09T09:07:33.617Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -582,6 +582,7 @@
       "versionFromFiles"
     ],
     "select-admission.mjs": [
+      "SELECTION_CONTEXT_KEYS",
       "classifySelectOutcome",
       "executeSelectControl",
       "selectAdmission",
@@ -693,6 +694,7 @@
       "usableGeneration"
     ],
     "topic-agent-ledger.mjs": [
+      "AILY_SESSION_SHAPE",
       "ARTIFACT_TYPE",
       "AUTHORIZED_BY_SHAPE",
       "CHAT_SHAPE",
@@ -700,6 +702,7 @@
       "ID_SHAPE",
       "LEDGER_DIR_ENV",
       "LINEAGE_SHAPE",
+      "OM_SHAPE",
       "OWNER_SELECT_HANDLE_TTL_MS",
       "OWNER_SELECT_REAFFIRM_TTL_MS",
       "REAFFIRM_HANDLE_SHAPE",

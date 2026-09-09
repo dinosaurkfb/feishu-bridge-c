@@ -19168,7 +19168,7 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
   const { expect } = expectation;
   const logicalTaskKey = expect.logicalTaskKey;
   const h = "osh_" + "c".repeat(32);
-  const msgId = "msg_sel_inflight_claude";
+  const msgId = "om_selinflightclaude";
   const key = claimKey(msgId, logicalTaskKey);
 
   const acquired = acquireClaim({
@@ -42685,10 +42685,12 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(oldRes.ok, false);
     assert.equal(oldRes.why, "selection_context_missing", "resumeControlClaim 归约到 selection_context_missing");
 
-    // 1b. 缺必需字段（例如缺 endpoint）
-    const msgIdIncomplete = "msg_p15_incomp";
+    // 1b. 缺必需字段（例如缺 endpoint）——键集完整，endpoint 置 null（形状不对）→ 点名缺/形状 endpoint
+    const msgIdIncomplete = "om_p15incomp";
     const incompCtx = {
+      endpoint: null,
       chat: "oc_r57b",
+      session: "sess-p15",
       sender: "ou_owner57b",
       message: msgIdIncomplete,
       handle: h,
@@ -42711,7 +42713,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const incompDirect = dispatchControlRepair({ control: "select", handle: h, handle_kind: "rfh" }, {}, { claim: readClaimState({ claimsDir, key: incompClaim.key }).claim });
     assert.equal(incompDirect.ok, false);
     assert.equal(incompDirect.reason, "selection_context_incomplete");
-    assert.match(incompDirect.why, /缺项：endpoint/u, "点名缺 endpoint");
+    assert.match(incompDirect.why, /endpoint/u, "点名 endpoint");
 
     const incompRes = resumeControlClaim({
       claimsDir,
@@ -42721,11 +42723,12 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(incompRes.ok, false);
     assert.equal(incompRes.why, "selection_context_incomplete");
 
-    // 1c. digest 不一致
-    const msgIdBadDigest = "msg_p15_baddig";
+    // 1c. digest 不一致（键集/形状都合法，只 digest 错）
+    const msgIdBadDigest = "om_p15baddig";
     const fullCtx = {
       endpoint: EP57B,
       chat: "oc_r57b",
+      session: "sess-p15",
       sender: "ou_owner57b",
       message: msgIdBadDigest,
       handle: h,
@@ -42840,6 +42843,56 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(codexInboundRes.ok, true, "Codex 入口 partial+rfh 成功");
     assert.equal(codexInboundRes.status, "consumed");
     assert.match(codexInboundRes.text, /已按你的确认重签/u);
+  }));
+
+  test("R57b 返修二 P1-5：claim 上下文缺 session 仍放行——封闭精确键集 + 各字段形状，session 必填；session null 配自洽 digest → 拒", () => withLedgerB((root, dir) => {
+    const h = "rfh_" + "c".repeat(32);
+    const mkCtx = (over = {}) => ({
+      endpoint: EP57B,
+      chat: "oc_r57b",
+      session: "sess-p15",
+      message: "om_p15sess",
+      sender: "ou_owner57b",
+      handle: h,
+      kind: "rfh",
+      ...over,
+    });
+    const mkClaim = (ctx, digest = SA.selectionContextDigestV1(ctx)) => ({
+      control: { control: "select", handle: h, handle_kind: "rfh" },
+      selection_context: ctx,
+      selection_context_digest_v1: digest,
+    });
+
+    // ① 反例：session 置 null（自洽 digest）→ 拒（P1-5 前 verifySelectionContext 放行）。
+    const ctxNullSession = mkCtx({ session: null });
+    const vNull = SA.verifySelectionContext(mkClaim(ctxNullSession));
+    assert.equal(vNull.ok, false, "session:null 必须拒");
+    assert.equal(vNull.reason, "selection_context_incomplete", "reason 为 selection_context_incomplete");
+    assert.match(vNull.why, /session/u, "点名 session");
+
+    // ② 反例：session 缺键（键集不完整）→ 拒。
+    const ctxNoSession = { ...mkCtx(), session: undefined };
+    delete ctxNoSession.session;
+    const vNo = SA.verifySelectionContext(mkClaim(ctxNoSession));
+    assert.equal(vNo.ok, false, "缺 session 键必须拒");
+    assert.equal(vNo.reason, "selection_context_incomplete", "键集不对→拒");
+
+    // ③ 反例：多出非白名单键（如 extra）→ 拒。
+    const ctxExtra = { ...mkCtx(), extra: "x" };
+    const vExtra = SA.verifySelectionContext(mkClaim(ctxExtra));
+    assert.equal(vExtra.ok, false, "多出白名单外键必须拒");
+    assert.equal(vExtra.reason, "selection_context_incomplete", "键集不对→拒");
+
+    // ④ 反例：kind=rfh 但 handle 是 osh_ 前缀（kind/handle 不一致）→ 拒。
+    const ctxBadHandle = mkCtx({ handle: "osh_" + "d".repeat(32) });
+    const vBad = SA.verifySelectionContext(mkClaim(ctxBadHandle));
+    assert.equal(vBad.ok, false, "kind/handle 不一致必须拒");
+    assert.equal(vBad.reason, "selection_context_incomplete");
+    assert.match(vBad.why, /handle/u, "点名 handle");
+
+    // ⑤ 正例：完整合法上下文 → 放行（同源 digest）。
+    const vOk = SA.verifySelectionContext(mkClaim(mkCtx()));
+    assert.equal(vOk.ok, true, "完整合法上下文放行：" + JSON.stringify(vOk));
   }));
 
   // ── D. 终端签发命令 scripts/feishu-reaffirm-issue.mjs（预览零写；--apply 才写）──

@@ -10,7 +10,7 @@
 // osh/orh 支仍落 failed 终态 select_executor_absent（另单，PR #136 二轮裁定：failed 是终态，重做须发新消息）。
 
 import { createHash } from "node:crypto";
-import { REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
+import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
 import { canonKey } from "./maintenance/canon.mjs";
@@ -50,7 +50,13 @@ export function selectionContextDigestV1({
   return createHash("sha256").update(payload).digest("hex");
 }
 
-/** 校验 claim 里的 selection_context 与 digest，fail-closed 点名缺项。 */
+/** selection_context 的精确允许键集（封闭：缺一/多一都拒，P1-5）。 */
+export const SELECTION_CONTEXT_KEYS = "chat,endpoint,handle,kind,message,sender,session";
+const SELECTION_KIND_SHAPE = /^(osh|orh|rfh)$/u;
+/** kind → handle 形状（封闭映射；kind 与 handle 前缀不一致 → 拒）。 */
+const HANDLE_SHAPE_BY_KIND = Object.freeze({ osh: SELECTION_HANDLE_SHAPE, orh: REBIND_HANDLE_SHAPE, rfh: REAFFIRM_HANDLE_SHAPE });
+
+/** 校验 claim 里的 selection_context 与 digest，fail-closed 点名缺项/形状不对（P1-5：封闭精确键集 + 各字段形状，session 必填）。 */
 export function verifySelectionContext(claim) {
   if (!claim || typeof claim !== "object") {
     return { ok: false, reason: "selection_context_missing", why: "claim 为空或不是对象" };
@@ -63,15 +69,21 @@ export function verifySelectionContext(claim) {
   if (typeof digest !== "string" || !/^[0-9a-f]{64}$/u.test(digest)) {
     return { ok: false, reason: "selection_context_digest_missing", why: "缺 selection_context_digest_v1（旧形 claim）" };
   }
+  // P1-5：封闭精确键集——缺任一键或多出非白名单键都 fail-closed。
+  if (Object.keys(ctx).sort().join(",") !== SELECTION_CONTEXT_KEYS) {
+    return { ok: false, reason: "selection_context_incomplete", why: "selection_context 键集不对（须 " + SELECTION_CONTEXT_KEYS + "）" };
+  }
   const missing = [];
-  if (!ctx.endpoint) missing.push("endpoint");
-  if (!ctx.chat) missing.push("chat");
-  if (!ctx.sender) missing.push("sender");
-  if (!ctx.message) missing.push("message");
-  if (!ctx.handle) missing.push("handle");
-  if (!ctx.kind) missing.push("kind");
+  if (typeof ctx.endpoint !== "string" || !ENDPOINT_SHAPE.test(ctx.endpoint)) missing.push("endpoint");
+  if (typeof ctx.chat !== "string" || !CHAT_SHAPE.test(ctx.chat)) missing.push("chat");
+  if (typeof ctx.session !== "string" || !AILY_SESSION_SHAPE.test(ctx.session)) missing.push("session");
+  if (typeof ctx.message !== "string" || !OM_SHAPE.test(ctx.message)) missing.push("message");
+  if (typeof ctx.sender !== "string" || !AUTHORIZED_BY_SHAPE.test(ctx.sender)) missing.push("sender");
+  if (typeof ctx.kind !== "string" || !SELECTION_KIND_SHAPE.test(ctx.kind)) missing.push("kind");
+  const handleShape = typeof ctx.kind === "string" ? HANDLE_SHAPE_BY_KIND[ctx.kind] : null;
+  if (typeof ctx.handle !== "string" || !(handleShape && handleShape.test(ctx.handle))) missing.push("handle");
   if (missing.length > 0) {
-    return { ok: false, reason: "selection_context_incomplete", why: "selection_context 缺项：" + missing.join(", ") };
+    return { ok: false, reason: "selection_context_incomplete", why: "selection_context 缺/形状不对：" + missing.join(", ") };
   }
   const expectedDigest = selectionContextDigestV1(ctx);
   if (digest !== expectedDigest) {

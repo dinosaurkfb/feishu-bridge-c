@@ -42079,7 +42079,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const iChat = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tChat, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue chat");
     const iFam = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tFam, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue family");
     const iDig = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: tDig, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue digest");
-    const consume = (handle, over = {}) => RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...over });
+    const consume = (handle, over = {}) => RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "wc" + handle), ...over });
     // ① sender ≠ intent.authorized_owner
     let r = consume(iSender.reaffirm_handle, { sender: "ou_stranger" });
     assert.equal(r.ok, false); assert.equal(r.reason, "sender_mismatch", "sender 核");
@@ -42144,7 +42144,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
     // 2. 正常 reaffirm 消费
     const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
-    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "consume");
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "p11") }), "consume");
     assert.equal(res.ok, true);
 
     // 3. reaffirm 之后：migrationInventory legacy 归零
@@ -42169,7 +42169,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       proof_ref: { kind: "wat_unknown", om: "om_wat", matched_fields: ["chat_id", "sender", "body"], pending_token_state: "present" }
     };
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(badDoc, null, 2) + "\n", { mode: 0o600 });
-    const rBad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intentBad.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    const rBad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intentBad.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "p11bad") });
     assert.equal(rBad.ok, false, "未知 proof kind tombstone 必须拒");
   }));
 
@@ -42792,9 +42792,33 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
     // ⑧ 反例：写失败 → fail-closed（注入 beforeRename 抛错验证，不进账本提交）。
     const key3 = "e".repeat(64);
-    const wFail = SP.writeSelectionPlan({ claimsDir, key: key3, plan: mkPlan({ claim_key: key3 }), _inject: { beforeRename: () => { throw new Error("boom"); } } });
-    assert.equal(wFail.ok, false, "rename 前注入失败 → fail-closed");
+    const wFail = SP.writeSelectionPlan({ claimsDir, key: key3, plan: mkPlan({ claim_key: key3 }), _inject: { beforeLink: () => { throw new Error("boom"); } } });
+    assert.equal(wFail.ok, false, "link 前注入失败 → fail-closed");
     assert.equal(wFail.reason, "tmp_write_failed", "reason 为 tmp_write_failed");
+    assert.equal(fs.existsSync(path.join(claimsDir, key3 + ".selection-plan.json")), false, "失败后无截断目标");
+
+    // ⑨ 反例：成功后目录里无遗留 tmp（原子发布、不原地写、不 rename 覆盖）。
+    const key4 = "f".repeat(64);
+    const wOk4 = SP.writeSelectionPlan({ claimsDir, key: key4, plan: mkPlan({ claim_key: key4 }) });
+    assert.equal(wOk4.ok, true, "key4 写成功");
+    const tmps = fs.readdirSync(claimsDir).filter((n) => n.includes(".selection-plan.json.tmp."));
+    assert.equal(tmps.length, 0, "成功后目录无遗留 tmp");
+
+    // ⑩ 反例：link 后目录 fsync 失败 → durability_uncertain（提交不确定，非普通失败）。
+    const key5 = "b".repeat(64);
+    const dup = SP.writeSelectionPlan({ claimsDir, key: key5, plan: mkPlan({ claim_key: key5 }), _inject: { failDirFsync: true } });
+    assert.equal(dup.ok, false, "目录 fsync 失败必须非绿");
+    assert.equal(dup.commit, "committed_durability_uncertain", "commit 为 committed_durability_uncertain");
+    assert.equal(dup.reason, "dir_fsync_failed", "reason 为 dir_fsync_failed");
+
+    // P2 反例：同内容不同键序（嵌套 cas 键序不同）→ 深层全符 → reused，不 conflict。
+    const key6 = "c".repeat(64);
+    const w6 = SP.writeSelectionPlan({ claimsDir, key: key6, plan: mkPlan({ claim_key: key6 }) });
+    assert.equal(w6.ok, true, "key6 写成");
+    const reordered = { ...mkPlan({ claim_key: key6 }), cas: { expected_expires_at: "2026-09-18T09:00:00.000Z", intent_id: handle } };
+    const w6r = SP.writeSelectionPlan({ claimsDir, key: key6, plan: reordered });
+    assert.equal(w6r.ok, true, "同内容不同键序 → reused");
+    assert.equal(w6r.reused, true, "reused:true（canonKey 深层全符）");
 
     fs.rmSync(claimsDir, { recursive: true, force: true });
   });
@@ -42802,7 +42826,8 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   test("R57b 返修六 P1-1：执行器强制 plan 上下文——不传 claimsDir/key 直接消费 → selection_plan_context_missing 拒；repair 透传后 E2E 通过", () => withLedgerB((root, dir) => {
     const b3 = seedB3B(dir, "r57b_p16", 56, "sess-b-56");
     const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
-    // 反例：执行器（executeSelectControl）不传 claimsDir/key → 结构化拒，不进账本提交。
+    const rev0 = loadOkB(dir).revision;
+    // 反例①：执行器（executeSelectControl）不传 claimsDir/key → 结构化拒，不进账本提交。
     const noCtx = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
       endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId: "om_p16",
       selectAdmissionFn: () => ({ state: "partial" }),
@@ -42810,6 +42835,11 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(noCtx.ok, false, "不传 claimsDir/key 直接消费必须拒");
     assert.equal(noCtx.reason, "selection_plan_context_missing", "reason 为 selection_plan_context_missing");
     assert.equal(readIntentsB(dir)?.entries[intent.reaffirm_handle] != null, true, "拒时 intent 未消费");
+    // 反例②：公开 consumeReaffirmIntent 直调不传上下文 → 拒且账本 revision 不变（mutation 层强制）。
+    const noCtxDirect = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_p16", clock: () => T0B + 1000 });
+    assert.equal(noCtxDirect.ok, false, "直调 consumeReaffirmIntent 不传上下文必须拒");
+    assert.equal(noCtxDirect.reason, "selection_plan_context_missing", "reason 为 selection_plan_context_missing");
+    assert.equal(loadOkB(dir).revision, rev0, "拒时账本 revision 不变");
     // 正例：传 claimsDir/key → 正常消费成功，plan 落盘。
     const pc = mkPlanCtx(root, "om_p16", "p16_ok");
     const ok = SA.executeSelectControl({ control: "select", handle: intent.reaffirm_handle, handle_kind: "rfh" }, {
@@ -42900,7 +42930,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       const v0 = TAL.validateLedger(doc, { endpointId: EP57B });
       assert.equal(v0.ok, true, "owner_select 夹具自洽：" + JSON.stringify(v0));
       const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
-      const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "consume");
+      const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "remap") }), "consume");
       const doc2 = loadOkB(dir);
       const opEntry = Object.values(doc2.operations).find((o) => o.op_type === "owner_select_reaffirm");
       const r = opEntry.result;
@@ -42933,7 +42963,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const direct = talOkB(TAL.ownerSelectReaffirm({ endpointId: EP57B, targetId: b3, targetFamily: "B3", expectedOldProofClosureDigest: intent.entry.expected_old_proof_closure_digest, reaffirmHandle: intent.reaffirm_handle, authorizedBy: "ou_owner57b", chatId: "oc_r57b", selectedSessionId: "sess-b-47", selectedRootOm: "om_rb47", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "直接 ledger op");
     assert.ok(readIntentsB(dir), "intent 未清（崩溃现场）");
     const rev = loadOkB(dir).revision;
-    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 2000 }), "恢复重发");
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 2000, ...mkPlanCtx(root, "om_sel57b", "crash1") }), "恢复重发");
     assert.equal(res.idempotent, true, "按 request_key 判已完成（幂等重放，不再写账本）");
     assert.equal(res.result.new_link_proof.selection_handle, intent.reaffirm_handle, "返存量证明（rfh_ 在重签 link 里）");
     assert.equal(loadOkB(dir).revision, rev, "账本不再变");
@@ -42943,10 +42973,10 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     // ②：签发 → 消费被拒（sender 不符）→ intent 仍在 → 改对后同一 intent 消费成功。
     const b3b = seedB3B(dir, "r57b_r2", 48, "sess-b-48");
     const intent2 = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3b, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue#2");
-    const bad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_stranger", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    const bad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_stranger", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "crash2b") });
     assert.equal(bad.ok, false);
     assert.ok(readIntentsB(dir), "失败后 intent 仍在（可重跑）");
-    const ok2 = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "重跑成功");
+    const ok2 = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent2.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "crash2") }), "重跑成功");
     assert.equal(ok2.cleared, true);
     assert.equal(loadOkB(dir).records[b3b].locator_link_proof_ref.kind, "owner_selected_route_v1");
   }));
@@ -42965,7 +42995,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: "rfh_" + "1".repeat(32), sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
     assert.equal(r.reason, "reaffirm_handle_unknown", "无此 intent");
     // 消费成功后同 handle 再发 → unknown（一个 handle 恰消费一次）
-    talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "首次消费");
+    talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000, ...mkPlanCtx(root, "om_sel57b", "ledgerop") }), "首次消费");
     r = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
     assert.equal(r.reason, "reaffirm_handle_unknown", "已消费再发 → unknown（要重做请重新签发）");
   }));
@@ -43007,6 +43037,7 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
       sender: "ou_owner57b",
       chatId: "oc_r57b",
       selectionMessageId: "om_sel57b",
+      ...mkPlanCtx(root, "om_sel57b", "p17ok"),
       now: T0B + 30 * 86400e3, // 锁外 now
       clock: () => T0B + 1000, // 锁内 clock 未到期
     }), "消费成功");

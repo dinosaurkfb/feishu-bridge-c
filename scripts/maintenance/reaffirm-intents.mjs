@@ -34,6 +34,7 @@ import {
 } from "../topic-agent-ledger.mjs";
 import { classifySelectOutcome } from "../select-outcome.mjs";
 import { writeSelectionPlan, SELECTION_PLAN_SCHEMA } from "../selection-plan.mjs";
+import { CLAIM_KEY_SHAPE } from "../shapes.mjs";
 
 export const REAFFIRM_INTENTS_FILE = "reaffirm-intents.json";
 export const REAFFIRM_INTENTS_LOCK = "reaffirm-intents.lock";
@@ -452,25 +453,26 @@ export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender,
     if (!L.ok) return { ok: false, status: "failed", reason: L.reason === "ledger_corrupt" ? "ledger_corrupt" : "ledger_unreadable", why: L.why ?? L.reason ?? null };
     const rec = L.doc.records[entry.target_id];
     if (!rec || rec.kind !== "live") return { ok: false, status: "failed", reason: "reaffirm_target_missing" };
-    // R57b 返修五/六：rfh 支在账本提交前原子持久化 selection plan（两链同一份代码，真实 claim 写方）。
+    // R57b 返修五/六/七：rfh 支在账本提交前原子持久化 selection plan（两链同一份代码，真实 claim 写方）。
     //   plan = { schema_version, action:"reaffirm", target_id, basis:"reaffirm", handle:reaffirmHandle, kind:"rfh",
     //            claim_key, cas:{intent_id, expected_expires_at} }。
-    //   上下文（claimsDir+key）由执行器 executeSelectControl 强制在场（返修六 P1-1）——执行器先拒 selection_plan_context_missing，
-    //   因此到达这里时上下文恒在场；此处写 plan 失败 → fail-closed，不进账本提交。
-    if (typeof claimsDir === "string" && claimsDir.length > 0 && typeof key === "string" && key.length > 0) {
-      const plan = {
-        schema_version: SELECTION_PLAN_SCHEMA,
-        action: "reaffirm",
-        target_id: entry.target_id,
-        basis: "reaffirm",
-        handle: reaffirmHandle,
-        kind: "rfh",
-        claim_key: key,
-        cas: { intent_id: reaffirmHandle, expected_expires_at: entry.expires_at },
-      };
-      const wp = writeSelectionPlan({ claimsDir, key, plan, _inject });
-      if (!wp.ok) return { ok: false, status: "failed", reason: "selection_plan_write_failed", why: (wp.why ?? wp.reason ?? "selection plan 写失败，不进账本提交"), plan_write: wp };
+    //   mutation 层**无条件强制**合法上下文（返修七 P1-1）：缺 claimsDir / key（或 key 非 CLAIM_KEY_SHAPE）→
+    //   selection_plan_context_missing，不进账本提交。executeSelectControl 只是透传。
+    if (typeof claimsDir !== "string" || claimsDir.length === 0 || typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
+      return { ok: false, status: "failed", reason: "selection_plan_context_missing", why: "rfh 消费需合法 claimsDir+key（key 须 64hex）才可持久化 selection plan（缺上下文 = 不在控制事务内），不进账本提交" };
     }
+    const plan = {
+      schema_version: SELECTION_PLAN_SCHEMA,
+      action: "reaffirm",
+      target_id: entry.target_id,
+      basis: "reaffirm",
+      handle: reaffirmHandle,
+      kind: "rfh",
+      claim_key: key,
+      cas: { intent_id: reaffirmHandle, expected_expires_at: entry.expires_at },
+    };
+    const wp = writeSelectionPlan({ claimsDir, key, plan, _inject });
+    if (!wp.ok) return { ok: false, status: "failed", reason: "selection_plan_write_failed", why: (wp.why ?? wp.reason ?? "selection plan 写失败，不进账本提交"), plan_write: wp };
     const res = ownerSelectReaffirm({
       endpointId, targetId: entry.target_id, targetFamily: entry.target_family,
       expectedOldProofClosureDigest: entry.expected_old_proof_closure_digest,

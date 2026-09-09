@@ -114,10 +114,13 @@ export function readSelectionPlan({ claimsDir, key }) {
 }
 
 /**
- * 写 plan sidecar（原子、不可覆盖）。返回：
+ * 写 plan sidecar（原子 no-replace 落盘）。返回：
  *   { ok:true, reused:false, created:true }  新建
- *   { ok:true, reused:true }                 既有 plan 逐字全符（幂等）
+ *   { ok:true, reused:true }                 既有 plan 深层全符（canonKey，幂等）
  *   { ok:false, reason, why }                conflict / 校验 / 写失败（fail-closed）
+ * 发布序列（返修七 P1-2）：完整写 tmp → fsync(tmp) → linkSync(tmp, final)（final 已存在 → EEXIST → 全符复用/conflict）
+ * → unlink tmp → fsync 目录 → 受验读回。任何阶段失败：link 前 → 清 tmp（清不掉 → residue 点名）；
+ * link 后目录 fsync 失败 → durability_uncertain；所有 fd 在 finally 关闭。
  */
 export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}) {
   if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: false, reason: "claimsDir 缺失" };
@@ -130,17 +133,17 @@ export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}
   if (bytes.length > SELECTION_PLAN_MAX_BYTES) return { ok: false, reason: "over_capacity", why: "序列化长度超出上限" };
   const file = planPath(claimsDir, key);
 
-  // 既有 plan：只能「受验全符复用」或 conflict，绝不覆盖。
+  // 既有 plan：只能「深层全符复用」或 conflict，绝不覆盖（P2：用 canonKey，非原始字节）。
   const existing = readSelectionPlan({ claimsDir, key });
   if (!existing.ok) return { ok: false, reason: existing.reason ?? "selection_plan_readback_failed", why: existing.problem };
   if (!existing.absent) {
-    if (existing.sha256 === sha256(bytes)) return { ok: true, reused: true };
-    return { ok: false, reason: "selection_plan_conflict", why: "既有 plan 与本次计划逐字不等（不可覆盖），保持原计划" };
+    if (canonKey(existing.plan) === canonKey(plan)) return { ok: true, reused: true };
+    return { ok: false, reason: "selection_plan_conflict", why: "既有 plan 与本次计划深层不等（不可覆盖），保持原计划" };
   }
 
   const tmp = path.join(claimsDir, "." + SELECTION_PLAN_FILE(key) + ".tmp." + process.pid + "." + crypto.randomUUID());
   let fd = null;
-  let landed = false;
+  let linked = false;
   const cleanupTmp = () => {
     try { fs.unlinkSync(tmp); } catch (err) { if (err?.code !== "ENOENT") throw err; }
   };
@@ -162,52 +165,46 @@ export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = null;
-    if (typeof _inject?.beforeRename === "function") _inject.beforeRename();
-    // 目标文件不覆盖：O_CREAT|O_EXCL 打开（既有 → EEXIST → 此处应已被上面 existing 分支拦住）。
-    let ofd = null;
+    if (typeof _inject?.beforeLink === "function") _inject.beforeLink();
+    // no-replace 发布：linkSync(tmp, final)。final 已存在 → EEXIST → 走全符复用 / conflict；绝不用 rename 覆盖。
     try {
-      ofd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
+      fs.linkSync(tmp, file);
     } catch (err) {
       if (err?.code === "EEXIST") {
-        // 目标在写窗口内被并发创建：重读核是否逐字全符。
+        // 目标在写窗口内被并发创建：重读核深层是否全符。
         const later = readSelectionPlan({ claimsDir, key });
-        if (later.ok && !later.absent && later.sha256 === sha256(bytes)) return { ok: true, reused: true };
-        return { ok: false, reason: "selection_plan_conflict", why: "目标文件已被并发写（逐字不等，不可覆盖）" };
+        if (later.ok && !later.absent && canonKey(later.plan) === canonKey(plan)) return { ok: true, reused: true };
+        return { ok: false, reason: "selection_plan_conflict", why: "目标文件已被并发写（深层不等，不可覆盖）" };
       }
       throw err;
     }
-    let off2 = 0;
-    while (off2 < bytes.length) {
-      const n = fs.writeSync(ofd, bytes, off2, bytes.length - off2);
-      if (n <= 0) break;
-      off2 += n;
-    }
-    fs.fsyncSync(ofd);
-    fs.closeSync(ofd);
-    ofd = null;
-    landed = true;
+    linked = true;
+    // 发布成功后清 tmp（link 之后 tmp 与 final 同 inode；unlink tmp 只剩 final）。
+    try { cleanupTmp(); } catch (err2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(err2) }; }
   } catch (err) {
     if (fd !== null) { try { fs.closeSync(fd); fd = null; } catch {} }
-    if (!landed) {
+    if (!linked) {
       try { cleanupTmp(); } catch (e2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(e2) }; }
       return { ok: false, reason: "tmp_write_failed", why: errCode(err) };
     }
+    // link 已成功但后续（目录 fsync / 读回）失败 → durability_uncertain。
+    return { ok: false, reason: "commit_uncertain", why: "link 后收口失败: " + errCode(err) };
   } finally {
     if (fd !== null) { try { fs.closeSync(fd); } catch {} }
   }
-  // rename 后目录 fsync（不吞异常）——此处目标文件直接用 O_EXCL 写成，仍需 fsync 目录（条目耐久）。
+  // 发布后目录 fsync（不吞异常）
   try {
     if (_inject?.failDirFsync) { const e = new Error("EIO: i/o error"); e.code = "EIO"; throw e; }
     let dfd = null;
     try { dfd = fs.openSync(claimsDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
     finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch {} } }
   } catch (err) {
-    return { ok: false, reason: "dir_fsync_failed", why: "目录 fsync 失败: " + errCode(err) };
+    return { ok: false, reason: "dir_fsync_failed", why: "目录 fsync 失败: " + errCode(err), commit: "committed_durability_uncertain" };
   }
   // 受验读回逐字节等
   if (typeof _inject?.beforeReadback === "function") _inject.beforeReadback();
   const rb = readSelectionPlan({ claimsDir, key });
-  if (!rb.ok) return { ok: false, reason: "readback_failed", why: "受验读回未通过（" + (rb.problem ?? "?") + "）" };
-  if (rb.sha256 !== sha256(bytes)) return { ok: false, reason: "readback_failed", why: "读回字节与写入字节不一致" };
+  if (!rb.ok) return { ok: false, reason: "readback_failed", why: "受验读回未通过（" + (rb.problem ?? "?") + "）", commit: "committed_durability_uncertain" };
+  if (rb.sha256 !== sha256(bytes)) return { ok: false, reason: "readback_failed", why: "读回字节与写入字节不一致", commit: "committed_durability_uncertain" };
   return { ok: true, created: true, reused: false };
 }

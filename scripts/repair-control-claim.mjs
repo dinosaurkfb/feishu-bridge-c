@@ -19,7 +19,7 @@ import { executeSelectControl, verifySelectionContext } from "./select-admission
 import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE } from "./topic-agent-ledger.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock } from "./m1a/dual-write.mjs";
-import { readSelectionPlan } from "./selection-plan.mjs";
+import { readSelectionPlan, recoverSelectionPlanTmp } from "./selection-plan.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -193,6 +193,11 @@ function repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanReco
   // P1-4b（续）：核 selection plan 的 target_id——plan 必须在场，且 plan / unclean / 账本 operation 三者
   //   target_id 逐字一致。R57b 返修五：真实 claim 写方把 plan 落盘到 claims/<key>.selection-plan.json（不再
   //   依赖手工拼的 claim.selection_plan）；repair 从盘读回。plan 缺席或任一不等 → ledger_commit_unverifiable。
+  // 规则 5：repair 是持锁入口——读 plan 前先调受验恢复（unlink「link 后未 unlink」tmp）；恢复不了（residue）→ 非绿。
+  const rec = recoverSelectionPlanTmp({ claimsDir, key });
+  if (rec && rec.ok === false) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan tmp 残骸待人工（" + (rec.why ?? "?") + "）" };
+  }
   const planRead = readSelectionPlan({ claimsDir, key });
   if (!planRead.ok) {
     return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan 读不出（" + (planRead.problem ?? "?") + "），保持 control-committed-unclean" };

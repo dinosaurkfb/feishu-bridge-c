@@ -42821,29 +42821,112 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.equal(w6r.reused, true, "reused:true（canonKey 深层全符）");
 
     // ── R57b 返修八：link 发布残骸窗口 ──
+    // 封闭形状：.<key>.selection-plan.json.tmp.<正整数 pid>.<v4 uuid>。夹具一律用合法名（<pid>.<uuid>），
+    // 不用 .stale/.mismatch——那两种后缀不匹配封闭形状 → 既不算候选也不算 residue（叶子层面没有「未知文件」
+    // 口径，就不点名、也不删；见「非法后缀」反例）。
+    const legalTmp = (k, uuid) => path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(k) + "4242." + uuid);
+    const U9 = "11111111-2222-4333-8444-555555555555";
+    const UA = "22222222-3333-4444-8555-666666666666";
+    const UB = "33333333-4444-4555-8666-777777777777";
+    const UC = "44444444-5555-4666-8777-888888888888";
 
-    // 窗口②（正）：link 完成、tmp 未 unlink（同 inode nlink=2）→ 读取受验恢复（final 可读、tmp 被清）。
+    // 【规则 2/5】纯 readSelectionPlan 面对合法 linked tmp（同 inode nlink=2）→ fail-closed 报 residue，
+    //   tmp 仍在（readSelectionPlan 不删任何文件）；经 recoverSelectionPlanTmp 恢复后 → nlink=1、tmp 被清。
     const key9 = "9".repeat(64);
     SP.writeSelectionPlan({ claimsDir, key: key9, plan: mkPlan({ claim_key: key9 }) });
     const final9 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(key9));
-    const tmp9 = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(key9) + ".stale");
+    const tmp9 = legalTmp(key9, U9);
     fs.linkSync(final9, tmp9);
     assert.equal(fs.lstatSync(final9).nlink, 2, "预造同 inode nlink=2（link 后未 unlink）");
     const r9 = SP.readSelectionPlan({ claimsDir, key: key9 });
-    assert.equal(r9.ok, true, "受验恢复后 final 可读：" + JSON.stringify(r9));
-    assert.equal(r9.plan.target_id, target, "恢复后读回 plan");
-    assert.equal(fs.lstatSync(final9).nlink, 1, "受验恢复后 nlink=1");
-    assert.equal(fs.existsSync(tmp9), false, "受验恢复后 tmp 被清");
+    assert.equal(r9.ok, false, "纯 read 面对合法 linked tmp → fail-closed：" + JSON.stringify(r9));
+    assert.equal(r9.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(r9.residue) && r9.residue.includes(tmp9), "residue 点名 tmp：" + JSON.stringify(r9.residue));
+    assert.equal(fs.existsSync(tmp9), true, "纯 read 不删 tmp");
+    assert.equal(fs.lstatSync(final9).nlink, 2, "纯 read 不恢复（nlink 仍 2）");
+    // 经恢复入口 → 恢复、nlink=1、tmp 被清、final 可读。
+    const rec9 = SP.recoverSelectionPlanTmp({ claimsDir, key: key9 });
+    assert.equal(rec9.ok, true, "recoverSelectionPlanTmp：" + JSON.stringify(rec9));
+    assert.equal(rec9.recovered, tmp9, "recovered 点名 tmp");
+    assert.equal(fs.lstatSync(final9).nlink, 1, "恢复后 nlink=1");
+    assert.equal(fs.existsSync(tmp9), false, "恢复后 tmp 被清");
+    assert.equal(SP.readSelectionPlan({ claimsDir, key: key9 }).ok, true, "恢复后 final 可读");
 
-    // 窗口②（负）：tmp 与 final 同目录但不同 inode / 内容不等 → 不自动清（residue 点名，fail-closed）。
-    const keyA = "a" + "0".repeat(63);
-    SP.writeSelectionPlan({ claimsDir, key: keyA, plan: mkPlan({ claim_key: keyA }) });
-    const tmpA = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(keyA) + ".mismatch");
-    fs.writeFileSync(tmpA, JSON.stringify(mkPlan({ claim_key: keyA, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
-    const rA = SP.readSelectionPlan({ claimsDir, key: keyA });
-    assert.equal(rA.ok, false, "不匹配 tmp → fail-closed（residue 点名）");
-    assert.ok(Array.isArray(rA.residue) && rA.residue.includes(tmpA), "residue 点名 tmp");
-    assert.equal(fs.existsSync(tmpA), true, "不匹配 tmp 不自动清（待人工）");
+    // 【gap1 反例】合法 linked tmp + 异 inode 残骸同在 → 非绿（规则 1），两者都不删，residue 列出两条。
+    const keyA2 = "aa" + "0".repeat(62);
+    SP.writeSelectionPlan({ claimsDir, key: keyA2, plan: mkPlan({ claim_key: keyA2 }) });
+    const finalA2 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyA2));
+    const linkedA = legalTmp(keyA2, UA);
+    const diffA = legalTmp(keyA2, UB);
+    fs.linkSync(finalA2, linkedA);
+    fs.writeFileSync(diffA, JSON.stringify(mkPlan({ claim_key: keyA2, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    const rA = SP.readSelectionPlan({ claimsDir, key: keyA2 });
+    assert.equal(rA.ok, false, "合法+异 inode 同在 → 非绿：" + JSON.stringify(rA));
+    assert.equal(rA.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rA.residue) && rA.residue.length === 2 && rA.residue.includes(linkedA) && rA.residue.includes(diffA), "residue 列出两条：" + JSON.stringify(rA.residue));
+    assert.equal(fs.existsSync(linkedA), true, "合法 linked tmp 不删");
+    assert.equal(fs.existsSync(diffA), true, "异 inode 残骸不删");
+    assert.equal(fs.lstatSync(finalA2).nlink, 2, "两者都不删（final nlink 仍 2，linked 与 final 同 inode）");
+
+    // 【gap3 反例】注入 readdir EIO（_inject.readdir）→ 非绿带错误码，不删。
+    const keyR = "d1" + "0".repeat(62);
+    const rdTmp = legalTmp(keyR, UC);
+    fs.writeFileSync(rdTmp, JSON.stringify(mkPlan({ claim_key: keyR }), null, 2) + "\n", { mode: 0o600 });
+    const rEIO = SP.readSelectionPlan({ claimsDir, key: keyR, _inject: { readdir: () => { const e = new Error("EIO: i/o error"); e.code = "EIO"; throw e; } } });
+    assert.equal(rEIO.ok, false, "readdir EIO → 非绿：" + JSON.stringify(rEIO));
+    assert.equal(rEIO.reason, "residue", "reason 为 residue");
+    assert.match(rEIO.problem ?? "", /EIO/u, "错误码带出");
+    assert.equal(fs.existsSync(rdTmp), true, "readdir 失败不删");
+
+    // 【gap1/规则 1 反例】多于一个合法候选（两个都同 inode）→ 非绿，不删（recoverSelectionPlanTmp 要求唯一候选）。
+    const keyC2 = "e1" + "0".repeat(62);
+    SP.writeSelectionPlan({ claimsDir, key: keyC2, plan: mkPlan({ claim_key: keyC2 }) });
+    const finalC2 = path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyC2));
+    const c2a = legalTmp(keyC2, UA);
+    const c2b = legalTmp(keyC2, UB);
+    fs.linkSync(finalC2, c2a);
+    fs.linkSync(finalC2, c2b);
+    const recC2 = SP.recoverSelectionPlanTmp({ claimsDir, key: keyC2 });
+    assert.equal(recC2.ok, false, "多于一个候选（同 inode）→ 非绿：" + JSON.stringify(recC2));
+    assert.equal(recC2.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(recC2.residue) && recC2.residue.length === 2, "residue 列出两条：" + JSON.stringify(recC2.residue));
+    assert.equal(fs.existsSync(c2a), true, "候选不删");
+    assert.equal(fs.existsSync(c2b), true, "候选不删");
+
+    // 【规则 3 反例】final 缺席 + 精确候选在场 → residue 点名（不是「无窗口」）。
+    const keyD = "f1" + "0".repeat(62);
+    const dTmp = legalTmp(keyD, UC);
+    fs.writeFileSync(dTmp, JSON.stringify(mkPlan({ claim_key: keyD }), null, 2) + "\n", { mode: 0o600 });
+    const rD = SP.readSelectionPlan({ claimsDir, key: keyD });
+    assert.equal(rD.ok, false, "final 缺席 + 候选在场 → 非绿：" + JSON.stringify(rD));
+    assert.equal(rD.reason, "residue", "reason 为 residue");
+    assert.ok(Array.isArray(rD.residue) && rD.residue.includes(dTmp), "residue 点名 tmp：" + JSON.stringify(rD.residue));
+    assert.equal(fs.existsSync(dTmp), true, "候选不删");
+
+    // 【gap4 反例】EEXIST（并发写）后重读发现异 inode 残骸 → 写返回 reason:residue 且 residue 含路径，tmp 仍在（不折成 conflict）。
+    const keyE = "12" + "0".repeat(62);
+    const ePlan = mkPlan({ claim_key: keyE });
+    const eResidue = legalTmp(keyE, UB);
+    const wE = SP.writeSelectionPlan({ claimsDir, key: keyE, plan: ePlan, _inject: { beforeLink: () => {
+      fs.writeFileSync(path.join(claimsDir, SP.SELECTION_PLAN_FILE(keyE)), JSON.stringify(ePlan, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(eResidue, JSON.stringify(mkPlan({ claim_key: keyE, target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(wE.ok, false, "EEXIST 后遇 residue → 非绿：" + JSON.stringify(wE));
+    assert.equal(wE.reason, "residue", "reason 为 residue（不折成 selection_plan_conflict）");
+    assert.ok(Array.isArray(wE.residue) && wE.residue.includes(eResidue), "residue 含残骸路径：" + JSON.stringify(wE.residue));
+    assert.equal(fs.existsSync(eResidue), true, "异 inode 残骸 tmp 仍在（不自动清）");
+
+    // 【非法后缀】.stale / .mismatch 不匹配封闭形状 → 不算候选：既不删也不算 residue（叶子层面无「未知文件」口径，就不点名）。
+    const keyF = "34" + "0".repeat(62);
+    SP.writeSelectionPlan({ claimsDir, key: keyF, plan: mkPlan({ claim_key: keyF }) });
+    const staleTmp = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(keyF) + "4242.stale");
+    const mismTmp = path.join(claimsDir, SP.SELECTION_PLAN_TMP_PREFIX(keyF) + ".mismatch");
+    fs.writeFileSync(staleTmp, JSON.stringify(mkPlan({ claim_key: keyF }), null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(mismTmp, JSON.stringify(mkPlan({ claim_key: keyF }), null, 2) + "\n", { mode: 0o600 });
+    const rF = SP.readSelectionPlan({ claimsDir, key: keyF });
+    assert.equal(rF.ok, true, "非法后缀不算候选，final 正常读：" + JSON.stringify(rF));
+    assert.equal(fs.existsSync(staleTmp), true, ".stale 不被删");
+    assert.equal(fs.existsSync(mismTmp), true, ".mismatch 不被删");
 
     // 窗口①：EEXIST（并发写）后 reused / conflict 都不留本次 tmp。用 beforeLink 注入并发写 final。
     const keyB = "b" + "0".repeat(63);

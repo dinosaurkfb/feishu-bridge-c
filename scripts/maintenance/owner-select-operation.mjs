@@ -680,7 +680,11 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const d = resolveEndpointDir(ep, { env });
         const L = loadLedger(d.dir, { endpointId: ep });
         const inv = migrationInventory(L.doc);
-        if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: ep + " 当场盘点 legacy=" + inv.legacy_proof_count + " nullB1=" + inv.null_b1_count, phase };
+        // R53 返修五 P1-4（#138 五轮）：precheck 做四字段完整投影等式（revision/ledger_sha256/两计数），不只核两计数——否则可记假 after。
+        if (!L.ok || inv.legacy_proof_count !== st.intended_after.legacy_proof_count || inv.null_b1_count !== st.intended_after.null_b1_count
+          || L.doc.revision !== st.intended_after.revision || L.sha256 !== st.intended_after.ledger_sha256) {
+          return { ok: false, reason: "precheck_failed", why: ep + " 前置投影与预算不符（revision=" + String(L.doc?.revision ?? "?") + " 预期 " + st.intended_after.revision + "）", phase };
+        }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -716,7 +720,17 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const cs = readCampaignState(env);
         const intended = st.intended_after;
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "complete";
-        if (!atIntended) {
+        if (atIntended) {
+          // R53 返修五 P1-4：complete 恢复支逐 endpoint 复核——仍 strict(1.1) 且计数 0，现场被改 → 拒。
+          const members = frozenMembersOf(ctx, { env, frozen: intended.endpoints });
+          if (members?.why) return { ok: false, reason: "complete_members_unreadable", why: members.why, phase };
+          for (const ep of intended.endpoints) {
+            const m = members[ep];
+            if (!m || m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
+              return { ok: false, reason: "complete_members_drift", why: ep + " 恢复支现场不符（schema=" + String(m?.schema_version ?? "?") + "）", phase };
+            }
+          }
+        } else {
           let sealedFull;
           try { sealedFull = JSON.parse(cs.raw.toString("utf-8")); }
           catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
@@ -804,7 +818,11 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const d = resolveEndpointDir(ep, { env });
         const L = loadLedger(d.dir, { endpointId: ep });
         const inv = migrationInventory(L.doc);
-        if (inv.legacy_proof_count !== 0 || inv.null_b1_count !== 0) return { ok: false, reason: "precheck_failed", why: ep + " 当场盘点非零", phase };
+        // R53 返修五 P1-4：precheck 做四字段完整投影等式（revision/ledger_sha256/两计数），不只核两计数——否则可记假 after。
+        if (!L.ok || inv.legacy_proof_count !== st.intended_after.legacy_proof_count || inv.null_b1_count !== st.intended_after.null_b1_count
+          || L.doc.revision !== st.intended_after.revision || L.sha256 !== st.intended_after.ledger_sha256) {
+          return { ok: false, reason: "precheck_failed", why: ep + " 前置投影与预算不符（revision=" + String(L.doc?.revision ?? "?") + " 预期 " + st.intended_after.revision + "）", phase };
+        }
         const m = stepDone(st.id, st.intended_after);
         if (m) return { ok: false, reason: m.reason, why: m.why ?? null, phase };
         afterStep(ctx, st.id);
@@ -865,7 +883,17 @@ export function osmForward(ctx, { token, lease, env = process.env, _inject = nul
         const cs = readCampaignState(env);
         const intended = st.intended_after;
         const atIntended = cs.exists && cs.sha256 === intended.sha256 && cs.state === "complete";
-        if (!atIntended) {
+        if (atIntended) {
+          // R53 返修五 P1-4：complete 恢复支逐 endpoint 复核——仍 strict(1.1) 且计数 0，现场被改 → 拒。
+          const members = frozenMembersOf(ctx, { env, frozen: intended.endpoints });
+          if (members?.why) return { ok: false, reason: "complete_members_unreadable", why: members.why, phase };
+          for (const ep of intended.endpoints) {
+            const m = members[ep];
+            if (!m || m.schema_version !== "1.1" || m.legacy_proof_count !== 0 || m.null_b1_count !== 0) {
+              return { ok: false, reason: "complete_members_drift", why: ep + " 恢复支现场不符（schema=" + String(m?.schema_version ?? "?") + "）", phase };
+            }
+          }
+        } else {
           let sealedFull;
           try { sealedFull = JSON.parse(cs.raw.toString("utf-8")); }
           catch (err) { return { ok: false, reason: "campaign_unreadable", why: errText(err), phase }; }
@@ -1200,8 +1228,9 @@ export function osmReopening(ctx, token, lease, env = process.env) {
     const opId = ownerSelectSchemaUpgradeOpId(token, ep);
     const op = L.doc.operations[opId] ?? null;
     const mi = doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
-    // P1-7 (b)：撤门前逐 ep 核——当前账本 SHA === 最后（mint）step.after、schema op 的 from/to（在 op.result）、mint op 的 fingerprint/result。
+    // P1-7 (b)：撤门前逐 ep 核——当前账本 SHA === 最后（mint）step.after；B/direct 无 mint → 核最后 schema step.after（R53 返修五 P1-4）。
     if (mi && L.sha256 !== mi.after.ledger_sha256) incomplete.push({ id: mi.id, why: "当前账本 SHA ≠ 最后（mint）step.after（" + String(L.sha256).slice(0, 12) + " ≠ " + mi.after.ledger_sha256.slice(0, 12) + "）" });
+    else if (!mi && L.sha256 !== se.after?.ledger_sha256) incomplete.push({ id: se.id, why: "当前账本 SHA ≠ 最后 schema step.after（" + String(L.sha256).slice(0, 12) + " ≠ " + String(se.after?.ledger_sha256 ?? "?").slice(0, 12) + "）" });
     if (!op) incomplete.push({ id: se.id, why: "账本内不含本 operation 的 schema_upgrade op（" + opId.slice(0, 8) + "）" });
     else if (op.request_key !== token + ":schema:" + ep) incomplete.push({ id: se.id, why: "schema_upgrade 的 request_key 非本 operation 派生键" });
     else if (op.result?.from_schema !== se.before.schema_version || op.result?.to_schema !== se.after.schema_version) incomplete.push({ id: se.id, why: "schema_upgrade 的 from/to 与 step.before/after 不符（" + String(op.result?.from_schema) + "→" + String(op.result?.to_schema) + "，应 " + se.before.schema_version + "→" + se.after.schema_version + "）" });

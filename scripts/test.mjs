@@ -38976,6 +38976,28 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     }
   });
 
+  test("R53 返修五 P1-4 ①：precheck 做四字段完整投影等式——篡改 revision 后 resume → precheck step 不记 done、precheck_failed（改前只核两计数 → 记假 after 通过）", () => {
+    const fx = r53SetupB({ crashAfter: 8 });
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { kind: "b", apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // 篡改一个账本的 revision（+1）——precheck 投影（revision）与预算不符。
+      const ep = fx.eps[0];
+      const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+      const dd = JSON.parse(fs.readFileSync(p, "utf-8"));
+      dd.revision += 1;
+      fs.writeFileSync(p, JSON.stringify(dd, null, 2) + "\n", { mode: 0o600 });
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "precheck 投影与预算不符必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "precheck_failed", "拒因：" + r.reason);
+      assert.equal(readJournal({ dir: fx.dir, token: act.token }).doc.steps.find((s) => s.kind === "precheck").state, "prepared", "precheck step 不记 done");
+    } finally { fx.cleanup(); }
+  });
+
   test("R53 返修一 (b)：三 kind × 失败文案失败/拒绝路径各自措辞", () => {
     // 用 C 类前置失败让 osmEnter 走 !r.ok 拒绝路径；逐 kind 断言输出含「迁移 A/B/direct」。
     const run = (kind, ctxFn) => {

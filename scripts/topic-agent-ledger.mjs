@@ -835,13 +835,6 @@ const RESULT_SHAPE = Object.freeze({
         && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
         && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
     }
-    if (keysOf(r) === "affected_live_ids_after_commit,new_link_proof,proof_effects,selection_message_id,target_id,tombstone_remap") {
-      return isId(r.target_id) && idArraySortedMaybeEmpty(r.affected_live_ids_after_commit) && r.affected_live_ids_after_commit.length === 1 && r.affected_live_ids_after_commit[0] === r.target_id
-        && validProofEffects(r.proof_effects) && r.proof_effects.length === 1 && r.proof_effects[0].topic_agent_id === r.target_id && r.proof_effects[0].binding_effect === "preserved" && r.proof_effects[0].link_effect === "produced"
-        && linkProofProblem(r.new_link_proof, { schemaVersion: "1.1" }) === null && r.new_link_proof.kind === "owner_selected_route_v1" && REAFFIRM_HANDLE_SHAPE.test(r.new_link_proof.selection_handle)
-        && Array.isArray(r.tombstone_remap) && r.tombstone_remap.every((m, i) => isObj(m) && isId(m.old_tomb_id) && isObj(m.new_proof_ref) && keysOf(m.new_proof_ref) === "kind,selected_root_om,selection_handle,selection_operation_id" && m.new_proof_ref.kind === "owner_select_merge_v1" && REAFFIRM_HANDLE_SHAPE.test(m.new_proof_ref.selection_handle) && (i === 0 || r.tombstone_remap[i - 1].old_tomb_id < m.old_tomb_id))
-        && typeof r.selection_message_id === "string" && OM_SHAPE.test(r.selection_message_id);
-    }
     return false;
   },
   schema_upgrade: (r) => keysOf(r) === "endpoint,from_schema,to_schema"
@@ -3301,8 +3294,8 @@ export function ownerSelectReaffirm({ endpointId, targetId, targetFamily, expect
         .filter((r) => r.kind === "forwarding_tombstone" && r.forwards_to === targetId);
       for (const t of relatedTombstones) {
         const pk = t.proof_ref?.kind;
-        if (pk !== "pairing" && pk !== "owner_select_merge_v1" && pk !== "f4_anchor") {
-          return { ok: false, reason: "bad_input", why: "tombstone " + t.topic_agent_id + " 的 proof kind " + String(pk) + " 不在 {pairing, owner_select_merge_v1, f4_anchor}，reaffirm 无法收敛" };
+        if (pk !== "pairing" && pk !== "owner_select_merge_v1") {
+          return { ok: false, reason: "bad_input", why: "tombstone " + t.topic_agent_id + " 的 proof kind " + String(pk) + " 不在 {pairing, owner_select_merge_v1}，reaffirm 无法收敛" };
         }
       }
       const opIdRef = { id: null };

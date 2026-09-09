@@ -42035,6 +42035,44 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.ok(afterDoc === null || Object.keys(afterDoc.entries).length === 0, "消费后 intent 清空收尾（删文件或空 entries）");
   }));
 
+  test("R57b 返修一 P1-1：reaffirm 让迁移收敛（pairing binding 换 owner_select_v1 + pairing tombstone 换 owner_select_merge_v1），migrationInventory legacy 归零；未知 proof kind tombstone 拒", () => withLedgerB((root, dir) => {
+    // 1. 构造含 pairing binding 的 B3 以及关联的 pairing tombstone
+    const b3 = seedB3B(dir, "r57b_p1_1", 33, "sess-b-33");
+    const beforeDoc = loadOkB(dir);
+    const beforeInv = TAL.migrationInventory(beforeDoc);
+    assert.ok(beforeInv.legacy_proof_count >= 2, "reaffirm 前 legacy proof count > 0");
+
+    // 2. 正常 reaffirm 消费
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const res = talOkB(RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 }), "consume");
+    assert.equal(res.ok, true);
+
+    // 3. reaffirm 之后：migrationInventory legacy 归零
+    const afterDoc = loadOkB(dir);
+    const afterInv = TAL.migrationInventory(afterDoc);
+    assert.equal(afterInv.legacy_proof_count, 0, "reaffirm 后 migrationInventory legacy 计数必须为 0（完全收敛）");
+    const rec = afterDoc.records[b3];
+    assert.equal(rec.binding_proof.kind, "owner_select_v1", "binding 换成 owner_select_v1");
+    assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1", "link 换成 owner_selected_route_v1");
+
+    // 4. 反例：关联 tombstone 包含未知 proof kind → 整笔拒
+    const b3_bad = seedB3B(dir, "r57b_p1_1_bad", 34, "sess-b-34");
+    const intentBad = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3_bad, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue bad");
+    const badDoc = loadOkB(dir);
+    const badTombId = "ta_" + "9".repeat(32);
+    badDoc.records[badTombId] = {
+      kind: "forwarding_tombstone",
+      topic_agent_id: badTombId,
+      forwards_to: b3_bad,
+      merged_at: ISO0B,
+      origin_operation_id: badDoc.records[b3_bad].origin_operation_id,
+      proof_ref: { kind: "wat_unknown", om: "om_wat", matched_fields: ["chat_id", "sender", "body"], pending_token_state: "present" }
+    };
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(badDoc, null, 2) + "\n", { mode: 0o600 });
+    const rBad = RI.consumeReaffirmIntent({ endpointId: EP57B, reaffirmHandle: intentBad.reaffirm_handle, sender: "ou_owner57b", chatId: "oc_r57b", selectionMessageId: "om_sel57b", clock: () => T0B + 1000 });
+    assert.equal(rBad.ok, false, "未知 proof kind tombstone 必须拒");
+  }));
+
   test("R57b 消费（produced 支 + remap）：owner_select_v1 binding 的 B3——binding 重签六字段、关联 owner_select_merge_v1 tombstone 同笔 remap（有序）、产物过 validateLedger", () => {
     // 手工 transition 账本：activate 增量 op 产 owner_select 双证 + tombstone（owner_select_merge_v1）。
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r57b-os-")));

@@ -43729,6 +43729,27 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     return a1.result.created_id;
   };
 
+  // ── R57c 返修三·补钉：Codex 原探针——真实 flow（activate→issue→consume→reaffirm）后，tombstone proof 降回合法 pairing 必须拒 ──
+  //   （reaffirmTombG13 的宽容支必须逐字核：不要把降级 fail-open 的一条核改 if(false) 后还有别的路径顶着。）
+
+  test("R57c3-review-probe：reaffirm 后 tombstone proof 降回合法 pairing 必须拒", () => withLedgerC((root, dir) => {
+    const b1 = b1WithHandle(dir, "r57d_p1r", 112, "om_p1r");
+    const a1 = a1Of(dir, "r57d_p1ra", "sess-p1r");
+    talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57d_p1ract", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-p1r", selectedRootOm: "om_p1r", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_p1rm", selectionBasis: "explicit_handle", clock: () => T0C }), "owner_select activate");
+    const intent = talOkC(RI.issueReaffirmIntent({ endpointId: EP57C, targetId: b1.result.created_id, authorizedOwner: "ou_owner57c", chatId: "oc_r57c", clock: () => T0C + 10 }), "issue intent");
+    talOkC(RI.consumeReaffirmIntent({ endpointId: EP57C, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57c", chatId: "oc_r57c", selectionMessageId: "om_p1rr", clock: () => T0C + 20 }), "consume intent");
+    const doc = loadOkC(dir);
+    const tomb = Object.values(doc.records).find((r) => r.kind === "forwarding_tombstone");
+    tomb.proof_ref = {
+      kind: "pairing",
+      om: "om_p1r",
+      matched_fields: ["chat_id", "sender", "body", "thread_root"],
+      pending_token_state: "present"
+    };
+    const v = TAL.validateLedger(doc, { endpointId: EP57C });
+    assert.equal(v.ok, false, "reaffirm remap 后不得把真实 tombstone proof 降回 legacy pairing");
+  }));
+
   // ── A. §5 候选解析（纯函数）──
 
   test("R57c 解析：显式 osh_（activate→B1 / anchor→A2）恰一命中、basis=explicit_handle、不要求集合恰一；显式 orh_ 只盘点待 rebind B3", () => withLedgerC((root, dir) => {

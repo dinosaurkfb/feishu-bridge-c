@@ -745,7 +745,10 @@ const runControl = (replay) => {
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
-    execute: () => executeSelectControl(control, {
+    // R57d 返修一 B 段 P1-3：现算的 selection context digest 传进事务，终态短路前与 claim 里持久化的逐字比对。
+    contextDigest: selectionContextDigest,
+    execute: (_target, txCtx) => executeSelectControl(control, {
+      txCtx,
       selectAdmissionFn,
       // R57b/R57d §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；
       // chat=链路模板登记群（账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；

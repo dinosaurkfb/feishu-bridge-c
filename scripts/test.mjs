@@ -19549,6 +19549,60 @@ test("R52a 返修二：/feishu-select 入站全路径（owner 默认 off + 终�
   assert.equal(executorCalls, 1, "执行器总调用次数保持为 1");
 });
 
+test("R57d 返修一 B 段 P1-3：终态短路前逐字比较 selection context digest——漂移 → select_context_conflict，绝不回「已处理」；一致 → 按记录重出", () => {
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-seldrift-"));
+  const root = path.join(local, "project");
+  fs.mkdirSync(root, { recursive: true });
+  const registryFile = path.join(local, "registry.json");
+  const templateFile = path.join(local, "template.json");
+  const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "7621020633916345545", chat_name: "群", chat_id: "oc_drift", default_freshness_ms: 900000, agent_uid: "agent_drift" };
+  fs.writeFileSync(templateFile, JSON.stringify(TPL));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
+    id: "drift", root, name: "Drift", root_message_id: "om_drift", expires_at: "2099-01-01T00:00:00Z",
+    session_id: "aily_drift", inbound_state: "bound", status: "active", bound_at: "2026-09-13T00:00:00.000Z",
+  }] }));
+  const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+  fs.mkdirSync(claimsDir, { recursive: true });
+  const { expect } = claudeClaimExpectation({ root, registryFile, templateFile });
+  const h = "osh_" + "d".repeat(32);
+  const msgId = "msg_sel_drift";
+  const key = claimKey(msgId, expect.logicalTaskKey);
+  const ctx = { endpoint: legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid }), chat: TPL.chat_id, session: "aily_drift", message: msgId, sender: "ou_owner", handle: h, kind: "osh" };
+  const digest = SA.selectionContextDigestV1(ctx);
+  acquireClaim({ claimsDir, messageId: msgId, logicalTaskKey: expect.logicalTaskKey, meta: {
+    control: { control: "select", handle: h, handle_kind: "osh" },
+    selection_context: ctx, selection_context_digest_v1: digest,
+    session_id: "aily_drift", binding_id: expect.bindingId, policy_id: MAPPING_POLICY_ID, policy_version: "1.0",
+    local_target_id: "lt_drift", origin_channel_generation_id: "gen_drift",
+  } });
+  // 先闭合一份 consumed 终态（重放会短路回「已处理」）
+  const tx0 = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: false, expect,
+    contextDigest: digest,
+    execute: () => ({ ok: true, changed: true, text: "已生效" }) });
+  assert.equal(tx0.ok, true, "首跑闭合：" + JSON.stringify(tx0));
+  // 漂移重放（同 message、不同 session 事实）：终态短路**之前**就拒，绝不回「已处理」
+  const drifted = SA.selectionContextDigestV1({ ...ctx, session: "aily_drift_2" });
+  let executed = 0;
+  const tx1 = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: true, expect,
+    contextDigest: drifted,
+    execute: () => { executed += 1; return { ok: true, changed: false, text: "不该被调" }; } });
+  assert.equal(tx1.ok, false, "漂移重放拒：" + JSON.stringify(tx1));
+  assert.equal(tx1.reason, "select_context_conflict", "reason：" + tx1.reason);
+  assert.equal(executed, 0, "漂移重放不执行");
+  // 一致的重放：按记录重出（replayed），不执行
+  const tx2 = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: true, expect,
+    contextDigest: digest,
+    execute: () => { executed += 1; return { ok: true, changed: false, text: "不该被调" }; } });
+  assert.equal(tx2.ok, true, "一致重放按记录重出：" + JSON.stringify(tx2));
+  assert.equal(tx2.replayed, true, "replayed 投影");
+  assert.equal(executed, 0, "一致重放也不执行");
+  // 不传 contextDigest（旧行为/维护路径）→ 仍按记录重出，不误伤
+  const tx3 = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: true, expect,
+    execute: () => { executed += 1; return { ok: true, changed: false, text: "不该被调" }; } });
+  assert.equal(tx3.ok, true, "无 digest 不误伤：" + JSON.stringify(tx3));
+  fs.rmSync(local, { recursive: true, force: true });
+});
+
 test("R55：/feishu-select 准入默认接真状态 —— writer_state off/partial/on/坏文件 × 真入口，四种文案与终态（R57d：三支全接真执行器）", () => {
   const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r55-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
@@ -46063,9 +46117,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "r57d", root, name: "R57d", root_message_id: ROOT_D, expires_at: "2099-01-01T00:00:00Z", session_id: SESSION_D, inbound_state: "bound", status: "active", bound_at: "2026-09-13T00:00:00.000Z" }] }));
       const bin = path.join(local, "bin"); fs.mkdirSync(bin, { recursive: true });
       fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
-      const run = (messageId) => {
+      const run = (messageId, sessionId = SESSION_D) => {
         const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> /feishu-select " + b1.result.selection_handle;
-        const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: SESSION_D, role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+        const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: messageId, sessionID: sessionId, role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
         return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(local, "maint"), AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: SESSION_D, AILY_CLI_RUN_ID: "run_" + messageId, FAKE_AILY_ENVELOPE: envelope } });
       };
       const revBefore = TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision;
@@ -46087,6 +46141,17 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(r2.status, 0, r2.stdout + r2.stderr);
       assert.match(r2.stdout, /已处理/u, "重放回「已处理」：" + r2.stdout);
       assert.equal(TAL.loadLedger(path.join(ledgerDir, EP_ENTRY), { endpointId: EP_ENTRY }).doc.revision, rev1, "重放不重执行");
+      // B 段 P1-3：执行前持久化的 immutable selection plan 写进 claim 记录（省略/续做可复现的封闭形状）
+      const claimsDirEntry = path.join(root, ".runtime-data", "inbound", "delivery-claims");
+      const claimFiles = fs.readdirSync(claimsDirEntry).filter((n) => n.endsWith(".claim.json"));
+      assert.equal(claimFiles.length, 1, "claim 记录恰一份：" + claimFiles.join(","));
+      const claimRec = JSON.parse(fs.readFileSync(path.join(claimsDirEntry, claimFiles[0]), "utf-8"));
+      const plan = claimRec.selection_plan;
+      assert.ok(plan, "claim 里有 selection_plan");
+      assert.deepEqual(Object.keys(plan).sort(), ["action", "cas", "handle", "selection_basis", "target_id"], "plan 封闭键集：" + JSON.stringify(Object.keys(plan)));
+      assert.equal(plan.action, "activate");
+      assert.equal(plan.target_id, b1.result.created_id);
+      assert.equal(plan.handle, b1.result.selection_handle);
       void revBefore;
     } finally {
       if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR;

@@ -114,6 +114,8 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
       chatId: sc.chat,
       senderId: sc.sender,
       messageId: sc.message,
+      eventSessionId: sc.session ?? null,
+      txCtx: ctx && ctx.claimsDir && ctx.key ? { claimsDir: ctx.claimsDir, key: ctx.key, claim: ctx.claim ?? null } : null,
       env: ctx?.env,
       _inject: ctx?._inject,
       // R57b 返修六 P1-1：in-flight repair 调执行器也要透传 plan 上下文（缺 → 结构化拒，不进账本）。

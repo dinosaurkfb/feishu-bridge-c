@@ -338,15 +338,15 @@ const jointWhy = (failed, consumed) => "failed（" + SIDECAR_WORD[failed.status]
  * intent：调用方这次解析出的意图（生产路径），锁内必须与 claim 里持久化的意图一致；传 null（维护入口）= 以锁内 claim 的意图为准。
  * expect：当前绑定 / task 的身份期望（与 claim 里写的身份字段同一算法）—— 锁内重读 claim 时核对，别的 binding / thread 的同 key claim 不许执行、不许写记录。
  */
-export function runControlTransaction({ claimsDir, key, intent = null, execute, replay = false, expect = {} }) {
+export function runControlTransaction({ claimsDir, key, intent = null, execute, replay = false, expect = {}, contextDigest = null }) {
   // key 的闸只有一道，在 withControlLock 里：任何路径派生、任何回调之前。
   if (intent !== null) {
     const problem = controlIntentProblem(intent);
     if (problem || intent === undefined) return { ok: false, reason: "control_intent_invalid", why: problem ?? "缺 control" };
   }
-  return withControlLock({ claimsDir, key }, () => runLockedTransaction({ claimsDir, key, intent, execute, replay, expect }));
+  return withControlLock({ claimsDir, key }, () => runLockedTransaction({ claimsDir, key, intent, execute, replay, expect, contextDigest }));
 }
-function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay, expect }) {
+function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay, expect, contextDigest = null }) {
   const quarantined = [];
   // **锁内先重读 claim，身份与意图都以锁内为准**（评审 #94 第 5 轮探针：旧 binding 的同 key claim 重放能改当前模式）：
   // claim 不属于当前身份 → claim_unreadable；没有控制意图 → not_control；调用方意图与锁内不一致 → claim_intent_mismatch —— 三种都不执行、不写记录。
@@ -356,6 +356,15 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
   if (intent === undefined) return { ok: false, reason: "not_control", why: "锁内读到的 claim 没有控制意图", quarantined };
   if (caller !== null && !sameControlIntent(caller, intent)) {
     return { ok: false, reason: "claim_intent_mismatch", why: "锁内 claim 的意图（" + intentTarget(intent) + "）与这次的（" + intentTarget(caller) + "）不一致", quarantined };
+  }
+  // R57d 返修一 B 段 P1-3：同 message 的事实漂移不得被终态 claim 遮蔽 —— **终态短路之前**逐字比较
+  //   selection context digest（调用方从当前事件现算，claim 里是持久化的）；不一致 → select_context_conflict，
+  //   绝不回「已处理」。claim 没带 digest（旧形）不在这里拒 —— 执行器/维护入口的 verifySelectionContext 会点名。
+  if (caller !== null && intent?.control === "select" && typeof contextDigest === "string" && contextDigest.length > 0) {
+    const claimDigest = claim.claim?.selection_context_digest_v1;
+    if (typeof claimDigest === "string" && claimDigest.length > 0 && claimDigest !== contextDigest) {
+      return { ok: false, reason: "select_context_conflict", why: "当前事件上下文与 claim 持久化的 selection_context_digest_v1 不一致（同一条消息换会话/发送者重放）", quarantined };
+    }
   }
   // **锁内状态对所有调用者都是权威的**：不管调用方自称首次还是重放，这一笔已经闭合（consumed / 受验 failed / 并存）就不再执行。
   // 重复投递先完成、原 claim 持有者晚到 —— 晚到者在这里按记录重出回执（replayed），而不是再切一次并覆写记录。

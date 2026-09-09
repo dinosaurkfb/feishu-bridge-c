@@ -633,7 +633,10 @@ const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: paths.claims, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
     // R57b/R57d：三支真执行器——事件事实按 §8.1 消费侧核验传入（sender/endpoint/chat/session/根 om）。
-    execute: () => executeSelectControl(control, {
+    // R57d 返修一 B 段 P1-3：现算的 selection context digest 传进事务，终态短路前与 claim 里持久化的逐字比对。
+    contextDigest: selectionContextDigest,
+    execute: (_target, txCtx) => executeSelectControl(control, {
+      txCtx,
       selectAdmissionFn,
       // R57b/R57d：三支真执行器——事件事实按 §8.1 消费侧核验传入（sender/endpoint/chat/session；
       // R57d 返修一 P1-5：root 改由命中记录现场供给，不再传 mapping 的 transport 根）。

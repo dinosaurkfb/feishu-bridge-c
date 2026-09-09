@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
+import { recordClaimState } from "./claim.mjs";
 import { canonKey } from "./maintenance/canon.mjs";
 import { resolveSelectionCandidate } from "./select-resolve.mjs";
 import { wireSelectActivate, wireSelectAnchor, wireSelectRebind } from "./m1a/wiring.mjs";
@@ -148,6 +149,9 @@ export function selectRejectTextByReason(reason) {
   if (reason === "select_legacy_required") return "迁移未完成（账本仍是影子），执行需要同步更新绑定登记；这一步不可用，未执行";
   if (reason === "select_legacy_failed") return "绑定登记更新失败，未执行（账本未落）；请稍后重试";
   if (reason === "select_ledger_skipped") return "选择没有落到账本（该端点账本未启用镜像），未生效";
+  if (reason === "select_context_conflict") return "这条选择与当时的事件上下文不一致（同一条消息被重放到不同会话/发送者），未执行";
+  if (reason === "select_plan_conflict") return "选择计划与 claim 里持久化的不一致（现场已变动），未执行";
+  if (reason === "select_plan_unwritten") return "选择计划落盘失败，未执行（fail-closed）";
   if (reason === "ledger_corrupt" || reason === "ledger_unreadable") return "账本读不出，未执行（fail-closed）";
   if (reason === "schema_not_11") return "账本还没升到 1.1，不能重签";
   return "控制执行失败（" + reason + "）";
@@ -205,6 +209,9 @@ export function selectAmbiguityReceipt(doc, candidateIds) {
   return ["选择不唯一（" + rows.length + " 个候选），请带对应 handle 重新发送 /feishu-select：", ...lines, ...tail].join("\n");
 }
 
+/** 稳定序列化（键序递归排序）—— selection plan 的逐字比对用。 */
+const stableStringify = (v) => JSON.stringify(v, (_k, x) => (x !== null && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k2) => [k2, x[k2]])) : x));
+
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
 function wiredOutcome(w, action) {
@@ -245,6 +252,7 @@ export function executeSelectControl(intent, {
   senderId = null, chatId = null, endpointId = null, messageId = null,
   eventSessionId = null,
   mappingUpdate = null,
+  txCtx = null,
   now = undefined, clock = () => Date.now(), env = process.env, _inject = undefined,
   claimsDir = undefined, key = undefined,
 } = {}) {
@@ -339,7 +347,34 @@ export function executeSelectControl(intent, {
     }
     return { ok: false, status: "failed", reason: res.reason, text: selectRejectTextByReason(res.reason) };
   }
-  const target = doc.records[res.target_id];
+const target = doc.records[res.target_id];
+  // R57d 返修一 B 段 P1-3：执行前把解析后的 immutable selection plan 持久化进 claim —— 否则省略 handle 的
+  //   重放/续做无法复现同一目标。plan 已在（重放/续做）→ 逐字比对，不一致 → select_plan_conflict。
+  if (txCtx && txCtx.claimsDir && txCtx.key && txCtx.claim) {
+    const plan = {
+      action,
+      target_id: res.target_id,
+      selection_basis: res.selection_basis,
+      handle: handle ?? (action === "rebind" ? target.rebind_handle : target.selection_handle) ?? null,
+      cas: action === "activate"
+        ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.aliases?.root_om ?? null, selection_handle: (handle ?? target.selection_handle) ?? null }
+        : action === "anchor"
+          ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.anchor_candidate ?? null, expected_handle: (handle ?? target.selection_handle) ?? null, expected_expires_at: target.handle_expires_at ?? null, expected_anchor_candidate: target.anchor_candidate ?? null }
+          : { new_session_id: eventSessionId ?? null, expected_old_session_id: target.aliases?.session_id ?? null, rebind_handle: (handle ?? target.rebind_handle) ?? null, expected_expires_at: target.rebind_expires_at ?? null },
+    };
+    const prior = txCtx.claim.selection_plan;
+    if (prior !== undefined) {
+      if (stableStringify(prior) !== stableStringify(plan)) {
+        return { ok: false, status: "failed", reason: "select_plan_conflict", text: selectRejectTextByReason("select_plan_conflict") };
+      }
+    } else {
+      try {
+        recordClaimState({ claimsDir: txCtx.claimsDir, key: txCtx.key, state: "claim", detail: { ...txCtx.claim, selection_plan: plan } });
+      } catch {
+        return { ok: false, status: "failed", reason: "select_plan_unwritten", text: selectRejectTextByReason("select_plan_unwritten") };
+      }
+    }
+  }
   // R57d 返修二 P1-1：载荷带足 legacy writer（Claude promoteBinding / Codex promoteTask）需要的身份 ——
   //   generation（lineageId）/ CAS（rootOm、expectedOldSessionId、expectedExpiresAt）/ 目标项目根。
   const legacy = typeof mappingUpdate === "function"

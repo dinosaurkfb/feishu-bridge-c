@@ -11,6 +11,7 @@ import { RESUMABLE_REJECT_STATES, describeRejectRepair, inspectRejectedClaim, re
 import { bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, setTaskInteractionMode, taskPaths } from "./state.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import { executeSelectControl } from "../select-admission.mjs";
+import { legacyEndpointId } from "../subscription.mjs";
 
 export { codexControlPrecondition as codexControlRepairPrecondition } from "./control-identity.mjs";
 
@@ -22,14 +23,15 @@ if (isDirectRun(import.meta.url)) {
   if (!found.ok) { process.stdout.write("找不到这个 thread 的 task（" + found.reason + "）\n"); process.exit(1); }
   const claimsDir = taskPaths(found.task, home).claims;
   const expect = { logicalTaskKey: found.task.logical_task_key, codexThreadId: parsed.root };
-  // R57d 返修三 P1-2：repair 的 owner 重核上下文（当前角色表 + 链路登记 chat），select 支重核后才重铸 capability。
+  // R57d 返修三 P1-2：repair 的 owner 重核上下文（当前角色表 + 链路登记 chat + 由 chain(codex) + agent_uid 派生 endpoint）；
+  //   select 支重核角色 / chat / endpoint 后才重铸 capability。frank_sender_id 或 agent_uid 读不出 → ownerContext 缺席（select 支 fail-closed）。
   let ownerContext = null;
   try {
     const tpl = loadCodexTemplate();
-    if (tpl?.ok === true && typeof tpl.template?.frank_sender_id === "string") {
-      ownerContext = { frankSenderId: tpl.template.frank_sender_id, senders: tpl.template.senders ?? [], chatId: tpl.template.chat_id ?? null };
+    if (tpl?.ok === true && typeof tpl.template?.frank_sender_id === "string" && typeof tpl.template?.agent_uid === "string") {
+      ownerContext = { frankSenderId: tpl.template.frank_sender_id, senders: tpl.template.senders ?? [], chatId: tpl.template.chat_id ?? null, endpoint: legacyEndpointId({ runtime: "codex", agentUid: tpl.template.agent_uid }) };
     }
-  } catch { /* 读不出不阻断非 select 支 */ }
+  } catch { /* 读不出不阻断非 select 支（select 支由 dispatchControlRepair fail-closed） */ }
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）

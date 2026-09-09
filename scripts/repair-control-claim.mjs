@@ -21,6 +21,8 @@ import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
 import { readSelectionPlan, recoverSelectionPlanTmp } from "./selection-plan.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 
 export function parseRepairControlArgs(argv, { target = "--project" } = {}) {
   let root = null; let key = null; let apply = false;
@@ -110,13 +112,15 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
         _inject: ctx?._inject,
       });
     }
-    // R57d 返修三 P1-2：repair 重核角色（角色表 owner）/ endpoint / chat 后才重新铸造 capability。
+    // R57d 返修三 P1-2：repair 对 select 支 fail-open——ownerContext 缺席时直接跳过角色/chat 核验并铸 capability。
+    //   返修四：select 支 repair 必须拿到完整受验角色表（frank_sender_id + senders）/ chat / 由当前 chain + agent_uid 派生的
+    //   endpoint，任一读不出或与 claim 的 selection_context 不符 → 拒（context_missing / sender_mismatch / endpoint_mismatch），不铸 capability。
     const ownerCtx = ctx?.ownerContext ?? null;
-    if (ownerCtx) {
-      const role = senderRole({ frank_sender_id: ownerCtx.frankSenderId, senders: ownerCtx.senders ?? [] }, sc.sender);
-      if (role !== "owner") return { ok: false, reason: "select_sender_mismatch", why: "repair 重核角色：claim 登记的 sender 当前不是 owner（角色=" + String(role) + "）" };
-      if (ownerCtx.chatId != null && sc.chat !== ownerCtx.chatId) return { ok: false, reason: "select_sender_mismatch", why: "repair 重核 chat：claim 的 chat（" + sc.chat + "）与当前链路登记（" + ownerCtx.chatId + "）不一致" };
-    }
+    if (!ownerCtx) return { ok: false, reason: "select_repair_context_missing", why: "select 支 repair 拿不到完整受验角色表/chat/endpoint（链路模板读不出或缺 owner/agent_uid 字段）——不铸 capability" };
+    const role = senderRole({ frank_sender_id: ownerCtx.frankSenderId, senders: ownerCtx.senders ?? [] }, sc.sender);
+    if (role !== "owner") return { ok: false, reason: "select_sender_mismatch", why: "repair 重核角色：claim 登记的 sender 当前不是 owner（角色=" + String(role) + "）" };
+    if (ownerCtx.chatId != null && sc.chat !== ownerCtx.chatId) return { ok: false, reason: "select_sender_mismatch", why: "repair 重核 chat：claim 的 chat（" + sc.chat + "）与当前链路登记（" + ownerCtx.chatId + "）不一致" };
+    if (ownerCtx.endpoint != null && sc.endpoint !== ownerCtx.endpoint) return { ok: false, reason: "select_endpoint_mismatch", why: "repair 重核 endpoint：claim 的 endpoint（" + sc.endpoint + "）与当前链路派生（" + ownerCtx.endpoint + "）不一致" };
     return executeSelectControl(target, {
       endpointId: sc.endpoint,
       chatId: sc.chat,
@@ -300,15 +304,16 @@ if (isDirectRun(import.meta.url)) {
   const expectation = claudeClaimExpectation({ root, claudeSessionId });
   if (!expectation.ok) { process.stdout.write("当前项目没有可用绑定（" + expectation.reason + "）\n"); process.exit(1); }
   const expect = expectation.expect;
-  // R57d 返修三 P1-2：repair 的 owner 重核上下文 —— 当前角色表（frank_sender_id + senders）与链路登记 chat
-  //   从链路模板解析；select 支重核角色 / chat 后才重铸 capability。模板读不出 → ownerContext 缺席（其余闸不变）。
+  // R57d 返修三 P1-2：repair 的 owner 重核上下文 —— 当前角色表（frank_sender_id + senders）、链路登记 chat、
+  //   由当前 chain(claude) + agent_uid 派生的 endpoint；select 支重核角色 / chat / endpoint 后才重铸 capability。
+  //   frank_sender_id 或 agent_uid 其中一个读不出 → ownerContext 缺席（select 支返修四起 fail-closed，不铸 capability）。
   let ownerContext = null;
   try {
     const tpl = loadChainTemplate();
-    if (tpl?.ok === true && typeof tpl.template?.frank_sender_id === "string") {
-      ownerContext = { frankSenderId: tpl.template.frank_sender_id, senders: tpl.template.senders ?? [], chatId: tpl.template.chat_id ?? null };
+    if (tpl?.ok === true && typeof tpl.template?.frank_sender_id === "string" && typeof tpl.template?.agent_uid === "string") {
+      ownerContext = { frankSenderId: tpl.template.frank_sender_id, senders: tpl.template.senders ?? [], chatId: tpl.template.chat_id ?? null, endpoint: legacyEndpointId({ runtime: "claude", agentUid: tpl.template.agent_uid }) };
     }
-  } catch { /* 读不出不阻断非 select 支 */ }
+  } catch { /* 读不出不阻断非 select 支（select 支由 dispatchControlRepair fail-closed） */ }
   const seen = inspectControlClaim({ claimsDir, key: parsed.key, expect });
   let result = null;
   if (parsed.apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）

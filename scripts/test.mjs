@@ -19716,7 +19716,7 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
         chat: TPL.chat_id,
         session: "aily_claude_ctl",
         message: msgId,
-        sender: "ou_user_1",
+        sender: TPL.frank_sender_id,
         handle: h,
         kind: "osh",
       },
@@ -19725,7 +19725,7 @@ test("R52a 返修三 P1-1: Claude 侧 select in-flight claim 维护恢复（clai
         chat: TPL.chat_id,
         session: "aily_claude_ctl",
         message: msgId,
-        sender: "ou_user_1",
+        sender: TPL.frank_sender_id,
         handle: h,
         kind: "osh",
       }),
@@ -19796,6 +19796,21 @@ test("R52a 返修四 P2: Claude 侧 repair 消费者显式按 kind 穷举（cont
   });
   assert.deepEqual(selectGiven, selTarget);
   assert.equal(selRes.reason, "select_off");
+});
+
+test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext 缺席 → 拒（select_repair_context_missing）；endpoint 漂移 → 拒（select_endpoint_mismatch）", () => {
+  const h = "osh_" + "c".repeat(32);
+  const epClaim = legacyEndpointId({ runtime: "claude", agentUid: "agent_x" });
+  const ctx = { endpoint: epClaim, chat: "oc_r57d", session: "aily_r57d", message: "om_p12mismatch", sender: "12345", handle: h, kind: "osh" };
+  const mkClaim = (over = {}) => ({ control: { control: "select", handle: h, handle_kind: "osh" }, selection_context: { ...ctx, ...over }, selection_context_digest_v1: SA.selectionContextDigestV1({ ...ctx, ...over }) });
+  // ① 模板缺席（ownerContext = null）→ select_repair_context_missing，不铸 capability
+  const missing = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim() });
+  assert.equal(missing.ok, false, "① ownerContext 缺席必须拒：" + JSON.stringify(missing));
+  assert.equal(missing.reason, "select_repair_context_missing", "① " + missing.reason);
+  // ② endpoint 漂移（模板派生 endpoint ≠ claim 的）→ select_endpoint_mismatch（角色/chat 先过，endpoint 不符点出）
+  const drift = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim(), ownerContext: { frankSenderId: "12345", senders: [], chatId: "oc_r57d", endpoint: "endpoint_" + "9".repeat(24) } });
+  assert.equal(drift.ok, false, "② endpoint 漂移必须拒：" + JSON.stringify(drift));
+  assert.equal(drift.reason, "select_endpoint_mismatch", "② " + drift.reason);
 });
 
 test("R52a 返修三 P2: describeControlRepair 按 kind 投影（select 显示 handle / 默认候选，不显示 mode）", () => {

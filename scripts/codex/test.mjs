@@ -10465,5 +10465,20 @@ test("R52a 返修四 P2: Codex 侧 repair 消费者显式按 kind 穷举（contr
   assert.equal(selRes.reason, "select_off");
 });
 
+test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext 缺席 → 拒（select_repair_context_missing）；endpoint 漂移 → 拒（select_endpoint_mismatch）", () => {
+  const h = "osh_" + "c".repeat(32);
+  const epClaim = legacyEndpointId({ runtime: "codex", agentUid: "agent_cx" });
+  const ctx = { endpoint: epClaim, chat: "oc_test", session: "aily_ccx", message: "om_p12mismatch", sender: "12345", handle: h, kind: "osh" };
+  const mkClaim = (over = {}) => ({ control: { control: "select", handle: h, handle_kind: "osh" }, selection_context: { ...ctx, ...over }, selection_context_digest_v1: selectionContextDigestV1({ ...ctx, ...over }) });
+  // ① ownerContext 缺席（模板读不出）→ select_repair_context_missing，不铸 capability
+  const missing = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim() });
+  assert.equal(missing.ok, false, "① ownerContext 缺席必须拒：" + JSON.stringify(missing));
+  assert.equal(missing.reason, "select_repair_context_missing", "① " + missing.reason);
+  // ② endpoint 漂移（模板派生 endpoint ≠ claim 的）→ select_endpoint_mismatch（角色/chat 先过，endpoint 不符点出）
+  const drift = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim(), ownerContext: { frankSenderId: "12345", senders: [], chatId: "oc_test", endpoint: "endpoint_" + "9".repeat(24) } });
+  assert.equal(drift.ok, false, "② endpoint 漂移必须拒：" + JSON.stringify(drift));
+  assert.equal(drift.reason, "select_endpoint_mismatch", "② " + drift.reason);
+});
+
 sealSummary();
 printSummary({ suiteLabel: "Codex adapter" });

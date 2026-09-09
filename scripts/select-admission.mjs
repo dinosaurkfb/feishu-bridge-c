@@ -21,6 +21,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { canonKey } from "./maintenance/canon.mjs";
 import { resolveSelectionCandidate } from "./select-resolve.mjs";
+// R57d 对齐 P1-4：plan 持久化走 R57b 同一写原语（sidecar 硬链接发布 + 受验读回 + 复用/冲突），不再手写 claim.json。
+import { writeSelectionPlan, SELECTION_PLAN_SCHEMA } from "./selection-plan.mjs";
+import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 import { wireSelectActivate, wireSelectAnchor, wireSelectRebind } from "./m1a/wiring.mjs";
 import { requestKeyFor } from "./m1a/dual-write.mjs";
 
@@ -236,9 +239,6 @@ export function selectAmbiguityReceipt(doc, candidateIds) {
   return ["选择不唯一（" + rows.length + " 个候选），请带对应 handle 重新发送 /feishu-select：", ...lines, ...tail].join("\n");
 }
 
-/** 稳定序列化（键序递归排序）—— selection plan 的逐字比对用。 */
-const stableStringify = (v) => JSON.stringify(v, (_k, x) => (x !== null && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k2) => [k2, x[k2]])) : x));
-
 // P1-5a：selection plan 的 digest（与 selection-plan.mjs 同一约定：sha256(canonKey(plan))）。
 const planRefDigest = (plan) => (plan && typeof plan === "object") ? createHash("sha256").update(canonKey(plan)).digest("hex") : null;
 const actionOpType = (action) => (action === "anchor" ? "anchor" : action === "rebind" ? "rebind_session_alias" : "activate");
@@ -434,11 +434,19 @@ export function executeSelectControl(intent, {
   // R57d 返修一 B 段 P1-3：执行前把解析后的 immutable selection plan 持久化进 claim —— 否则省略 handle 的
   //   重放/续做无法复现同一目标。plan 已在（重放/续做）→ 逐字比对，不一致 → select_plan_conflict。
   if (txCtx && txCtx.claimsDir && txCtx.key && txCtx.claim) {
+    // R57d 对齐 P1-4：key 形状封闭（与 writeSelectionPlan 同一判据，非 64hex 一律拒）——
+    //   不进路径派生，目录预建也拒（守卫不是路径写失败的侥幸）。
+    if (!CLAIM_KEY_SHAPE.test(txCtx.key)) {
+      return { ok: false, status: "failed", reason: "select_plan_key_invalid", text: selectRejectTextByReason("select_plan_key_invalid") };
+    }
     const plan = {
+      schema_version: SELECTION_PLAN_SCHEMA,
       action,
       target_id: res.target_id,
-      selection_basis: res.selection_basis,
+      basis: res.selection_basis,
       handle: actualHandle,
+      kind: action === "rebind" ? "orh" : "osh",
+      claim_key: txCtx.key,
       cas: action === "activate"
         ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.aliases?.root_om ?? null, selection_handle: actualHandle }
         : action === "anchor"
@@ -446,21 +454,15 @@ export function executeSelectControl(intent, {
           : { new_session_id: eventSessionId ?? null, expected_old_session_id: target.aliases?.session_id ?? null, rebind_handle: (handle ?? target.rebind_handle) ?? null, expected_expires_at: target.rebind_expires_at ?? null },
     };
     planRefVal = planRefDigest(plan);
-    const prior = txCtx.claim.selection_plan;
-    if (prior !== undefined) {
-      if (stableStringify(prior) !== stableStringify(plan)) {
+    // R57d 对齐 P1-4：plan 走 writeSelectionPlan sidecar（R57b 同一写原语：硬链接发布 + 受验读回 + 复用/冲突），
+    //   不再手写进 claim.json（repair 改读 sidecar）。plan 先受验落盘，随后才调 legacy/ledger：
+    //   写失败 → select_plan_unwritten 不执行；既有 plan 深层不等 → select_plan_conflict 不覆盖。
+    const w = writeSelectionPlan({ claimsDir: txCtx.claimsDir, key: txCtx.key, plan });
+    if (!w.ok) {
+      if (w.reason === "selection_plan_conflict") {
         return { ok: false, status: "failed", reason: "select_plan_conflict", text: selectRejectTextByReason("select_plan_conflict") };
       }
-    } else {
-      // 写进 readClaimState 读的那份 claim 记录（<key>.claim/claim.json）——repair 的重读才拿得到 plan
-      try {
-        const file = path.join(txCtx.claimsDir, txCtx.key + ".claim", "claim.json");
-        const tmp = file + ".tmp." + process.pid;
-        fs.writeFileSync(tmp, JSON.stringify({ ...txCtx.claim, selection_plan: plan }, null, 2) + "\n", { mode: 0o600 });
-        fs.renameSync(tmp, file);
-      } catch {
-        return { ok: false, status: "failed", reason: "select_plan_unwritten", text: selectRejectTextByReason("select_plan_unwritten") };
-      }
+      return { ok: false, status: "failed", reason: "select_plan_unwritten", text: selectRejectTextByReason("select_plan_unwritten") };
     }
   }
   // R57d 返修二 P1-1：载荷带足 legacy writer（Claude promoteBinding / Codex promoteTask）需要的身份 ——

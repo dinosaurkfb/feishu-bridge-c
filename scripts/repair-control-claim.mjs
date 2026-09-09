@@ -155,10 +155,12 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
     if (!d0.ok) return { ok: false, reason: "endpoint_dir_unresolvable", why: d0.why };
     const L0 = loadLedger(d0.dir, { endpointId: sc.endpoint });
     if (!L0.ok) return { ok: false, reason: "ledger_unreadable", why: L0.why ?? L0.reason };
-    const plan = claim?.selection_plan;
-    if (!plan || typeof plan !== "object" || typeof plan.target_id !== "string" || typeof plan.action !== "string") {
-      return { ok: false, reason: "selection_plan_missing", why: "claim 里没有可复核的 selection plan（旧形 unclean），保持 control-committed-unclean" };
+    // R57d 对齐 P1-4：plan 读 sidecar（执行器 writeSelectionPlan 的产物；claim.json 不再内嵌）。
+    const planRead = readSelectionPlan({ claimsDir, key: claim?.claim_key ?? key });
+    if (!planRead.ok || planRead.absent || typeof planRead.plan?.target_id !== "string" || typeof planRead.plan?.action !== "string") {
+      return { ok: false, reason: "selection_plan_missing", why: "selection plan sidecar 缺席/读不出（" + (planRead.absent ? "absent" : (planRead.problem ?? "?")) + "），保持 control-committed-unclean" };
     }
+    const plan = planRead.plan;
     const opType = plan.action === "rebind" ? "rebind_session_alias" : plan.action;
     const wantKey = requestKeyFor({ opType, externalRequestId: sc.message, entityId: plan.target_id });
     if (!wantKey.ok) return { ok: false, reason: "select_plan_invalid", why: wantKey.why ?? "request key 派生失败" };

@@ -43736,8 +43736,8 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b1 = b1WithHandle(dir, "r57d_p1r", 112, "om_p1r");
     const a1 = a1Of(dir, "r57d_p1ra", "sess-p1r");
     talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57d_p1ract", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-p1r", selectedRootOm: "om_p1r", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_p1rm", selectionBasis: "explicit_handle", clock: () => T0C }), "owner_select activate");
-    const intent = talOkC(RI.issueReaffirmIntent({ endpointId: EP57C, targetId: b1.result.created_id, authorizedOwner: "ou_owner57c", chatId: "oc_r57c", clock: () => T0C + 10 }), "issue intent");
-    talOkC(RI.consumeReaffirmIntent({ endpointId: EP57C, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57c", chatId: "oc_r57c", selectionMessageId: "om_p1rr", clock: () => T0C + 20 }), "consume intent");
+    const intent = talOkC(RI.issueReaffirmIntent({ endpointId: EP57C, targetId: b1.result.created_id, authorizedOwner: "ou_owner57c", chatId: "oc_r57c", clock: () => T0C + 10, _inject: { selectAdmissionFn: () => ({ state: "partial" }) } }), "issue intent");
+    talOkC(RI.consumeReaffirmIntent({ endpointId: EP57C, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57c", chatId: "oc_r57c", selectionMessageId: "om_p1rr", clock: () => T0C + 20, selectAdmissionFn: () => ({ state: "partial" }) }), "consume intent");
     const doc = loadOkC(dir);
     const tomb = Object.values(doc.records).find((r) => r.kind === "forwarding_tombstone");
     tomb.proof_ref = {
@@ -44124,8 +44124,8 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     const b1 = b1WithHandle(dir, "r57d_p1r", 112, "om_p1r");
     const a1 = a1Of(dir, "r57d_p1ra", "sess-p1r");
     talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57d_p1ract", b1Id: b1.result.created_id, a1Id: a1.result.created_id, authorizedBy: "ou_r57c", selectedSessionId: "sess-p1r", selectedRootOm: "om_p1r", selectionHandle: b1.result.selection_handle, selectionMessageId: "om_p1rm", selectionBasis: "explicit_handle", clock: () => T0C }), "owner_select activate");
-    const intent = talOkC(RI.issueReaffirmIntent({ endpointId: EP57C, targetId: b1.result.created_id, authorizedOwner: "ou_owner57c", chatId: "oc_r57c", clock: () => T0C + 10 }), "issue intent");
-    talOkC(RI.consumeReaffirmIntent({ endpointId: EP57C, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57c", chatId: "oc_r57c", selectionMessageId: "om_p1rr", clock: () => T0C + 20 }), "consume intent");
+    const intent = talOkC(RI.issueReaffirmIntent({ endpointId: EP57C, targetId: b1.result.created_id, authorizedOwner: "ou_owner57c", chatId: "oc_r57c", clock: () => T0C + 10, _inject: { selectAdmissionFn: () => ({ state: "partial" }) } }), "issue intent");
+    talOkC(RI.consumeReaffirmIntent({ endpointId: EP57C, reaffirmHandle: intent.reaffirm_handle, sender: "ou_owner57c", chatId: "oc_r57c", selectionMessageId: "om_p1rr", clock: () => T0C + 20, selectAdmissionFn: () => ({ state: "partial" }) }), "consume intent");
     const doc = loadOkC(dir); // loadOkC 内含 validateLedger：remap 后反向核不误报
     const tomb = Object.values(doc.records).find((r) => r.kind === "forwarding_tombstone");
     const reOp = Object.values(doc.operations).find((o) => o.op_type === "owner_select_reaffirm");

@@ -2635,6 +2635,11 @@ export function voidPending({ endpointId, requestKey, b1Id, reason, expectedHand
         if (reason !== "expired" && (expectedHandle != null || expectedExpiresAt != null)) {
           return { ok: false, reason: "bad_input", why: "manual/superseded 的 expected_handle/expected_expires_at 必须显式 null" };
         }
+        // R57a 返修六 P1-3：expired 支（1.1+）必须携带有效 expected_handle + expected_expires_at（§6 void 行）；
+        // transition null-handle blocker（无 handle 可核）走不了 expired → bad_input（只能被 manual/superseded 清）。
+        if (reason === "expired" && (expectedHandle == null || expectedExpiresAt == null)) {
+          return { ok: false, reason: "bad_input", why: "void(expired) 在 1.1+ 必须带 expected_handle + expected_expires_at（null-handle blocker 走不了 expired）" };
+        }
         // R57a §4：B1 到期走 void(reason=expired)——核 now ≥ handle_expires_at（锁内时间）；
         // 无 handle 字段（1.0）或 transition null-blocker（无到期可核）不适用此核。
         if (reason === "expired" && b1.handle_expires_at != null && !(clock() >= Date.parse(b1.handle_expires_at))) {

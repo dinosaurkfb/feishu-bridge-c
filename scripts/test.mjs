@@ -40677,6 +40677,22 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
     assert.match(String(v.why), /跨 schema 指纹形不符（新形落边界前）/, "why 点名新形落边界前：" + v.why);
   });
 
+  test("R57a 返修六 P1-3：null-handle B1 无证 void(reason=expired) 拒——1.1+ 且 expired 必带 expected_handle + expected_expires_at，缺一 → bad_input", () => withLedger57((dir) => {
+    const b1 = talOk(TAL.createB1({ endpointId: EP57, requestKey: "p3_b1", chatId: "oc_p3", rootOm: "om_p3", lineageId: "lin_p3", bindingTarget: TGT57(31), clock: () => T0 }), "createB1");
+    const b1Id = b1.result.created_id;
+    // ① 1.1 且 reason=expired 但两个 expected 缺省（null）→ bad_input。
+    const r1 = TAL.voidPending({ endpointId: EP57, requestKey: "p3_v1", b1Id, reason: "expired", clock: () => Date.parse(b1.result.handle_expires_at) + 1 });
+    assert.equal(r1.ok, false, "expired 缺 expected 必拒");
+    assert.equal(r1.reason, "bad_input", "缺 expected → bad_input（无证 void(expired) 走不了）");
+    // ② 只给一个 expected → bad_input。
+    const r2 = TAL.voidPending({ endpointId: EP57, requestKey: "p3_v2", b1Id, reason: "expired", expectedHandle: b1.result.selection_handle, clock: () => Date.parse(b1.result.handle_expires_at) + 1 });
+    assert.equal(r2.ok, false, "只给 expected_handle 必拒");
+    assert.equal(r2.reason, "bad_input", "缺 expected_expires_at → bad_input");
+    // ③ 带齐两键 → 合法（正常到期 void）。
+    const r3 = TAL.voidPending({ endpointId: EP57, requestKey: "p3_v3", b1Id, reason: "expired", expectedHandle: b1.result.selection_handle, expectedExpiresAt: b1.result.handle_expires_at, clock: () => Date.parse(b1.result.handle_expires_at) + 1 });
+    assert.equal(r3.ok, true, "带齐两键 → 合法");
+  }, { schema: "1.1" }));
+
 
 }
 

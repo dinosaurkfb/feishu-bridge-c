@@ -45813,12 +45813,12 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(wD.release, null, "④ 无 outer 锁");
   }));
 
-  test("R57d 返修一 P1-1（wiring 层）：锁内复核 A1 缺席 → no_a1；账本 mode 说不清 → fail-closed", () => withLedgerD((root, dir, ids) => {
-    // 锁内复核：事件会话上没有可归并 A1 → no_a1（§12 ⑥），legacy 仍被调（复合语义：legacy 已提交、账本 op 拒）
-    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => ({ ok: true, legacyCommitted: true }), messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
-    assert.ok(w.ok, "wired.ok 仍 true（legacy 成、账本步拒）：" + JSON.stringify(w));
-    assert.equal(w.shadow[0].ok, false, "账本步拒");
-    assert.equal(w.shadow[0].reason, "no_a1", "锁内复核缺 A1 → no_a1");
+  test("R57d 返修二 P1-6：A1 复核在 legacy 之前（preflight）——缺席 → no_a1 且 legacy 调用数为 0（Codex #147 二轮）", () => withLedgerD((root, dir, ids) => {
+    let calls = 0;
+    const w = WIRE.wireSelectActivate({ endpointId: EP57D, env: process.env, legacy: () => { calls += 1; return { ok: true, legacyCommitted: true }; }, messageId: "om_w5", b1Id: ids.b1Id, chatId: CHAT_D, eventSessionId: "aily_none", authorizedBy: "ou_owner57d", selectedRootOm: "om_b1root", selectionHandle: ids.b1Handle, selectionBasis: "explicit_handle", clock: () => T0D });
+    assert.equal(w.ok, false, "preflight 拒 → 整笔拒：" + JSON.stringify(w));
+    assert.equal(w.reason, "no_a1", "reason：" + w.reason);
+    assert.equal(calls, 0, "legacy 调用数为 0（A1 复核在 legacy 之前，不再出现 legacy 已提交、shadow no_a1）");
   }));
 
   test("R57d 返修一 P1-1（执行器层）：shadow 缺 mappingUpdate → select_legacy_required 且账本不动（禁直写）；注入后复合成功且回调带选择上下文；anchor 免注入", () => withLedgerD((root, dir, ids) => {

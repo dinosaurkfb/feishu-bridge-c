@@ -501,22 +501,31 @@ function selectLedgerOnly(step) {
 const selectLegacyMissing = () => ({ ok: false, commit: "not_committed", reason: "select_legacy_required", why: "shadow 期该动作必须带 legacy 提交回调（更新 mapping）；缺席 → 拒", legacy: null, shadow: null, release: null });
 
 /** wireSelectActivate —— owner_select activate（B1+A1 归并）的双写分派。
- * shadow：outer 锁内先复核事件会话/chat 上仍存在可归并 A1（§12 ⑥，缺 → no_a1）再 legacy → activate。 */
+ * A1 复核在 preflight（outer 锁内、legacy 提交之前，R57d 返修二 P1-6）：缺 → no_a1 整笔拒，
+ * 不再出现「legacy 已提交、shadow no_a1」的半笔。 */
 export function wireSelectActivate({ endpointId, env = process.env, legacy = null, messageId, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
   const mode = selectAuthorityMode({ endpointId, env });
   if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
-  const submit = () => {
+  // preflight 在 outer 锁内、legacy 之前跑（runWired 的 preflight 槽位）：复核事件会话/chat 上仍存在可归并 A1（§12 ⑥）。
+  const preflight = () => {
     const l = loadByEndpoint(endpointId, { env });
-    if (!l.ok) return [{ op: "activate", ok: false, reason: "ledger_unreadable", why: l.why ?? null }];
+    if (!l.ok) return { ok: false, reason: "ledger_unreadable", why: l.why ?? null };
     const a1 = Object.values(l.doc.records).find((x) => x?.kind === "live" && familyOf(x.facts) === "A1" && x.chat_id === chatId && x.aliases.session_id === eventSessionId);
-    if (!a1) return [{ op: "activate", ok: false, reason: "no_a1", why: "锁内复核：事件会话/chat 上无可归并 A1（§12 ⑥）" }];
+    if (!a1) return { ok: false, reason: "no_a1", why: "preflight 复核：事件会话/chat 上无可归并 A1（§12 ⑥）" };
+    return { ok: true, a1Id: a1.topic_agent_id };
+  };
+  const submit = (_legacyRes, pf) => {
     const k = rk("activate", messageId, b1Id);
     if (!k.ok) return [{ op: "activate", ...k }];
-    return [capture("activate", activate({ endpointId, requestKey: k.request_key, b1Id, a1Id: a1.topic_agent_id, authorizedBy, selectedSessionId: eventSessionId, selectedRootOm, selectionHandle, selectionMessageId: messageId, selectionBasis, clock, env }))];
+    return [capture("activate", activate({ endpointId, requestKey: k.request_key, b1Id, a1Id: pf.a1Id, authorizedBy, selectedSessionId: eventSessionId, selectedRootOm, selectionHandle, selectionMessageId: messageId, selectionBasis, clock, env }))];
   };
-  if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
+  if (mode.mode === "authoritative") {
+    const pf = preflight();
+    if (!pf.ok) return { ok: false, commit: "not_committed", reason: pf.reason, why: pf.why, legacy: null, shadow: [{ op: "activate", ok: false, reason: pf.reason, why: pf.why }], release: null };
+    return selectLedgerOnly(submit(null, pf)[0]);
+  }
   if (typeof legacy !== "function") return selectLegacyMissing();
-  return runWired({ endpointId, env, legacy, submit });
+  return runWired({ endpointId, env, legacy, preflight, submit });
 }
 
 /** wireSelectAnchor —— owner_select anchor（A2 → A3 补链路证明）的双写分派。

@@ -13,6 +13,8 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+// 两套件共用一份注册器（R59）：async 用例拒绝、汇总/退出码一致都在那里
+import { createTestHarness, installUnhandledRejectionGuard } from "./test-harness.mjs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
@@ -613,57 +615,16 @@ function suppressAll(dir, { reason = "t", generation = "gen-1", digest } = {}) {
   });
 }
 
-let passed = 0;
-let failed = 0;
-const failures = [];
-
-/**
- * `TEST_FILTER` —— 变异测试的**定向击杀**用（见 references/mutation-runner.mjs）。
- * 逗号分隔多个子串，测试名含任一即跑。**未设置时一个分支都不走**：
- * 全量语义是变异终检与 CI 的判据，不能被过滤器沾湿。
- *
- * 被过滤的运行不许看起来像"全绿全量"，所以：汇总之后另起一行报命中数；
- * "0 命中"用**退出码 2** —— 1 已被"有测试红"占了，而 runner 把 1 读成 KILLED、
- * 把 0 读成"定向没红、升级全量"，把 2 读成"过滤器本身没挑中东西"（那是表的错，不是守卫的功劳）。
- */
-const TEST_FILTER = (process.env.TEST_FILTER ?? "").split(",")
-  .map((s) => s.trim()).filter((s) => s.length > 0);
-let registered = 0;   // 注册进来的条数（含被过滤掉的）—— 汇总里的"总 M"
-let executed = 0;     // 命中并真的跑的 —— "命中 N"
-
-/**
- * 汇总打印之后就封条。之后任何 `test()` 调用立刻响亮失败。
- *
- * 防的是一个真实发生过、而且**报绿**的失败：把新测试追加到文件末尾，
- * 而汇总与 process.exit 在更靠前的位置 —— 那几条要么根本不执行，要么执行了
- * 但结果已经不计入统计。2026-08-23 我一次追加三条，套件照报 393 通过，
- * 三条从未生效；其中一条正是防线上故障复现的。
- *
- * 用运行期封条而不是"扫描源码看有没有 test 写在汇总后面"：后者是在断言形状，
- * 而这条断言的是效果 —— 只要一条测试的结果没被计入，就必须红。
- */
-let summarySealed = false;
-
-function test(name, fn) {
-  if (summarySealed) {
-    console.error("\n✗ 测试「" + name + "」写在汇总之后 —— 它的结果不会计入统计。");
-    console.error("  把它移到 `console.log(\`\\n通过 …\`)` 之前。");
-    process.exit(1);
-  }
-  registered += 1;
-  // 没命中的**不调用 fn()**：被跳过的测试不许留下副作用（夹具会往真 tmp 写东西）。
-  if (TEST_FILTER.length > 0 && !TEST_FILTER.some((needle) => name.includes(needle))) return;
-  executed += 1;
-  try {
-    fn();
-    passed += 1;
-  } catch (err) {
-    failed += 1;
+// ── 测试注册器：与 scripts/codex/test.mjs 共用一份（R59，scripts/test-harness.mjs）──
+// async 用例拒绝、汇总/退出码一致、TEST_FILTER 语义都在共用侧；失败呈现的差异留在这一侧：
+// TEST_TRACE=1 把完整断言与栈打出来（汇总只留第一行），否则汇总后统一打清单。
+const { test, sealSummary, printSummary, TEST_FILTER, failures } = createTestHarness({
+  onFail: (name, err, failures) => {
     failures.push(`${name}\n    ${err.message.split("\n")[0]}`);
-    // 定位用：TEST_TRACE=1 把完整断言与栈打出来（汇总只留第一行）。
     if (process.env.TEST_TRACE) console.error("\n✗ " + name + "\n" + (err.stack ?? err.message));
-  }
-}
+  },
+});
+installUnhandledRejectionGuard();
 
 // ---------- 固定装置（取自 2026-08-19 真实信封） ----------
 
@@ -7595,7 +7556,7 @@ test("测试文件里没有写在汇总之后的 test()", () => {
   //
   // 两层都要：结构检查覆盖"没执行到"，运行期封条覆盖"执行了但不计数"。
   const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8").split("\n");
-  const sealAt = src.findIndex((line) => line.startsWith("summarySealed = true;"));
+  const sealAt = src.findIndex((line) => line.startsWith("sealSummary();"));
   assert.ok(sealAt > 0, "找不到封条那一行 —— 它被改名或删掉了，本检查会失效");
   const late = [];
   for (let i = sealAt + 1; i < src.length; i += 1) {
@@ -7612,7 +7573,10 @@ test("测试文件里没有写在汇总之后的 test()", () => {
 // 进程退出码 1 看得出来；四方验收都只 grep 汇总行。守卫抽在共用注册器
 // scripts/test-harness.mjs 里（两套件共用一份）；这里的测试打的是它真会拒。
 
-/** 最小套件：真套件太重（1100+ 用例的注册时序也受不起），共用注册器配最小夹具在子进程里跑。 */
+/** 最小套件：真套件太重（1100+ 用例的注册时序也受不起），共用注册器配最小夹具在子进程里跑。
+ *  子进程显式清掉 TEST_FILTER：夹具用例名不该受外层定向击杀影响（环境继承是真坑，第①轮就踩过）。 */
+const r59MiniRun = (file) => spawnSync(process.execPath, [file],
+  { encoding: "utf-8", env: { ...process.env, TEST_FILTER: "" } });
 const r59MiniSuite = (body) => {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-r59-"));
   const file = path.join(dir, "mini-" + crypto.randomBytes(4).toString("hex") + ".mjs");
@@ -7631,23 +7595,23 @@ const r59MiniSuite = (body) => {
 
 test("R59 注册器拒绝 async 用例（行为，子进程）：async 声明与 thenable 返回值都点名并 exit 1；同步用例照常绿", () => {
   // ① async 声明：改前汇总报「通过 1 / 失败 0」且 exit 0 —— 正是 R57d 验收踩的假绿
-  const p1 = spawnSync(process.execPath, [r59MiniSuite(
-    'h.test("x", async () => { throw new Error("不会被计数"); });')], { encoding: "utf-8" });
+  const p1 = r59MiniRun(r59MiniSuite(
+    'h.test("x", async () => { throw new Error("不会被计数"); });'));
   assert.equal(p1.status, 1, "async 用例必须 exit 1（改前 exit 0 假绿）：" +
     JSON.stringify({ status: p1.status, stdout: p1.stdout, stderr: p1.stderr?.slice(0, 400) }));
   assert.match(p1.stderr, /async/u, "stderr 点名 async：" + p1.stderr);
   assert.match(p1.stderr, /「x」/u, "点名用例名：" + p1.stderr);
   assert.doesNotMatch(p1.stdout, /通过/u, "用例根本不该执行、不该出汇总：" + p1.stdout);
   // ② 同步函数返回 thenable（如 () => Promise.all(...)）：同样拒绝 —— ① 拦的是声明，② 拦的是返回值
-  const p2 = spawnSync(process.execPath, [r59MiniSuite(
-    'h.test("y", () => Promise.reject(new Error("不会被计数")));')], { encoding: "utf-8" });
+  const p2 = r59MiniRun(r59MiniSuite(
+    'h.test("y", () => Promise.reject(new Error("不会被计数")));'));
   assert.equal(p2.status, 1, "thenable 返回值必须 exit 1：" +
     JSON.stringify({ status: p2.status, stdout: p2.stdout, stderr: p2.stderr?.slice(0, 400) }));
   assert.match(p2.stderr, /async/u, "stderr 点名 async：" + p2.stderr);
   assert.match(p2.stderr, /「y」/u, "点名用例名：" + p2.stderr);
   // ③ 同步用例照常：绿 → exit 0（守卫不许伤及正常路径）
-  const p3 = spawnSync(process.execPath, [r59MiniSuite(
-    'h.test("ok", () => { assert.equal(1, 1); });')], { encoding: "utf-8" });
+  const p3 = r59MiniRun(r59MiniSuite(
+    'h.test("ok", () => { assert.equal(1, 1); });'));
   assert.equal(p3.status, 0, "同步绿用例 exit 0：" +
     JSON.stringify({ status: p3.status, stdout: p3.stdout, stderr: p3.stderr?.slice(0, 400) }));
   assert.match(p3.stdout, /通过 1 \/ 失败 0/u, "同步路径汇总不变：" + p3.stdout);
@@ -7655,15 +7619,15 @@ test("R59 注册器拒绝 async 用例（行为，子进程）：async 声明与
 
 test("R59 汇总与退出码一致（行为，子进程）：红用例汇总「通过 0 / 失败 1」且 exit 1；未处理 rejection 点名原因并 exit 1", () => {
   // ④ 同步红用例：汇总行与退出码必须说同一件事 —— 验收除了 grep 汇总行，必须看退出码
-  const p4 = spawnSync(process.execPath, [r59MiniSuite(
-    'h.test("bad", () => { assert.equal(1, 2); });')], { encoding: "utf-8" });
+  const p4 = r59MiniRun(r59MiniSuite(
+    'h.test("bad", () => { assert.equal(1, 2); });'));
   assert.equal(p4.status, 1, "同步红用例 exit 1：" +
     JSON.stringify({ status: p4.status, stdout: p4.stdout, stderr: p4.stderr?.slice(0, 400) }));
   assert.match(p4.stdout, /通过 0 \/ 失败 1/u, "红用例汇总如实计数：" + p4.stdout);
   // ⑤ 绕过注册器的 async（fire-and-forget 的 rejection）：注册器两道闸都拦不到，
   //    unhandledRejection 兑底接住 —— 把原因说清（多半是 async 用例）并 exit 1
-  const p5 = spawnSync(process.execPath, [r59MiniSuite(
-    'h.test("z", () => { Promise.reject(new Error("绕过注册器的 async")); });')], { encoding: "utf-8" });
+  const p5 = r59MiniRun(r59MiniSuite(
+    'h.test("z", () => { Promise.reject(new Error("绕过注册器的 async")); });'));
   assert.equal(p5.status, 1, "未处理 rejection → exit 1：" +
     JSON.stringify({ status: p5.status, stdout: p5.stdout, stderr: p5.stderr?.slice(0, 400) }));
   assert.match(p5.stderr, /未处理的 rejection/u, "stderr 把原因说清：" + p5.stderr);
@@ -44270,20 +44234,6 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
 
 }
 
-summarySealed = true;
+sealSummary();
 
-
-
-console.log(`\n通过 ${passed} / 失败 ${failed}\n`);
-if (TEST_FILTER.length > 0) {
-  console.log("TEST_FILTER 命中 " + executed + " / 总 " + registered
-    + "（子串：" + TEST_FILTER.join(" | ") + "）—— 这不是全量，不许当全量绿");
-}
-if (failed > 0) {
-  for (const f of failures) console.log("  ✗ " + f);
-  process.exit(1);
-}
-if (TEST_FILTER.length > 0 && executed === 0) {
-  console.log("  ✗ 一个测试名都没命中 —— 跑了 0 项不等于全绿（退出码 2 只说这一件事）");
-  process.exit(2);
-}
+printSummary({ printFailures: true });

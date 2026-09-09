@@ -27,6 +27,8 @@ import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
 export { canonKey, sha256 };
+// R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
+import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./shapes.mjs";
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -37,7 +39,6 @@ const MAX_FILE_BYTES = 1 << 20;
 const MAX_LIVE = 512;
 const MAX_OPERATIONS = 4096;
 
-const ID_SHAPE = /^ta_[0-9a-f]{32}$/u;
 export { ID_SHAPE }; // 只读导出（policy-store 派生 policy_subject_id 复用同一判据，#R33 P2-1）
 const OP_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
@@ -64,10 +65,7 @@ const F4_NO_TOKEN_FIELDS = ["chat_id", "sender", "thread_root"];
 // R48：owner_select 账本地基 schema 与 handle 前缀形状
 // P1-3：导出 SCHEMA_VERSIONS——过渡 runtime 前置要核已装 runtime 的账本模块认 1.1-transition/1.1。
 export const SCHEMA_VERSIONS = Object.freeze(["1.0", "1.1-transition", "1.1"]);
-const SELECTION_HANDLE_SHAPE = /^osh_[0-9a-f]{32}$/u;
-const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
-const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;
-export { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE }; // R52a: 单一出处导出供控制命令解析
+export { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE }; // R52a: 单一出处导出供控制命令解析（定义住叶子 shapes.mjs）
 export { SHA_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE }; // R57b: reaffirm intent store 封闭 schema 复用同一形状（不另写一份；ENDPOINT_SHAPE/ID_SHAPE 已有专行导出）
 const ANY_HANDLE_SHAPE = /^(osh|orh|rfh)_[0-9a-f]{32}$/u;
 const ALLOWED_PRODUCE_OPS = Object.freeze(["activate", "anchor", "rebind_session_alias", "owner_select_reaffirm"]);

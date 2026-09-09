@@ -1,40 +1,51 @@
 /**
- * R57b 返修五：selection plan sidecar（叶子模块，无反向依赖）。
- *   真实 claim 写方（inbound / codex-inbound 两链）在 rfH 支账本提交前，把本次选择的计划持久化为
+ * R57b 返修五/六：selection plan sidecar（真叶子模块，无上层依赖）。
+ *   真实 claim 写方（inbound / codex-inbound 两链）在 rfh 支账本提交前，把本次选择的计划持久化为
  *   claims/<key>.selection-plan.json；repair（control-committed-unclean 恢复）读回它做三方逐字绑定
  *   （plan / uncleanRecord / 账本 op 的 target_id 逐字一致）。无 plan 或目标不一致 → 不转 consumed。
  *
- *   计划键集（与 R57d B 段 plan 同形）：action / target_id / basis / handle / kind / cas。其中
- *   cas（compare-and-set 上下文）在 rfH 支为 { intent_id, expected_expires_at }（绑定本次所见 intent）。
+ *   计划封闭键集（返修六，与 R57d B 段同形 + claim_key + schema_version）：
+ *   action / basis / cas / claim_key / handle / kind / schema_version / target_id。
+ *   cas（compare-and-set 上下文）在 rfh 支为 { intent_id, expected_expires_at }（绑定本次所见 intent）。
+ *
+ *   不可变约束（返修六 P1-2）：plan 本体含 claim_key，readback 与文件名逐字互证；key 核 CLAIM_KEY_SHAPE
+ *   （64hex，防路径型 key 越界）；既有 plan 只能「受验全符复用」（逐字相等 → ok, reused:true）或
+ *   selection_plan_conflict，**绝不覆盖**（写用 O_EXCL 目标文件，不用 rename 覆盖既有）。
  *
  *   写原语（同侧 sidecar 纪律）：临时文件 O_CREAT|O_EXCL 0600 → fstat 核普通文件/单硬链接/0600 →
- *   fsync 写端 fd → rename → fsync 父目录 → 受验读回（fd 绑定：O_NOFOLLOW|O_NONBLOCK、fstat 核
- *   0600/单硬链接/大小上限、JSON 封闭 schema、逐字节等）。失败 fail-closed（写失败 = 不进账本提交）。
+ *   fsync 写端 fd → 目标文件 O_CREAT|O_EXCL（不覆盖）→ fsync 父目录 → 受验读回（fd 绑定：O_NOFOLLOW|
+ *   O_NONBLOCK、fstat 核 0600/单硬链接/大小上限、JSON 封闭 schema、逐字节等）。失败 fail-closed
+ *   （写失败 = 不进账本提交）。
  *
  *   注意：本模块只做 sidecar 持久化，不读环境变量、不碰账本、不 import 任何可能反向依赖本模块的模块。
+ *   形状常量住叶子 scripts/shapes.mjs（返修六 P2），不 import 大账本模块。
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { isObj, canonKey, sha256 } from "./maintenance/canon.mjs";
-import { ID_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
+import { ID_SHAPE, REAFFIRM_HANDLE_SHAPE, CLAIM_KEY_SHAPE } from "./shapes.mjs";
 
 export const SELECTION_PLAN_SCHEMA = "selection-plan-1";
 export const SELECTION_PLAN_FILE = (key) => key + ".selection-plan.json";
 export const SELECTION_PLAN_MAX_BYTES = 64 * 1024;
+// 封闭键集（含 claim_key + schema_version，返修六 P1-2 / P2-a）。
+const SELECTION_PLAN_KEYS = "action,basis,cas,claim_key,handle,kind,schema_version,target_id";
 
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 
-/** 封闭 schema 校验器：返回 null 或问题短句。 */
-export function selectionPlanProblem(plan) {
+/** 封闭 schema 校验器：返回 null 或问题短句（真正用 SELECTION_PLAN_SCHEMA 逐字段校验）。 */
+export function selectionPlanProblem(plan, key) {
   if (!isObj(plan)) return "plan 不是对象";
-  // 键集 = action,basis,cas,handle,kind,target_id（与 R57d B 段同形）。
-  if (keysOf(plan) !== "action,basis,cas,handle,kind,target_id") return "plan 键集不对";
+  if (keysOf(plan) !== SELECTION_PLAN_KEYS) return "plan 键集不对（须 " + SELECTION_PLAN_KEYS + "）";
+  if (plan.schema_version !== SELECTION_PLAN_SCHEMA) return "schema_version 不是 " + SELECTION_PLAN_SCHEMA;
   if (plan.action !== "reaffirm") return "action 不是 reaffirm";
   if (plan.basis !== "reaffirm") return "basis 不是 reaffirm";
   if (plan.kind !== "rfh") return "kind 不是 rfh";
+  if (typeof plan.claim_key !== "string" || !CLAIM_KEY_SHAPE.test(plan.claim_key)) return "claim_key 形状不对";
+  if (typeof key === "string" && plan.claim_key !== key) return "claim_key 与文件名不一致";
   if (typeof plan.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(plan.handle)) return "handle 形状不对";
   if (typeof plan.target_id !== "string" || !ID_SHAPE.test(plan.target_id)) return "target_id 形状不对";
   // cas：封闭对象，键集 = expected_expires_at,intent_id；两值形状/自洽。
@@ -56,13 +67,19 @@ function planPath(claimsDir, key) {
   return path.join(claimsDir, SELECTION_PLAN_FILE(key));
 }
 
+function validateKey(key) {
+  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return "key 形状不对（须 64hex）";
+  return null;
+}
+
 /**
  * 受验读回：fd 绑定、O_NOFOLLOW|O_NONBLOCK、普通文件、单硬链接、0600、大小上限、JSON 封闭 schema。
- * 返回 { ok:true, plan, sha256, bytes } / { ok:true, absent:true } / { ok:false, problem }。
+ * 返回 { ok:true, plan, sha256, bytes, reused } / { ok:true, absent:true } / { ok:false, problem, reason? }。
  */
 export function readSelectionPlan({ claimsDir, key }) {
   if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: false, problem: "claimsDir 缺失" };
-  if (typeof key !== "string" || key.length === 0) return { ok: false, problem: "key 缺失" };
+  const kv = validateKey(key);
+  if (kv !== null) return { ok: false, problem: kv };
   const file = planPath(claimsDir, key);
   let fd = null;
   try {
@@ -86,8 +103,8 @@ export function readSelectionPlan({ claimsDir, key }) {
     }
     let plan = null;
     try { plan = JSON.parse(buf.toString("utf-8")); } catch (err) { return { ok: false, problem: "JSON 解析失败: " + errCode(err) }; }
-    const p = selectionPlanProblem(plan);
-    if (p !== null) return { ok: false, problem: p };
+    const p = selectionPlanProblem(plan, key);
+    if (p !== null) return { ok: false, problem: p, reason: "selection_plan_key_mismatch" };
     return { ok: true, plan, sha256: sha256(buf), bytes: buf.length };
   } catch (err) {
     return { ok: false, problem: errCode(err) };
@@ -97,21 +114,33 @@ export function readSelectionPlan({ claimsDir, key }) {
 }
 
 /**
- * 原子写 plan sidecar：tmp O_EXCL 0600 写满 → fsync → rename → fsync 父目录 → 受验读回逐字节等。
- * 失败 fail-closed（带 residue 点名 tmp）。
- * @returns { ok:true } | { ok:false, reason, why, residue? }
+ * 写 plan sidecar（原子、不可覆盖）。返回：
+ *   { ok:true, reused:false, created:true }  新建
+ *   { ok:true, reused:true }                 既有 plan 逐字全符（幂等）
+ *   { ok:false, reason, why }                conflict / 校验 / 写失败（fail-closed）
  */
 export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}) {
   if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: false, reason: "claimsDir 缺失" };
-  if (typeof key !== "string" || key.length === 0) return { ok: false, reason: "key 缺失" };
-  const p = selectionPlanProblem(plan);
+  const kv = validateKey(key);
+  if (kv !== null) return { ok: false, reason: "selection_plan_key_invalid", why: kv };
+  // plan 必须带与 key 一致的 claim_key（P1-2：读回与文件名互证）。
+  const p = selectionPlanProblem(plan, key);
   if (p !== null) return { ok: false, reason: "selection_plan_invalid", why: p };
   const bytes = Buffer.from(JSON.stringify(plan, null, 2) + "\n", "utf-8");
   if (bytes.length > SELECTION_PLAN_MAX_BYTES) return { ok: false, reason: "over_capacity", why: "序列化长度超出上限" };
   const file = planPath(claimsDir, key);
+
+  // 既有 plan：只能「受验全符复用」或 conflict，绝不覆盖。
+  const existing = readSelectionPlan({ claimsDir, key });
+  if (!existing.ok) return { ok: false, reason: existing.reason ?? "selection_plan_readback_failed", why: existing.problem };
+  if (!existing.absent) {
+    if (existing.sha256 === sha256(bytes)) return { ok: true, reused: true };
+    return { ok: false, reason: "selection_plan_conflict", why: "既有 plan 与本次计划逐字不等（不可覆盖），保持原计划" };
+  }
+
   const tmp = path.join(claimsDir, "." + SELECTION_PLAN_FILE(key) + ".tmp." + process.pid + "." + crypto.randomUUID());
   let fd = null;
-  let renameLanded = false;
+  let landed = false;
   const cleanupTmp = () => {
     try { fs.unlinkSync(tmp); } catch (err) { if (err?.code !== "ENOENT") throw err; }
   };
@@ -134,16 +163,39 @@ export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}
     fs.closeSync(fd);
     fd = null;
     if (typeof _inject?.beforeRename === "function") _inject.beforeRename();
-    fs.renameSync(tmp, file);
-    renameLanded = true;
+    // 目标文件不覆盖：O_CREAT|O_EXCL 打开（既有 → EEXIST → 此处应已被上面 existing 分支拦住）。
+    let ofd = null;
+    try {
+      ofd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
+    } catch (err) {
+      if (err?.code === "EEXIST") {
+        // 目标在写窗口内被并发创建：重读核是否逐字全符。
+        const later = readSelectionPlan({ claimsDir, key });
+        if (later.ok && !later.absent && later.sha256 === sha256(bytes)) return { ok: true, reused: true };
+        return { ok: false, reason: "selection_plan_conflict", why: "目标文件已被并发写（逐字不等，不可覆盖）" };
+      }
+      throw err;
+    }
+    let off2 = 0;
+    while (off2 < bytes.length) {
+      const n = fs.writeSync(ofd, bytes, off2, bytes.length - off2);
+      if (n <= 0) break;
+      off2 += n;
+    }
+    fs.fsyncSync(ofd);
+    fs.closeSync(ofd);
+    ofd = null;
+    landed = true;
   } catch (err) {
     if (fd !== null) { try { fs.closeSync(fd); fd = null; } catch {} }
-    if (!renameLanded) {
+    if (!landed) {
       try { cleanupTmp(); } catch (e2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(e2) }; }
       return { ok: false, reason: "tmp_write_failed", why: errCode(err) };
     }
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
   }
-  // rename 后目录 fsync（不吞异常）
+  // rename 后目录 fsync（不吞异常）——此处目标文件直接用 O_EXCL 写成，仍需 fsync 目录（条目耐久）。
   try {
     if (_inject?.failDirFsync) { const e = new Error("EIO: i/o error"); e.code = "EIO"; throw e; }
     let dfd = null;
@@ -157,5 +209,5 @@ export function writeSelectionPlan({ claimsDir, key, plan, _inject = null } = {}
   const rb = readSelectionPlan({ claimsDir, key });
   if (!rb.ok) return { ok: false, reason: "readback_failed", why: "受验读回未通过（" + (rb.problem ?? "?") + "）" };
   if (rb.sha256 !== sha256(bytes)) return { ok: false, reason: "readback_failed", why: "读回字节与写入字节不一致" };
-  return { ok: true };
+  return { ok: true, created: true, reused: false };
 }

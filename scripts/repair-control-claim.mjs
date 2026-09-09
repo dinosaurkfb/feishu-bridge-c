@@ -116,6 +116,9 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
       messageId: sc.message,
       env: ctx?.env,
       _inject: ctx?._inject,
+      // R57b 返修六 P1-1：in-flight repair 调执行器也要透传 plan 上下文（缺 → 结构化拒，不进账本）。
+      claimsDir: ctx?.claimsDir,
+      key: claim?.claim_key ?? ctx?.key,
     });
   }
   if (kind === "mode") return onMode(typeof target === "string" ? target : target.mode);
@@ -203,6 +206,13 @@ function repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanReco
   }
   if (planTarget !== unTarget) {
     return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan.target_id（" + planTarget + "）与 uncleanRecord.result.target_id（" + unTarget + "）不一致，保持 control-committed-unclean" };
+  }
+  // P1-2（续）：repair 也比对 plan.handle === claim.handle 与 plan.kind === claim.kind（不全只比 target）。
+  if (planRead.plan?.handle !== sc.handle) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan.handle 与 claim.handle 不一致，保持 control-committed-unclean" };
+  }
+  if (planRead.plan?.kind !== sc.kind) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan.kind 与 claim.kind 不一致，保持 control-committed-unclean" };
   }
   // 精确绑定的 request_key 与写入侧共用同一派生函数（P2）；不再保留本地字面拼接。
   const matches = Object.values(L.doc.operations).filter((op) =>

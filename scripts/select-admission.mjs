@@ -165,6 +165,10 @@ export function executeSelectControl(intent, {
   if (typeof intent.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(intent.handle)) {
     return { ok: false, reason: "reaffirm_handle_unknown", text: selectRejectTextByReason("reaffirm_handle_unknown") };
   }
+  // R57b 返修六 P1-1：rfh 支强制 plan 上下文在场（缺 claimsDir/key → 结构化拒，不进账本提交）。
+  if (typeof claimsDir !== "string" || claimsDir.length === 0 || typeof key !== "string" || key.length === 0) {
+    return { ok: false, status: "failed", reason: "selection_plan_context_missing", text: selectRejectTextByReason("selection_plan_context_missing") };
+  }
   const res = consumeReaffirm({ endpointId, reaffirmHandle: intent.handle, sender: senderId, chatId, selectionMessageId: messageId, selectAdmissionFn, now, env, _inject, claimsDir, key });
   if (res.status === "control-committed-unclean") {
     return {

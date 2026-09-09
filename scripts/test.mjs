@@ -40819,6 +40819,29 @@ test("R58 返修一 P1-3：原子 no-replace 发布——既存半截/不合法 
   assert.deepEqual([r5.ok, r5.reason], [false, "conflict"], "内容不等 → conflict");
 });
 
+test("R58 返修一 P1-5：result 受验写失败 → 不建回执（gated：先 result 后回执）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58p15-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  const outbox = path.join(local, "outbox");
+  fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true }); fs.mkdirSync(outbox, { recursive: true });
+  const errBody = "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 boom', num_turns: 1, duration_ms: 2500 }) + '\\n');";
+  const key = r54Key(50);
+  // 预放一个 symlink 到 result 路径 → writeDocFile 检测到符号链接 → ok:false → 不写回执、不覆盖 symlink。
+  fs.symlinkSync("/dev/null", path.join(runs, key + ".forward.result.json"));
+  fs.writeFileSync(path.join(bin, "claude"), r54Shim(null, errBody), { mode: 0o700 });
+  const r = deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key, outboxDir: outbox, originGenerationId: "gen-r58",
+    env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  // 等待 runner 结束（result 写失败路径也应收敛，不挂起）
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline && fs.existsSync(path.join(runs, key + ".forward.started.json"))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  assert.equal(fs.existsSync(path.join(outbox, key + R58_RECEIPT_SUFFIX)), false, "result 写失败 → 无回执文件");
+  assert.equal(fs.lstatSync(path.join(runs, key + ".forward.result.json")).isSymbolicLink(), true, "symlink 不被覆盖");
+});
+
 test("R58 doctor ⑯：失败但回执缺失 → 子计数点名 key；回执在项目级 / 会话级 outbox → 不点名；桶之和不变", () => {
   const m = doctorMachine();
   const root = m.project("r58doc", { expiresAt: "2099-01-01T00:00:00.000Z" });

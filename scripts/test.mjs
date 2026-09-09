@@ -40610,6 +40610,7 @@ test("R54 返修七 P1：未知 arch / 非法 endianness 先封闭拒绝——�
 // ── R58：入站转发失败回执（issue #140 后半；Frank 2026-09-10 已批准这类自动写入）──
 
 const R58_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
+const R58_SHA = "c".repeat(64); // P1-5：result_sha256 的假值（result 文件内容摘要）
 /** 轮询等回执落盘（runner 是 detached 进程，与 R54 的 r54WaitResult 同款纪律）。 */
 const r58WaitReceipt = (file, ms = 5000) => {
   const deadline = Date.now() + ms;
@@ -40640,10 +40641,10 @@ test("R58 失败回执正文（P1-4）：四类固定文案逐字；非四类拒
 test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不被改）、key 形状守卫、代际不可用记 null、审计三态闭合", () => {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58w-"));
   const key = r54Key(9);
-  const w1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_1", targetGenerationId: "gen-9" });
+  const w1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_1", targetGenerationId: "gen-9", resultSha256: R58_SHA });
   assert.equal(w1.ok, true, JSON.stringify(w1));
   assert.equal(path.basename(w1.file), key + R58_RECEIPT_SUFFIX, "文件名绑定 key");
-  const w2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_1", targetGenerationId: "gen-9" });
+  const w2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_1", targetGenerationId: "gen-9", resultSha256: R58_SHA });
   assert.deepEqual([w2.ok, w2.reason], [false, "duplicate"], "同 key 第二次输给 O_EXCL");
   const kept = JSON.parse(fs.readFileSync(w1.file, "utf-8"));
   assert.equal(kept.kind, "forward_failed");
@@ -40668,7 +40669,7 @@ test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不�
   assert.equal(fs.existsSync(path.join(dir, r54Key(10) + R58_RECEIPT_SUFFIX)), false, "不可用代际不写回执");
   const w3b = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(11), category: "session_error", messageId: "", targetGenerationId: null });
   assert.deepEqual([w3b.ok, w3b.reason], [false, "generation_unavailable"], "null 代际拒");
-  const w3c = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(12), category: "session_error", messageId: "", targetGenerationId: "gen-r58" });
+  const w3c = r58AppendReceipt({ outboxDir: dir, forwardKey: r54Key(12), category: "session_error", messageId: "", targetGenerationId: "gen-r58", resultSha256: R58_SHA });
   assert.equal(w3c.ok, true, "可用代际写回执：" + JSON.stringify(w3c));
   const rec3 = JSON.parse(fs.readFileSync(w3c.file, "utf-8"));
   assert.equal(rec3.target_channel_generation_id, "gen-r58", "可用冻结代际带出");
@@ -40707,6 +40708,7 @@ test("R58 失败回执行为（假 claude）：is_error 失败 → outbox 一条
   assert.equal(d1.forward_key, r54Key(1));
   assert.equal(d1.message_id, "om_msg" + r54Key(1).slice(-4));
   assert.equal(d1.target_channel_generation_id, "gen-r58");
+  assert.ok(/^[0-9a-f]{64}$/u.test(d1.result_sha256), "回执带 result_sha256（result 文件内容摘要）：" + d1.result_sha256);
   assert.equal(d1.text, outboxModule.FORWARD_FAILURE_TEXT.session_error, "正文 = 封闭固定文案（不含 reason 首行）：" + JSON.stringify(d1.text));
   // ② 同 key 重跑（result 会被重写）：回执仍只有一条
   const first = JSON.stringify(r54WaitResult(path.join(runs, r54Key(1) + ".forward.result.json")));
@@ -40745,7 +40747,7 @@ test("R58 发布器 dry-run：forward_failed 走既有出站发布器按回执�
     event_key: "forward-failed:" + r54Key(21), source: "forward-runner",
     input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null,
     forward_key: r54Key(21), message_id: "om_m1",
-    created_at: createdAt, publish_eligible_at: createdAt, published_at: null,
+    created_at: createdAt, publish_eligible_at: createdAt, published_at: null, result_sha256: R58_SHA,
   }, null, 2) + "\n", { mode: 0o600 });
   const r = drainProject({ root: dir, dryRun: true });
   assert.equal(r.status, "dry_run", JSON.stringify({ status: r.status, reason: r.reason, detail: r.details ?? r.why ?? null }));
@@ -40775,7 +40777,7 @@ test("R58 返修一 P1-2：forward_failed 封闭校验器五处共用——伪�
   assert.equal(d1.runs?.published?.length ?? 0, 0, "伪造记录不进入发布队列");
   fs.rmSync(path.join(outbox, r54Key(30) + R58_RECEIPT_SUFFIX), { force: true });
   // ② 篡改 forward_key 与文件名不符 → 拒（unexplainable），发布 dry-run 不挑它
-  const goodRec = { schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal", id: "forward-failed-" + r54Key(31), kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.unknown, event_key: "forward-failed:" + r54Key(31), source: "forward-runner", input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null, forward_key: "0".repeat(63) + "f", message_id: "om_m1", created_at: createdAt, publish_eligible_at: createdAt, published_at: null };
+  const goodRec = { schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal", id: "forward-failed-" + r54Key(31), kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.unknown, event_key: "forward-failed:" + r54Key(31), source: "forward-runner", input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null, forward_key: "0".repeat(63) + "f", message_id: "om_m1", created_at: createdAt, publish_eligible_at: createdAt, published_at: null, result_sha256: R58_SHA };
   fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(goodRec));
   const audit2 = auditOutbox(outbox);
   assert.ok(audit2.unexplainable.some((u) => u.file === r54Key(31) + R58_RECEIPT_SUFFIX), "forward_key 与文件名不符 → unexplainable：" + JSON.stringify(audit2.unexplainable));
@@ -40798,22 +40800,22 @@ test("R58 返修一 P1-3：原子 no-replace 发布——既存半截/不合法 
   const file = path.join(dir, key + R58_RECEIPT_SUFFIX);
   // ① 预置内容为 "{" 的同名文件 → append → residue（不是 duplicate、不覆盖）
   fs.writeFileSync(file, "{");
-  const r1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1" });
+  const r1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1", resultSha256: R58_SHA });
   assert.deepEqual([r1.ok, r1.reason], [false, "residue"], JSON.stringify(r1));
   assert.equal(fs.readFileSync(file, "utf-8"), "{", "半截文件不被覆盖");
   // ② 崩溃在 link 前（beforeLink 抛错）→ 无最终文件、tmp 被清
   fs.rmSync(file, { force: true });
-  const r2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1", _inject: { beforeLink: () => { throw new Error("crash before link"); } } });
+  const r2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1", resultSha256: R58_SHA, _inject: { beforeLink: () => { throw new Error("crash before link"); } } });
   assert.equal(r2.ok, false, JSON.stringify(r2));
   assert.equal(fs.existsSync(file), false, "link 前崩溃 → 无最终文件");
   assert.equal(fs.readdirSync(dir).filter((n) => n.includes(".tmp.")).length, 0, "tmp 被清");
   // ③ 正常写成功 → 读回过校验器；同内容重放 → duplicate
-  const r3 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1" });
+  const r3 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1", resultSha256: R58_SHA });
   assert.equal(r3.ok, true, JSON.stringify(r3));
-  const r4 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1" });
+  const r4 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_m1", targetGenerationId: "gen-1", resultSha256: R58_SHA });
   assert.deepEqual([r4.ok, r4.reason], [false, "duplicate"], "同内容重放 → duplicate");
   // ④ 既存内容不等（不同 category）→ conflict
-  const r5 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "unknown", messageId: "om_m1", targetGenerationId: "gen-1" });
+  const r5 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "unknown", messageId: "om_m1", targetGenerationId: "gen-1", resultSha256: R58_SHA });
   assert.deepEqual([r5.ok, r5.reason], [false, "conflict"], "内容不等 → conflict");
 });
 

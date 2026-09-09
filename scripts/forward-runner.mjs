@@ -202,12 +202,12 @@ function fsyncDirOf(dir) {
  */
 function writeDocFile(targetPath, errPath, doc, maxBytes) {
   const bytes = Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
-  if (bytes.length > maxBytes) { noteErr(errPath, "result 超过大小上限（" + bytes.length + "），不落盘"); return; }
+  if (bytes.length > maxBytes) { noteErr(errPath, "result 超过大小上限（" + bytes.length + "），不落盘"); return { ok: false }; }
   try {
     try {
-      if (fs.lstatSync(targetPath).isSymbolicLink()) { noteErr(errPath, "目标已是符号链接，不跟随不覆盖：" + targetPath); return; }
+      if (fs.lstatSync(targetPath).isSymbolicLink()) { noteErr(errPath, "目标已是符号链接，不跟随不覆盖：" + targetPath); return { ok: false }; }
     } catch (err) {
-      if (err?.code !== "ENOENT") { noteErr(errPath, "目标 lstat 失败（" + String(err?.code ?? err?.message ?? err) + "），停止写入：" + targetPath); return; } // #141 三轮 P2-5：只有 ENOENT 算缺席
+      if (err?.code !== "ENOENT") { noteErr(errPath, "目标 lstat 失败（" + String(err?.code ?? err?.message ?? err) + "），停止写入：" + targetPath); return { ok: false }; } // #141 三轮 P2-5：只有 ENOENT 算缺席
     }
     const tmp = targetPath + ".tmp." + process.pid;
     let fd = null;
@@ -216,7 +216,6 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
       fs.writeFileSync(fd, bytes);
       fs.fsyncSync(fd);
     } catch (err) {
-      // rename 之前失败：清自己建的 tmp（#141 二轮 P2-5），再上抛走统一记診断
       try { fs.rmSync(tmp, { force: true }); } catch { /* 清不掉就留着交盘点 */ }
       throw err;
     }
@@ -230,12 +229,14 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
     const back = fs.readFileSync(targetPath);
     if (crypto.createHash("sha256").update(back).digest("hex") !== crypto.createHash("sha256").update(bytes).digest("hex")) {
       noteErr(errPath, "落盘读回 SHA 不等：" + targetPath);
-      return;
+      return { ok: false };
     }
     const dirErr = fsyncDirOf(path.dirname(targetPath));
     if (dirErr !== null) noteErr(errPath, "目录 fsync 失败（" + dirErr + "）：" + path.dirname(targetPath));
+    return { ok: true, sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
   } catch (err) {
     noteErr(errPath, String(err?.code ?? err?.message ?? err).slice(0, 200));
+    return { ok: false };
   }
 }
 
@@ -246,8 +247,8 @@ function noteErr(errPath, line) {
 /** 写端自校验（#141 P1-2）：problem 非空 → 不落盘、记 stderr.log。 */
 function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expectedKey) {
   const problem = problemFn(doc, { now: Date.now(), expectedKey });
-  if (problem !== null) { noteErr(errPath, "自校验失败不落盘（" + path.basename(targetPath) + "）：" + problem); return; }
-  writeDocFile(targetPath, errPath, doc, maxBytes);
+  if (problem !== null) { noteErr(errPath, "自校验失败不落盘（" + path.basename(targetPath) + "）：" + problem); return { ok: false }; }
+  return writeDocFile(targetPath, errPath, doc, maxBytes);
 }
 
 /**
@@ -265,7 +266,7 @@ function failureCategory(doc) {
   return "unknown";
 }
 
-function writeFailureReceipt({ spec, doc, errPath }) {
+function writeFailureReceipt({ spec, doc, errPath, resultSha256 }) {
   if (doc.sent === true) return; // 成功不写；失败 = is_error / 非零退出 / 崩溃 / 起不来（sent 必为 false）
   if (typeof spec.outboxDir !== "string" || spec.outboxDir.length === 0) return;
   const r = appendForwardFailureReceipt({
@@ -274,6 +275,7 @@ function writeFailureReceipt({ spec, doc, errPath }) {
     category: failureCategory(doc),
     messageId: spec.messageId ?? null,
     targetGenerationId: spec.originGenerationId ?? null,
+    resultSha256,
   });
   // duplicate = 同 key 的回执已经在（重放）：正是想要的结果，不算失败。
   if (!r.ok && r.reason !== "duplicate") {
@@ -283,8 +285,9 @@ function writeFailureReceipt({ spec, doc, errPath }) {
 
 /** result 落盘后紧跟回执判断 —— 三个结局路径共用这一份，不另抄。 */
 function writeResultAndMaybeReceipt(resultPath, errPath, doc, spec) {
-  writeValidatedDoc(resultPath, errPath, doc, forwardResultProblem, 64 * 1024, spec.key);
-  writeFailureReceipt({ spec, doc, errPath });
+  const w = writeValidatedDoc(resultPath, errPath, doc, forwardResultProblem, 64 * 1024, spec.key);
+  // P1-5：只有 result 受验写成（写回 + fsync + 读回）之后才创建回执；result 写失败 → 不写回执（记 stderr.log）。
+  if (w && w.ok === true) writeFailureReceipt({ spec, doc, errPath, resultSha256: w.sha256 });
 }
 
 /** 有界读：只取文件末尾 256 KiB（O_NOFOLLOW 打开、同 fd fstat），逐行 JSON 解析，坏行跳过。 */

@@ -153,7 +153,7 @@ export function forwardFailureText(category) {
 /** 回执 message_id 形状（与既有 OM_SHAPE 同源），或 null。 */
 const OM_BUILTIN = /^om_[A-Za-z0-9]{1,120}$/u;
 /** 回执的封闭键集（P1-2，多一个键也拒）。result_sha256 在 P1-5 加入后由 P1-5 更新此表。 */
-const FORWARD_RECEIPT_KEYS = "artifact_type,classification,created_at,event_key,forward_key,id,input_origin,input_text,kind,message_id,publish_eligible_at,published_at,run_id,schema_version,source,target_channel_generation_id,text,zone";
+const FORWARD_RECEIPT_KEYS = "artifact_type,classification,created_at,event_key,forward_key,id,input_origin,input_text,kind,message_id,publish_eligible_at,published_at,result_sha256,run_id,schema_version,source,target_channel_generation_id,text,zone";
 
 /**
  * forward_failed 回执的**唯一**封闭校验器（P1-2）：写前自证、outbox 快照读取、auditOutbox、发布器挑选、
@@ -181,6 +181,7 @@ export function forwardFailureReceiptProblem(record, { expectedKey = null } = {}
   if (record.created_at !== record.publish_eligible_at || !isCanonicalIso(record.created_at)) return "created_at !== publish_eligible_at 或非法时间（born eligible）";
   if (record.published_at !== null && !isCanonicalIso(record.published_at)) return "published_at 不是 null 或规范时间";
   if (record.input_origin !== null || record.input_text !== null || record.run_id !== null) return "input_origin/input_text/run_id 必须为 null";
+  if (typeof record.result_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(record.result_sha256)) return "result_sha256 不是 64hex";
   return null;
 }
 
@@ -214,15 +215,17 @@ export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
  */
 export function appendForwardFailureReceipt({
   outboxDir, forwardKey, category, messageId, targetGenerationId,
-  source = "forward-runner", _inject = null,
+  source = "forward-runner", resultSha256 = null, _inject = null,
 }) {
   if (typeof outboxDir !== "string" || outboxDir.length === 0) return { ok: false, reason: "outbox_dir_missing" };
   if (typeof forwardKey !== "string" || !/^[0-9a-f]{64}$/u.test(forwardKey)) return { ok: false, reason: "key_shape" };
+  // P1-1：代际必须可用（可用冻结代际）。缺失 / 不可用 → 不生成回执、不写 null（绝不写 null 令发布器回落当前话题）。
+  if (!usableGeneration(targetGenerationId)) return { ok: false, reason: "generation_unavailable", why: "targetGenerationId 缺失或不可用（不生成回执、不写 null）" };
   // P1-4：正文封闭 —— 类别必须合法，reasonFirstLine 一个字不进正文。
   const text = forwardFailureText(category);
   if (text === null) return { ok: false, reason: "unknown_failure_category", why: "未知失败类别（不接受任意模型输出进正文）" };
-  // P1-1：代际必须可用（可用冻结代际）。缺失 / 不可用 → 不生成回执、不写 null（绝不写 null 令发布器回落当前话题）。
-  if (!usableGeneration(targetGenerationId)) return { ok: false, reason: "generation_unavailable", why: "targetGenerationId 缺失或不可用（不生成回执、不写 null）" };
+  // P1-5：回执记录带 result_sha256（result 文件内容摘要）；缺失/非 64hex → 拒（证据链不闭合）。
+  if (typeof resultSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(resultSha256)) return { ok: false, reason: "result_sha256_missing", why: "result_sha256 缺失或非 64hex" };
   { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
   const createdAt = new Date().toISOString();
   const record = {
@@ -244,6 +247,7 @@ export function appendForwardFailureReceipt({
     created_at: createdAt,
     publish_eligible_at: createdAt,
     published_at: null,
+    result_sha256: resultSha256,
   };
   // 写前自证（P1-2）：不合法不落盘。
   const ip = forwardFailureReceiptProblem(record, { expectedKey: forwardKey });

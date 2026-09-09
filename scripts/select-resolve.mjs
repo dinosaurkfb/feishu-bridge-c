@@ -2,7 +2,8 @@
  * R57c：owner_select 候选解析（owner-select-route.md §5——纯函数，无 IO）。
  *
  * 候选集合 = 同 endpoint、同受验 chat、未过期（now 为调用方传入的锁内 clock 值）、动作类型相符：
- *   · activate → 合法族 B1（pending）且 selection_handle 非空未过期；
+ *   · activate → 合法族 B1（pending）且 selection_handle 非空未过期，且同 chat 上存在
+ *     aliases.session_id === 事件 session 的 live A1（R57d 返修一 P1-6，§12 ⑥）；
  *   · anchor   → 合法族 A2 且 selection_handle 非空未过期；
  *   · rebind   → 合法族 B3 且 rebind_handle 非空未过期。
  * 三分支（§5）：
@@ -23,7 +24,7 @@ export const SELECTION_BASES = Object.freeze(["explicit_handle", "unique_candida
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
-export function resolveSelectionCandidate({ doc, endpointId, chatId, action, handle = null, now } = {}) {
+export function resolveSelectionCandidate({ doc, endpointId, chatId, action, handle = null, eventSessionId = null, now } = {}) {
   if (!isObj(doc) || doc.endpoint_id !== endpointId) return { ok: false, reason: "endpoint_mismatch" };
   if (!SELECTION_ACTIONS.includes(action)) return { ok: false, reason: "bad_action" };
   if (!Number.isSafeInteger(now) || now < 0) return { ok: false, reason: "bad_now" };
@@ -31,6 +32,14 @@ export function resolveSelectionCandidate({ doc, endpointId, chatId, action, han
     if (typeof handle !== "string") return { ok: false, reason: "handle_kind_mismatch" };
     const shapeOk = action === "rebind" ? REBIND_HANDLE_SHAPE.test(handle) : SELECTION_HANDLE_SHAPE.test(handle);
     if (!shapeOk) return { ok: false, reason: "handle_kind_mismatch" };
+  }
+  // R57d 返修一 P1-6（§12 ⑥）：activate 族 eligibility 加「同 chat 且 aliases.session_id === 事件 session
+  // 的 live A1 存在」——省略分支不再把不可执行的 B1 算进歧义集合；锁内再复核归 wireSelectActivate（缺 → no_a1）。
+  if (action === "activate") {
+    const hasA1 = typeof eventSessionId === "string" && eventSessionId.length > 0
+      && Object.values(doc.records ?? {}).some((x) => x?.kind === "live" && x.chat_id === chatId
+        && familyOf(x.facts) === "A1" && x.aliases.session_id === eventSessionId);
+    if (!hasA1) return { ok: false, reason: "no_candidate" };
   }
   const wantFam = action === "activate" ? "B1" : action === "anchor" ? "A2" : "B3";
   const hField = action === "rebind" ? "rebind_handle" : "selection_handle";

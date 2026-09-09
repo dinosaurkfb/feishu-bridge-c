@@ -45275,10 +45275,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   test("R57c 解析：显式 osh_（activate→B1 / anchor→A2）恰一命中、basis=explicit_handle、不要求集合恰一；显式 orh_ 只盘点待 rebind B3", () => withLedgerC((root, dir) => {
     const b1 = b1WithHandle(dir, "r57c_b1", 81, "om_c81");
     const a2 = a2Of(dir, "r57c_a2", 82, "sess-c-82", "om_cand82");
+    a1Of(dir, "r57c_a1e", "sess-c-live"); // P1-6：activate 族 eligibility 需同 chat 存在事件 session 上的 live A1
     // 另一个 chat 的 B1（不受验 chat，不算候选）
     talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57c_b1x", chatId: "oc_other", rootOm: "om_c81x", lineageId: "lin_x1", bindingTarget: TGTC(83), clock: () => T0C }), "B1 other chat");
     const d1 = loadOkC(dir);
-    let r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: b1.result.selection_handle, now: T0C });
+    let r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: b1.result.selection_handle, eventSessionId: "sess-c-live", now: T0C });
     assert.deepEqual({ ok: r.ok, target_id: r.target_id, family: r.family, selection_basis: r.selection_basis }, { ok: true, target_id: b1.result.created_id, family: "B1", selection_basis: "explicit_handle" }, JSON.stringify(r));
     r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "anchor", handle: a2 ? d1.records[a2].selection_handle : null, now: T0C });
     assert.equal(r.ok, true); assert.equal(r.family, "A2"); assert.equal(r.selection_basis, "explicit_handle");
@@ -45292,13 +45293,14 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
   test("R57c 解析：省略 handle → 集合恰一 basis=unique_candidate；多候选 → ambiguous 只回 opaque id；过期候选被过滤", () => withLedgerC((root, dir) => {
     const b1 = b1WithHandle(dir, "r57c_b1u", 84, "om_c84");
+    a1Of(dir, "r57c_a1u", "sess-c-u"); // P1-6：eligibility 需事件 session 上的 live A1
     const d1 = loadOkC(dir);
-    let r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    let r = SR.resolveSelectionCandidate({ doc: d1, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, eventSessionId: "sess-c-u", now: T0C });
     assert.equal(r.ok, true); assert.equal(r.selection_basis, "unique_candidate"); assert.equal(r.target_id, b1.result.created_id);
     // 多候选：再建一个同 chat 的 B1
     b1WithHandle(dir, "r57c_b1u2", 85, "om_c85");
     const d2 = loadOkC(dir);
-    r = SR.resolveSelectionCandidate({ doc: d2, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    r = SR.resolveSelectionCandidate({ doc: d2, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, eventSessionId: "sess-c-u", now: T0C });
     assert.equal(r.ok, false); assert.equal(r.reason, "ambiguous");
     assert.deepEqual(r.candidates.length, 2, "只回计数与 opaque id");
     for (const id of r.candidates) assert.match(id, /^ta_[0-9a-f]{32}$/u);
@@ -45309,11 +45311,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     for (const rec of Object.values(doc.records)) {
       if (rec.selection_handle !== null && rec.topic_agent_id !== b1.result.created_id) rec.handle_expires_at = "2026-01-01T00:00:00.000Z";
     }
-    r = SR.resolveSelectionCandidate({ doc, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    r = SR.resolveSelectionCandidate({ doc, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, eventSessionId: "sess-c-u", now: T0C });
     assert.equal(r.ok, true, "过期候选被过滤后恰一：" + JSON.stringify(r));
     // 过滤到零 → no_candidate
     for (const rec of Object.values(doc.records)) if (rec.selection_handle !== null) rec.handle_expires_at = "2026-01-01T00:00:00.000Z";
-    r = SR.resolveSelectionCandidate({ doc, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    r = SR.resolveSelectionCandidate({ doc, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, eventSessionId: "sess-c-u", now: T0C });
     assert.equal(r.ok, false); assert.equal(r.reason, "no_candidate");
   }));
 
@@ -45483,17 +45485,18 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
   test("R57c 返修一 T2：resolveSelectionCandidate 同 chat 过滤——跨 chat B1 不得计入；显式 handle 命中跨 chat 记录 → no_candidate", () => withLedgerC((root, dir) => {
     b1WithHandle(dir, "r57cf_t2a", 96, "om_t2a");  // 同 chat（oc_r57c）
+    a1Of(dir, "r57cf_t2a1", "sess-cf-t2"); // P1-6：eligibility 需事件 session 上的 live A1
     // 另一 chat 的 B1，handle 在场未过期
     talOkC(TAL.createB1({ endpointId: EP57C, requestKey: "r57cf_t2b", chatId: "oc_other", rootOm: "om_t2b", lineageId: "lin_t2b", bindingTarget: TGTC(97), clock: () => T0C }), "B1 other chat");
     const d = loadOkC(dir);
     // 省略 handle：同 chat 恰一 + 跨 chat 一 = 候选集应只含同 chat 的 → unique_candidate
-    let r = SR.resolveSelectionCandidate({ doc: d, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, now: T0C });
+    let r = SR.resolveSelectionCandidate({ doc: d, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: null, eventSessionId: "sess-cf-t2", now: T0C });
     assert.equal(r.ok, true, "同 chat 恰一 → unique_candidate（跨 chat 不算）");
     assert.equal(r.selection_basis, "unique_candidate");
     // 删掉 chat 过滤后此处的另一 chat B1 会计入 → ambiguous → 转红
     // 显式 handle 命中跨 chat 的记录 → no_candidate
     const otherB1 = Object.values(d.records).find((x) => x.kind === "live" && x.chat_id === "oc_other" && x.selection_handle !== null);
-    r = SR.resolveSelectionCandidate({ doc: d, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: otherB1.selection_handle, now: T0C });
+    r = SR.resolveSelectionCandidate({ doc: d, endpointId: EP57C, chatId: "oc_r57c", action: "activate", handle: otherB1.selection_handle, eventSessionId: "sess-cf-t2", now: T0C });
     assert.equal(r.ok, false, "显式 handle 命中跨 chat 记录 → no_candidate");
     assert.equal(r.reason, "no_candidate");
   }));
@@ -45866,6 +45869,29 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const doc = TAL.loadLedger(dir, { endpointId: EP57D });
     assert.equal(doc.doc.records[ids.a2Id].locator_link_proof_ref.kind, "owner_selected_route_v1");
     assert.equal(doc.doc.records[ids.a2Id].anchor_candidate, ROOT_D, "anchor_candidate 保留");
+  }));
+
+  test("R57d 返修一 P1-6：activate 族 eligibility 进解析器——同 chat 且 session=事件 session 的 live A1 存在；省略分支不再把不可执行的 B1 算进歧义集合", () => withLedgerD((root, dir, ids) => {
+    // ① 显式 osh：事件会话上无 A1（另一 A1 在别的 chat 上也不算）→ no_candidate（原实现走到 op 才 no_a1）
+    talTmp(TAL.createA1({ endpointId: EP57D, requestKey: "r57d_a1other", chatId: "oc_other", sessionId: "aily_none", clock: () => T0D }));
+    let r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ eventSessionId: "aily_none" }));
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, "no_candidate", "① " + r.reason);
+    // ② 省略：B1 不可执行 → activate 集空；A2 可执行 → 唯一候选 → anchor 成功（原实现 ambiguous 2 候选）
+    const a2rec = TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.a2Id];
+    r = SA.executeSelectControl({ control: "select", handle: null, handle_kind: null }, ctxD({ eventSessionId: a2rec.aliases.session_id }));
+    assert.equal(r.ok, true, "② 省略 → 唯一 anchor 候选：" + JSON.stringify(r));
+    assert.equal(r.action, "anchor");
+  }));
+
+  test("R57d 返修一 P1-6：锁内到期——解析时未过期、提交时已过期 → handle_expired（锁内 clock 交给账本 op，不预先求值）", () => withLedgerD((root, dir, ids) => {
+    const day = 24 * 3600 * 1000;
+    let n = 0;
+    const stepClock = () => T0D + (++n) * 20 * day; // ①解析 ②op 记账 ③锁内到期核（handle TTL 30 天）
+    const r = SA.executeSelectControl({ control: "select", handle: ids.b1Handle, handle_kind: "osh" }, ctxD({ mappingUpdate: mappingStub([]), clock: stepClock }));
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.reason, "handle_expired", "刚过期 handle → 拒：" + r.reason);
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[ids.b1Id].facts.binding, "pending", "handle 未被消费");
   }));
 
   test("R57d 返修一 P1-5：root/session 来源——root=命中记录现场（B1.root_om / A2.anchor_candidate）、session=受验事件 session；不再收 transport 根", () => withLedgerD((root, dir, ids) => {

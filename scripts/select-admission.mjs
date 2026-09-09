@@ -142,6 +142,7 @@ export function selectRejectTextByReason(reason) {
   if (reason === "no_candidate") return "账本里没有符合条件的选择目标（可能已过期、不在该话题或已被处理）";
   if (reason === "no_a1") return "当前会话上没有待绑定的 A1 记录，无法完成绑定";
   if (reason === "cas_mismatch") return "选择与账本现场不符（记录可能已变动），请重新发起选择";
+  if (reason === "handle_expired") return "这个 handle 已过期，未执行";
   if (reason === "select_endpoint_unknown") return "无法确定所属 endpoint，未执行";
   // R57d 返修一 P1-1：按 authority_mode 分派走 m1a wrapper 的新失败面
   if (reason === "select_legacy_required") return "迁移未完成（账本仍是影子），执行需要同步更新绑定登记；这一步不可用，未执行";
@@ -265,7 +266,7 @@ export function executeSelectControl(intent, {
   // 候选解析（§5）：osh → activate(B1) 再 anchor(A2)；orh → rebind；省略 → 三候选集合并集恰一
   let res = null, action = null;
   if (kind === "osh") {
-    res = resolveSelectionCandidate({ doc, endpointId, chatId, action: "activate", handle, now: nowMs });
+    res = resolveSelectionCandidate({ doc, endpointId, chatId, action: "activate", handle, eventSessionId, now: nowMs });
     if (res.ok) { action = "activate"; }
     else {
       const r2 = resolveSelectionCandidate({ doc, endpointId, chatId, action: "anchor", handle, now: nowMs });
@@ -276,7 +277,7 @@ export function executeSelectControl(intent, {
     if (res.ok) action = "rebind";
   } else {
     const tries = [
-      ["activate", resolveSelectionCandidate({ doc, endpointId, chatId, action: "activate", handle: null, now: nowMs })],
+      ["activate", resolveSelectionCandidate({ doc, endpointId, chatId, action: "activate", handle: null, eventSessionId, now: nowMs })],
       ["anchor", resolveSelectionCandidate({ doc, endpointId, chatId, action: "anchor", handle: null, now: nowMs })],
       ["rebind", resolveSelectionCandidate({ doc, endpointId, chatId, action: "rebind", handle: null, now: nowMs })],
     ];

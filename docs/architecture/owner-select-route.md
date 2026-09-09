@@ -85,7 +85,7 @@ chat_id、同 endpoint、handle 与候选一一映射且 eligible、owner 先验
 或同时无**。任一半有半无 = 损坏。
 
 **到期比较（P2-3）**：一律"持久化规范时间字段 + **锁内当前时间**比较"，**不依赖内存 timer**。
-**只有到期类事务核 `now ≥ expected_expires_at`**（B1 `void(expired)`、A2/rebind 的到期清理）；
+**只有到期类事务核 `now ≥ expected_expires_at`**（B1 `void(expired)`、A2/rebind 的到期清理）；**消费 handle 的事务（`activate` 消费 B1 handle、`anchor` 消费 A2 handle、`rebind_session_alias` 消费 rebind handle）在锁内 CAS 之后还要复核 `clock() < 记录上持久化的到期字段`，等于或超过即拒（`handle_expired`）——锁外候选解析按 now 过滤不算数（#146 一轮 P1-1 回带）**；
 **主动 `cancel_*`/`reissue_*` 不核时间**（可未到期做，P1-2）。清理/换发 fingerprint 一律含
 `expected_handle` + `expected_expires_at`（expected-value CAS，防陈旧定时器清掉后换发的新 handle）。
 **具体 TTL 数值必须在实现单开工前拍定为单一常量**（不可"字段已进 schema、有效期由各调用方自定"，
@@ -299,7 +299,7 @@ owner_select_reaffirm}**（P1-6 补 reaffirm）、因果 revision 与直接归�
   只收 `osh_`、rebind_session_alias 只收 `orh_`、owner_select_reaffirm 只收 `rfh_`；跨支即拒。
 
 **G-handle 的反向不变量（#144 一轮 P1-3 回带）**：G-handle 不只是「非空 handle 必可追溯到产生 op」；反向也成立——若记录当前的产生 op（`origin_operation_id` / `selection_operation_id` 语义）是一个**尚未被后续消费覆盖**的 handle 产生 op（`create_b1` / `attach_a2` / `mint_selection_handles` / `reissue_selection_handle` / `request_rebind`），则 live 的 handle 与到期字段必须与该 op 的 result **逐字相等且非空**；把已铸 handle 抹成 null 而保留 op 记录 = `ledger_corrupt`。新形 `create_b1` / `attach_a2` 的 result handle/expiry 不得双 null（`migrate_seed` 除外）。
-**跨 schema 重放（#144 一轮 P1-4 回带）**：同 request_key 的重放判定同时接受「合法的历史 1.0 描述符」与「当前 schema 的新描述符」；首次执行只能用当前 schema 的新形。**锁内时钟（#144 一轮 P1-5 回带）**：到期/签发/CAS 用的 now 必须在账本锁内由时钟 seam 读取，不得在取锁前预先求值。
+**跨 schema 重放（#144 一轮 P1-4 回带；三轮 P1 收紧）**：同 request_key 的重放判定**按既有 operation 的 `result_revision` 相对升级边界（首次离开 1.0 的 `schema_upgrade` 的 revision，与 G12 同一出处）二选一**——账本仍是 1.0、或 prior 落在边界之前 → 只接受旧 1.0 描述符；边界之后、或零升级历史的 1.1*/strict 账本 → 只接受当前描述符；**不得同时给两者**（否则边界后伪造的旧形指纹会被当幂等重放）。校验器同样钉：边界后的 `void` / `attach_a2` 指纹必须是当前形。首次执行只能用当前 schema 的新形。**带 owner_select 输入的调用（activate / anchor 增量形）其重放描述符必须携带完整增量载荷，不按当前 schema 抹字段**——1.0 账本下 fresh key 进 mutate 拒 `bad_input`、旧 key 同载荷不同 → `request_conflict`，不能被 1.0 旧形操作吞成 idempotent（#146 一轮 P1-2 回带）。**锁内时钟（#144 一轮 P1-5 回带）**：到期/签发/CAS 用的 now 必须在账本锁内由时钟 seam 读取，不得在取锁前预先求值。
 ## 8. 迁移状态机：两次维护 operation + 持久 campaign（P1-4/P1-5/P1-6）
 
 **过渡 schema**（合法容旧形+新形）破"旧 schema 不能存新形 / 严格不能在旧形非零时启用"的循环。

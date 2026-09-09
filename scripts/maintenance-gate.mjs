@@ -13,6 +13,9 @@ import path from "node:path";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
 import { acquireInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus } from "./maintenance/operation.mjs";
+import { osmExit } from "./maintenance/owner-select-operation.mjs";
+import { exitCodeFor } from "./maintenance-ledger.mjs";
+import { readActive, readJournal } from "./maintenance/journal.mjs";
 
 /** 参数封闭：每个 flag 至多一次；--status 不带任何别的；--exit 只许 --apply；--enter 必须 --reason，可选 --wait-ms / --apply。 */
 export function parseMaintenanceGateArgs(argv) {
@@ -36,7 +39,7 @@ export function parseMaintenanceGateArgs(argv) {
 
 const fmtItems = (items) => items.map((i) => "  ✗ " + i.id + "：" + i.why).join("\n");
 
-export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdout.write(s + "\n") } = {}) {
+export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdout.write(s + "\n"), env = process.env } = {}) {
   const parsed = parseMaintenanceGateArgs(argv);
   if (!parsed.ok) { out("用法：node maintenance-gate.mjs --status | --enter --reason <r> [--wait-ms N] [--apply] | --exit [--apply]（" + parsed.reason + "）"); return 1; }
   const c = ctx ?? maintenanceContext({ repoRoot: path.dirname(moduleDir(import.meta.url)) });
@@ -49,7 +52,7 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
     if (!surface.ok) { out("安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没动。"); return surface.reason === "surface_install_busy" ? 1 : 3; }
   }
   let code;
-  try { code = runMaintenanceGateLocked(parsed, c, out, surface); }
+  try { code = runMaintenanceGateLocked(parsed, c, out, surface, env); }
   finally {
     if (surface !== null) {
       const rel = surface.release();
@@ -60,7 +63,7 @@ export function runMaintenanceGate(argv, { ctx = null, out = (s) => process.stdo
   return code;
 }
 
-function runMaintenanceGateLocked(parsed, c, out, surface) {
+function runMaintenanceGateLocked(parsed, c, out, surface, env = process.env) {
   if (parsed.mode === "enter") {
     const r = enterMaintenance(c, { reason: parsed.reason, waitMs: parsed.waitMs, apply: parsed.apply });
     const residue = r.leaseUncleared ? "\n租约交不还：" + r.leaseUncleared.path + "（" + r.leaseUncleared.why + "）—— 下一个执行者会按 pid 活性接管；请人工核对" : "";
@@ -73,6 +76,25 @@ function runMaintenanceGateLocked(parsed, c, out, surface) {
     }
     if (r.dryRun) { out("[预览] 预检通过，进门会：停两链定时器（" + r.plan.chains.claude.timer + " / " + r.plan.chains.codex.timer + "）→ 两链 current 切到维护桩（" + r.plan.chains.claude.entries.length + " + " + r.plan.chains.codex.entries.length + " 个入口）→ 建门（" + r.plan.reason + "）→ 等既有进程退出最多 " + r.plan.waitMs + " ms。加 --apply 执行。"); return 0; }
     out("已进门：token " + r.token.slice(0, 8) + "，阶段 " + r.phase + "。出门：--exit --apply"); return 0;
+  }
+  // R53：owner_select 三 kind 的 --exit 分派到 osmExit（B-4 重开 / 只向前 / 回退 / 清 active），
+  //   不落入 exitMaintenance 的通用 rollback（owner_select 的 journal 合同与通用 rollback 不匹配）。
+  {
+    const act = readActive({ dir: c.dir });
+    if (act.state === "active") {
+      const j = readJournal({ dir: c.dir, token: act.token });
+      if (j.state === "valid" && ["owner_select_migration_a", "owner_select_migration_b", "owner_select_migration_direct"].includes(j.doc.operation_kind)) {
+        const r = osmExit(c, { apply: parsed.apply, env, surface });
+        if (r.dryRun) { out("[预览] owner_select operation " + r.token.slice(0, 8) + " 阶段 " + r.phase + " → 动作：" + r.action + "。加 --apply 执行。"); return 0; }
+        if (!r.ok && !r.phase && (r.reason === "no_operation" || r.reason === "journal_absent")) { out("出门做不了（" + r.reason + "）"); return 1; }
+        const leak = r.leaseRelease ?? null;
+        const residue = leak ? "\n租约交不还：" + leak.path + "（" + (leak.why ?? "") + "）—— 请人工核对" : "";
+        if (r.ok && r.activeCleared && !leak) { out("已出门：阶段 " + r.phase + "，active 已清" + (r.incomplete?.length ? "\n" + r.incomplete.map((i) => "  · " + i.id + "：" + i.why).join("\n") : "")); return 0; }
+        if (r.ok && r.activeCleared) { out("业务收口已完成、锁残骸未清：阶段 " + String(r.phase) + "、active 已清" + residue); return 3; }
+        out("出门没做完：阶段 " + String(r.phase) + (r.incomplete ?? []).map((i) => "\n  · " + i.id + "：" + i.why).join("") + residue + "\n门与账保留，处置后再跑 --exit --apply 只向前继续。");
+        return exitCodeFor({ ...r });
+      }
+    }
   }
   const r = exitMaintenance(c, { apply: parsed.apply, surface });
   if (r.dryRun) { out("[预览] operation " + r.token.slice(0, 8) + " 阶段 " + r.phase + " → 动作：" + r.action + (r.executor ? "（执行者 pid " + r.executor + " 正在跑，此刻 --apply 会被拒）" : "") + "。加 --apply 执行。"); return 0; }

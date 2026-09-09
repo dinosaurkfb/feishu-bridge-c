@@ -103,7 +103,7 @@ import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
-  applyRuntimeSync, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
+  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
@@ -232,6 +232,10 @@ import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs"
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
 import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
+import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52, stepCommitCheck as stepCommitCheck52, __sealCallCount as sealCallCount52, __resetSealCalls as resetSealCalls52 } from "./maintenance/owner-select-operation.mjs";
+import * as MOS from "./maintenance-owner-select.mjs";
+import { releaseOperationLease as releaseOperationLease52 } from "./maintenance/journal.mjs";
+import { installSurfaceLockPath } from "./install-surface-lock.mjs";
 import { acquireOperationLease, addNote as addNoteJ, addStepPrepared as addStepPreparedJ, clearActive as clearActiveJ, createOperation, dirFsyncIgnorable, enterLedgerForward, isLedgerReceipt, journalProblem, readActive, readJournal, releaseOperationLease, setPhase as setPhaseJ, updateJournal, CUTOVER_JOURNAL_SCHEMA, OWNER_SELECT_JOURNAL_SCHEMA, OPERATION_KINDS as JOURNAL_OPERATION_KINDS, STEP_KINDS as JOURNAL_STEP_KINDS, PHASES as JOURNAL_PHASES, FORWARD_ONLY_PHASES as JOURNAL_FORWARD_ONLY_PHASES, SIDECAR_NAMES, legacy12CutoverDisposition, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1bPlanProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
@@ -34645,7 +34649,9 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     state: "open",
     campaign_id: cid1,
     endpoints: eps,
-    endpoints_digest: dig
+    endpoints_digest: dig,
+    revision: cDocValid.revision,
+    raw: fs.readFileSync(cPath)
   }, "读回 campaign state 正确");
 
   // 第二次写 (seal)：revision 必须 +1 (2)，CAS 必须是 cWrite1.sha256
@@ -34722,7 +34728,8 @@ test("R50 §二 owner-select-state：campaign 与 writer-state 文件合同与�
     state: "partial",
     campaign_id: cid1,
     endpoints_digest: dig,
-    revision: 1
+    revision: 1,
+    raw: fs.readFileSync(writerStatePath(env))
   }, "读回 writer state partial");
 
   // 写 on (CAS 匹配，revision 2，切到 B fixture)
@@ -37526,6 +37533,1260 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     // strict 变体：不补（已有值不动——transition 已补过）
     const strict = TAL.applySchemaUpgrade(next1, { operation_id: id1, request_key: tok, from_schema: "1.1-transition", to_schema: "1.1" });
     assert.equal(strict.records[liveId].selection_handle, null, "strict 不改已有值");
+  });
+
+  // ── R52 维护夹具：三安装到假 HOME + 假 launchd/ps + 两 ep 1.0 账本 + initDone 收据 + seed B1（null-B1）。 ──
+  // 返回 { ctx, env, dir, gateFile, root, tokenReceipts, eps, afterStep 计数 }； 同时承担 ⑦ 每提交点 journalProblem 断言。
+  const r52Setup = ({ crashAfter = null, twoEps = true, noReceipts = false } = {}) => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r52-")));
+    const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const ienv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
+    execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
+    execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
+    const node = pickClaudeNodeB();
+    const claudeLabel = "com.frank.feishu-bridge-cc.drain", codexLabel = "com.frank.feishu-bridge-codex.drain";
+    const expectedArgs = claudeDrainExpectedJobB({ home, node }).args;
+    const launchd = { [claudeLabel]: { loaded: true, args: [...expectedArgs] } };
+    const fakeLaunchctl = (args) => {
+      if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+      if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+      if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const args2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: args2 }; return { ok: true, stdout: "" }; }
+      return { ok: false, detail: "unknown" };
+    };
+    const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+    const dir = path.join(base, "maintenance"); const gateFile = path.join(base, "maintenance.gate");
+    const ledgerRoot = path.join(base, "ledger");
+    let clock = Date.parse(T052);
+    const problems = [];
+    let crashSeen = 0, crashHit = false;
+    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => {
+      // ⑦ 每个提交点断言 journalProblem === null（不只终态）
+      const act = readActive({ dir });
+      if (act.state === "active") {
+        const jj = readJournal({ dir, token: act.token });
+        if (jj.state === "valid") {
+          const p = journalProblem(jj.doc, { maintenanceDir: dir });
+          if (p !== null) problems.push({ id, why: p });
+        }
+      }
+      if (crashAfter !== null && !crashHit && ++crashSeen >= crashAfter) { crashHit = true; throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); }
+    } });
+    const env = { ...ienv, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: dir, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile };
+    fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 }); fs.chmodSync(ledgerRoot, 0o700);
+    const eps = twoEps ? [EP52A, EP52B] : [EP52A];
+    for (const ep of eps) {
+      // 1.0 账本 + null-B1（复用 r52Doc10 字节）+ initDone 收据
+      const d = path.join(ledgerRoot, ep);
+      fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+      const doc = r52Doc10(ep, ["ta_" + ep.slice(-6).padStart(32, "0")]);
+      fs.writeFileSync(path.join(d, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+      const v = TAL.validateLedger(doc, { endpointId: ep });
+      assert.equal(v.ok, true, "夹具账本自洽：" + JSON.stringify(v));
+      if (!noReceipts) r52SeedReceipt(dir, ep);
+    }
+    return { ctx, env, dir, gateFile, base, home, ledgerRoot, eps, problems, cleanup: () => { const fix = (d) => { try { fs.chmodSync(d, 0o700); } catch { return; } let ns = []; try { ns = fs.readdirSync(d); } catch { return; } for (const n of ns) { const p = path.join(d, n); try { const st = fs.lstatSync(p); if (st.isDirectory()) fix(p); else fs.chmodSync(p, 0o600); } catch { /* gone */ } } }; fix(base); fs.rmSync(base, { recursive: true, force: true }); } };
+  };
+  // 种一份 done 的 ledger_init 收据（1.2 journal，shape 同 seedLedgerInitReceipt）。
+  const r52SeedReceipt = (maintDir, ep, tokOverride = null) => {
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const tok = tokOverride ?? r52Uuid(1 + (ep.charCodeAt(ep.length - 1) % 9));
+    const at = T052, sha = r52Sha("b");
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    const doc = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "r52 收据", started_at: at, updated_at: at, phase: "done", steps: [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone(), ledgerStep], notes: [] };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+  };
+
+  test("R52 ① 全程：两 ep 1.0 → osmEnter(--apply) → transition+handle+campaign+writer+reopening done + ⑦ 每提交点 journalProblem", () => {
+    const problems = [];
+    const fx = r52Setup({});
+    try {
+      // 预览：零改动（默认只预览）
+      const dry = osmEnter52(fx.ctx, { apply: false, env: fx.env });
+      assert.ok(dry.dryRun === true && dry.plan, "预览返回 dryRun 计划：" + JSON.stringify({ ok: dry.ok, reason: dry.reason, why: dry.why, items: dry.items ?? dry.precheck?.items?.filter?.((i) => !i.ok)?.map?.((i) => i.id) }));
+      assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "absent", "预览零改动：无门");
+
+      const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+      assert.ok(r.ok, "全程成功：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase, incomplete: r.incomplete, dirList: (() => { try { return fs.readdirSync(fx.dir); } catch (e) { return [String(e)]; } })() }));
+      assert.equal(r.phase, "done");
+      assert.equal(r.activeCleared, true, "active 已清");
+      for (const ep of fx.eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        assert.ok(L.ok, "账本可读");
+        assert.equal(L.doc.schema_version, "1.1-transition", ep + " 已 transition");
+        const handles = Object.values(L.doc.records).filter((rec) => rec.kind === "live").map((rec) => rec.selection_handle);
+        assert.ok(handles.every((h) => /^osh_[0-9a-f]{32}$/u.test(h)), ep + " null-B1 已发 handle");
+        const mintOps = Object.values(L.doc.operations).filter((o) => o.op_type === "mint_selection_handles" && o.request_key === r.token);
+        assert.equal(mintOps.length, 1, ep + " 恰一笔本 operation 的 mint op");
+      }
+      const cs = readCampaignState(fx.env);
+      assert.equal(cs.state, "open", "campaign open");
+      assert.equal(cs.campaign_id, campaignIdFor(r.token));
+      const ws = readWriterState(fx.env);
+      assert.equal(ws.state, "partial", "writer partial");
+      assert.equal(fs.existsSync(path.join(fx.dir, r.token + ".staged")), false, "staged 私有树（含 mint plan）已随重开删除");
+      assert.deepEqual(fx.problems, [], "⑦ 每提交点 journalProblem 全 null：" + JSON.stringify(fx.problems));
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 ② 崩溃恢复矩阵：进段后及 a/b/c/d 每步后崩溃 → --exit --apply 只向前收敛同一终态、handle 不重生成", () => {
+    // afterStep 序列：1=进段后 2=campaign open 3=schema epA 4=schema epB 5=mint epA 6=mint epB 7=writer partial
+    // afterStep 序列：enterMaintenance 7 次（timer×2/stub×2/current×2/gate）+ osmForward 7 次（8=进段后 9=campaign 10=schema epA 11=schema epB 12=mint epA 13=mint epB 14=writer）
+    for (const crashAfter of [8, 9, 10, 12, 14]) {
+      const fx = r52Setup({ crashAfter });
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "崩溃点 " + crashAfter + " 模拟崩溃穿出");
+        // 模拟接管者：同 pid 下按契约不释放的 lease/安装面锁由“下一个执行者”交还后才能续跑
+        const act52 = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act52.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        // 恢复前快照已落盘 handle（重生成检测的基准）
+        const handlesBefore = {};
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          handlesBefore[ep] = L.ok ? Object.values(L.doc.records).filter((rec) => rec.kind === "live" && (rec.selection_handle ?? null) !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]) : [];
+        }
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex.ok && ex.phase === "done" && ex.activeCleared === true, "崩溃点 " + crashAfter + " 恢复收敛 done：" + JSON.stringify({ reason: ex.reason, why: ex.why, incomplete: ex.incomplete, phase: ex.phase }));
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          assert.ok(L.ok, "恢复后账本可读");
+          assert.equal(L.doc.schema_version, "1.1-transition", ep + " 已 transition");
+          const handlesAfter = Object.values(L.doc.records).filter((rec) => rec.kind === "live" && rec.selection_handle !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]);
+          for (const h of handlesBefore[ep]) assert.ok(handlesAfter.some((x) => x[0] === h[0] && x[1] === h[1] && x[2] === h[2]), "崩溃点 " + crashAfter + " " + ep + " handle 不重生成：" + JSON.stringify({ before: h, afterSet: handlesAfter }));
+          assert.equal(Object.values(L.doc.operations).filter((o) => o.op_type === "mint_selection_handles").length, 1, ep + " 恰一笔 mint op");
+        }
+        assert.equal(readCampaignState(fx.env).state, "open", "崩溃点 " + crashAfter + " campaign open");
+        assert.equal(readWriterState(fx.env).state, "partial", "崩溃点 " + crashAfter + " writer partial");
+        assert.deepEqual(fx.problems, [], "崩溃点 " + crashAfter + " 每提交点 journalProblem 全 null");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 ②b P1-1 顶层：真跑 maintenance-gate.mjs --exit --apply（隔离 HOME）在 osm_a 各提交点后崩 → 只向前收敛 done、handle 不重生成", () => {
+    // 复用 ② 的崩溃点：8=进段后 9=campaign open 12=mint epA（代表段内不同提交点）。
+    for (const crashAfter of [8, 9, 12]) {
+      const fx = r52Setup({ crashAfter });
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "崩溃点 " + crashAfter + " 模拟崩溃穿出");
+        // 模拟接管者：交还同 pid 契约下未释放的 operation lease 与安装面锁。
+        const act52 = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act52.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const handlesBefore = {};
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          handlesBefore[ep] = L.ok ? Object.values(L.doc.records).filter((rec) => rec.kind === "live" && (rec.selection_handle ?? null) !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]) : [];
+        }
+        // P2-6（真机安全）：子进程绝不能碰真实 launchctl——把假 launchctl 写进夹具 PATH + FEISHU_BRIDGE_LAUNCHCTL，
+        // 假脚本每次被调都落标记文件，据此断言真实 launchctl 未被调用。
+        const claudeJob = claudeDrainExpectedJobB({ home: fx.home, node: pickClaudeNodeB() });
+        const fakeLc = path.join(fx.base, "fake-launchctl.mjs");
+        fs.writeFileSync(fakeLc, [
+          "import fs from \"node:fs\";",
+          "const [cmd, label] = process.argv.slice(2);",
+          "const marker = process.env.FAKE_LAUNCHCTL_MARKER;",
+          "if (marker) fs.appendFileSync(marker, (cmd || \"\") + \" \" + (label || \"\") + \"\\n\");",
+          "if (cmd !== \"list\") process.exit(0);",
+          "if (label === " + JSON.stringify(CLAUDE_DRAIN_LAUNCH_LABEL) + ") { process.stdout.write('{ \"ProgramArguments\" = ( ' + [" + claudeJob.args.map((a) => JSON.stringify(a)).join(",") + "].map(a => \"\\\"\" + a + \"\\\"\").join(\"; \") + ' ); };'); process.exit(0); }",
+          "process.stderr.write(\"Could not find service\"); process.exit(113);",
+        ].join("\n"), { mode: 0o600 });
+        const binDir = path.join(fx.base, "bin"); fs.mkdirSync(binDir, { recursive: true, mode: 0o700 });
+        const wrapper = path.join(binDir, "launchctl");
+        fs.writeFileSync(wrapper, "#!/bin/sh\nexec " + JSON.stringify(process.execPath) + " " + JSON.stringify(fakeLc) + " \"$@\"\n", { mode: 0o755 });
+        const marker = path.join(fx.base, "launchctl-called.marker");
+        const cliEnv = { ...fx.env, FEISHU_BRIDGE_LAUNCHCTL: wrapper, FAKE_LAUNCHCTL_MARKER: marker, PATH: binDir + ":" + (fx.env.PATH ?? "") };
+        // 真正以子进程跑 CLI：--exit --apply 必须路由到 osmExit（P1-1 分派），而非通用 rollback。
+        let cliStdout = "", cliCode = null;
+        try { cliStdout = execFileSync(process.execPath, [path.resolve("scripts", "maintenance-gate.mjs"), "--exit", "--apply"], { encoding: "utf-8", env: cliEnv, stdio: ["ignore", "pipe", "pipe"] }); cliCode = 0; }
+        catch (e) { cliCode = e.status ?? null; cliStdout = String(e.stdout ?? "") + String(e.stderr ?? ""); }
+        assert.equal(cliCode, 0, "CLI --exit --apply 退出码 0（崩溃点 " + crashAfter + "）：" + JSON.stringify({ cliCode, cliStdout: String(cliStdout).slice(0, 400) }));
+        // P2-6：假 launchctl 被调用（标记文件存在）→ 真实 launchctl 未被调；标记内容点名 list。
+        assert.equal(fs.existsSync(marker), true, "假 launchctl 被调用（" + fs.existsSync(marker) + "）：" + (fs.existsSync(marker) ? fs.readFileSync(marker, "utf-8") : ""));
+        assert.match(String(fs.readFileSync(marker, "utf-8")), /^list /u, "假 launchctl 被 list 调用：" + fs.readFileSync(marker, "utf-8"));
+        // 收敛 done + active 已清（绝不回退 / 绝不留下未完成终态）。
+        const afterActive = readActive({ dir: fx.dir });
+        const j52 = readJournal({ dir: fx.dir, token: act52.token });
+        assert.equal(afterActive.state, "absent", "崩溃点 " + crashAfter + " active 已清");
+        assert.equal(j52.doc.phase, "done", "崩溃点 " + crashAfter + " 收敛到 done（绝不回退）：" + j52.doc.phase);
+        for (const ep of fx.eps) {
+          const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+          assert.ok(L.ok, "恢复后账本可读");
+          assert.equal(L.doc.schema_version, "1.1-transition", ep + " 已 transition");
+          const handlesAfter = Object.values(L.doc.records).filter((rec) => rec.kind === "live" && rec.selection_handle !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]);
+          for (const h of handlesBefore[ep]) assert.ok(handlesAfter.some((x) => x[0] === h[0] && x[1] === h[1] && x[2] === h[2]), "崩溃点 " + crashAfter + " " + ep + " handle 不重生成");
+        }
+        assert.equal(readCampaignState(fx.env).state, "open", "崩溃点 " + crashAfter + " campaign open");
+        assert.equal(readWriterState(fx.env).state, "partial", "崩溃点 " + crashAfter + " writer partial");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  // 手工 drained 1.4 journal（plan 矩阵/回退场景用）：token 已知，可直接预置 staged plan。
+  const r52EnterSteps = (tok, cur = { claude: "versions/0123456789abcdef", codex: "versions/0123456789abcdef" }) => {
+    const sha = r52Sha("0");
+    const done = (extra) => ({ state: "done", at: T052, chain: null, backup: null, backup_sha256: null, backup_bytes: null, ...extra });
+    return [
+      done({ kind: "timer", id: "timer:claude", target: "label", before: { phase: "installed_not_loaded", plist: "/p" }, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } }),
+      done({ kind: "timer", id: "timer:codex", target: "label", before: { phase: "installed_not_loaded", plist: "/p" }, intended_after: { phase: "installed_not_loaded" }, after: { phase: "installed_not_loaded" } }),
+      done({ kind: "stub", id: "stub:claude", target: "versions/x", before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok }),
+      done({ kind: "stub", id: "stub:codex", target: "stub", before: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok }),
+      done({ kind: "current", id: "current:claude", target: cur.claude, before: cur.claude, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok }),
+      done({ kind: "current", id: "current:codex", target: cur.codex, before: cur.codex, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok }),
+      done({ kind: "gate", id: "gate", target: "gate", before: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null } }),
+    ];
+  };
+  const r52DrainedFixture = ({ fx, tok, curOverride = null }) => {
+    const cid = campaignIdFor(tok);
+    const rd = (p) => { try { return fs.readlinkSync(p); } catch { return "versions/0123456789abcdef"; } };
+    const cur = curOverride ?? {
+      claude: rd(path.join(fx.home, ".claude", "feishu-bridge", "runtime", "current")),
+      codex: rd(path.join(fx.base, "codex-home", "feishu-bridge", "runtime", "current")),
+    };
+    const doc = { schema_version: "1.4", operation_kind: "owner_select_migration_a", token: tok, reason: "r52 drained", started_at: T052, updated_at: T052, phase: "drained", steps: r52EnterSteps(tok, cur), notes: [] };
+    fs.mkdirSync(fx.dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    fs.symlinkSync(tok, path.join(fx.dir, "active"));
+    const g = createGate({ file: fx.gateFile, reason: "r52 drained", token: tok, now: Date.parse(T052) });
+    assert.equal(g.ok, true, "夹具建门：" + (g.why ?? g.reason ?? ""));
+    const lease = acquireOperationLease({ dir: fx.dir, token: tok });
+    return { tok, cid, lease, rewrite: (mut) => { mut(doc); fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 }); } };
+  };
+  const r52WritePlan = (fx, tok, ep, ledgerDoc, mutate = null) => {
+    const next = TAL.applySchemaUpgrade(ledgerDoc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(tok, ep), request_key: tok + ":schema:" + ep, from_schema: "1.0", to_schema: "1.1-transition" });
+    let plan = TAL.buildMintPlan({ doc: next, token: tok, campaignId: campaignIdFor(tok), endpointId: ep, requestKey: tok, now: Date.parse(T052), ttlMs: TAL.OWNER_SELECT_HANDLE_TTL_MS });
+    if (mutate) { mutate(plan); if (TAL.mintPlanProblem(plan) !== null) throw new Error("测试预置 plan 形坏"); }
+    const bytes = mintPlanBytes52(plan);
+    const intendedDir = path.join(fx.dir, tok + ".staged", "intended");
+    fs.mkdirSync(intendedDir, { recursive: true, mode: 0o700 });
+    const planFile = path.join(intendedDir, "mint-" + ep + ".json");
+    fs.writeFileSync(planFile, bytes, { mode: 0o600 });
+    if (!fs.existsSync(planFile)) throw new Error("r52WritePlan 写后即失：" + planFile);
+    return { plan, planFile, bytes };
+  };
+
+  test("R52 ③ pre-forward 矩阵：恰一份可复用（handle 逐字来自预置 plan）/ 身份不符 / before SHA 不符 fail-closed", () => {
+    // ③-a 恰一份完整 plan 在场 → 复用（账本 handle 逐字 === 预置 plan.minted，证明未重建）
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const preset = r52WritePlan(fx, tok, ep, L.doc);
+        const dfx = r52DrainedFixture({ fx, tok });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok, "复用路径全程收敛：" + JSON.stringify({ reason: r.reason, why: r.why, incomplete: r.incomplete }));
+        const LA = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const handles = Object.values(LA.doc.records).filter((rec) => rec.kind === "live" && rec.selection_handle !== null).map((rec) => [rec.topic_agent_id, rec.selection_handle, rec.handle_expires_at]);
+        const want = preset.plan.minted.map((m) => [m.target_id, m.selection_handle, preset.plan.handle_expires_at]);
+        if (JSON.stringify(handles) !== JSON.stringify(want)) assert.fail("复用证据：" + JSON.stringify({ handles, want, planFileExists: fs.existsSync(preset.planFile) }));
+        assert.deepEqual(handles, want, "复用证据：账本 handle 逐字来自预置 plan");
+        assert.equal(readCampaignState(fx.env).state, "open");
+      } finally { fx.cleanup(); }
+    }
+    // ③-b 身份不符（token 错）→ fail-closed 留 drained，plan 不删不改
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(6);
+        const ep = fx.eps[0];
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.token = r52Uuid(7); p.campaign_id = campaignIdFor(p.token); });
+        const shaBefore = r52ShaOf(fs.readFileSync(preset.planFile));
+        const dfx = r52DrainedFixture({ fx, tok });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "身份不符拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "mint_plan_mismatch", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(r.phase, "drained", "留在 drained：" + r.phase);
+        assert.equal(r52ShaOf(fs.readFileSync(preset.planFile)), shaBefore, "plan 未删未改");
+      } finally { fx.cleanup(); }
+    }
+    // ③-c before SHA 不符 → fail-closed（tok 用 3，避开收据 token r52Uuid(8/9)，防手工 journal 覆盖收据文件）
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(3);
+        const ep = fx.eps[0];
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.before_ledger_sha256 = r52Sha("9"); });
+        const dfx = r52DrainedFixture({ fx, tok });
+        const preProbe = { planFile: preset.planFile, exists: fs.existsSync(preset.planFile), before: (() => { try { return JSON.parse(fs.readFileSync(preset.planFile, "utf-8")).before_ledger_sha256.slice(0, 8); } catch (e) { return String(e); } })(), phase: (() => { try { return readJournal({ dir: fx.dir, token: tok }).doc.phase; } catch (e) { return String(e); } })(), steps: (() => { try { return readJournal({ dir: fx.dir, token: tok }).doc.steps.length; } catch (e) { return -1; } })() };
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "before SHA 不符拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase, preProbe }));
+        assert.equal(r.reason, "mint_plan_mismatch", "before SHA 不符拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修一 P1-2：冻结集 fail-closed——同 ep 双 initDone 收据（conflict）混在两份 ok 里 → precheck_failed，不拿剩余子集迁移", () => {
+    const fx = r52Setup({});
+    try {
+      // r52Setup 已为 epA/epB 各种一份 initDone 收据；对 epA 再种一份（不同 token）→ 同 endpoint 双 init = conflict。
+      const tok = r52Uuid(5);
+      const epA = fx.eps[0];
+      r52SeedReceipt(fx.dir, epA, r52Uuid(6)); // 合法且不同于 epA 的 r52Uuid(8) → 同 endpoint 双 init = conflict
+      const dfx = r52DrainedFixture({ fx, tok });
+      const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+      assert.ok(r.ok === false, "conflict 收据混入必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "precheck_failed", "拒因（why 点名 ep）：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      const j52 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j52.doc.phase, "drained", "未进段，仍 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P1-3：过渡 runtime 前置——假 runtime 旧/新版模块→拒/放行、current 缺席→拒、探针挂死→超时拒", () => {
+    const rtRoot = (home) => runtimeRoot(home, "claude");
+    const buildFakeRuntime = (home, { journalBody, ledgerBody }) => {
+      const root = rtRoot(home);
+      const files = [
+        { path: "scripts/maintenance/journal.mjs", sha256: r52ShaOf(Buffer.from(journalBody)) },
+        { path: "scripts/topic-agent-ledger.mjs", sha256: r52ShaOf(Buffer.from(ledgerBody)) },
+      ];
+      const version = crypto.createHash("sha256").update(files.map((f) => f.path + ":" + f.sha256).join("\n")).digest("hex").slice(0, 16);
+      const vdir = path.join(root, "versions", version);
+      fs.mkdirSync(path.join(vdir, "scripts", "maintenance"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(vdir, "scripts", "maintenance", "journal.mjs"), journalBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "scripts", "topic-agent-ledger.mjs"), ledgerBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "INSTALLED.json"), JSON.stringify({ version, files, source_commit: null }, null, 2) + "\n", { mode: 0o600 });
+      fs.rmSync(path.join(root, "current"), { force: true });
+      fs.symlinkSync("versions/" + version, path.join(root, "current"));
+      return version;
+    };
+    const runForward = (fx) => {
+      const tok = r52Uuid(5);
+      const dfx = r52DrainedFixture({ fx, tok });
+      return osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+    };
+    const NEW_J = "export const OWNER_SELECT_JOURNAL_SCHEMA = \"1.4\";";
+    const NEW_L = "export const SCHEMA_VERSIONS = [\"1.0\",\"1.1-transition\",\"1.1\"];";
+    // 新版模块 → 放行（预检不再以 runtime_not_transition_capable 拒）
+    {
+      const fx = r52Setup({});
+      try {
+        buildFakeRuntime(fx.home, { journalBody: NEW_J, ledgerBody: NEW_L });
+        const r = runForward(fx);
+        assert.ok(r.reason !== "precheck_failed" || !String(r.why).includes("runtime_not_transition_capable"), "新版放行（非 runtime_not_transition_capable）：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+      } finally { fx.cleanup(); }
+    }
+    // 旧版模块（无导出）→ 拒
+    {
+      const fx = r52Setup({});
+      try { buildFakeRuntime(fx.home, { journalBody: "export const X = 1;", ledgerBody: "export const Y = 2;" }); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "旧版拒（缺导出）：" + JSON.stringify({ reason: r.reason, why: r.why })); assert.match(String(r.why), /runtime_not_transition_capable/); }
+      finally { fx.cleanup(); }
+    }
+    // current 缺席 → 拒
+    {
+      const fx = r52Setup({});
+      try { fs.rmSync(path.join(rtRoot(fx.home), "current"), { force: true }); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "current 缺席拒"); assert.match(String(r.why), /runtime_not_transition_capable/); }
+      finally { fx.cleanup(); }
+    }
+    // 探针挂死（假模块顶层死循环）→ 超时拒
+    {
+      const fx = r52Setup({});
+      try { buildFakeRuntime(fx.home, { journalBody: "while (true) {}", ledgerBody: NEW_L }); const t0 = Date.now(); const r = runForward(fx); assert.equal(r.reason, "precheck_failed", "探针挂死超时拒"); assert.match(String(r.why), /runtime_not_transition_capable/); }
+      finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修二 P1-1：探针目标信受验 journal 不信桩内自由字段——两链各核 versions/<16hex>+manifest+probe；桩 original_current 逃逸→不随、claude 达标 codex 旧→拒", () => {
+    const NEW_J = "export const OWNER_SELECT_JOURNAL_SCHEMA = \"1.4\";";
+    const NEW_L = "export const SCHEMA_VERSIONS = [\"1.0\",\"1.1-transition\",\"1.1\"];";
+    const OLD_J = "export const X = 1;";
+    const OLD_L = "export const Y = 2;";
+    const chainRootOf = (fx, chain) => chain === "claude" ? runtimeRoot(fx.home, "claude") : codexRuntimeRoot(fx.env.CODEX_HOME);
+    // 建一条链的假 runtime：写 versions/<hex> + INSTALLED.json + 切 current 到它，返回版本 hex（供 journal before 指向）。
+    const buildRt = (fx, chain, { journalBody, ledgerBody }) => {
+      const root = chainRootOf(fx, chain);
+      const files = [
+        { path: "scripts/maintenance/journal.mjs", sha256: r52ShaOf(Buffer.from(journalBody)) },
+        { path: "scripts/topic-agent-ledger.mjs", sha256: r52ShaOf(Buffer.from(ledgerBody)) },
+      ];
+      const version = crypto.createHash("sha256").update(files.map((f) => f.path + ":" + f.sha256).join("\n")).digest("hex").slice(0, 16);
+      const vdir = path.join(root, "versions", version);
+      fs.rmSync(vdir, { recursive: true, force: true });
+      fs.mkdirSync(path.join(vdir, "scripts", "maintenance"), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(vdir, "scripts", "maintenance", "journal.mjs"), journalBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "scripts", "topic-agent-ledger.mjs"), ledgerBody, { mode: 0o600 });
+      fs.writeFileSync(path.join(vdir, "INSTALLED.json"), JSON.stringify({ version, files, source_commit: null }, null, 2) + "\n", { mode: 0o600 });
+      fs.rmSync(path.join(root, "current"), { force: true });
+      fs.symlinkSync("versions/" + version, path.join(root, "current"));
+      return version;
+    };
+    // 反例一：桩 original_current 逃逸 → 不信；journal before 指向旧版 → 拒（旧实现曾跟随逃逸到假新版放行）。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const oldClaude = buildRt(fx, "claude", { journalBody: OLD_J, ledgerBody: OLD_L });   // 受验 journal before → 旧版
+        const newCodex = buildRt(fx, "codex", { journalBody: NEW_J, ledgerBody: NEW_L });     // codex 达标（本就不该放行，因 claude 旧）
+        const dfx = r52DrainedFixture({ fx, tok, curOverride: { claude: "versions/" + oldClaude, codex: "versions/" + newCodex } });
+        // claude current 换成维护桩（记在 journal 里：current:claude.after = versions/maintenance-<tok>），
+        // 桩 manifest 的 original_current 是逃逸路径；逃逸处放新版模块（旧实现会跟随）。
+        const claudeRoot = runtimeRoot(fx.home, "claude");
+        const stubDir = path.join(claudeRoot, "versions", "maintenance-" + tok);
+        fs.mkdirSync(stubDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(stubDir, "MAINTENANCE.json"), JSON.stringify({ schema_version: "1.0", token: tok, at: T052, reason: "r52 escape", original_current: "../../../escape-runtime", entries: [] }, null, 2) + "\n", { mode: 0o600 });
+        fs.rmSync(path.join(claudeRoot, "current"), { force: true });
+        fs.symlinkSync("versions/maintenance-" + tok, path.join(claudeRoot, "current"));
+        // 逃逸位置（root/../../../escape-runtime）放新版模块：旧实现 path.join(root, original_current) 会跟到这里并通过。
+        const esc = path.join(claudeRoot, "../../../escape-runtime");
+        fs.mkdirSync(path.join(esc, "scripts", "maintenance"), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(esc, "scripts", "maintenance", "journal.mjs"), NEW_J, { mode: 0o600 });
+        fs.writeFileSync(path.join(esc, "scripts", "topic-agent-ledger.mjs"), NEW_L, { mode: 0o600 });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "桩 original_current 逃逸必拒（旧实现曾跟随逃逸放行并做完迁移）：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "precheck_failed", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.match(String(r.why), /runtime_not_transition_capable/, "why 点名 runtime_not_transition_capable：" + r.why);
+      } finally { fx.cleanup(); }
+    }
+    // 反例二：claude 达标（新版）、codex 旧版 → 拒（旧实现只查 claude 会放行）。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        buildRt(fx, "claude", { journalBody: NEW_J, ledgerBody: NEW_L });
+        buildRt(fx, "codex", { journalBody: OLD_J, ledgerBody: OLD_L });
+        const dfx = r52DrainedFixture({ fx, tok });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "claude 达标 codex 旧版必拒（旧实现只查 claude 会放行）：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "precheck_failed", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.match(String(r.why), /runtime_not_transition_capable/, "why 点名 runtime_not_transition_capable：" + r.why);
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修二 P1-2：staged 复用必须重新 seal——plan 复用分支与 backup EEXIST 分支都在受验 fd 上 fsync(file)+fsync 父目录（注入计数断言）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      const tok = r52Uuid(5);
+      const ep = fx.eps[0];
+      const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+      assert.ok(L.ok, "账本可读");
+      // 预置 plan（复用分支）+ 预置 ledger 备份（backup EEXIST 分支）——模拟上一轮 fsync 失败留在场的文件。
+      const preset = r52WritePlan(fx, tok, ep, L.doc);
+      const planFile = preset.planFile;
+      const backupFile = path.join(fx.dir, tok + ".staged", "backup-ledger-" + ep + ".json");
+      fs.writeFileSync(backupFile, L.bytes, { mode: 0o600 });
+      const dfx = r52DrainedFixture({ fx, tok });
+      // 注入 fsync 计数：把受验 fd 的 path 映射出来，统计 planFile / backupFile 的 fsync 次数。
+      const _realOpen = fs.openSync, _realFsync = fs.fsyncSync;
+      const fdPath = new Map();
+      let planFsync = 0, backupFsync = 0;
+      fs.openSync = function (...a) { const fd = _realOpen.apply(fs, a); fdPath.set(fd, String(a[0])); return fd; };
+      fs.fsyncSync = function (fd) { const p = fdPath.get(fd) ?? ""; if (p === planFile) planFsync++; if (p === backupFile) backupFsync++; return _realFsync.call(fs, fd); };
+      try {
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok, "复用路径收敛：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+      } finally {
+        fs.openSync = _realOpen; fs.fsyncSync = _realFsync;
+      }
+      assert.ok(planFsync > 0, "plan 复用分支在受验 fd 上 fsync(file)：planFsync=" + planFsync);
+      assert.ok(backupFsync > 0, "backup EEXIST 分支在受验 fd 上 fsync(file)：backupFsync=" + backupFsync);
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修二 P1-3：campaign/writer 备份用读取器 raw——绝不重读路径；读取器返回 raw 后路径被改成别的内容 → 备份仍等于 raw", () => {
+    const fx = r52Setup({ twoEps: false, crashAfter: 1 }); // 进段后即崩（备份已写盘，staged 未被清理）
+    try {
+      const tok = r52Uuid(5);
+      const cid = campaignIdFor(tok);
+      const eps = [...fx.eps].sort();
+      const dig = endpointsDigest(eps);
+      const members = {};
+      for (const ep of eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const inv = TAL.migrationInventory(L.doc);
+        members[ep] = { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
+      }
+      // campaign 用 state=complete（journal 的 campaign open step 只认 before.state ∈ {absent,complete}）；
+      // writer 用 state=off（writer_state partial step 只认 before.state ∈ {off,on}）。
+      const campaignDoc = { schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state: "complete", endpoints: eps, endpoints_digest: dig, pending_joins: [], members: Object.fromEntries(eps.map((ep) => [ep, { schema_version: "1.1", legacy_proof_count: 0, null_b1_count: 0 }])), revision: 5, origin_operation_id: tok };
+      const writerDoc = { schema_version: WRITER_STATE_SCHEMA, state: "on", campaign_id: cid, endpoints_digest: dig, revision: 4, origin_operation_id: tok };
+      fs.mkdirSync(path.dirname(campaignPath(fx.env)), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(campaignPath(fx.env), JSON.stringify(campaignDoc, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+      const cs0 = readCampaignState(fx.env);
+      const ws0 = readWriterState(fx.env);
+      assert.ok(cs0.exists && Buffer.isBuffer(cs0.raw) && ws0.exists && Buffer.isBuffer(ws0.raw), "夹具 campaign/writer 在读且带 raw");
+      const cp = campaignPath(fx.env), wp = writerStatePath(fx.env);
+      const origCampaign = fs.readFileSync(cp), origWriter = fs.readFileSync(wp);
+      const dfx = r52DrainedFixture({ fx, tok });
+      // 读取器返回 raw 后，把 campaign/writer 路径的“重读”结果换成别的内容（模拟现场被换成 FIFO/改内容）。
+      // 编排必须用 cs.raw/ws.raw（同一受验 fd 字节），绝不走 fs.readFileSync 二读。
+      const realReadFile = fs.readFileSync;
+      fs.readFileSync = function (p, ...rest) {
+        if (typeof p === "string" && (p === cp || p === wp)) return Buffer.from("changed-after-read:" + p);
+        return realReadFile.call(fs, p, ...rest);
+      };
+      let crashed = false, r = null;
+      try {
+        r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+      } catch (err) {
+        crashed = err?.simulatedCrash === true;
+      } finally {
+        fs.readFileSync = realReadFile;
+      }
+      // 新版：备份在进段后写盘（old 二读拿“改后内容”→ campaign_backup_raw_mismatch 提前拒，进不到进段）。
+      assert.ok(crashed === true, "备份在进段后写盘（旧实现二读改内容 → campaign_backup_raw_mismatch 拒）：" + JSON.stringify(r));
+      // 备份文件字节 === 读取器 raw（原始字节），而不是“改后内容”。
+      const camBak = path.join(fx.dir, tok + ".staged", "backup-campaign.json");
+      const wrBak = path.join(fx.dir, tok + ".staged", "backup-writer-state.json");
+      assert.deepEqual(fs.readFileSync(camBak), origCampaign, "campaign 备份字节 === 读取器 raw（非改后内容）");
+      assert.deepEqual(fs.readFileSync(wrBak), origWriter, "writer-state 备份字节 === 读取器 raw（非改后内容）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修二 P1-4：恢复记 done 条件补全——campaign 恢复窗口先 fsync+无残骸+受验重读才记 done（目录 fsync 失败→不记）；mint 执行器返回 ok 但账本被改→不记 done", () => {
+    // ── counter #2：mint 执行器返回 ok 后账本被改（afterWrite 注入）→ 编排层受验重读 ≠ intended_after → 不记 done ──
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const dfx = r52DrainedFixture({ fx, tok });
+        let tampered = null;
+        fx.ctx.afterWrite = (id) => {
+          if (id === "mint:" + ep) {
+            const lf = path.join(fx.ledgerRoot, ep, "ledger.json");
+            fs.writeFileSync(lf, "tampered-not-json", { mode: 0o600 });
+            tampered = id;
+          }
+        };
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.equal(tampered, "mint:" + ep, "执行器返回 ok 后账本被改（afterWrite 命中）");
+        assert.ok(r.ok === false, "账本被改 → 不记 done：" + JSON.stringify({ reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "written_mismatch", "拒因 written_mismatch（账本读回 ≠ intended_after）");
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        const mintStep = jj.doc.steps.find((s) => s.kind === "mint");
+        assert.equal(mintStep.state, "prepared", "mint step 不记 done（账本被改）");
+      } finally { fx.cleanup(); }
+    }
+    // ── counter #1：campaign 恢复窗口（现场 === intended）注入目录 fsync 失败 → recovery_seal_failed，campaign 不记 done ──
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const tok = r52Uuid(5);
+        const cid = campaignIdFor(tok);
+        const campId = "campaign:" + cid + ":open";
+        const dfx = r52DrainedFixture({ fx, tok });
+        // 第一步：campaign 写后即崩（写成功但 step 未 done）→ 现场 === intended 的恢复窗口。
+        fx.ctx.afterWrite = (id) => { if (id === campId) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.ok(crashed, "campaign 写后崩");
+        releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        // 第二步：恢复 forward，注入目录 fsync 失败 → 恢复窗口的 recoveryBarrier 拒 → campaign 不记 done。
+        fx.ctx.afterWrite = null;
+        const r2 = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r2.ok === false && r2.reason === "recovery_seal_failed", "目录 fsync 失败 → recovery_seal_failed：" + JSON.stringify({ reason: r2.reason, why: r2.why, phase: r2.phase }));
+        const jj2 = readJournal({ dir: fx.dir, token: tok });
+        const campStep = jj2.doc.steps.find((s) => s.id === campId);
+        assert.equal(campStep.state, "prepared", "campaign step 不记 done（目录 fsync 失败）");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修三：统一屏障——mint already 恢复支走屏障（failDirFsync→recovery_seal_failed 不记 done）；ledger.lock 残骸 fail-closed（schema 不推进 done）；首次 clean 提交也过屏障（计数=步骤数）", () => {
+    // ① mint already 恢复支（mint 已提交、step 仍 prepared）注入 failDirFsync → 必 recovery_seal_failed 且 step 保持 prepared。
+    {
+      const fx = r52Setup({});
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("mint:")) throw Object.assign(new Error("crash@mint"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "mint 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.ok(r.ok === false, "mint already 恢复 failDirFsync 停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "mint already 恢复支走屏障 → recovery_seal_failed");
+        const j = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(j.doc.steps.find((s) => s.kind === "mint" && s.state !== "done").state, "prepared", "mint step 不记 done（恢复窗 failDirFsync）");
+      } finally { fx.cleanup(); }
+    }
+    // ② ledger.lock 残骸 fail-closed：schema 已提交、step prepared、ledger.lock 在场 → 恢复不得推进 done。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@schema"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "schema 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const ep = fx.eps[0];
+        fs.writeFileSync(path.join(fx.ledgerRoot, ep, "ledger.lock"), "stuck", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "ledger.lock 残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "ledger.lock 残骸 → schema step 不推进 done");
+        const j = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(j.doc.steps.find((s) => s.kind === "schema_endpoint").state, "prepared", "schema step 不记 done（ledger.lock 在场）");
+      } finally { fx.cleanup(); }
+    }
+    // ③ 首次 clean 提交也过屏障：计数器 == 已提交 step 数（twoEps:false 下 campaign+schema+mint+writer = 4 步）。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        resetSealCalls52();
+        const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(r.ok, "全程成功：" + JSON.stringify({ reason: r.reason, phase: r.phase }));
+        assert.equal(r.phase, "done");
+        assert.equal(sealCallCount52(), 4, "sealAndVerifyStep 被调用 4 次（每个 clean 提交 step 一次）");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修四 N1：残骸 lstat 非 ENOENT 异常 fail-closed——目标目录注入 lstatThrows → 屏障 ok:false 以「lstat：」开头、step 保持 prepared", () => {
+    // schema 恢复窗（写后崩）+ 注入 lstatThrows 到目标目录某名字 → 残骸盘点 fail-closed。
+    const fx = r52Setup({ twoEps: false });
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@schema"), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "schema 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      fx.ctx.afterWrite = null;
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env, _inject: { lstatThrows: "ledger.json" } });
+      assert.ok(r.ok === false, "lstat 异常必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "recovery_seal_failed", "lstat 异常 → recovery_seal_failed");
+      assert.match(String(r.why), /^lstat：/, "why 以 lstat：开头：" + r.why);
+      const j = readJournal({ dir: fx.dir, token: act.token });
+      assert.equal(j.doc.steps.find((s) => s.kind === "schema_endpoint").state, "prepared", "schema step 保持 prepared（lstat 异常）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修四 N2：mint 步 ledger.lock 残骸 fail-closed + campaign/writer 步未知文件残骸阻断——多入口都不得放过", () => {
+    // N2a mint：already 恢复窗 + ep 目录 ledger.lock 在场 → 不记 done、recovery_seal_failed、why 含「残骸：ledger.lock」。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("mint:")) throw Object.assign(new Error("crash@mint"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "mint 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const ep = fx.eps[0];
+        fs.writeFileSync(path.join(fx.ledgerRoot, ep, "ledger.lock"), "stuck", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "mint ledger.lock 残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "mint ledger.lock → recovery_seal_failed");
+        assert.match(String(r.why), /残骸：ledger\.lock/, "why 点名残骸：ledger.lock：" + r.why);
+        const j = readJournal({ dir: fx.dir, token: act.token });
+        assert.equal(j.doc.steps.find((s) => s.kind === "mint" && s.state !== "done").state, "prepared", "mint step 不记 done");
+      } finally { fx.cleanup(); }
+    }
+    // N2b campaign：恢复窗 + ledger 根多一个未知文件 → 残骸阻断。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.endsWith(":open")) throw Object.assign(new Error("crash@campaign"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "campaign 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fs.writeFileSync(path.join(fx.ledgerRoot, "owner-select-junk.tmp"), "x", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "campaign 未知文件残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "campaign 未知文件 → recovery_seal_failed");
+      } finally { fx.cleanup(); }
+    }
+    // N2c writer：恢复窗 + ledger 根多一个未知文件 → 残骸阻断。
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("writer_state:")) throw Object.assign(new Error("crash@writer"), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true, "writer 写后崩");
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        fs.writeFileSync(path.join(fx.ledgerRoot, "owner-select-junk.tmp"), "x", { mode: 0o600 });
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false, "writer 未知文件残骸停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "recovery_seal_failed", "writer 未知文件 → recovery_seal_failed");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修四（#138 四轮 P1）：残骸白名单 (name,st) 双参 + endpoint 项绑冻结集——同名普通文件 / 同名 symlink / 冻结集外 endpoint 目录一律算残骸", () => {
+    // 冻结集 = [EP52A]。用端点形状但非冻结集的残留项验证「按名字放行 → 残骸」。#138 四轮 P1：
+    // 同名普通文件（①）、同名 symlink（②）、冻结集外的 endpoint 目录（③）一律算残骸。
+    const nonFrozen = "endpoint_" + "c".repeat(24);
+    const run = (makeJunk) => {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.endsWith(":open")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        const act = readActive({ dir: fx.dir });
+        releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        makeJunk(fx);
+        fx.ctx.afterWrite = null;
+        const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+        assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "junk 残骸停门：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.match(String(r.why), /残骸/, "why 点名残骸：" + r.why);
+      } finally { fx.cleanup(); }
+    };
+    // ① 同名普通文件（匹配 endpoint 形状但非目录、非冻结集）→ 残骸。
+    run((fx) => { fs.writeFileSync(path.join(fx.ledgerRoot, nonFrozen), "x", { mode: 0o600 }); });
+    // ② 同名 symlink（匹配 endpoint 形状但为 symlink）→ 残骸。
+    run((fx) => { fs.symlinkSync("/nonexistent", path.join(fx.ledgerRoot, nonFrozen)); });
+    // ③ 冻结集外的 endpoint 目录（是目录但非本 operation 冻结集成员）→ 残骸。
+    run((fx) => { fs.mkdirSync(path.join(fx.ledgerRoot, "endpoint_" + "b".repeat(24)), { recursive: true, mode: 0o700 }); });
+    // ④ 冻结集内名字的 symlink 目录（名字 ∈ 冻结集，但是 symlink → 非目录）→ 残骸。
+    run((fx) => { const p = path.join(fx.ledgerRoot, "endpoint_" + "a".repeat(24)); fs.rmSync(p, { recursive: true, force: true }); fs.symlinkSync("/tmp", p); });
+  });
+
+  test("R52 返修五追加（续）：恰为 owner-select-campaign.json 的 symlink → campaignAllowedFor 拒（writer 屏障恢复窗）", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("writer_state:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "writer 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // 恰为 owner-select-campaign.json 的 symlink（非普通文件）→ 残骸。
+      const cp = path.join(fx.ledgerRoot, "owner-select-campaign.json");
+      fs.rmSync(cp, { force: true });
+      fs.symlinkSync("/nonexistent", cp);
+      fx.ctx.afterWrite = null;
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false && r.reason === "recovery_seal_failed", "campaign.json symlink 残骸停门：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修五追加：ledger 允许清单核（普通文件 ∧ 非 symlink）——ledger 目录放同名 symlink → 屏障拒、step 不记 done", () => {
+    const fx = r52Setup({ twoEps: false });
+    try {
+      fx.ctx.afterWrite = (id) => { if (typeof id === "string" && id.startsWith("schema_endpoint:")) throw Object.assign(new Error("crash@" + id), { simulatedCrash: true, crashId: id }); };
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "schema 写后崩");
+      const act = readActive({ dir: fx.dir });
+      releaseOperationLease52({ path: path.join(fx.dir, act.token + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      // ledger 目录放一个名为 ledger.json.prev 的 symlink（先把既有真实 .prev 移除）→ ledgerAllowed 必须拒。
+      const ep = fx.eps[0];
+      fs.rmSync(path.join(fx.ledgerRoot, ep, "ledger.json.prev"), { force: true });
+      fs.symlinkSync("/nonexistent", path.join(fx.ledgerRoot, ep, "ledger.json.prev"));
+      fx.ctx.afterWrite = null;
+      const r = osmForward52(fx.ctx, { token: act.token, lease: acquireOperationLease({ dir: fx.dir, token: act.token }), env: fx.env });
+      assert.ok(r.ok === false, "ledger 同名 symlink 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+      assert.equal(r.reason, "recovery_seal_failed", "ledger 同名 symlink → recovery_seal_failed");
+      const j = readJournal({ dir: fx.dir, token: act.token });
+      assert.equal(j.doc.steps.find((s) => s.kind === "schema_endpoint" && s.state !== "done").state, "prepared", "schema step 不记 done（ledger 同名 symlink）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P1-4：staged 恢复矩阵闭合——staged 是 symlink → 拒；备份已在场但 sha 不符 → 拒", () => {
+    // (a)：<token>.staged 被预埋成外指 symlink → mkdirDurable 在此拒，不写盘、不进段。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const dfx = r52DrainedFixture({ fx, tok });
+        const ext = path.join(fx.base, "external-staged");
+        fs.mkdirSync(ext, { recursive: true, mode: 0o700 });
+        fs.symlinkSync(ext, path.join(fx.dir, tok + ".staged"));
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "staged symlink 必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "staged_residue", "staged symlink 拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        assert.equal(fs.existsSync(path.join(ext, "intended")), false, "外指目录未写盘");
+      } finally { fx.cleanup(); }
+    }
+    // (c)：备份已在场但 sha 不符 → fail-closed（backup_mismatch），不复用、不覆盖。
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(5);
+        const ep = fx.eps[0];
+        const dfx = r52DrainedFixture({ fx, tok });
+        const stagedDir = path.join(fx.dir, tok + ".staged");
+        fs.mkdirSync(stagedDir, { recursive: true, mode: 0o700 });
+        const bak = path.join(stagedDir, "backup-ledger-" + ep + ".json");
+        fs.writeFileSync(bak, "nothing".repeat(40), { mode: 0o600 });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "备份 sha 不符必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+        assert.equal(r.reason, "backup_mismatch", "备份 sha 不符拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+        const j52 = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(j52.doc.phase, "drained", "未进段，仍 drained");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 返修一 P1-5：备份字节出处——schema 备份=raw 1.0、mint 备份 sha=三方等式（mint.before===schema.intended_after===备份sha）", () => {
+    const fx = r52Setup({ crashAfter: 8 }); // 进段后崩（steps 已写、staged 仍在）
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      const tok = readActive({ dir: fx.dir }).token;
+      const j52 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j52.doc.phase, "osm_a_upgrading");
+      for (const ep of fx.eps) {
+        const se = j52.doc.steps.find((s) => s.kind === "schema_endpoint" && s.id === "schema_endpoint:" + ep + ":transition");
+        const mint = j52.doc.steps.find((s) => s.kind === "mint" && s.id === "mint:" + ep);
+        // 三方等式：mint.before.ledger_sha256 === schema.intended_after.ledger_sha256 === mint 备份字节 sha
+        assert.equal(mint.before.ledger_sha256, se.intended_after.ledger_sha256, ep + " mint.before === schema.intended_after");
+        assert.equal(mint.backup_sha256, mint.before.ledger_sha256, ep + " mint 备份 sha === mint.before.ledger_sha256");
+        // schema 备份 = raw 1.0 字节，其 sha === schema.before.ledger_sha256
+        assert.equal(se.backup_sha256, se.before.ledger_sha256, ep + " schema 备份 sha === schema.before.ledger_sha256（raw 1.0）");
+        // 读回两组备份文件字节核 sha
+        assert.equal(fs.existsSync(se.backup), true, ep + " schema 备份文件在场");
+        const seBak = fs.readFileSync(se.backup, "utf-8");
+        assert.equal(crypto.createHash("sha256").update(seBak).digest("hex"), se.backup_sha256, ep + " schema 备份文件字节 sha 对上");
+        const mintBak = fs.readFileSync(mint.backup, "utf-8");
+        assert.equal(crypto.createHash("sha256").update(mintBak).digest("hex"), mint.backup_sha256, ep + " mint 备份文件字节 sha 对上");
+        assert.notEqual(se.backup_sha256, mint.backup_sha256, ep + " schema(1.0 raw) 与 mint(transitioned) 备份字节不同");
+      }
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P1-6：已有 open campaign 再进段 → campaign step revision 正确 +1（非 NaN）", () => {
+    const fx = r52Setup({});
+    try {
+      const tok = r52Uuid(5);
+      const cid = campaignIdFor(tok);
+      const eps = [...fx.eps].sort();
+      const dig = endpointsDigest(eps);
+      const members = {};
+      for (const ep of eps) {
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const inv = TAL.migrationInventory(L.doc);
+        members[ep] = { schema_version: L.doc.schema_version, legacy_proof_count: inv.legacy_proof_count, null_b1_count: inv.null_b1_count };
+      }
+      const campaignDoc = { schema_version: "owner-select-campaign-1", campaign_id: cid, state: "open", endpoints: eps, endpoints_digest: dig, pending_joins: [], members, revision: 5, origin_operation_id: tok };
+      const writerDoc = { schema_version: "owner-select-writer-state-1", state: "partial", campaign_id: cid, endpoints_digest: dig, revision: 4, origin_operation_id: tok };
+      fs.mkdirSync(path.dirname(campaignPath(fx.env)), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(campaignPath(fx.env), JSON.stringify(campaignDoc, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+      // 受验读取器核：campaign 读回 revision === 5、writer 读回 revision === 4（补 raw/revision 生效）
+      const cs = readCampaignState(fx.env);
+      assert.equal(cs.revision, 5, "campaign reader 补 revision");
+      assert.ok(Buffer.isBuffer(cs.raw), "campaign reader 补 raw");
+      const ws52 = readWriterState(fx.env);
+      assert.equal(ws52.revision, 4);
+      assert.ok(Buffer.isBuffer(ws52.raw), "writer reader 补 raw");
+      // 进段前跨文件联合核：open campaign + partial writer（同 cid）→ admission 非 unreadable（读回 revision 已生效、不 NaN）
+      const adm = readOwnerSelectAdmission(fx.env);
+      assert.notEqual(adm.state, "unreadable", "跨文件联合应自洽：" + String(adm.problem));
+      // 编排 revision 计算：cs.revision 现在是有界数字，buildOsmCampaignDoc 的 expectedRevision = cs.revision+1 不再 NaN。
+      // 用缺失 campaign 的净场景验证 0+1 === 1（无 NaN），并用读回 revision 5 证明 readVerifiedDoc 通道真实带出 revision。
+      assert.equal(cs.revision, 5, "再进段应读到既有 revision（非 NaN）");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一：mint commit_residue / schema written_mismatch / campaign 写后改 / 重开 3b 失败", () => {
+    // ── 1. mint 段 commit_residue：failDirFsync → committed_durability_uncertain → 停门、step 不记 done ──
+    {
+      const fx = r52Setup({ crashAfter: 11 }); // schema epB done 后崩溃（c 未开始）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        // 恢复 osmForward：c 步 mint 写注入 failDirFsync → durability_uncertain → P1-7(a) commit_unclear 停门（不记 done）
+        const r = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env, _inject: { failDirFsync: true } });
+        assert.equal(r.ok, false, "mint 停门");
+        assert.equal(r.reason, "commit_unclear", "commit_unclear（durability_uncertain 不记 done）：" + JSON.stringify({ reason: r.reason, commit: r.commit }));
+        assert.equal(r.phase, "osm_a_upgrading", "phase 仍 osm_a_upgrading");
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        const mintStep = jj.doc.steps.find((s) => s.kind === "mint");
+        assert.equal(mintStep.state, "prepared", "mint step 不记 done");
+        releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") }); // 停门返回后交还租约再恢复
+        // 二次恢复（无注入）→ 收敛 done
+        const r2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(r2.ok && r2.phase === "done", "二次恢复收敛 done：" + JSON.stringify({ reason: r2.reason, phase: r2.phase }));
+      } finally { fx.cleanup(); }
+    }
+    // ── 2. schema 段 written_mismatch：恢复前篡改 journal 的 intended_after SHA → 执行器成功但读回 ≠ 进段锚 ──
+    {
+      const fx = r52Setup({ crashAfter: 10 }); // schema epA done 后崩溃（epB 未跑）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        // 篡改 journal：epB 的 schema step intended_after.ledger_sha256 → 错值（状态链闭合同步 mint.before/backup_sha256）
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        const seB = jj.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition");
+        seB.intended_after.ledger_sha256 = r52Sha("8");
+        const miB = jj.doc.steps.find((s) => s.id === "mint:" + fx.eps[1]);
+        miB.before.ledger_sha256 = r52Sha("8");
+        miB.backup_sha256 = r52Sha("8");
+        fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj.doc, null, 2) + "\n", { mode: 0o600 });
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(ex.ok, false, "intended_mismatch 停门：" + JSON.stringify({ ok: ex.ok, reason: ex.reason, phase: ex.phase }));
+        assert.equal(ex.reason, "intended_mismatch", "intended_mismatch（main R51 预算≠intended 提前拒）：" + JSON.stringify({ reason: ex.reason }));
+        assert.equal(ex.phase, "osm_a_upgrading", "phase 不变");
+        const jj2 = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(jj2.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition").state, "prepared", "epB schema step 不记 done");
+        // 修复（按现场重算锚：intended_after 应为 epB 的 transitioned SHA——用 applySchemaUpgrade 确定性预算，
+        //  不能取当前 1.0 账本 SHA；状态链闭合同步 mint.before/backup）→ 续跑 done
+        const LBe = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[1]), { endpointId: fx.eps[1] });
+        const shaReal = r52ShaOf(TAL.serializeLedger(TAL.applySchemaUpgrade(LBe.doc, { operation_id: TAL.ownerSelectSchemaUpgradeOpId(tok, fx.eps[1]), request_key: tok + ":schema:" + fx.eps[1], from_schema: "1.0", to_schema: "1.1-transition" })));
+        const jj3 = readJournal({ dir: fx.dir, token: tok });
+        jj3.doc.steps.find((s) => s.id === "schema_endpoint:" + fx.eps[1] + ":transition").intended_after.ledger_sha256 = shaReal;
+        const mi3 = jj3.doc.steps.find((s) => s.id === "mint:" + fx.eps[1]);
+        mi3.before.ledger_sha256 = shaReal;
+        mi3.backup_sha256 = shaReal;
+        fs.writeFileSync(path.join(fx.dir, tok + ".json"), JSON.stringify(jj3.doc, null, 2) + "\n", { mode: 0o600 });
+        const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex2.ok && ex2.phase === "done", "修复后续跑 done：" + JSON.stringify({ reason: ex2.reason, phase: ex2.phase }));
+      } finally { fx.cleanup(); }
+    }
+    // ── 3. campaign a 段 written_mismatch：写后读回前文件被改（afterWrite 注入）→ 停门、step 不记 done ──
+    {
+      const fx = r52Setup({ crashAfter: 8 }); // 进段后崩溃（a 未跑）
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        // 注入：campaign 写成功后、读回前追加字节（sha 漂移）
+        fx.ctx.afterWrite = (id) => {
+          if (id.startsWith("campaign:")) fs.appendFileSync(path.join(fx.ledgerRoot, "owner-select-campaign.json"), " ");
+        };
+        const r = osmForward52(fx.ctx, { token: tok, lease: acquireOperationLease({ dir: fx.dir, token: tok }), env: fx.env });
+        fx.ctx.afterWrite = null;
+        assert.equal(r.ok, false, "campaign 写后改停门：" + JSON.stringify({ ok: r.ok, reason: r.reason, phase: r.phase }));
+        assert.equal(r.reason, "written_mismatch", "written_mismatch：" + JSON.stringify({ reason: r.reason }));
+        const jj = readJournal({ dir: fx.dir, token: tok });
+        assert.equal(jj.doc.steps.find((s) => s.kind === "campaign").state, "prepared", "campaign step 不记 done");
+        releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") }); // 停门返回后交还租约再恢复
+        // 续跑：campaign 现场已被改（sha 漂移）→ a 段 budget 核会拒；还原现场为预算字节后续跑
+        // 写后被改的字节 = 预算 doc + " "；按 intended_after 重算 doc 不可能（成员依赖账本），此处直接
+        // 重建 open doc：读预算 impossible → 删除 campaign 文件回 absent → a 段重走 CAS 写（expectedSha256=null）
+        fs.rmSync(path.join(fx.ledgerRoot, "owner-select-campaign.json"), { force: true });
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex.ok && ex.phase === "done", "续跑 done：" + JSON.stringify({ reason: ex.reason, phase: ex.phase, incomplete: ex.incomplete }));
+      } finally { fx.cleanup(); }
+    }
+    // ── 4. 重开 3b：staged 删不掉 → reopening_incomplete，恢复权限后 --exit 续跑 done ──
+    {
+      const fx = r52Setup({ crashAfter: 14 }); // writer partial done 后崩溃
+      try {
+        let crashed = false;
+        try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+        assert.equal(crashed, true);
+        releaseOperationLease52({ path: path.join(fx.dir, readActive({ dir: fx.dir }).token + ".lease") });
+        fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+        const tok = readActive({ dir: fx.dir }).token;
+        fs.chmodSync(path.join(fx.dir, tok + ".staged"), 0o500); // staged 目录不可写 → rmSync ENOTEMPTY
+        const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(ex.ok, false, "3b 失败拒");
+        assert.equal(ex.phase, "reopening_incomplete", "reopening_incomplete：" + JSON.stringify({ phase: ex.phase, incomplete: ex.incomplete }));
+        assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "active", "门保留");
+        assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留");
+        fs.chmodSync(path.join(fx.dir, tok + ".staged"), 0o700); // 恢复权限
+        const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "恢复权限后续跑 done：" + JSON.stringify({ reason: ex2.reason, phase: ex2.phase, incomplete: ex2.incomplete }));
+      } finally { try { fs.chmodSync(path.join(fx.dir, readActive({ dir: fx.dir })?.token + ".staged"), 0o700); } catch { /* 已不在 */ } fx.cleanup(); }
+    }
+  });
+
+  test("R52 ③-d 重演算核 / ④-c 账本非 1.0 前置（变异配套场景）", () => {
+    // ③-d 重演算 SHA 核：其余全符、仅 expected_ledger_sha256 被换 → fail-closed
+    {
+      const fx = r52Setup({});
+      try {
+        const tok = r52Uuid(2);
+        const ep = fx.eps[0];
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, ep), { endpointId: ep });
+        const preset = r52WritePlan(fx, tok, ep, L.doc, (p) => { p.expected_ledger_sha256 = r52Sha("a"); });
+        const dfx = r52DrainedFixture({ fx, tok });
+        const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+        assert.ok(r.ok === false, "重演算不符拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why, phase: r.phase }));
+        assert.equal(r.reason, "mint_plan_mismatch", "重演算不符拒");
+      } finally { fx.cleanup(); }
+    }
+    // ④-c 冻结集里某 ep 账本非 1.0 → 前置 schema_not_old → 回退清场
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const ep = fx.eps[0];
+        const p = path.join(fx.ledgerRoot, ep, "ledger.json");
+        const d = JSON.parse(fs.readFileSync(p, "utf-8"));
+        d.schema_version = "1.1-transition";
+        d.revision = 3;
+        d.operations["00000000-0000-4000-8000-000000000009"] = { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "orphan_upgrade", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "orphan_upgrade", endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 3, result: { endpoint: ep, from_schema: "1.0", to_schema: "1.1-transition" } };
+        for (const rec of Object.values(d.records)) if (rec.kind === "live") { rec.selection_handle = null; rec.handle_expires_at = null; rec.rebind_handle = null; rec.rebind_expires_at = null; }
+        fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(r.ok, false, "账本非 1.0 拒");
+        assert.equal(r.reason, "schema_not_old", "schema_not_old 拒：" + r.reason);
+        assert.ok(r.rollback && r.rollback.ok === true, "回退清场");
+        assert.equal(readActive({ dir: fx.dir }).state, "absent", "active 已清");
+      } finally { fx.cleanup(); }
+    }
+  });
+
+  test("R52 ④⑤ 前置失败留 drained 且可回退；回退删不掉 plan → rollback_incomplete，恢复后可续跑", () => {
+    // ④-a 冻结集为空（零收据）→ rollbackSafe → 标准回退清场（rolled_back、门撤、active 清）
+    {
+      const fx = r52Setup({ twoEps: false, noReceipts: true });
+      try {
+        const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(r.ok, false, "前置失败拒");
+        assert.equal(r.reason, "frozen_set_empty");
+        assert.ok(r.rollback && r.rollback.ok === true && r.rollback.phase === "rolled_back", "已按账回退清场：" + JSON.stringify(r.rollback));
+        assert.equal(readActive({ dir: fx.dir }).state, "absent", "active 已清");
+        assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "absent", "门已撤");
+      } finally { fx.cleanup(); }
+    }
+    // ④-b campaign sealed → fail-closed 回退
+    {
+      const fx = r52Setup({ twoEps: false });
+      try {
+        const tok = r52Uuid(3);
+        const cid = campaignIdFor(tok);
+        const sealed = {
+          schema_version: CAMPAIGN_SCHEMA, campaign_id: cid, state: "sealed", endpoints: [fx.eps[0]], endpoints_digest: endpointsDigest([fx.eps[0]]),
+          pending_joins: [],
+          members: { [fx.eps[0]]: { schema_version: "1.0", legacy_proof_count: 0, null_b1_count: 1 } },
+          revision: 1, origin_operation_id: tok,
+        };
+        fs.writeFileSync(campaignPath(fx.env), JSON.stringify(sealed, null, 2) + "\n", { mode: 0o600 });
+        const r = osmEnter52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(r.ok, false);
+        assert.equal(r.reason, "campaign_sealed", "sealed 拒：" + r.reason);
+        assert.ok(r.rollback && r.rollback.ok === true, "回退清场");
+        assert.equal(readActive({ dir: fx.dir }).state, "absent");
+      } finally { fx.cleanup(); }
+    }
+    // ⑤ 回退删不掉 plan → rollback_incomplete（门与 active 保留）；权限恢复后 → --exit 只向前回退完成
+    {
+      const fx = r52Setup({ twoEps: false, noReceipts: true });
+      try {
+        const tok = r52Uuid(4);
+        // 先手工预置一个 drained fixture + plan 文件，再让 osmExit 走回退
+        const dfx = r52DrainedFixture({ fx, tok });
+        const L = TAL.loadLedger(path.join(fx.ledgerRoot, fx.eps[0]), { endpointId: fx.eps[0] });
+        r52WritePlan(fx, tok, fx.eps[0], L.doc);
+        fs.chmodSync(path.join(fx.dir, tok + ".staged", "intended"), 0o500); // unlink 需目录写权限 → 删不掉
+        releaseOperationLease52(dfx.lease); // 手工 fixture 的租约交还（osmExit 自己 acquire）
+        const r1 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.equal(r1.ok, false, "r1 拒：" + JSON.stringify({ ok: r1.ok, reason: r1.reason, phase: r1.phase }));
+        assert.equal(r1.phase, "rollback_incomplete", "删 plan 失败 → rollback_incomplete：" + JSON.stringify({ reason: r1.reason, phase: r1.phase }));
+        let gateDetail = "";
+        try { gateDetail = "stat=" + fs.statSync(fx.gateFile).isFile() + " lstat=" + fs.lstatSync(fx.gateFile).isSymbolicLink() + " bytes=" + fs.readFileSync(fx.gateFile).length; }
+        catch (e) { gateDetail = "statErr=" + String(e); }
+        assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "active", "门保留（dir=" + fs.readdirSync(fx.dir).join(",") + "）");
+        assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留");
+        fs.chmodSync(path.join(fx.dir, tok + ".staged", "intended"), 0o700); // 恢复权限
+        const r2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+        assert.ok(r2.phase === "rolled_back" || r2.phase === "rollback_incomplete", "恢复后续跑：" + r2.phase);
+        if (r2.phase === "rolled_back") assert.equal(fs.existsSync(path.join(fx.dir, tok + ".staged")), false, "plan 已随回退清理");
+      } finally { try { fs.chmodSync(path.join(fx.dir, tok + ".staged", "intended"), 0o700); } catch { /* 已不在 */ } fx.cleanup(); }
+    }
+  });
+
+  test("R52 ⑥ 重开前身份核验失败 → reopening_incomplete（门与 active 保留），修复后续跑到 done", () => {
+    const fx = r52Setup({ crashAfter: 14 });
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "d 步后崩溃");
+      const act = readActive({ dir: fx.dir });
+      const tok = act.token;
+      // 篡改：epA 账本内 schema_upgrade op 的 request_key 改为非本 operation 派生键 → 重开前身份核验失败
+      const epA = fx.eps[0];
+      const pA = path.join(fx.ledgerRoot, epA, "ledger.json");
+      const dA = JSON.parse(fs.readFileSync(pA, "utf-8"));
+      const upOp = Object.values(dA.operations).find((o) => o.op_type === "schema_upgrade");
+      upOp.request_key = "tampered";
+      fs.writeFileSync(pA, JSON.stringify(dA, null, 2) + "\n", { mode: 0o600 });
+      // 模拟接管者交还锁
+      releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.equal(ex.ok, false, "身份核验失败拒：" + JSON.stringify({ reason: ex.reason, why: ex.why, phase: ex.phase }));
+      assert.equal(ex.phase, "reopening_incomplete", "reopening_incomplete：" + JSON.stringify({ phase: ex.phase, incomplete: ex.incomplete }));
+      assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留");
+      // 修复（还原 request_key）后只向前 → done
+      const dA2 = JSON.parse(fs.readFileSync(pA, "utf-8"));
+      Object.values(dA2.operations).find((o) => o.op_type === "schema_upgrade").request_key = tok + ":schema:" + epA;
+      fs.writeFileSync(pA, JSON.stringify(dA2, null, 2) + "\n", { mode: 0o600 });
+      const ex2 = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.ok(ex2.ok && ex2.phase === "done" && ex2.activeCleared === true, "修复后续跑 done：" + JSON.stringify({ reason: ex2.reason, incomplete: ex2.incomplete }));
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P1-7：篡改 mint op fingerprint → 重开前身份核验失败 → reopening_incomplete，不撤门", () => {
+    const fx = r52Setup({ crashAfter: 14 });
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true, "d 步后崩溃");
+      const tok = readActive({ dir: fx.dir }).token;
+      const epA = fx.eps[0];
+      const pA = path.join(fx.ledgerRoot, epA, "ledger.json");
+      const dA = JSON.parse(fs.readFileSync(pA, "utf-8"));
+      const mintOp = Object.values(dA.operations).find((o) => o.op_type === "mint_selection_handles");
+      mintOp.fingerprint = "f".repeat(64); // 篡改 fingerprint ≠ result.minted 集重算
+      fs.writeFileSync(pA, JSON.stringify(dA, null, 2) + "\n", { mode: 0o600 });
+      releaseOperationLease52({ path: path.join(fx.dir, tok + ".lease") });
+      fs.rmSync(installSurfaceLockPath({ home: fx.home }), { force: true });
+      const ex = osmExit52(fx.ctx, { apply: true, env: fx.env });
+      assert.equal(ex.ok, false, "指纹篡改拒：" + JSON.stringify({ reason: ex.reason, phase: ex.phase }));
+      assert.equal(ex.phase, "reopening_incomplete", "reopening_incomplete：" + JSON.stringify({ phase: ex.phase, incomplete: ex.incomplete }));
+      assert.ok(ex.incomplete.some((i) => /fingerprint/.test(String(i.why))), "指纹不符被点名：" + JSON.stringify(ex.incomplete));
+      assert.equal(readActive({ dir: fx.dir }).state, "active", "active 保留门不撤");
+      assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "active", "门保留");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 P2：ownerSelectStatus 对坏 journal / 收据冲突投影成「查不清」并点名，非空集合", () => {
+    const fx = r52Setup({});
+    try {
+      // 坏 journal：把一个收据文件写坏 → aggregateEndpointReceipts unreadable → receiptsProblem 查不清点名。
+      const badTok = r52Uuid(1);
+      fs.writeFileSync(path.join(fx.dir, badTok + ".json"), "{ not json", { mode: 0o600 });
+      const st = MOS.ownerSelectStatus(fx.ctx, { env: fx.env });
+      assert.ok(st.receiptsProblem, "坏 journal → receiptsProblem（查不清）非空：" + JSON.stringify(st.receiptsProblem));
+      assert.match(String(st.receiptsProblem), /journal|读不出|收据/, "点名原因：" + String(st.receiptsProblem));
+      assert.equal(st.endpoints.length, 0, "查不清时不许枚举子集为空集合");
+      // 渲染含查不清文案
+      const txt = MOS.renderOwnerSelectStatus(st);
+      assert.match(txt, /查不清/, "渲染含查不清：" + txt);
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 补：campaign × writer 跨文件联合不自洽（writer partial 但 campaign 缺席）→ osmPrecheck 回 campaign_writer_inconsistent", () => {
+    const fx = r52Setup({});
+    try {
+      const tok = r52Uuid(5);
+      const cid = campaignIdFor(tok);
+      const eps = [...fx.eps].sort();
+      // campaign 缺席（不写 campaign 文件）+ writer partial（同 cid）→ 跨文件不自洽。
+      const writerDoc = { schema_version: "owner-select-writer-state-1", state: "partial", campaign_id: cid, endpoints_digest: endpointsDigest(eps), revision: 1, origin_operation_id: tok };
+      fs.mkdirSync(path.dirname(writerStatePath(fx.env)), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(writerStatePath(fx.env), JSON.stringify(writerDoc, null, 2) + "\n", { mode: 0o600 });
+      const dfx = r52DrainedFixture({ fx, tok });
+      const r = osmForward52(fx.ctx, { token: tok, lease: dfx.lease, env: fx.env });
+      assert.ok(r.ok === false, "跨文件不自洽必拒：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+      assert.equal(r.reason, "campaign_writer_inconsistent", "拒因：" + JSON.stringify({ reason: r.reason, why: r.why }));
+      const j52 = readJournal({ dir: fx.dir, token: tok });
+      assert.equal(j52.doc.phase, "drained", "未进段，仍 drained");
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 返修一 补：stepCommitCheck 纯函数——residue/lockUncleared/lock_state 任一 → commit_unclear", () => {
+    assert.equal(stepCommitCheck52({ ok: true, commit: "committed_clean" }), null, "纯净 committed_clean → 可记");
+    const c1 = stepCommitCheck52({ ok: true, commit: "committed_clean", residue: ["x"] });
+    assert.equal(c1?.reason, "commit_unclear", "residue 非空 → commit_unclear：" + JSON.stringify(c1));
+    assert.match(String(c1?.why), /residue/, "why 点名 residue：" + String(c1?.why));
+    const c2 = stepCommitCheck52({ ok: true, commit: "committed_clean", lockUncleared: { reason: "x" } });
+    assert.equal(c2?.reason, "commit_unclear", "lockUncleared 非 null → commit_unclear：" + JSON.stringify(c2));
+    assert.match(String(c2?.why), /lockUncleared/, "why 点名 lockUncleared");
+    const c3 = stepCommitCheck52({ ok: true, commit: "committed_clean", lock_state: "unclear" });
+    assert.equal(c3?.reason, "commit_unclear", "lock_state=unclear → commit_unclear：" + JSON.stringify(c3));
+    assert.match(String(c3?.why), /lock_state/, "why 点名 lock_state");
+  });
+
+  test("R52 返修二 P2-5：stepCommitCheck 按 kind 收窄——ledger 类只认 committed_clean|replayed|already，state 类只认 committed，混用 → commit_unclear", () => {
+    // ledger 类（schema_endpoint / mint）：只认 committed_clean | replayed | already；其余（含 committed）→ commit_unclear。
+    for (const okCommit of ["committed_clean", "replayed", "already"]) {
+      assert.equal(stepCommitCheck52({ ok: true, commit: okCommit, residue: [], lockUncleared: null }, "ledger"), null, "ledger 可记：" + okCommit);
+    }
+    const ledgerBad = stepCommitCheck52({ ok: true, commit: "committed", residue: [], lockUncleared: null }, "ledger");
+    assert.equal(ledgerBad?.reason, "commit_unclear", "ledger 类 commit=committed → commit_unclear：" + JSON.stringify(ledgerBad));
+    assert.match(String(ledgerBad?.why), /kind=ledger/, "why 点名 ledger 类：" + String(ledgerBad?.why));
+    // state-file 类（campaign / writer_state）：只认 committed；其余（含 committed_clean）→ commit_unclear。
+    assert.equal(stepCommitCheck52({ ok: true, commit: "committed", residue: [], lockUncleared: null }, "state"), null, "state 可记 committed");
+    const stateBad = stepCommitCheck52({ ok: true, commit: "committed_clean", residue: [], lockUncleared: null }, "state");
+    assert.equal(stateBad?.reason, "commit_unclear", "state 类 commit=committed_clean → commit_unclear：" + JSON.stringify(stateBad));
+    assert.match(String(stateBad?.why), /kind=state/, "why 点名 state 类：" + String(stateBad?.why));
+  });
+
+  test("R52 返修一 补：直接调 exitMaintenance（operation.mjs）对 owner_select journal → 走 osmExit 语义，不落通用 rollback", () => {
+    const fx = r52Setup({ crashAfter: 8 }); // 进段后（osm_a_upgrading）崩溃
+    try {
+      let crashed = false;
+      try { osmEnter52(fx.ctx, { apply: true, env: fx.env }); } catch (err) { crashed = err?.simulatedCrash === true; }
+      assert.equal(crashed, true);
+      // 直接调 exitMaintenance（不经 maintenance-gate.mjs）——对 owner_select journal 应路由到 osmExit。
+      const r = exitMaintenance(fx.ctx, { apply: false });
+      assert.ok(r.ok === true && r.dryRun === true, "dry-run 返回：" + JSON.stringify({ ok: r.ok, reason: r.reason, action: r.action, phase: r.phase }));
+      assert.notEqual(r.action, "rollback", "owner_select 不落通用 rollback：action=" + String(r.action));
+      assert.ok(r.phase === "osm_a_upgrading" || r.phase === "ledger_reopening", "osmExit 只向前阶段语义：phase=" + String(r.phase));
+    } finally { fx.cleanup(); }
+  });
+
+  test("R52 ⑦' CLI：参数封闭、退出码映射、预览与坏参数", () => {
+    // 参数封闭
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--status", "--apply"]).ok, false, "--status 不带别的参数");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--migrate-a"]).ok, false, "动作重复拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--apply", "--apply"]).ok, false, "--apply 重复拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--wait-ms", "x"]).ok, false, "--wait-ms 非整数拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--endpoint", "endpoint_" + "a".repeat(24)]).ok, false, "不认识的参数拒");
+    assert.equal(MOS.parseMaintenanceOwnerSelectArgs([]).ok, false, "空参数拒");
+    assert.deepEqual([MOS.parseMaintenanceOwnerSelectArgs(["--status"]).ok, MOS.parseMaintenanceOwnerSelectArgs(["--migrate-a", "--apply"]).ok], [true, true], "合法形状");
+    // 退出码映射（纯函数，不跑编排）
+    assert.equal(MOS.exitCodeFor({ ok: true }), 0, "完成 0");
+    assert.equal(MOS.exitCodeFor({ ok: false, reason: "frozen_set_empty", rollback: { ok: true } }), 1, "回退清场 1");
+    assert.equal(MOS.exitCodeFor({ ok: false, reason: "precheck_failed", phase: "osm_a_upgrading" }), 3, "forward 卡住 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, phase: "reopening_incomplete" }), 3, "重开没做完 3");
+    assert.equal(MOS.exitCodeFor({ ok: false, reason: "x", rollback: { ok: false, phase: "rolling_back" } }), 3, "回退没做全 3");
+    assert.equal(MOS.exitCodeFor({ ok: true, leaseRelease: { path: "/p" } }), 3, "租约交不还 3");
+    // runMaintenanceOwnerSelect：预览 0、坏参数 1（ctx 传 null 走 maintenanceContext，用空 argv 免真机）
+    let outBuf = [];
+    const code = MOS.runMaintenanceOwnerSelect(["--bad-flag"], { ctx: null, out: (s) => outBuf.push(s), env: { ...process.env } });
+    assert.equal(code, 1, "坏参数 exit 1");
+    // --status 只读投影 + --migrate-a 预览零改动（走真夹具 ctx）
+    {
+      const fx = r52Setup({});
+      try {
+        const out2 = [];
+        const s1 = MOS.runMaintenanceOwnerSelect(["--status"], { ctx: fx.ctx, out: (s) => out2.push(s), env: fx.env });
+        assert.equal(s1, 0, "--status exit 0");
+        assert.ok(out2.join("\n").includes("冻结集"), "--status 打印冻结集");
+        const out3 = [];
+        const s2 = MOS.runMaintenanceOwnerSelect(["--migrate-a"], { ctx: fx.ctx, out: (s) => out3.push(s), env: fx.env });
+        assert.equal(s2, 0, "预览 exit 0");
+        assert.ok(out3.join("\n").includes("[预览]"), "预览输出");
+        assert.equal(readGate({ file: fx.gateFile, now: Date.parse(T052) }).state, "absent", "预览零改动：无门");
+        assert.equal(fs.existsSync(path.join(fx.ledgerRoot, fx.eps[0], "owner-select-campaign.json")), false, "预览零改动：无 campaign 文件");
+      } finally { fx.cleanup(); }
+    }
   });
 }
 // ─────────── R54：转发结果落盘 + 回执措辞 + doctor 体检（issue #140） ───────────

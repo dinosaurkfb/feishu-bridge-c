@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-08T21:13:28.303Z",
+  "generated_at": "2026-09-09T02:56:31.535Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -696,6 +696,7 @@
       "REBIND_HANDLE_SHAPE",
       "REQUEST_KEY_SHAPE",
       "SCHEMA_VERSION",
+      "SCHEMA_VERSIONS",
       "SELECTION_HANDLE_SHAPE",
       "activate",
       "anchor",

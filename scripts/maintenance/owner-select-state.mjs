@@ -217,7 +217,9 @@ function readVerifiedDoc({ file, docValidator, maxBytes = MAX_STATE_FILE_BYTES }
     }
     const p = docValidator(doc);
     if (p !== null) return { ok: false, problem: p };
-    return { ok: true, doc, sha256: sha, bytes: buf.length, mtimeMs: st.mtimeMs }; // 同 fd fstat 时间（#141 二轮 P1-4）
+    // P1-6：raw 暴露原始字节（供备份直接用读取器 raw，不再从状态投影重新 JSON 化）；bytes 保持字节长度语义；
+    // mtimeMs 同 fd fstat 时间（#141 二轮 P1-4）。
+    return { ok: true, doc, sha256: sha, raw: buf, bytes: buf.length, mtimeMs: st.mtimeMs };
   } catch (err) {
     return { ok: false, problem: errCode(err) };
   } finally {
@@ -251,7 +253,9 @@ export function readCampaignState(env = process.env) {
     state: res.doc.state,
     campaign_id: res.doc.campaign_id,
     endpoints: res.doc.endpoints,
-    endpoints_digest: res.doc.endpoints_digest
+    endpoints_digest: res.doc.endpoints_digest,
+    revision: res.doc.revision,
+    raw: res.raw
   };
 }
 
@@ -281,7 +285,8 @@ export function readWriterState(env = process.env) {
     state: res.doc.state,
     campaign_id: res.doc.campaign_id,
     endpoints_digest: res.doc.endpoints_digest,
-    revision: res.doc.revision
+    revision: res.doc.revision,
+    raw: res.raw
   };
 }
 

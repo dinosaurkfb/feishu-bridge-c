@@ -760,6 +760,21 @@ export function runDoctor({
     //   读不了（symlink / ENOTDIR / EIO / 残骸） → 查不清，不冒充核对过
     const hasReceipt = (rootDir, key, resultSha256, outboxDirRel) => {
       const dir = path.join(rootDir, outboxDirRel);
+      // P2-3（返修三）：outbox_dir 的 containment 不只词法 —— 中间目录可以是 symlink，把实际读取引到物理根外。
+      //   合同：outbox 目录是我们自己建的，父链不该有中间 symlink；join 后 realpath 必须仍在 realpath(root) 内。
+      //   （root 自己是个 symlink 仍支持：两边都取 realpath。）不过 → 查不清，不去读那个目录。
+      let realRoot; let realDir;
+      try { realRoot = fs.realpathSync(rootDir); } catch (err) {
+        return { ok: false, why: "项目根 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "），无法核 outbox_dir 落点" };
+      }
+      try { realDir = fs.realpathSync(dir); } catch (err) {
+        // 目录不存在（ENOENT）= 还没有回执，不算“说不清”；其他 IO 错误照样拦。
+        if (err?.code === "ENOENT") return { ok: true, present: false };
+        return { ok: false, why: "outbox 目录 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "）" };
+      }
+      if (realDir !== realRoot && !realDir.startsWith(realRoot + path.sep)) {
+        return { ok: false, why: "outbox_dir 的 realpath（" + realDir + "）不在项目根 realpath（" + realRoot + "）内（父链中间目录是 symlink），不冒充核对过" };
+      }
       const rt = readForwardFailureReceipt({ outboxDir: dir, forwardKey: key });
       if (rt.ok === true) {
         const mismatch = forwardReceiptResultProblem(rt.record, resultSha256);

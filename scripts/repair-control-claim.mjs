@@ -17,7 +17,7 @@ import { expectationFromMapping, claudeControlPrecondition } from "./control-ide
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext, mintSelectCapability } from "./select-admission.mjs";
 import { senderRole } from "./sender-roles.mjs";
-import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias } from "./topic-agent-ledger.mjs";
+import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias, fingerprintOf } from "./topic-agent-ledger.mjs";
 import { CHAT_SHAPE, ENDPOINT_SHAPE } from "./shapes.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
@@ -173,7 +173,7 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   try {
     innerRes = sc.kind === "rfh"
       ? repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanRecord, env, _inject, sc })
-      : repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, sc });
+      : repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, sc, _inject });
   } finally {
     try { outerRel = acq.release(); } catch (err) { outerRel = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }
@@ -208,7 +208,7 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
  *   · 其它组合（detail.legacy ≠ committed 等）→ 证据不够，保持 unclean 点名。
  *   · unclean 与 consumed/failed 记录共存 → select_state_conflict（判据在 control-command.mjs，盘点/恢复共用）。
  */
-function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, sc }) {
+function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, sc, _inject = undefined }) {
   const detail = uncleanRecord?.detail;
   if (!detail || typeof detail !== "object" || typeof detail.action !== "string") {
     return { ok: false, reason: "ledger_commit_unverifiable", why: "unclean 记录没有结构化 detail（旧形 unclean），保持 control-committed-unclean" };
@@ -246,27 +246,47 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
     return { ok: false, reason: "ledger_commit_unverifiable", why: "unclean detail.request_key（" + String(detail.request_key) + "）与共用派生（" + wantKey.request_key + "）不一致，保持 control-committed-unclean" };
   }
   const findCommitted = (doc) => Object.values(doc.operations).find((o) => o.op_type === opType && o.request_key === wantKey.request_key && o.result && typeof o.result_revision === "number");
-  // 提交记录与 plan 的逐字绑定：target 随 op type 取 surviving_id/affected_id，selection_message_id 与 CAS 逐字等。
-  // （activate 的 target 在 result.surviving_id；anchor/rebind 在 result.affected_id；anchor/rebind 的 expected CAS 在 op.inputs。）
+  // 提交记录与 plan 的逐字绑定（P1-C 返修五：统一一处重算预期投影 —— basis / target / selection_message_id /
+  // 全部 cas / 消费的 handle 一次核全，不在分支里各漏几个）：
+  //   · target：activate 在 result.surviving_id；anchor/rebind 在 result.affected_id；
+  //   · basis：三个 op 的 result.selection_basis（与 plan.basis 逐字）；
+  //   · selection_message_id：result 与 inputs 两处（都是冻结在 op 里的同一事实）；
+  //   · cas / 消费的 handle：activate 的 selected_* 与 selection_handle、anchor 的 expected 三件与
+  //     selected_*、rebind 的 new/old session 与 rebind_handle 与 expected_expires_at；
+  //   · 消费的 handle 另核 inputs（op 冻结的输入与 result 投影两处都得对）。
   const committedMismatch = (o) => {
     const target = o.op_type === "activate" ? o.result?.surviving_id : o.result?.affected_id;
     if (target !== plan.target_id) return "target（" + String(target) + "）与 plan.target_id 不一致";
-    if (o.result?.selection_message_id !== sc.message) return "selection_message_id（" + String(o.result?.selection_message_id) + "）与 claim message 不一致";
+    if (o.result?.selection_basis !== plan.basis) return "result.selection_basis（" + String(o.result?.selection_basis) + "）与 plan.basis（" + String(plan.basis) + "）不一致";
+    if (o.result?.selection_message_id !== sc.message) return "result.selection_message_id（" + String(o.result?.selection_message_id) + "）与 claim message 不一致";
     if (o.op_type === "activate") {
-      if (o.result?.selection_handle !== plan.cas.selection_handle) return "selection_handle 与 plan.cas 不一致";
+      if (o.result?.selection_handle !== plan.cas.selection_handle) return "result.selection_handle（消费的 handle）与 plan.cas 不一致";
       if (o.result?.selected_session_id !== plan.cas.selected_session_id) return "selected_session_id 与 plan.cas 不一致";
       if (o.result?.selected_root_om !== plan.cas.selected_root_om) return "selected_root_om 与 plan.cas 不一致";
+      // activate 的 inputs 还含 a1_id（picked at 执行时、plan 里没有），所以预期指纹在这里不可重算 ——
+      // 它的 CAS / basis / message / target 全部住在 result，而 result 已被上面逐条核过。
+      return null;
     }
     if (o.op_type === "anchor") {
-      for (const k of ["expected_handle", "expected_expires_at", "expected_anchor_candidate"]) {
-        if (o.inputs?.[k] !== plan.cas[k]) return "inputs." + k + " 与 plan.cas 不一致";
-      }
+      // P1-C：anchor 旧码只比 inputs 的 expected 三件，漏了 selected session / root / 消费的 handle。
+      if (o.result?.selection_handle !== plan.cas.expected_handle) return "result.selection_handle（消费的 handle）与 plan.cas.expected_handle 不一致";
+      if (o.result?.selected_session_id !== plan.cas.selected_session_id) return "selected_session_id 与 plan.cas 不一致";
+      if (o.result?.selected_root_om !== plan.cas.selected_root_om) return "selected_root_om 与 plan.cas 不一致";
+      if (o.result?.expected_anchor_candidate !== plan.cas.expected_anchor_candidate) return "expected_anchor_candidate 与 plan.cas 不一致";
+      // 预期指纹：anchor 的 inputs 全部可由 plan + claim 重算（含 expected_expires_at）——与执行器同一 fingerprintOf。
+      const expect = { request_key: wantKey.request_key, topic_agent_id: plan.target_id, selected_session_id: plan.cas.selected_session_id, selected_root_om: plan.cas.selected_root_om, selection_handle: plan.cas.expected_handle, selection_message_id: sc.message, selection_basis: plan.basis, expected_handle: plan.cas.expected_handle, expected_expires_at: plan.cas.expected_expires_at, expected_anchor_candidate: plan.cas.expected_anchor_candidate };
+      if (o.fingerprint !== fingerprintOf("anchor", expect)) return "fingerprint 与 plan 重算的预期输入不一致（全部 cas 逐字核）";
+      return null;
     }
-    if (o.op_type === "rebind_session_alias") {
-      if (o.result?.new_session_id !== plan.cas.new_session_id) return "new_session_id 与 plan.cas 不一致";
-      if (o.result?.old_session_id !== plan.cas.expected_old_session_id) return "old_session_id 与 plan.cas 不一致";
-      if (o.inputs?.expected_expires_at !== plan.cas.expected_expires_at) return "inputs.expected_expires_at 与 plan.cas 不一致";
-    }
+    // rebind_session_alias
+    if (o.result?.new_session_id !== plan.cas.new_session_id) return "new_session_id 与 plan.cas 不一致";
+    if (o.result?.old_session_id !== plan.cas.expected_old_session_id) return "old_session_id 与 plan.cas 不一致";
+    if (o.result?.selected_session_id !== plan.cas.new_session_id) return "result.selected_session_id 与 plan.cas.new_session_id 不一致";
+    if (o.result?.selected_root_om !== plan.cas.selected_root_om) return "result.selected_root_om 与 plan.cas 不一致";
+    // P1-C：rebind 旧码漏了「消费的 handle」。
+    if (o.result?.selection_handle !== plan.cas.rebind_handle) return "result.selection_handle（消费的 handle）与 plan.cas.rebind_handle 不一致";
+    const expectR = { request_key: wantKey.request_key, topic_agent_id: plan.target_id, old_session_id: plan.cas.expected_old_session_id, new_session_id: plan.cas.new_session_id, rebind_handle: plan.cas.rebind_handle, expected_expires_at: plan.cas.expected_expires_at, selection_message_id: sc.message };
+    if (o.fingerprint !== fingerprintOf("rebind_session_alias", expectR)) return "fingerprint 与 plan 重算的预期输入不一致（全部 cas 逐字核）";
     return null;
   };
   // 分支一：账本已提交 → 只做清理/收口转 consumed（不重执行、不补写；target/message/CAS 与 plan 逐字一致才认）。
@@ -287,19 +307,41 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
       if (!a1) {
         return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补 activate 失败：chat（" + sc.chat + "）会话（" + String(plan.cas.selected_session_id) + "）上无可归并 A1，保持 control-committed-unclean" };
       }
-      r = activate({ endpointId: sc.endpoint, requestKey: wantKey.request_key, b1Id: plan.target_id, a1Id: a1.topic_agent_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.selection_handle, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env });
+      r = activate({ endpointId: sc.endpoint, requestKey: wantKey.request_key, b1Id: plan.target_id, a1Id: a1.topic_agent_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.selection_handle, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env, _inject });
     } else if (opType === "anchor") {
-      r = anchor({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.expected_handle, expectedExpiresAt: plan.cas.expected_expires_at, expectedAnchorCandidate: plan.cas.expected_anchor_candidate, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env });
+      r = anchor({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.expected_handle, expectedExpiresAt: plan.cas.expected_expires_at, expectedAnchorCandidate: plan.cas.expected_anchor_candidate, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env, _inject });
     } else {
-      r = rebindSessionAlias({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, expectedOldSessionId: plan.cas.expected_old_session_id, newSessionId: plan.cas.new_session_id, authorizedBy: sc.sender, rebindHandle: plan.cas.rebind_handle, expectedExpiresAt: plan.cas.expected_expires_at, selectionMessageId: sc.message, clock, env });
+      r = rebindSessionAlias({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, expectedOldSessionId: plan.cas.expected_old_session_id, newSessionId: plan.cas.new_session_id, authorizedBy: sc.sender, rebindHandle: plan.cas.rebind_handle, expectedExpiresAt: plan.cas.expected_expires_at, selectionMessageId: sc.message, clock, env, _inject });
     }
     if (!r.ok) {
       return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补 " + opType + " 失败（" + (r.reason ?? "?") + (r.why ? "：" + r.why : "") + "），保持 control-committed-unclean" };
-    }
-    const L2 = loadLedger(d.dir, { endpointId: sc.endpoint });
+    }    const L2 = loadLedger(d.dir, { endpointId: sc.endpoint });
     if (!L2.ok) return { ok: false, reason: "ledger_unreadable", why: L2.why ?? L2.reason };
-    if (!findCommitted(L2.doc)) {
+    const filled = findCommitted(L2.doc);
+    if (!filled) {
       return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补后仍核不出提交（request_key " + wantKey.request_key + "），保持 control-committed-unclean" };
+    }
+    // P1-C（返修五）：补写的 op 也要过**同一份**逐字核（旧码只看「核得出提交」就转 consumed）。
+    const filledMismatch = committedMismatch(filled);
+    if (filledMismatch !== null) {
+      return { ok: false, reason: "ledger_commit_unverifiable", why: "前向补后的账本 " + opType + " op 与 plan 逐字核不过：" + filledMismatch + "，保持 control-committed-unclean" };
+    }
+    // P1-C：只有原语返回 clean / 幂等、且无 residue / lockUncleared 才闭合转 consumed；
+    //   committed_durability_uncertain（目录 fsync 没落）与 committed_with_residue（锁残骸/释放不净）都只是「写进去了」，
+    //   不是「收口干净了」—— 旧码只看 r.ok 就转 consumed，把不确定当成了确定。
+    const cleanCommit = r.ok === true
+      && ["committed_clean", "replayed", "already"].includes(r.commit)
+      && (!Array.isArray(r.residue) || r.residue.length === 0)
+      && !r.lockUncleared && r.lock_state !== "unclear";
+    if (!cleanCommit) {
+      return {
+        ok: false,
+        reason: "ledger_forward_fill_unclean",
+        why: "前向补 " + opType + " 未干净收口（commit=" + String(r.commit ?? "?") + (r.residue && r.residue.length > 0 ? "，with_residue" : "") + (r.lockUncleared ? "，lockUncleared" : "") + (String(r.commit ?? "") === "committed_durability_uncertain" ? "，durability_uncertain" : "") + "）：保持 control-committed-unclean",
+        commit: r.commit ?? null,
+        residue: r.residue ?? null,
+        lockUncleared: r.lockUncleared ?? null,
+      };
     }
     return { ok: true, changed: true };
   }

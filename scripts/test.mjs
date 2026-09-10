@@ -7774,6 +7774,35 @@ test("R60 返修一 P1-2：套件机器路径 env 是边界——无条件指向
   assert.match(String(treeDriftProblem(["a"], ["a", "b/x"])), /新增|漂移|不一致/u, "树多了东西 → 点名：" + treeDriftProblem(["a"], ["a", "b/x"]));
 });
 
+test("R60 返修二 P1-2a：用例抛错时注册器必须在 finally 中核验与恢复不变量，且失败信息包含漂移点名", () => {
+  const seen = [];
+  const h = createTestHarness({ onFail: (name, err) => seen.push([name, err.message]) });
+  let restored = 0;
+  const savedInv = setSuiteInvariants({
+    envDrift: () => (process.env.R60_PROBE_THROW_ENV ? "R60_PROBE_THROW_ENV 被改且没恢复" : null),
+    restore: () => {
+      restored += 1;
+      delete process.env.R60_PROBE_THROW_ENV;
+    },
+  });
+  try {
+    h.test("抛错且漂移用例", () => {
+      process.env.R60_PROBE_THROW_ENV = "drifted";
+      throw new Error("用例内部断言失败");
+    });
+    h.test("后续正常用例", () => {
+      assert.equal(process.env.R60_PROBE_THROW_ENV, undefined, "后续用例开始前 env 已被恢复");
+    });
+  } finally {
+    setSuiteInvariants(savedInv);
+    delete process.env.R60_PROBE_THROW_ENV;
+  }
+  assert.equal(restored, 1, "用例抛错后仍然调用 restore() 恢复了不变量（旧实现 catch 直接 return 导致 restored=0）");
+  assert.equal(seen.length, 1, "只报告了抛错的用例：" + JSON.stringify(seen));
+  assert.match(String(seen[0][1]), /用例内部断言失败/u, "原错误信息保留");
+  assert.match(String(seen[0][1]), /R60_PROBE_THROW_ENV/u, "失败信息附带了漂移点名");
+});
+
 test("R60 返修一 P2：证据层级改正——套件 HOME ≠ passwd home；passwd 路径由双临时 home 夹具单独证一次", () => {
   assert.notEqual(process.env.HOME, SUITE_HOME.passwdHome(), "套件 HOME ≠ passwd home（旧措辞把两者混为一谈）");
   const envHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60p2-envhome-")));

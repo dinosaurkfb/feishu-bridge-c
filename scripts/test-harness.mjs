@@ -251,34 +251,47 @@ export function createTestHarness({ onFail = () => {} } = {}) {
     // R60：tripwire 守卫要点名泄漏源 —— 记录当前正在跑的用例名（finally 清掉，异步逃逸的不背）。
     activeTestName = name;
     let r;
+    let threw = false;
+    let testErr = null;
     try {
       r = fn();
     } catch (err) {
-      failed += 1;
-      onFail(name, err, failures);
-      return;
+      threw = true;
+      testErr = err;
     } finally {
       activeTestName = null;
+      // R60 返修二 P1-2a：核验、恢复、cleanTree 覆盖成功与抛错两路，放进 finally
+      const drift = suiteInvariants && typeof suiteInvariants.envDrift === "function" ? suiteInvariants.envDrift() : null;
+      const treeHit = suiteInvariants && typeof suiteInvariants.treeProblem === "function" ? suiteInvariants.treeProblem() : null;
+      const invariantProblem = drift ?? treeHit;
+      if (invariantProblem) {
+        failedEnvDrift.push(name);
+        if (typeof suiteInvariants.restore === "function") suiteInvariants.restore();
+        if (typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree(); // 先点名再清：不让它级联污染后面的用例
+      } else {
+        if (typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree();
+      }
+
+      if (threw) {
+        failed += 1;
+        const errToReport = invariantProblem
+          ? new Error(String(testErr?.message ?? testErr) + "；且套件环境边界被破坏（R60 P1-2）：" + invariantProblem + "；隔离做法：用例自己 mkdtemp 指过去、finally 恢复/清理")
+          : testErr;
+        onFail(name, errToReport, failures);
+      } else {
+        // ② 调用后：thenable 返回值同样拒绝 —— 断言此刻已经不在计数窗口里了。
+        if (isThenable(r)) {
+          console.error("\n✗ 测试「" + name + "」是 async——注册器不 await，断言不会计入；改成同步（顶层 await import）");
+          process.exit(1);
+        }
+        if (invariantProblem) {
+          failed += 1;
+          onFail(name, new Error("套件环境边界被破坏（R60 P1-2）：" + invariantProblem + "；隔离做法：用例自己 mkdtemp 指过去、finally 恢复/清理"), failures);
+        } else {
+          passed += 1;
+        }
+      }
     }
-    // ② 调用后：thenable 返回值同样拒绝 —— 断言此刻已经不在计数窗口里了。
-    if (isThenable(r)) {
-      console.error("\n✗ 测试「" + name + "」是 async——注册器不 await，断言不会计入；改成同步（顶层 await import）");
-      process.exit(1);
-    }
-    // ③ R60 返修一 P1-2：用例之后核套件机器路径 env 仍是绊线默认值 —— 边界是环境，
-    //    用例 finally 没恢复就当场红、点名它，并恢复默认值（否则污染后面的用例）。
-    const drift = suiteInvariants && typeof suiteInvariants.envDrift === "function" ? suiteInvariants.envDrift() : null;
-    const treeHit = suiteInvariants && typeof suiteInvariants.treeProblem === "function" ? suiteInvariants.treeProblem() : null;
-    if (drift || treeHit) {
-      failed += 1;
-      failedEnvDrift.push(name);
-      if (typeof suiteInvariants.restore === "function") suiteInvariants.restore();
-      if (suiteInvariants.cleanTree) suiteInvariants.cleanTree(); // 先点名再清：不让它级联污染后面的用例
-      onFail(name, new Error("套件环境边界被破坏（R60 P1-2）：" + (drift ?? treeHit) + "；隔离做法：用例自己 mkdtemp 指过去、finally 恢复/清理"), failures);
-      return;
-    }
-    if (suiteInvariants && typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree();
-    passed += 1;
   }
 
   /** 汇总打印前的封条。套件尾部显式调用 —— 两套件各有一条"没有 test() 写在汇总之后"的结构检查锚在这一行。 */

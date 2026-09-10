@@ -761,9 +761,10 @@ export function runDoctor({
     const hasReceipt = (rootDir, key, resultSha256, outboxDirRel) => {
       const dir = path.join(rootDir, outboxDirRel);
       const rt = readForwardFailureReceipt({ outboxDir: dir, forwardKey: key });
-      if (rt.ok === true) return forwardReceiptResultProblem(rt.record, resultSha256) === null
-        ? { ok: true, present: true }
-        : { ok: true, present: false, mismatch: forwardReceiptResultProblem(rt.record, resultSha256) };
+      if (rt.ok === true) {
+        const mismatch = forwardReceiptResultProblem(rt.record, resultSha256);
+        return mismatch === null ? { ok: true, present: true } : { ok: true, present: false, mismatch };
+      }
       if (rt.absent) return { ok: true, present: false };
       if (rt.kind === "invalid") return { ok: true, present: false };
       return { ok: false, why: String(rt.why ?? "读不出来") + (rt.residue ? "（" + rt.residue.join("、") + "）" : "") };

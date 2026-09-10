@@ -199,15 +199,20 @@ function parseRunLines(lines) {
  *              且 is_error=false 且 exit_code=0（#141 P1-2：不从 assistant 文本补造）；
  *   result 报错（#140 的 400）→ is_error=true，reason_first_line 取错误文本第一行；
  *   崩溃     → 无 result 行（进程起不来 / 秒退 / jsonl 只有半截行）→ is_error=true、
- *              subtype="crash"、duration_ms 用 wall clock（#140 里那 2–4 秒本身就是证据）。
+ *              subtype="crash"、duration_ms 用 wall clock（#140 里那 2–4 秒本身就是证据）；
+ *   起不来   → 同步（PATH 上找不到 claude）subtype="claude_not_found"；异步（spawn 成功但 exec 失败，
+ *              如解释器缺失）subtype="spawn_error"（R58 返修二 P2：失败类别按**结构化 subtype** 分，
+ *              不再只看 reason_first_line 那一条字符串）。
  */
-function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false }) {
+function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false, spawnError = false }) {
   const { resultLine, initLine } = parseRunLines(lines);
   const malformed = resultLine !== null && resultLineProblem(resultLine) !== null; // #141 二轮 P1-1：坏形状绝不进成功公式
-  const crashed = !notFound && resultLine === null;
+  const crashed = !notFound && !spawnError && resultLine === null;
   const resultText = !malformed && resultLine !== null && typeof resultLine.result === "string" ? resultLine.result : "";
-  const is_error = notFound || crashed || malformed || resultLine.is_error === true;
+  // resultLine 为 null 时不许读它的字段（起不来 / 崩溃两条路径）——短路判据要显式。
+  const is_error = notFound || spawnError || crashed || malformed || (resultLine !== null && resultLine.is_error === true);
   const reason_first_line = notFound ? "claude_not_found"
+    : spawnError ? "spawn_error"
     : malformed ? "malformed_result"
     : crashed ? "no_result_line" + (exitCode === null ? "" : "(exit=" + exitCode + ")")
     : resultText.split("\n", 1)[0];
@@ -218,10 +223,10 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     pid,
     exit_code: exitCode,
     is_error,
-    subtype: notFound ? "claude_not_found" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
-    num_turns: crashed || notFound || malformed || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
+    subtype: notFound ? "claude_not_found" : spawnError ? "spawn_error" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
+    num_turns: crashed || notFound || spawnError || malformed || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
     duration_ms: notFound ? null
-      : crashed ? Math.max(0, finishedAt - startedAt)
+      : (crashed || spawnError) ? Math.max(0, finishedAt - startedAt)
       : (malformed || !Number.isFinite(resultLine.duration_ms)) ? null : resultLine.duration_ms,
     claude_code_version: initLine?.claude_code_version ?? initLine?.version ?? null,
     model: initLine?.model ?? resultLine?.model ?? null,
@@ -317,10 +322,15 @@ function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expect
  * 未给 outboxDir 的调用方（旧 spec / 不想测回执的路径）跳过，由 doctor ⑯ 点名回执缺失。
  * 幂等靠回执原语里的 O_EXCL；写不成记一行 stderr.log，绝不抛（runner 纪律）。
  */
-/** 失败类别（P1-4）：结果投影 → 封闭四类之一。reason_first_line 只留在本地 result，不进回执正文。 */
+/**
+ * 失败类别（P1-4 + 返修二 P2）：结果投影 → 封闭四类之一。reason_first_line 只留在本地 result，不进回执正文。
+ * **按结构化 subtype 分**：起不来的两条路（同步 claude_not_found / 异步 spawn_error）都归 spawn_failed。
+ * 旧版只认 reason_first_line === "claude_not_found" 这一条字符串，于是异步 spawn error（进程起来了、
+ * exec 失败）被折成 session_error —— owner 收到的说法与事实不符。
+ */
 function failureCategory(doc) {
   if (doc.sent === true) return null;
-  if (doc.reason_first_line === "claude_not_found") return "spawn_failed";
+  if (doc.subtype === "claude_not_found" || doc.subtype === "spawn_error") return "spawn_failed";
   if (doc.is_error === true) return "session_error";
   if (doc.exit_code !== null && doc.exit_code !== 0) return "exit_nonzero";
   return "unknown";
@@ -422,16 +432,17 @@ function runForwardRunner(spec) {
 
   let done = false;
   const keepalive = setInterval(() => {}, 60_000);
-  const finish = (exitCode) => {
+  const finish = (exitCode, spawnError = false) => {
     if (done) return; // spawn 失败时 error 与 close 可能都来：结果只写一份
     done = true;
     clearInterval(keepalive);
     writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, pid: child.pid, exitCode, lines: readJsonlLines(jsonlPath),
-      claudePath, startedAt, finishedAt: Date.now(),
+      claudePath, startedAt, finishedAt: Date.now(), spawnError,
     }), spec);
   };
-  child.on("error", () => finish(null));
+  // 异步 spawn error（进程没起来：解释器缺失 / EACCES / ENOEXEC）→ 结构化 subtype=spawn_error（P2）。
+  child.on("error", () => finish(null, true));
   child.on("close", (code) => finish(Number.isFinite(code) ? code : null));
 }
 

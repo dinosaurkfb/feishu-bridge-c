@@ -44108,6 +44108,63 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(diskIntents.doc.entries[handle], undefined, "repair 成功后 intent 被清");
   }));
 
+  test("R57d 返修七 P1-3（rfh）：dirty commit 保留真实分类证据（旧码折成 unknown/[]/false）；rfh repair 在同一路径上消费它——先清证据点名的残骸再闭合；证据自报 not_committed 不得闭合", () => withLedgerB((root, dir) => {
+    const claimsDir = path.join(root, "claims_f7rfh");
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+    const messageId = "om_f7rfh";
+    const logicalTaskKey = "task_f7rfh";
+    const b3 = seedB3B(dir, "r57b_f7rfh", 71, "sess-b-71");
+    const intent = talOkB(RI.issueReaffirmIntent({ endpointId: EP57B, targetId: b3, authorizedOwner: "ou_owner57b", chatId: "oc_r57b", clock: () => T0B }), "issue");
+    const handle = intent.reaffirm_handle;
+    // ① 真消费链：目录 fsync 注入失败 → 账本已提交但耐久不确定 → 分类 unclean
+    const rUnclean = SA.executeSelectControl({ control: "select", handle, handle_kind: "rfh" }, {
+      endpointId: EP57B, senderId: "ou_owner57b", chatId: "oc_r57b", messageId,
+      selectAdmissionFn: () => ({ state: "partial" }),
+      ...mkPlanCtx(root, messageId, "f7rfh"),
+      // 提交点之后删主锁 → 释放报 absent → foldRelease 出 committed_with_residue（真实 dirty commit）
+      _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch {} } },
+    });
+    assert.equal(rUnclean.status, "control-committed-unclean", "① 前置 unclean：" + JSON.stringify(rUnclean).slice(0, 220));
+    assert.ok(rUnclean.detail && rUnclean.detail.ledger_evidence, "① unclean detail 必带证据：" + JSON.stringify(rUnclean.detail));
+    assert.equal(rUnclean.detail.ledger_evidence.commit, "committed_with_residue", "① 证据带真实分类值（旧码恒 unknown）：" + JSON.stringify(rUnclean.detail.ledger_evidence));
+    assert.deepEqual(rUnclean.detail.ledger_evidence.residue, [], "① 无残骸");
+    assert.equal(rUnclean.detail.ledger_evidence.lock_uncleared, true, "① 锁没交还（真实事实）：" + JSON.stringify(rUnclean.detail.ledger_evidence));
+    assert.equal(rUnclean.detail.ledger, "committed", "① 顶层分类 unclean → detail.ledger 记 committed");
+    // 落盘记录的是同一份证据（unclean 记录的唯一写面）
+    const selCtx = { endpoint: EP57B, chat: "oc_r57b", sender: "ou_owner57b", message: messageId, session: "sess-b-71", handle, kind: "rfh" };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const cAcq = acquireClaim({ claimsDir, messageId, logicalTaskKey, meta: {
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_f7rfh",
+      control: { control: "select", handle, handle_kind: "rfh" }, selection_context: selCtx, selection_context_digest_v1: digest } });
+    assert.equal(cAcq.ok, true, "claim：" + JSON.stringify(cAcq));
+    writePlanB(claimsDir, cAcq.key, handle, b3);
+    const tx = runControlTransaction({ claimsDir, key: cAcq.key, intent: { control: "select", handle, handle_kind: "rfh" }, execute: () => rUnclean });
+    assert.equal(tx.status, "control-committed-unclean", "① 事务落 unclean：" + JSON.stringify(tx).slice(0, 220));
+    const uf = path.join(claimsDir, cAcq.key + ".control-committed-unclean.json");
+    const rec0 = readControlCommittedUncleanRecord({ claimsDir, key: cAcq.key });
+    assert.equal(rec0.status, "valid", "① 记录受验可读：" + JSON.stringify(rec0).slice(0, 240));
+    assert.equal(rec0.record.detail.ledger_evidence.commit, "committed_with_residue", "① 落盘证据 = 真实分类值：" + JSON.stringify(rec0.record.detail.ledger_evidence));
+    assert.equal(rec0.record.detail.ledger_evidence.lock_uncleared, true, "① 落盘证据带 lock_uncleared：" + JSON.stringify(rec0.record.detail.ledger_evidence));
+    const putEvidence = (ev) => {
+      const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
+      fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: ev } }, null, 2) + "\n", { mode: 0o600 });
+    };
+    const repairIt = () => resumeControlClaim({ claimsDir, key: cAcq.key, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
+    // ② 证据自报 not_committed（与“账本里有本笔 op”自相矛盾）→ rfh 没有 legacy 可前向补，不闭合
+    putEvidence({ commit: "not_committed", residue: [], lock_uncleared: false });
+    const rBad = repairIt();
+    assert.equal(rBad.ok, false, "② 证据说 not_committed 不得闭合：" + JSON.stringify(rBad).slice(0, 260));
+    assert.equal(fs.existsSync(path.join(claimsDir, cAcq.key + ".consumed.json")), false, "② 不写 consumed");
+    // ③ 证据点名账本侧封闭 tmp 残骸 → 必须先清掉它，然后才闭合
+    const residuePath = path.join(dir, "ledger.json.4747.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(residuePath, "x", { mode: 0o600 });
+    putEvidence({ commit: "committed_with_residue", residue: [residuePath], lock_uncleared: false });
+    const rep = repairIt();
+    assert.equal(rep.ok, true, "③ repair 消费证据后闭合：" + JSON.stringify(rep).slice(0, 300));
+    assert.equal(fs.existsSync(residuePath), false, "③ 证据点名的残骸被清（旧码不消费：文件仍在）");
+    assert.equal(fs.existsSync(path.join(claimsDir, cAcq.key + ".consumed.json")), true, "③ 转 consumed");
+  }));
+
   test("R57b 返修二 P1-4：repair 收尾判据禁假绿——cleanReaffirmIntent 返回 residue/unclear 不得转 consumed（保持 committed-unclean 点名）；同 handle 但不同 message 的伪 op 不得被 loose 绑定", () => withLedgerB((root, dir) => {
     const claimsDir = path.join(root, "claims_p14");
     fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
@@ -47093,6 +47150,211 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       fs.rmSync(local, { recursive: true, force: true });
     }
   });
+
+  // ── R57d 返修七（Codex #147 八轮）：3 P1 + 4 条钉 ──
+  // 一套新鲜 B3 + rebind handle 的场景（executor 路径，_inject 可注入账本写崩溃点）。
+  const f7RebindScene = (dir, claimsDir, ltk, msgId, inject) => {
+    const tag = msgId.slice(-2);
+    const sessUuid = "00000000-0000-4000-8000-" + crypto.createHash("sha256").update(msgId).digest("hex").slice(0, 12);
+    const b = talD(TAL.createB1({ endpointId: EP57D, requestKey: "f7_b_" + msgId, chatId: CHAT_D, rootOm: "om_f7" + tag, lineageId: "lin_f7" + tag, bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: sessUuid }, clock: () => T0D }), msgId + " B1");
+    const oldSession = SESSION_D + "-r" + tag;
+    const a1 = talD(TAL.createA1({ endpointId: EP57D, requestKey: "f7_a_" + msgId, chatId: CHAT_D, sessionId: oldSession, clock: () => T0D }), msgId + " A1");
+    talD(TAL.activate({ endpointId: EP57D, requestKey: "f7_act_" + msgId, b1Id: b.result.created_id, a1Id: a1.result.created_id, f4: { matched_om: "om_f7" + tag, matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }), msgId + " activate");
+    const rq = talD(TAL.requestRebind({ endpointId: EP57D, requestKey: "f7_rq_" + msgId, b3Id: b.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: oldSession, clock: () => T0D }), msgId + " requestRebind");
+    const session = SESSION_D + "-" + tag;
+    const selCtx = { endpoint: EP57D, chat: CHAT_D, session, message: msgId, sender: "ou_owner57d", handle: rq.result.rebind_handle, kind: "orh" };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const acq = acquireClaim({ claimsDir, messageId: msgId, logicalTaskKey: ltk, meta: {
+      control: { control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, selection_context: selCtx, selection_context_digest_v1: digest,
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_f7" } });
+    assert.equal(acq.ok, true, msgId + " claim：" + JSON.stringify(acq));
+    const tx = runControlTransaction({ claimsDir, key: acq.key, intent: { control: "select", handle: rq.result.rebind_handle, handle_kind: "orh" }, replay: false, expect: {}, contextDigest: digest,
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(rq.result.rebind_handle, "orh", { message: msgId, session }), messageId: msgId, eventSessionId: session, mappingUpdate: mappingStub([]), txCtx: ctx, _inject: inject })) });
+    return { key: acq.key, b3: b.result.created_id, rootOm: "om_f7" + tag, oldSession, newSession: session, tx };
+  };
+  // 一套新鲜 B1（osh handle）+ 事件会话 A1 的场景（executor 路径）。
+  const f7OshScene = (dir, claimsDir, ltk, msgId, inject) => {
+    const tag = msgId.slice(-2);
+    const sess = SESSION_D + "-o" + tag;
+    const sessUuid = "00000000-0000-4000-8000-" + crypto.createHash("sha256").update(msgId).digest("hex").slice(0, 12);
+    const b = talD(TAL.createB1({ endpointId: EP57D, requestKey: "f7o_b_" + msgId, chatId: CHAT_D, rootOm: "om_f7o" + tag, lineageId: "lin_f7o" + tag, bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: sessUuid }, clock: () => T0D }), msgId + " B1");
+    talD(TAL.createA1({ endpointId: EP57D, requestKey: "f7o_a_" + msgId, chatId: CHAT_D, sessionId: sess, clock: () => T0D }), msgId + " A1");
+    const handle = b.result.selection_handle;
+    const selCtx = { endpoint: EP57D, chat: CHAT_D, session: sess, message: msgId, sender: "ou_owner57d", handle, kind: "osh" };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const acq = acquireClaim({ claimsDir, messageId: msgId, logicalTaskKey: ltk, meta: {
+      control: { control: "select", handle, handle_kind: "osh" }, selection_context: selCtx, selection_context_digest_v1: digest,
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_f7o" } });
+    assert.equal(acq.ok, true, msgId + " claim：" + JSON.stringify(acq));
+    const tx = runControlTransaction({ claimsDir, key: acq.key, intent: { control: "select", handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(handle, "osh", { message: msgId, session: sess }), messageId: msgId, eventSessionId: sess, mappingUpdate: mappingStub([]), txCtx: ctx, _inject: inject })) });
+    return { key: acq.key, b1: b.result.created_id, handle, session: sess, tx };
+  };
+  // symlink 的存在性：existsSync 跟着链接目标走（目标不是真实路径时恒 false），一律 lstat。
+  const f7Sym = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
+  // 把 symlink 的 mtime 拨到 1 分钟前：旧码 staleMs:0 下才**一定**会删活 reap（这正是要钉的行为）。
+  const f7AgeReap = (p) => { const t = new Date(Date.now() - 60_000); fs.lutimesSync(p, t, t); };
+  const f7Repair = (claimsDir, key, inject) => resumeControlClaim({ claimsDir, key, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, inject ? { ...ctx, _inject: inject } : ctx) });
+  const f7RewriteEvidence = (claimsDir, key, ev) => {
+    const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
+    const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
+    fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: ev } }, null, 2) + "\n", { mode: 0o600 });
+    return uf;
+  };
+
+  test("R57d 返修七 P1-1：rebindSessionAlias 的 expectedRootOm 是真 CAS——锁内逐字比（root 漂移拒且账本零改动）、进指纹、缺席即拒；前向补 root 漂移同样拒", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const rk = (s) => "f7p1_" + s;
+    const b = talD(TAL.createB1({ endpointId: EP57D, requestKey: rk("b1"), chatId: CHAT_D, rootOm: "om_f7a1", lineageId: "lin_f7a1", bindingTarget: { runtime: "claude", project_root: "/p/r57d", claude_session_id: "00000000-0000-4000-8000-00000000f7a1" }, clock: () => T0D }), "B1");
+    const a1 = talD(TAL.createA1({ endpointId: EP57D, requestKey: rk("a1"), chatId: CHAT_D, sessionId: SESSION_D + "-f7a1", clock: () => T0D }), "A1");
+    talD(TAL.activate({ endpointId: EP57D, requestKey: rk("act"), b1Id: b.result.created_id, a1Id: a1.result.created_id, f4: { matched_om: "om_f7a1", matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" }, authorizedBy: "ou_r57d", clock: () => T0D }), "activate");
+    const b3 = b.result.created_id;
+    const base = { endpointId: EP57D, id: b3, expectedOldSessionId: SESSION_D + "-f7a1", authorizedBy: "ou_r57d", clock: () => T0D };
+    const doc0 = TAL.loadLedger(dir, { endpointId: EP57D }).doc;
+    assert.equal(doc0.records[b3].aliases.root_om, "om_f7a1", "夹具 B3 的 root_om");
+    const rev0 = doc0.revision;
+    // ① 缺席 expectedRootOm → 结构化拒（CAS 不得可绕过）
+    const noRoot = TAL.rebindSessionAlias({ ...base, requestKey: rk("noroot"), newSessionId: SESSION_D + "-f7a1-x" });
+    assert.equal(noRoot.ok, false, "① 缺 expectedRootOm 必须拒（旧码直接提交）：" + JSON.stringify(noRoot));
+    assert.equal(noRoot.reason, "bad_input", "① reason：" + noRoot.reason);
+    // ② root 漂移 → 拒（原因点名 root）且账本零改动
+    const drift = TAL.rebindSessionAlias({ ...base, requestKey: rk("drift"), newSessionId: SESSION_D + "-f7a1-x", expectedRootOm: "om_other_root" });
+    assert.equal(drift.ok, false, "② root 漂移必须拒：" + JSON.stringify(drift));
+    assert.equal(drift.reason, "cas_mismatch", "② reason：" + drift.reason);
+    assert.equal(drift.cas_field, "root_om", "② 结构化点名 root：" + JSON.stringify(drift));
+    const docAfter = TAL.loadLedger(dir, { endpointId: EP57D }).doc;
+    assert.equal(docAfter.revision, rev0, "② 拒后账本 revision 零改动");
+    assert.equal(docAfter.records[b3].aliases.session_id, SESSION_D + "-f7a1", "② 拒后 session 未变");
+    // ③ root 相符 → 提交；指纹逐字含 expected_root_om
+    talD(TAL.rebindSessionAlias({ ...base, requestKey: rk("ok"), newSessionId: SESSION_D + "-f7a1-n", expectedRootOm: "om_f7a1" }), "③ root 相符提交");
+    const op = Object.values(TAL.loadLedger(dir, { endpointId: EP57D }).doc.operations).find((o) => o.request_key === rk("ok"));
+    assert.ok(op, "③ 本笔 rebind op");
+    assert.equal(op.result.selected_root_om, "om_f7a1", "③ result 带出 root");
+    assert.equal(op.fingerprint, TAL.fingerprintOf("rebind_session_alias", { request_key: rk("ok"), topic_agent_id: b3, old_session_id: SESSION_D + "-f7a1", new_session_id: SESSION_D + "-f7a1-n", expected_root_om: "om_f7a1" }), "③ 指纹纳入 expected_root_om");
+    // ④ 前向补（legacy 已提交、账本未提交）+ plan 的 root 与现场漂移 → 拒且账本零改动
+    const s = f7RebindScene(dir, claimsDir, "ltk_f7p1", "om_f7p1ff", { beforeLedgerRename: () => { throw new Error("injected"); } });
+    assert.equal(s.tx.status, "control-committed-unclean", "④ 前置 unclean：" + JSON.stringify(s.tx).slice(0, 200));
+    const revFf = TAL.loadLedger(dir, { endpointId: EP57D }).doc.revision;
+    const planPath = path.join(claimsDir, s.key + ".selection-plan.json");
+    const plan = JSON.parse(fs.readFileSync(planPath, "utf-8"));
+    assert.equal(plan.cas.expected_root_om, s.rootOm, "④ plan 的 CAS 冻结了现场 root：" + JSON.stringify(plan.cas));
+    fs.writeFileSync(planPath, JSON.stringify({ ...plan, cas: { ...plan.cas, expected_root_om: "om_drifted_root" } }, null, 2) + "\n", { mode: 0o600 });
+    const r = f7Repair(claimsDir, s.key);
+    assert.equal(r.ok, false, "④ root 漂移下前向补必须拒：" + JSON.stringify(r).slice(0, 300));
+    assert.match(String(r.why), /root/u, "④ 点名 root：" + r.why);
+    const docFf = TAL.loadLedger(dir, { endpointId: EP57D }).doc;
+    assert.equal(docFf.revision, revFf, "④ 拒后账本 revision 零改动");
+    assert.equal(Object.values(docFf.operations).some((o) => o.op_type === "rebind_session_alias" && o.result?.selection_message_id === "om_f7p1ff"), false, "④ 没有补上 rebind op");
+  }));
+
+  test("R57d 返修七 P1-2：clearLedgerResidue 收成精确路径联合 + 真账本锁栅栏——活 reap 不删、lock 家族拒删、主锁仍在不得报 ok、封闭 tmp 才清", () => withLedgerD((root, dir, ids) => {
+    const lockPath = path.join(dir, "ledger.lock");
+    const reapPath = lockPath + ".reap";
+    const liveOwner = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "f7-live-1" });
+    // ① 当前进程持有的活 reap → 一律不删（旧码 staleMs:0 会把它删掉并报 ok）
+    fs.symlinkSync(liveOwner, reapPath);
+    f7AgeReap(reapPath);
+    const r1 = TAL.clearLedgerResidue({ dir, residue: [reapPath] });
+    assert.equal(r1.ok, false, "① 活 reap 在场不得闭合：" + JSON.stringify(r1));
+    assert.equal(f7Sym(reapPath), true, "① 活 reap 不得删除");
+    assert.ok(Array.isArray(r1.residue) && r1.residue.includes(reapPath), "① reap 点名进 residue：" + JSON.stringify(r1.residue));
+    // ② residue 里塞主锁 → 拒删
+    fs.symlinkSync(liveOwner, lockPath);
+    const r2 = TAL.clearLedgerResidue({ dir, residue: [lockPath] });
+    assert.equal(r2.ok, false, "② 主锁不得被本原语删：" + JSON.stringify(r2));
+    assert.equal(f7Sym(lockPath), true, "② 主锁仍在");
+    // ③ 主锁仍在 + residue=[] → 不得 ok:true（旧码空清理恒 ok，repair 据此把 lock_uncleared 清成 false）
+    const r3 = TAL.clearLedgerResidue({ dir, residue: [] });
+    assert.equal(r3.ok, false, "③ 主锁仍在不得报 ok：" + JSON.stringify(r3));
+    assert.equal(f7Sym(lockPath), true, "③ 主锁仍在");
+    // ④ 主锁与活 reap 都移走 → 只有形状封闭的账本 tmp 才被清（清后受验读回 ENOENT）
+    fs.unlinkSync(reapPath); fs.unlinkSync(lockPath);
+    const tmp = path.join(dir, "ledger.json.4242.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(tmp, "x", { mode: 0o600 });
+    const r4 = TAL.clearLedgerResidue({ dir, residue: [tmp] });
+    assert.equal(r4.ok, true, "④ 封闭 tmp 清后闭合：" + JSON.stringify(r4));
+    assert.deepEqual(r4.cleaned, [tmp], "④ 点名清掉的路径");
+    assert.equal(fs.existsSync(tmp), false, "④ tmp 已清");
+    // ⑤ 名字像但不是协议产出（pid 段不封闭）→ 拒
+    const weird = path.join(dir, "ledger.json.notapid.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(weird, "x", { mode: 0o600 });
+    const r5 = TAL.clearLedgerResidue({ dir, residue: [weird] });
+    assert.equal(r5.ok, false, "⑤ 名字不封闭不得清：" + JSON.stringify(r5));
+    assert.equal(fs.existsSync(weird), true, "⑤ 未动");
+    // ⑥ 名字对但形态不对（目录 / 多硬链接）→ 拒
+    const dirTmp = path.join(dir, "ledger.json.4343.11111111-2222-4333-8444-555555555555");
+    fs.mkdirSync(dirTmp);
+    const linked = path.join(dir, "ledger.json.4444.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(linked, "y", { mode: 0o600 });
+    fs.linkSync(linked, path.join(dir, "ledger.json.4444.alias"));
+    assert.equal(TAL.clearLedgerResidue({ dir, residue: [dirTmp] }).ok, false, "⑥ 目录不被删");
+    assert.equal(fs.existsSync(dirTmp), true, "⑥ 目录仍在");
+    assert.equal(TAL.clearLedgerResidue({ dir, residue: [linked] }).ok, false, "⑥ 多硬链接不被删");
+    assert.equal(fs.existsSync(linked), true, "⑥ 多硬链接仍在");
+    fs.unlinkSync(path.join(dir, "ledger.json.4444.alias"));
+    // ⑦ 越界目录（同名 tmp 放在本 endpoint 目录之外）→ 拒
+    const outside = path.join(root, "ledger.json.4545.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(outside, "z", { mode: 0o600 });
+    assert.equal(TAL.clearLedgerResidue({ dir, residue: [outside] }).ok, false, "⑦ 越界路径不得清");
+    assert.equal(fs.existsSync(outside), true, "⑦ 越界路径未动");
+  }));
+
+  test("R57d 返修七 P1-2（常驻反例）：lock_uncleared:true/residue:[] 在主锁仍在时不得闭合、不得把证据清成 false；residue 里的活 reap 不得删也不得闭合", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const lockPath = path.join(dir, "ledger.lock");
+    const reapPath = lockPath + ".reap";
+    // 场景 1：真链路 unclean（目录 fsync 注入失败）+ 证据 lock_uncleared:true + 盘上一把被活进程持有的主锁
+    const s1 = f7OshScene(dir, claimsDir, "ltk_f7p2a", "om_f7p2a", { failDirFsync: true });
+    assert.equal(s1.tx.status, "control-committed-unclean", "① 前置 unclean：" + JSON.stringify(s1.tx).slice(0, 200));
+    f7RewriteEvidence(claimsDir, s1.key, { commit: "committed_durability_uncertain", residue: [], lock_uncleared: true });
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "f7-held" }), lockPath);
+    const r1 = f7Repair(claimsDir, s1.key);
+    assert.equal(r1.ok, false, "① 主锁仍在 → 不得闭合：" + JSON.stringify(r1).slice(0, 300));
+    assert.equal(f7Sym(lockPath), true, "① 主锁不得被删");
+    assert.equal(fs.existsSync(path.join(claimsDir, s1.key + ".consumed.json")), false, "① 不写 consumed");
+    const rec1 = readControlCommittedUncleanRecord({ claimsDir, key: s1.key });
+    assert.equal(rec1.status, "valid", "① 记录仍受验可读：" + JSON.stringify(rec1).slice(0, 240));
+    assert.equal(rec1.record.detail.ledger_evidence.lock_uncleared, true, "① 不得把 lock_uncleared 清成 false");
+    assert.ok(rec1.record.repair_attempts.length >= 1, "① 追加 repair_attempts：" + JSON.stringify(rec1.record.repair_attempts));
+    // 主锁移走 → 这时才允许清 lock_uncleared 并闭合
+    fs.unlinkSync(lockPath);
+    const r1b = f7Repair(claimsDir, s1.key);
+    assert.equal(r1b.ok, true, "① 主锁不在 → 才可闭合：" + JSON.stringify(r1b).slice(0, 300));
+    assert.equal(fs.existsSync(path.join(claimsDir, s1.key + ".consumed.json")), true, "① 转 consumed");
+    // 场景 2：residue 里是活 reap → 不得删也不得闭合
+    const s2 = f7OshScene(dir, claimsDir, "ltk_f7p2b", "om_f7p2b", { failDirFsync: true });
+    assert.equal(s2.tx.status, "control-committed-unclean", "② 前置 unclean");
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "f7-reap" }), reapPath);
+    f7AgeReap(reapPath);
+    f7RewriteEvidence(claimsDir, s2.key, { commit: "committed_with_residue", residue: [reapPath], lock_uncleared: false });
+    const r2 = f7Repair(claimsDir, s2.key);
+    assert.equal(r2.ok, false, "② 活 reap 残骸不得闭合：" + JSON.stringify(r2).slice(0, 300));
+    assert.equal(f7Sym(reapPath), true, "② 活 reap 不得删除");
+    assert.equal(fs.existsSync(path.join(claimsDir, s2.key + ".consumed.json")), false, "② 不写 consumed");
+    assert.match(String(r2.why), /reap/u, "② 点名 reap：" + r2.why);
+    fs.unlinkSync(reapPath);
+  }));
+
+  test("R57d 返修七 P1-3：纯 durability-uncertain 支必须重做持久化屏障——目录 fsync 失败不闭合（追加 repair_attempts），屏障重做成功后才闭合；清理 tmp 之后也走同一屏障", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const s = f7OshScene(dir, claimsDir, "ltk_f7p3", "om_f7p3", { failDirFsync: true });
+    assert.equal(s.tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(s.tx).slice(0, 200));
+    const rec0 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
+    assert.equal(rec0.status, "valid", "记录可读");
+    assert.deepEqual(rec0.record.detail.ledger_evidence, { commit: "committed_durability_uncertain", residue: [], lock_uncleared: false }, "前置证据：" + JSON.stringify(rec0.record.detail.ledger_evidence));
+    // ① 屏障重做时目录 fsync 仍失败 → 不得闭合（读回不能替代耐久）
+    const r1 = f7Repair(claimsDir, s.key, { failDirFsync: true });
+    assert.equal(r1.ok, false, "① 目录 fsync 失败不得闭合：" + JSON.stringify(r1).slice(0, 300));
+    assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), false, "① 不写 consumed");
+    const rec1 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
+    assert.equal(rec1.status, "valid", "① 记录仍受验可读");
+    assert.equal(rec1.record.detail.ledger_evidence.commit, "committed_durability_uncertain", "① 证据仍是 durability_uncertain");
+    assert.ok(rec1.record.repair_attempts.length >= 1, "① 追加 repair_attempts：" + JSON.stringify(rec1.record.repair_attempts));
+    // ② 屏障重做成功 → 才转 consumed
+    const r2 = f7Repair(claimsDir, s.key);
+    assert.equal(r2.ok, true, "② 屏障重做成功后闭合：" + JSON.stringify(r2).slice(0, 300));
+    assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), true, "② 转 consumed");
+  }));
 
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }

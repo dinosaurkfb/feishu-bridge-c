@@ -578,9 +578,9 @@ export function clearStaleReapLock(lockDir, {
     return { entries };
   };
   const seen = inspect();
-  if (seen.ioError) return { present: false, stale: false, removed: false, reapDir, maintDir, reason: "io_error", ...seen.ioError };
+  if (seen.ioError) return { present: false, stale: false, removed: false, reapDir, maintDir, quarantine: [], maintUncleared: null, reason: "io_error", ...seen.ioError };
   const inv = inventoryQuarantine();
-  const base = { present: seen.present, stale: seen.stale ?? false, ageMs: seen.ageMs, owner: seen.owner ?? null, removed: false, reapDir, maintDir, quarantine: inv.entries };
+  const base = { present: seen.present, stale: seen.stale ?? false, ageMs: seen.ageMs, owner: seen.owner ?? null, removed: false, reapDir, maintDir, quarantine: inv.entries, maintUncleared: null };
   if (inv.ioError) return { ...base, reason: "io_error", ...inv.ioError };
   if (seen.present && !seen.recognized) return { ...base, reason: "unrecognized_artifact" };
   const quarantineWork = inv.entries.some((e) => e.recognized && e.ageMs > staleMs);
@@ -590,36 +590,71 @@ export function clearStaleReapLock(lockDir, {
 
   const token = crypto.randomUUID();
   const maint = tryLink(maintDir, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token }));
-  if (!maint.ok) return { ...base, reason: maint.reason === "publisher_busy" ? "maintenance_busy" : "io_error", phase: "maintenance_lock", error: maint.error };
+  if (!maint.ok) return { ...base, reason: maint.reason === "publisher_busy" ? "maintenance_busy" : "io_error", phase: "maintenance_lock", error: maint.error, maintUncleared: null };
+
+  let result = null;
   try {
-    if (typeof duringMaintenance === "function") duringMaintenance();
-    // 先清隔离残留（它们不在原路径上，谁也不会再碰）
-    for (const e of base.quarantine) {
-      if (!(e.recognized && e.ageMs > staleMs)) continue;
-      try { fs.unlinkSync(e.path); e.removed = true; }
-      catch (err) { if (err.code !== "ENOENT") e.error = err.message; else e.removed = true; }
-    }
-    if (!seen.present || !seen.stale) return base;
-    const again = inspect();
-    if (again.ioError) return { ...base, reason: "io_error", ...again.ioError };
-    if (!again.present) return { ...base, reason: "already_cleared" };
-    if (!again.recognized) return { ...base, reason: "unrecognized_artifact" };
-    if (!again.stale || JSON.stringify(again.owner) !== JSON.stringify(seen.owner)) return { ...base, reason: "instance_changed" };
-    const quarantine = reapDir + ".quarantine-" + token;
-    try { fs.renameSync(reapDir, quarantine); }
-    catch (err) {
-      if (err.code === "ENOENT") return { ...base, reason: "already_cleared" };
-      return { ...base, reason: "io_error", phase: "quarantine", error: err.message };
-    }
-    if (typeof afterQuarantine === "function") afterQuarantine();
-    try { fs.unlinkSync(quarantine); }
-    catch (err) {
-      // 隔离成功、删不掉：原路径已经空了（热路径不再卡），残留在隔离路径上，下次同一入口的盘点会看到它。
-      return { ...base, reason: "quarantine_unremoved", quarantinePath: quarantine, error: err.message };
-    }
-    return { ...base, removed: true, quarantinePath: quarantine };
+    const run = () => {
+      if (typeof duringMaintenance === "function") duringMaintenance();
+      // 先清隔离残留（它们不在原路径上，谁也不会再碰）
+      for (const e of base.quarantine) {
+        if (!(e.recognized && e.ageMs > staleMs)) continue;
+        try { fs.unlinkSync(e.path); e.removed = true; }
+        catch (err) { if (err.code !== "ENOENT") e.error = err.message; else e.removed = true; }
+      }
+      if (!seen.present || !seen.stale) return base;
+      const again = inspect();
+      if (again.ioError) return { ...base, reason: "io_error", ...again.ioError };
+      if (!again.present) return { ...base, reason: "already_cleared" };
+      if (!again.recognized) return { ...base, reason: "unrecognized_artifact" };
+      if (!again.stale || JSON.stringify(again.owner) !== JSON.stringify(seen.owner)) return { ...base, reason: "instance_changed" };
+      const quarantine = reapDir + ".quarantine-" + token;
+      try { fs.renameSync(reapDir, quarantine); }
+      catch (err) {
+        if (err.code === "ENOENT") return { ...base, reason: "already_cleared" };
+        return { ...base, reason: "io_error", phase: "quarantine", error: err.message };
+      }
+      if (typeof afterQuarantine === "function") afterQuarantine();
+      try { fs.unlinkSync(quarantine); }
+      catch (err) {
+        // 隔离成功、删不掉：原路径已经空了（热路径不再卡），残留在隔离路径上，下次同一入口的盘点会看到它。
+        return { ...base, reason: "quarantine_unremoved", quarantinePath: quarantine, error: err.message };
+      }
+      return { ...base, removed: true, quarantinePath: quarantine };
+    };
+    result = run();
+  } catch (err) {
+    result = { ...base, reason: "io_error", error: String(err?.message ?? err) };
   } finally {
-    const cur = readLockOwner(maintDir);
-    if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(maintDir, { recursive: true, force: true });
+    let maintUncleared = null;
+    const cur = readLockOwner(maintDir, { strict: true });
+    if (cur.unreadable) {
+      maintUncleared = { path: maintDir, error: cur.errorCode ?? cur.error };
+    } else if (cur.present && cur.owner === null) {
+      maintUncleared = { path: maintDir, error: "owner_unreadable" };
+    } else if (cur.present && cur.owner && cur.owner.token === token) {
+      try {
+        fs.rmSync(maintDir, { recursive: true, force: true });
+        const after = readLockOwner(maintDir, { strict: true });
+        if (after.unreadable) {
+          maintUncleared = { path: maintDir, error: after.errorCode ?? after.error };
+        } else if (after.present) {
+          maintUncleared = { path: maintDir, error: "still_present" };
+        }
+      } catch (err) {
+        maintUncleared = { path: maintDir, error: String(err?.code ?? err?.message ?? err) };
+      }
+    } else if (cur.present) {
+      maintUncleared = { path: maintDir, error: "not_owner" };
+    }
+    if (result) {
+      result.maintUncleared = maintUncleared;
+      if (maintUncleared !== null) {
+        if (result.removed === true || !result.reason) {
+          result.reason = "maintenance_unreleased";
+        }
+      }
+    }
   }
+  return result;
 }

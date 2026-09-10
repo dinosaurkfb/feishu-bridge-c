@@ -47918,6 +47918,141 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
   }));
 
+  test("R57d 返修十一 P1 T1：clearStaleReapLock finally 盘点 maintDir 遇 lstat EIO 绝不可折成干净成功，必须 maintUncleared 带出且 reason 为 maintenance_unreleased", () => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-reap-maint-t1-"));
+    const lockDir = path.join(local, "registry.lock");
+    const reapDir = lockDir + ".reap";
+    const maintDir = lockDir + ".maint";
+    const old = (Date.now() - 120_000) / 1000;
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old);
+
+    let armed = false;
+    const origLstat = fs.lstatSync;
+    try {
+      fs.lstatSync = function (p, ...args) {
+        if (armed && String(p) === maintDir) {
+          const err = new Error("EIO: injected");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat.call(fs, p, ...args);
+      };
+
+      const res1 = clearStaleReapLock(lockDir, {
+        apply: true,
+        afterQuarantine: () => { armed = true; },
+      });
+
+      assert.equal(res1.removed, true, "reap 残骸确实已清");
+      assert.equal(res1.reason, "maintenance_unreleased", "reason 必须是 maintenance_unreleased");
+      assert.ok(res1.maintUncleared !== null, "maintUncleared 必非 null");
+      assert.equal(res1.maintUncleared.error, "EIO", "error 为 EIO");
+      assert.equal(res1.maintUncleared.path, maintDir, "path 为 maintDir");
+
+      // 还原 fs 后验证 .maint 仍在盘上
+      armed = false;
+      fs.lstatSync = origLstat;
+      assert.equal(fs.lstatSync(maintDir).isSymbolicLink(), true, ".maint 锁仍在盘上");
+
+      // 放入新 stale reap 锁再调一次 → maintenance_busy（证明"不干净"是真的，维护锁阻挡了后续维护）
+      fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed2" }), reapDir);
+      fs.lutimesSync(reapDir, old, old);
+
+      const res2 = clearStaleReapLock(lockDir, { apply: true });
+      assert.equal(res2.reason, "maintenance_busy", "第二次调用因 .maint 仍在必须报 maintenance_busy");
+
+      // 手动删 .maint 后再调 → 正常
+      fs.rmSync(maintDir, { force: true, recursive: true });
+      const res3 = clearStaleReapLock(lockDir, { apply: true });
+      assert.equal(res3.removed, true, "手动删 .maint 后正常清掉新残骸");
+      assert.equal(res3.maintUncleared, null, "maintUncleared 为 null");
+      assert.throws(() => fs.lstatSync(maintDir), ".maint 锁已被干净清理");
+    } finally {
+      fs.lstatSync = origLstat;
+      try { fs.rmSync(local, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  test("R57d 返修十一 P1 T2：clearStaleReapLock maintDir readlink 非 JSON 导致 owner_unreadable 必须记入 maintUncleared 且保持 .maint", () => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-reap-maint-t2-"));
+    const lockDir = path.join(local, "registry.lock");
+    const reapDir = lockDir + ".reap";
+    const maintDir = lockDir + ".maint";
+    const old = (Date.now() - 120_000) / 1000;
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old);
+
+    let armed = false;
+    const origReadlink = fs.readlinkSync;
+    try {
+      fs.readlinkSync = function (p, ...args) {
+        if (armed && String(p) === maintDir) {
+          return "not valid json";
+        }
+        return origReadlink.call(fs, p, ...args);
+      };
+
+      const res = clearStaleReapLock(lockDir, {
+        apply: true,
+        afterQuarantine: () => { armed = true; },
+      });
+
+      assert.ok(res.maintUncleared !== null, "maintUncleared 必非 null");
+      assert.equal(res.maintUncleared.error, "owner_unreadable", "error 必须为 owner_unreadable");
+      assert.equal(res.maintUncleared.path, maintDir, "path 为 maintDir");
+      assert.equal(res.reason, "maintenance_unreleased", "reason 必须为 maintenance_unreleased");
+
+      armed = false;
+      fs.readlinkSync = origReadlink;
+      assert.equal(fs.lstatSync(maintDir).isSymbolicLink(), true, ".maint 锁仍在盘上");
+    } finally {
+      fs.readlinkSync = origReadlink;
+      try { fs.rmSync(local, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  test("R57d 返修十一 P1 T3：CLI repair-publish-lock 退出码——注入 T1 场景（维护锁释放遇 lstat EIO）退出码非零且 stdout/stderr 含 .maint 路径", () => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-repair-t3-"));
+    const lockDir = path.join(local, "registry.lock");
+    const maintDir = lockDir + ".maint";
+    const reapDir = lockDir + ".reap";
+    const hook = path.join(local, "hook.mjs");
+    const old = (Date.now() - 120_000) / 1000;
+
+    fs.writeFileSync(hook, `
+import fs from "node:fs";
+const orig = fs.lstatSync;
+const target = process.env.INJECT_MAINT_DIR;
+fs.lstatSync = function(p, ...rest) {
+  if (target && String(p) === target) {
+    const err = new Error("EIO: injected");
+    err.code = "EIO";
+    throw err;
+  }
+  return orig.call(fs, p, ...rest);
+};
+`);
+
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old);
+
+    try {
+      const cliPath = path.resolve("scripts", "repair-publish-lock.mjs");
+      const res = spawnSync(process.execPath, ["--import", hook, cliPath, "--lock", lockDir, "--apply"], {
+        encoding: "utf-8",
+        env: { ...process.env, INJECT_MAINT_DIR: maintDir }
+      });
+
+      assert.notEqual(res.status, 0, "维护锁未释放时 CLI 退出码必须非零");
+      const out = (res.stdout ?? "") + (res.stderr ?? "");
+      assert.match(out, /\.maint/u, "输出必须包含 .maint 路径：" + out);
+      assert.match(out, /维护锁释放状态不明/u, "输出必须包含维护锁释放状态不明文案：" + out);
+    } finally {
+      try { fs.rmSync(local, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }
 

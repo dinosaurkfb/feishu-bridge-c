@@ -60,7 +60,7 @@ import {
   recordClaimState, watcherExpectEnv, CLAIM_STATE } from "./claim.mjs";
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
-import { machineContext, runDoctor } from "./doctor.mjs";
+import { machineContext, runDoctor, firstDanglingSymlinkInChain } from "./doctor.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
 import {
@@ -41991,6 +41991,22 @@ test("#154 三轮 P2-1：realpath 首次 ENOENT、随后逐级复查全在 → �
   assert.match(c.detail, /查不清/u, "并发变化 → 查不清：" + c.detail);
   assert.match(c.detail, /期间发生变化/u, "点名核对期间变化：" + c.detail);
   assert.doesNotMatch(c.detail, /失败无回执/u, "不许折成「核对过且没有」：" + c.detail);
+});
+
+test("#154 三轮 P2-2：helper 直调——词法越界返回 outside_root 且无 realPath；根内 ..foo 组件不误伤（缺席=null，在场=concurrent_change）", () => {
+  // 词法越界：target 不在 root 词法下（判据依据是 rootDir 本身，不是 realpath）
+  const esc = firstDanglingSymlinkInChain("/x/root", "/x/root/../esc/outbox");
+  assert.deepEqual(esc, { path: "/x/root/../esc/outbox", reason: "outside_root" }, "词法越界 → outside_root 问题对象：" + JSON.stringify(esc));
+  assert.equal(esc.realPath, undefined, "词法越界那支没有 realPath（调用点文案不打印 undefined）");
+  // 根内 ..foo 组件：真目录名以两个点开头，不许被越界判据误伤
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r63esc-"), { mode: 0o700 }));
+  fs.mkdirSync(path.join(root, "..foo"), { recursive: true });
+  const absent = firstDanglingSymlinkInChain(root, path.join(root, "..foo", "outbox"));
+  assert.equal(absent, null, "..foo 组件 + 叶子缺席 → 真缺席 null（不是 outside_root）：" + JSON.stringify(absent));
+  fs.mkdirSync(path.join(root, "..foo", "outbox"), { recursive: true });
+  const present = firstDanglingSymlinkInChain(root, path.join(root, "..foo", "outbox"));
+  assert.equal(present?.reason, "concurrent_change", "..foo 组件 + 叶子在场 → 不是越界（无 realpath 首报时归并发变化）：" + JSON.stringify(present));
+  assert.notEqual(present?.reason, "outside_root", "..foo 在场也不许判越界");
 });
 
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──

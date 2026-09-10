@@ -41797,6 +41797,75 @@ test("Codex #149 四轮 P2 / #154 返修一 P1：doctor ⑯ 对 outbox_dir 父�
   assert.doesNotMatch(c3.detail, /查不清/u, "对照组不许归查不清：" + c3.detail);
 });
 
+test("Codex #154 返修二 T1 兄弟前缀：outbound → 同父前缀兄弟目录（r58sib2）→ 查不清点名 realpath；无分隔符前缀判会误判根内（刀口用例）", () => {
+  const m = doctorMachine();
+  const root = m.project("r58sib", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58sib", root, root_message_id: "om_r58sib", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const key1 = r54Key(95);
+  fs.writeFileSync(path.join(runsDir, key1 + ".forward.result.json"), r58FailedBody(key1, "API Error: 400 sib", ".runtime-data/outbound/outbox"), { mode: 0o600 });
+  const sibling = path.join(path.dirname(root), path.basename(root) + "2");
+  fs.mkdirSync(path.join(sibling, "sub"), { recursive: true });
+  fs.symlinkSync(path.join(sibling, "sub"), path.join(root, ".runtime-data", "outbound"));
+  const c1 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c1.detail, /查不清/u, "兄弟前缀 realpath 不在根内 → 查不清：" + c1.detail);
+  assert.match(c1.detail, /r58sib2/u, "点名兄弟目录 realpath：" + c1.detail);
+  assert.doesNotMatch(c1.detail, /失败无回执/u, "兄弟前缀不许当普通缺席：" + c1.detail);
+});
+
+test("Codex #154 返修二 T2 根内 ..foo 组件：..rd 经 symlink 指根外 → 查不清；对照根内真目录+叶子缺席 → 普通缺席；词法越界无 realPath 不打印 undefined", () => {
+  const m = doctorMachine();
+  const root = m.project("r58dotdot", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58dotdot", root, root_message_id: "om_r58dotdot", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const rdDir = path.join(root, "..rd"); fs.mkdirSync(rdDir, { recursive: true }); // 根内合法的、名字以两个点开头的组件
+  const key2 = r54Key(96);
+  fs.writeFileSync(path.join(runsDir, key2 + ".forward.result.json"), r58FailedBody(key2, "API Error: 400 dotdot", "..rd/outbound/outbox"), { mode: 0o600 });
+  const elsewhere2 = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58dotdot-"));
+  fs.symlinkSync(elsewhere2, path.join(rdDir, "outbound"));
+  const c2 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c2.detail, /查不清/u, "..rd 经 symlink 指根外 → 查不清：" + c2.detail);
+  assert.doesNotMatch(c2.detail, /失败无回执/u, "..foo 组件不许被 startsWith(\"..\") 误伤成普通缺席：" + c2.detail);
+  // 对照：..rd/outbound 换成根内真目录，叶子 outbox 缺席 → 目录真缺席 → 缺回执
+  fs.rmSync(path.join(rdDir, "outbound"));
+  fs.mkdirSync(path.join(rdDir, "outbound"), { recursive: true });
+  const c2b = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c2b.detail, /失败无回执 1：00000096/u, "对照：..rd 真目录 + 叶子缺席 → 缺回执点名：" + c2b.detail);
+  assert.doesNotMatch(c2b.detail, /查不清/u, "对照不许归查不清：" + c2b.detail);
+  // 附：outbox_dir 词法越出根（../esc/outbox）→ outside_root 查不清，且 why 不打印 undefined
+  fs.rmSync(path.join(runsDir, key2 + ".forward.result.json"));
+  const key2x = r54Key(98);
+  fs.writeFileSync(path.join(runsDir, key2x + ".forward.result.json"), r58FailedBody(key2x, "API Error: 400 esc", "../esc/outbox"), { mode: 0o600 });
+  const c2x = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c2x.detail, /查不清/u, "词法越出根 → outside_root 查不清：" + c2x.detail);
+  assert.doesNotMatch(c2x.detail, /undefined/u, "无 realPath 时 why 不打印 undefined：" + c2x.detail);
+});
+
+test("Codex #154 返修二 T3 末组件自身悬空：outbox 本身指不存在目标 → 查不清点名悬空；对照指根内存在目录 → 正常核对不算缺席", () => {
+  const m = doctorMachine();
+  const root = m.project("r58last", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58last", root, root_message_id: "om_r58last", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  fs.mkdirSync(path.join(root, ".runtime-data", "outbound"), { recursive: true });
+  const key3 = r54Key(97);
+  const body3 = r58FailedBody(key3, "API Error: 400 lastdangle", ".runtime-data/outbound/outbox");
+  fs.writeFileSync(path.join(runsDir, key3 + ".forward.result.json"), body3, { mode: 0o600 });
+  fs.symlinkSync(path.join(root, ".runtime-data", "outbound", "no-such-leaf"), path.join(root, ".runtime-data", "outbound", "outbox"));
+  const c3d = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c3d.detail, /查不清/u, "末组件自身悬空 → 查不清：" + c3d.detail);
+  assert.match(c3d.detail, /悬空 symlink/u, "点名悬空 symlink：" + c3d.detail);
+  assert.doesNotMatch(c3d.detail, /失败无回执/u, "末组件悬空不许当普通缺席：" + c3d.detail);
+  // 对照：outbox symlink 换成指向根内存在目录（回执就放那里）→ 正常核对，不算缺席也不查不清
+  fs.rmSync(path.join(root, ".runtime-data", "outbound", "outbox"));
+  const realLeaf = path.join(root, ".runtime-data", "outbound", "real-leaf");
+  fs.mkdirSync(realLeaf, { recursive: true });
+  fs.writeFileSync(path.join(realLeaf, key3 + R58_RECEIPT_SUFFIX), JSON.stringify(r58ReceiptDoc(key3, { result_sha256: r58ShaOf(body3) }), null, 2) + "\n", { mode: 0o600 });
+  fs.symlinkSync(realLeaf, path.join(root, ".runtime-data", "outbound", "outbox"));
+  const c3b = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.doesNotMatch(c3b.detail, /查不清/u, "对照：末组件指根内存在目录 → 不查不清：" + c3b.detail);
+  assert.doesNotMatch(c3b.detail, /失败无回执/u, "对照：回执在 symlink 目标里 → 正常核对：" + c3b.detail);
+});
+
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──
 
 const R56_T0 = "2026-09-07T10:00:00.000Z";

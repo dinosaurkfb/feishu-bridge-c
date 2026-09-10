@@ -1885,10 +1885,19 @@ const SIDECAR_TMP_RE = /^\.[0-9a-f]{64}\.selection-plan\.json\.tmp\.[1-9]\d*\.[0
  *   · tmp 清掉之后补一次目录 fsync（"清掉了"必须落到介质上）。
  * @returns { ok, cleaned: string[], residue: string[], lock_held?, why? }
  */
-export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process.env } = {}) {
+export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = null, env = process.env } = {}) {
   const { lock: lockDir } = ledgerPaths(dir);
-  const allowedDirs = new Set([dir]);
-  for (const d of Array.isArray(dirs) ? dirs : []) if (typeof d === "string" && d.length > 0) allowedDirs.add(d);
+  const allowedDirs = new Set([dir, path.resolve(dir)]);
+  if (claimsDir !== null && typeof claimsDir === "string" && claimsDir.length > 0) {
+    allowedDirs.add(claimsDir);
+    allowedDirs.add(path.resolve(claimsDir));
+  }
+  for (const d of Array.isArray(dirs) ? dirs : []) {
+    if (typeof d === "string" && d.length > 0) {
+      allowedDirs.add(d);
+      allowedDirs.add(path.resolve(d));
+    }
+  }
   const accepted = [];
   const left = [];
   const errors = [];
@@ -1904,7 +1913,8 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
       continue;
     }
     const base = path.basename(entry);
-    if ((LEDGER_TMP_RE.test(base) || SIDECAR_TMP_RE.test(base)) && allowedDirs.has(path.dirname(entry))) accepted.push(entry);
+    const parent = path.dirname(entry);
+    if ((LEDGER_TMP_RE.test(base) || SIDECAR_TMP_RE.test(base)) && (allowedDirs.has(parent) || allowedDirs.has(path.resolve(parent)))) accepted.push(entry);
     else left.push(entry);
   }
   // 锁家族先看：在场的主锁 / reap 家族一律不由本原语处置 —— 一个交人，一个交显式维护入口。
@@ -1947,7 +1957,18 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
       try { fs.unlinkSync(entry); } catch { left.push(entry); continue; }
       try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
     }
-    if (cleaned.length > 0) dirFsyncErr = fsyncDir(dir);
+    if (cleaned.length > 0) {
+      // R57d 返修八 P1-2b：按实际删除项的所有父目录逐一 fsync（去重），任一失败 → ok:false
+      const dirsToFsync = Array.from(new Set(cleaned.map((p) => path.dirname(p))));
+      if (!dirsToFsync.includes(path.resolve(dir))) dirsToFsync.push(path.resolve(dir));
+      for (const d of dirsToFsync) {
+        const err = fsyncDir(d);
+        if (err !== null) {
+          dirFsyncErr = "目录 " + d + " fsync 失败：" + err;
+          break;
+        }
+      }
+    }
   } finally {
     try { released = releasePublishLock(lockDir); } catch (err) { released = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }

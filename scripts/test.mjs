@@ -47322,6 +47322,35 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
   }));
 
+  test("R57d 返修八 P1-2b：clearLedgerResidue 删除 claimsDir 里的 tmp 必须 fsync claimsDir——注入 claimsDir 目录 fsync 失败必须 ok:false 保持 unclean", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const planTmp = path.join(claimsDir, "." + "b".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID());
+    fs.writeFileSync(planTmp, "content", { mode: 0o600 });
+    let claimsDirFsynced = false;
+    const origFsync = fs.fsyncSync;
+    const origOpen = fs.openSync;
+    try {
+      fs.openSync = (p, flags, mode) => {
+        if (String(p) === claimsDir) {
+          claimsDirFsynced = true;
+          const err = new Error("EIO: i/o error, fsyncDir");
+          err.code = "EIO";
+          throw err;
+        }
+        return origOpen(p, flags, mode);
+      };
+      const r = TAL.clearLedgerResidue({ dir, claimsDir, residue: [planTmp] });
+      assert.equal(claimsDirFsynced, true, "必须对发生删除的 claimsDir 调用 fsyncDir（旧实现只 fsync endpoint dir）");
+      assert.equal(r.ok, false, "claimsDir 目录 fsync 失败必须保持 unclean：" + JSON.stringify(r));
+      assert.match(String(r.why), /fsync/u, "why 说明 fsync 失败：" + r.why);
+    } finally {
+      fs.openSync = origOpen;
+      fs.fsyncSync = origFsync;
+      try { fs.unlinkSync(planTmp); } catch {}
+    }
+  }));
+
+
   test("R57d 返修七 P1-2（常驻反例）：lock_uncleared:true/residue:[] 在主锁仍在时不得闭合、不得把证据清成 false；residue 里的活 reap 不得删也不得闭合", () => withLedgerD((root, dir, ids) => {
     const claimsDir = txDirD(root);
     const lockPath = path.join(dir, "ledger.lock");

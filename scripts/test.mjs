@@ -41766,6 +41766,29 @@ test("R58 返修三 P2-3：outbox_dir 的 realpath 必须仍在 realpath(root) �
   assert.doesNotMatch(c2.detail, /失败无回执/u, "对照组：回执在且证据链对得上：" + c2.detail);
 });
 
+test("Codex #149 四轮 P2：doctor ⑯ 对 outbox_dir 父链悬空 symlink 归查不清（不是缺回执）；目录真缺席仍算缺回执", () => {
+  const m = doctorMachine();
+  const root = m.project("r58dangle", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58dangle", root, root_message_id: "om_r58dangle", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const key = r54Key(94);
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), r58FailedBody(key, "API Error: 400 dangle", ".runtime-data/outbound/outbox"), { mode: 0o600 });
+  // ① 父链中间组件是**悬空** symlink（目标不存在）→ realpath 也 ENOENT，但这是「查不清」
+  fs.symlinkSync(path.join(root, ".runtime-data", "no-such-target"), path.join(root, ".runtime-data", "outbound"));
+  const c1 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c1.ok, false, "有失败仍然红：" + c1.detail);
+  assert.match(c1.detail, /查不清/u, "悬空父链 → 查不清：" + c1.detail);
+  assert.match(c1.detail, /悬空 symlink/u, "点名悬空 symlink：" + c1.detail);
+  assert.doesNotMatch(c1.detail, /失败无回执/u, "不许当成「核对过且没有」：" + c1.detail);
+  // ② 对照组：outbound 是**可解析**的 symlink（指向存在的目录，只是里面没有 outbox）→ 目录真缺席 → 缺回执
+  const elsewhere = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58dangle-"));
+  fs.rmSync(path.join(root, ".runtime-data", "outbound"));
+  fs.symlinkSync(elsewhere, path.join(root, ".runtime-data", "outbound"));
+  const c2 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c2.detail, /失败无回执 1：00000094/u, "可解析父链 + 目录缺席 → 缺回执点名：" + c2.detail);
+  assert.doesNotMatch(c2.detail, /查不清/u, "对照组不许归查不清：" + c2.detail);
+});
+
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──
 
 const R56_T0 = "2026-09-07T10:00:00.000Z";

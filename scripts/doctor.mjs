@@ -730,7 +730,28 @@ export function runDoctor({
     }
   }
 
-  // ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
+  /**
+ * 从 root 到 target 逐级核父链，返回第一个**跳不过去的中间组件**（悬空 symlink / 非目录 / I/O 错）路径，否则 null。
+ * 只在 target 的 realpath 已经 ENOENT 时用：区分「目录真不存在」（→ 缺回执）与
+ * 「父链指到不存在的地方」（→ 查不清，Codex #149 四轮 P2）。最末一层缺席不算悬空。
+ */
+function firstDanglingSymlinkInChain(root, target) {
+  const rel = path.relative(root, target);
+  if (rel === "" || rel.startsWith("..")) return null;
+  const parts = rel.split(path.sep).filter((x) => x.length > 0);
+  let cur = root;
+  for (const [i, part] of parts.entries()) {
+    cur = path.join(cur, part);
+    let st;
+    try { st = fs.lstatSync(cur); }
+    catch (err) { return err?.code === "ENOENT" ? null : cur; }
+    if (!st.isSymbolicLink() || i === parts.length - 1) continue;
+    try { fs.statSync(cur); } catch { return cur; }
+  }
+  return null;
+}
+
+// ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
   // forward-runner 落在 <root>/.runtime-data/inbound/runs/<key>.forward.*（issue #140）。
   // 读盘纪律（#141 二轮 P1-4）：一律先走 readVerifiedDoc（fd 绑定，O_NOFOLLOW|O_NONBLOCK），只把
   // ENOENT 折成缺席；EIO/悬空 symlink/FIFO/并发变化 → 查不清并点名；不做受验读取前的 statSync fail-open。
@@ -768,8 +789,14 @@ export function runDoctor({
         return { ok: false, why: "项目根 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "），无法核 outbox_dir 落点" };
       }
       try { realDir = fs.realpathSync(dir); } catch (err) {
-        // 目录不存在（ENOENT）= 还没有回执，不算“说不清”；其他 IO 错误照样拦。
-        if (err?.code === "ENOENT") return { ok: true, present: false };
+        // 目录不存在（ENOENT）= 还没有回执；但**父链中间组件是悬空 symlink** 时同样 ENOENT ——
+        // 那种情况连"这条路径指向哪儿"都说不清，必须归查不清，不许当成「核对过且没有」
+        // （Codex #149 四轮 P2）。其他 IO 错误照样拦。
+        if (err?.code === "ENOENT") {
+          const dangling = firstDanglingSymlinkInChain(rootDir, dir);
+          if (dangling !== null) return { ok: false, why: "outbox_dir 父链有悬空 symlink（" + dangling + "），不冒充核对过" };
+          return { ok: true, present: false };
+        }
         return { ok: false, why: "outbox 目录 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "）" };
       }
       if (realDir !== realRoot && !realDir.startsWith(realRoot + path.sep)) {

@@ -1977,18 +1977,22 @@ function fsyncDirBound(d) {
 }
 
 /**
- * 账本侧残骸清理（R57d 返修七 P1-2；返修九 P1-1/P1-2 严格锁盘点与目录 fsync 义务传递）：
- *   · 路径集合封闭：只认受验 allowedDirs 下符合 isLedgerTmpName / isSidecarTmpName 的单硬链接普通文件；
- *   · 只要 residue 含任何非上述白名单的路径（如主锁、目录、多硬链接、越界路径、symlink）→ 立即 ok:false 保持 unclean；
+ * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口；返修八 P2 共享判别器；返修十一 P2-1/P2-2）：
+ *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（isLedgerTmpName / isSidecarTmpName）且落在获准目录
+ *     （endpoint 目录 + claimsDir 目录）里的那些；其余一律不动、进 residue（先清允许项、再因 left 非空报 ok:false）。
+ *   · **锁家族一律拒**：`<lock>` / `<lock>.reap` / `<lock>.reap.quarantine-<uuid>` 是锁协议自己的资源。在这里删
+ *     等于失去锁的归属证明 —— 旧码拿 `startsWith(lockDir + ".")` 收族、并以 `staleMs: 0` 调维护清理器，把**活**的
+ *     reap 实例（当前进程正持有）删掉还报 ok:true（探针现场）。它们只走 registry 的显式维护入口
+ *     repair-publish-lock.mjs；本原语只报 residue。
  *   · 删除段在**真正的账本锁栅栏**（acquirePublishLock）内跑：与写方互斥，且只在拿到锁之后才动文件；
  *     栅栏取不到 / 释放不干净 / 主锁仍在 → 一律不报 ok。
  *   · 主锁仍在（symlink + 受验持有者）→ 本原语**不报 ok**（residue=[] 也一样）：它没有资格替锁协议做决定，交人。
  *   · tmp 清掉之后补一次目录 fsync（"清掉了"必须落到介质上）。
  * @returns { ok, cleaned: string[], residue: string[], lock_held?, why? }
  */
-export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = null, dirsPendingFsync = [], env = process.env, _inject = null } = {}) {
-  const allowedSet = durabilityDirAllowSet({ dir, claimsDir });
-  const val = validateDirsPendingFsync(dirsPendingFsync, allowedSet);
+export function clearLedgerResidue({ dir, residue = [], claimsDir = null, dirsPendingFsync = [], env = process.env, _inject = null } = {}) {
+  const allowedDirs = durabilityDirAllowSet({ dir, claimsDir });
+  const val = validateDirsPendingFsync(dirsPendingFsync, allowedDirs);
   if (!val.ok) {
     return {
       ok: false,
@@ -2001,17 +2005,6 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
     };
   }
   const { lock: lockDir } = ledgerPaths(dir);
-  const allowedDirs = new Set([dir, path.resolve(dir)]);
-  if (claimsDir !== null && typeof claimsDir === "string" && claimsDir.length > 0) {
-    allowedDirs.add(claimsDir);
-    allowedDirs.add(path.resolve(claimsDir));
-  }
-  for (const d of Array.isArray(dirs) ? dirs : []) {
-    if (typeof d === "string" && d.length > 0) {
-      allowedDirs.add(d);
-      allowedDirs.add(path.resolve(d));
-    }
-  }
   const pendingDirs = new Set((Array.isArray(dirsPendingFsync) ? dirsPendingFsync : []).filter((x) => typeof x === "string" && x.length > 0));
   const accepted = [];
   const left = [];

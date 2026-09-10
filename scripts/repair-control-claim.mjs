@@ -225,7 +225,7 @@ function settleCommittedLedger({ dir, claimsDir, endpointId, evidence, env = pro
   const dirsPendingFsync = ev && Array.isArray(ev.dirs_pending_fsync) ? ev.dirs_pending_fsync : [];
   let pendingDirs = [...dirsPendingFsync];
   if (residue.length > 0 || lockUncleared) {
-    const cr = clearLedgerResidue({ dir, dirs: [claimsDir], claimsDir, residue, dirsPendingFsync, env, _inject });
+    const cr = clearLedgerResidue({ dir, claimsDir, residue, dirsPendingFsync, env, _inject });
     if (!cr.ok) {
       return {
         ok: false, reason: "ledger_residue_uncleared",

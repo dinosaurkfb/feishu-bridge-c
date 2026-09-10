@@ -41284,10 +41284,12 @@ test("R58 返修三 P2-2：selection-plan 的返回形逐字保留（薄适配�
   const badJson = rd(dir);
   assert.deepEqual(shape(badJson), ["ok", "problem"], "坏 JSON 只回 ok/problem：" + JSON.stringify(shape(badJson)));
   assert.match(String(badJson.problem), /^JSON 解析失败/u, "文案：" + badJson.problem);
-  // ⑤ 封闭校验不过：{ok, problem, reason}，reason 逐字
-  fs.writeFileSync(file, JSON.stringify(mkPlan({ target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+  // ⑤ 封闭校验不过（basis 不合法）：{ok, problem, reason}，reason 逐字
+  fs.writeFileSync(file, JSON.stringify(mkPlan({ basis: "bogus" }), null, 2) + "\n", { mode: 0o600 });
   const badPlan = rd(dir);
   assert.deepEqual(shape(badPlan), ["ok", "problem", "reason"], "校验不过的形：" + JSON.stringify(shape(badPlan)));
+  assert.equal(badPlan.reason, "selection_plan_key_mismatch", "校验不过的 reason 逐字：" + badPlan.reason);
+  assert.match(String(badPlan.problem), /basis/u, "点名 basis：" + badPlan.problem);
   fs.writeFileSync(file, good, { mode: 0o600 });
   // ⑥ mode 不是 0600：{ok, problem}
   fs.chmodSync(file, 0o644);

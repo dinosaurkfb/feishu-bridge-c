@@ -84,6 +84,7 @@ const SIDECAR = createVerifiedSidecar({
   dirMissingReason: "claims_dir_missing",
   problemReason: "selection_plan_key_mismatch",
   keyProblem: "key 形状不对（须 64hex）",
+  dirMissingWhy: "claimsDir 缺失",
 });
 
 function planPath(claimsDir, key) {
@@ -103,6 +104,7 @@ function tmpPathFor(claimsDir, key) {
 /**
  * 受验恢复（返修九 规则 2/5）：见 verified-sidecar.mjs 模块头 ③。只在持锁入口被显式调用。
  * 返回 { ok:true, recovered, residue:null } / { ok:false, reason, residue:[...], why }。
+ * （叶子与旧形同形，无需映射。）
  */
 export function recoverSelectionPlanTmp({ claimsDir, key, _inject = null } = {}) {
   return SIDECAR.recoverTmp({ dir: claimsDir, key, _inject });
@@ -111,12 +113,23 @@ export function recoverSelectionPlanTmp({ claimsDir, key, _inject = null } = {})
 /**
  * 受验读回：见 verified-sidecar.mjs 模块头 ② ④。
  * 返回 { ok:true, plan, sha256, bytes } / { ok:true, absent:true } / { ok:false, problem, reason?, residue? }。
+ *
+ * **P2-2（R58 返修三）：返回形是 R57b 十一轮放行的对外契约，逐字保留。** verified-sidecar 是共用叶子，
+ * 它为了别的消费面多带了字段（失败时的 `kind`、成功时的 `raw`）——本薄适配层把它们挡在模块边界外：
+ *   成功 → 恰 {ok, plan, sha256, bytes}
+ *   输入错 / 读不出 → 恰 {ok, problem}
+ *   校验不过 → {ok, problem, reason}
+ *   残骸 / 盘点失败 → {ok, problem, reason:"residue", residue}
+ * 新增字段一律不许漏出去（有键集逐字断言钉着）。
  */
 export function readSelectionPlan({ claimsDir, key, _inject = null }) {
   const r = SIDECAR.read({ dir: claimsDir, key, _inject });
-  if (r.ok !== true || r.absent === true) return r;
-  const { value, ...rest } = r;
-  return { ...rest, plan: value };
+  if (r.ok === true && r.absent === true) return { ok: true, absent: true };
+  if (r.ok === true) return { ok: true, plan: r.value, sha256: r.sha256, bytes: r.bytes };
+  const out = { ok: false, problem: r.problem };
+  if (r.reason !== undefined) out.reason = r.reason;
+  if (r.residue !== undefined) out.residue = r.residue;
+  return out;
 }
 
 

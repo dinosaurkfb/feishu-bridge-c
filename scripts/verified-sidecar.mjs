@@ -45,8 +45,9 @@ export const sidecarTmpName = (key, fileName) => "." + fileName + ".tmp." + proc
  * @param {string} cfg.dirMissingReason 目录缺失时的 reason 名（各调用方自己的词）
  * @param {string|null} cfg.problemReason 读回遇封闭校验不过时的 reason 名（null = 不给 reason）
  * @param {string} [cfg.keyProblem]    key 形状不符的文案（默认「key 形状不对」）
+ * @param {string} [cfg.dirMissingWhy] 目录缺失的文案（默认「目录缺失」）
  */
-export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, keyShape, dirMissingReason, problemReason = null, keyProblem = "key 形状不对" }) {
+export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, keyShape, dirMissingReason, problemReason = null, keyProblem = "key 形状不对", dirMissingWhy = "目录缺失" }) {
   const filePath = (dir, key) => path.join(dir, fileNameOf(key));
   const tmpPrefixOf = (key) => "." + fileNameOf(key) + ".tmp.";
   const tmpPathFor = (dir, key) => path.join(dir, sidecarTmpName(key, fileNameOf(key)));
@@ -128,7 +129,7 @@ export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, 
    * 返回 { ok:true, recovered:path|null, residue:null } / { ok:false, reason, residue:[...], why }。
    */
   function recoverTmp({ dir, key, _inject = null } = {}) {
-    if (typeof dir !== "string" || dir.length === 0) return { ok: false, reason: dirMissingReason, why: "目录缺失" };
+    if (typeof dir !== "string" || dir.length === 0) return { ok: false, reason: dirMissingReason, why: dirMissingWhy };
     const kv = validateKey(key);
     if (kv !== null) return { ok: false, reason: "key_shape", why: kv };
     const scan = scanTmpCandidates({ dir, key, _inject });
@@ -172,7 +173,7 @@ export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, 
    * 规则 ④：**不删任何文件**；遇任何精确 tmp 候选 → residue fail-closed。
    */
   function read({ dir, key, _inject = null }) {
-    if (typeof dir !== "string" || dir.length === 0) return { ok: false, kind: "unreadable", problem: "目录缺失" };
+    if (typeof dir !== "string" || dir.length === 0) return { ok: false, kind: "unreadable", problem: dirMissingWhy };
     const kv = validateKey(key);
     if (kv !== null) return { ok: false, kind: "unreadable", problem: kv };
     const scan = scanTmpCandidates({ dir, key, _inject });
@@ -211,7 +212,8 @@ export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, 
         // reason 保留（selection-plan 的 selection_plan_key_mismatch 是既有对外契约），kind 是新加的通用分档。
         return problemReason === null ? { ok: false, kind: "invalid", problem: p } : { ok: false, kind: "invalid", problem: p, reason: problemReason };
       }
-      return { ok: true, value, sha256: sha256(buf), bytes: buf.length };
+      // raw 与 value 出自**同一次 fd 读取**：消费面（outbox 快照）要的 _raw 不许再读第二次。
+      return { ok: true, value, sha256: sha256(buf), bytes: buf.length, raw: buf };
     } catch (err) {
       return { ok: false, kind: "unreadable", problem: errCode(err) };
     } finally {

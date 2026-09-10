@@ -433,12 +433,17 @@ export function executeSelectControl(intent, {
   const actualHandle = handle ?? (action === "rebind" ? target.rebind_handle : target.selection_handle) ?? null;
   // R57d 返修一 B 段 P1-3：执行前把解析后的 immutable selection plan 持久化进 claim —— 否则省略 handle 的
   //   重放/续做无法复现同一目标。plan 已在（重放/续做）→ 逐字比对，不一致 → select_plan_conflict。
-  if (txCtx && txCtx.claimsDir && txCtx.key && txCtx.claim) {
-    // R57d 对齐 P1-4：key 形状封闭（与 writeSelectionPlan 同一判据，非 64hex 一律拒）——
-    //   不进路径派生，目录预建也拒（守卫不是路径写失败的侥幸）。
-    if (!CLAIM_KEY_SHAPE.test(txCtx.key)) {
-      return { ok: false, status: "failed", reason: "select_plan_key_invalid", text: selectRejectTextByReason("select_plan_key_invalid") };
-    }
+  // R57d 返修五 P1-B：**无条件要求**受验 plan 上下文（claimsDir / key（CLAIM_KEY_SHAPE）/ claim）——
+  //   旧码把这一段包在 `if (txCtx && …)` 里，上下文缺失就跳过 plan 持久化直接调 wire/账本，
+  //   与 rfh 支的 mutation 层纪律不一致（那条路少一个“先落盘再提交”的前置）。
+  //   缺任一项 → selection_plan_context_missing，不执行（wire 调用数 0、账本零变更）。
+  const planCtx = txCtx ?? null;
+  if (!planCtx || typeof planCtx.claimsDir !== "string" || planCtx.claimsDir.length === 0
+    || typeof planCtx.key !== "string" || !CLAIM_KEY_SHAPE.test(planCtx.key)
+    || planCtx.claim === null || typeof planCtx.claim !== "object") {
+    return { ok: false, status: "failed", reason: "selection_plan_context_missing", text: selectRejectTextByReason("selection_plan_context_missing"), why: "osh/orh 支执行前必须持久化 selection plan：需合法 claimsDir / key（64hex）/ claim（缺上下文 = 不在控制事务内）" };
+  }
+  {
     const plan = {
       schema_version: SELECTION_PLAN_SCHEMA,
       action,
@@ -446,7 +451,7 @@ export function executeSelectControl(intent, {
       basis: res.selection_basis,
       handle: actualHandle,
       kind: action === "rebind" ? "orh" : "osh",
-      claim_key: txCtx.key,
+      claim_key: planCtx.key,
       cas: action === "activate"
         ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.aliases?.root_om ?? null, selection_handle: actualHandle }
         : action === "anchor"
@@ -457,7 +462,7 @@ export function executeSelectControl(intent, {
     // R57d 对齐 P1-4：plan 走 writeSelectionPlan sidecar（R57b 同一写原语：硬链接发布 + 受验读回 + 复用/冲突），
     //   不再手写进 claim.json（repair 改读 sidecar）。plan 先受验落盘，随后才调 legacy/ledger：
     //   写失败 → select_plan_unwritten 不执行；既有 plan 深层不等 → select_plan_conflict 不覆盖。
-    const w = writeSelectionPlan({ claimsDir: txCtx.claimsDir, key: txCtx.key, plan });
+    const w = writeSelectionPlan({ claimsDir: planCtx.claimsDir, key: planCtx.key, plan });
     if (!w.ok) {
       if (w.reason === "selection_plan_conflict") {
         return { ok: false, status: "failed", reason: "select_plan_conflict", text: selectRejectTextByReason("select_plan_conflict") };

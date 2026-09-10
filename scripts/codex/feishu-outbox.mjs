@@ -436,7 +436,8 @@ export function collectBacklog({ home = bridgeHome(), threadId = null, taskKey =
       // **逐记录真解析一次目标代际** —— 只验字段形状会漏掉"冻结到已 retired 的代际"。
       const resolveTarget = (key) => resolveTaskOutboundGeneration(
         task, key === null || key === undefined ? null : key);
-      for (const r of snap.records) {
+      // 解释不了的待发记录不在候选集（snap.records）里，但只读投影必须看得见它们。
+      for (const r of [...snap.records, ...(snap.recordsUnexplained ?? [])]) {
         const state = describeRecordState(r, { resolveTarget });
         // 被永久拒绝过的要单独说（同项目条目一份投影）—— 它不会再自动重试，是在等人。
         const rp = retryProtection(r);

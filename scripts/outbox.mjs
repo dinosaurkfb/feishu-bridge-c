@@ -212,6 +212,28 @@ export function recoverForwardReceiptTmp({ outboxDir, forwardKey, _inject = null
 }
 
 /**
+ * 回执文件名 → forward_key（P1-2）：**只有规范文件名 <key>.forward-failed.outbox.json 才绑得上 key**。
+ * 解析不出（后缀不对、key 不是 64hex、多一层路径）→ null。调用方拿到 null 就必须拒，
+ * **绝不重落成「expectedKey=null」而放过内部自洽的伪造记录**（那条路会让 arbitrary.json 里的记录进待发队列）。
+ */
+export function forwardReceiptKeyFromFileName(name) {
+  if (typeof name !== "string" || !name.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX)) return null;
+  const key = name.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length);
+  return /^[0-9a-f]{64}$/u.test(key) ? key : null;
+}
+
+/**
+ * forward_failed 记录的**唯一**落点判据（P1-2）：文件里的 forward_key 必须与文件名逐字一致，
+ * 而文件名必须是规范形状。返回 null（合规）或问题短句。
+ */
+export function forwardReceiptFileBindingProblem(record, fileName) {
+  const fromName = forwardReceiptKeyFromFileName(fileName);
+  if (fromName === null) return "文件名不是 <64hex key>" + FORWARD_FAILURE_RECEIPT_SUFFIX + "（kind=forward_failed 只能住规范文件名）";
+  if (record?.forward_key !== fromName) return "forward_key 与文件名不符（文件名的 key 是 " + fromName + "）";
+  return null;
+}
+
+/**
  * 受验读回（P1-1/P1-3/doctor 共用）：fd 绑定（O_NOFOLLOW|O_NONBLOCK）、普通文件、单硬链接、0600、
  * 大小上限、JSON、封闭校验器。**不删任何文件**；遇任何精确 tmp 候选 → residue fail-closed。
  * 返回：
@@ -962,7 +984,11 @@ export function readOutboxSnapshot(outboxDir) {
   }
   const unclassified = [];
   const unexplainable = [];
+  // records            = **候选集**（解释得了的待发记录）——发布器只认它
+  // recordsUnexplained = 待发但解释不了的记录（不进候选集，但读模型仍要看得见它们，
+  //                      否则只读投影会把这些"等人看"的记录折叠成 0）
   const records = [];
+  const recordsUnexplained = [];
   let pending = 0;
   for (const name of names) {
     const file = path.join(outboxDir, name);
@@ -975,14 +1001,20 @@ export function readOutboxSnapshot(outboxDir) {
     const verdict = classifyOutboxRecord(rec);
     if (verdict.unclassified) { unclassified.push({ file: name, why: verdict.why }); continue; }
     const gaps = explainabilityGaps(rec);
-    // P1-2：forward_failed 回执用唯一封闭校验器（写前自证同一份）；不合法 → unexplainable（整批 fail-closed）。
+    // P1-2：forward_failed 回执先用唯一封闭校验器（写前自证同一份），再核**落点**——
+    // forward_key 只能从规范文件名解析（解析不出即拒）；不合法 → unexplainable（整批 fail-closed）。
     if (rec?.kind === "forward_failed") {
-      const expectedKey = name.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX) ? name.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length) : null;
-      const rp = forwardFailureReceiptProblem(rec, { expectedKey });
+      const bind = forwardReceiptFileBindingProblem(rec, name);
+      if (bind !== null) gaps.push("forward_failed 回执落点不对：" + bind);
+      const rp = forwardFailureReceiptProblem(rec, { expectedKey: forwardReceiptKeyFromFileName(name) });
       if (rp !== null) gaps.push("forward_failed 回执不合法：" + rp);
     }
     if (gaps.length > 0) {
       unexplainable.push({ file: name, why: "缺少解释这条记录所必需的字段：" + gaps.join("、") });
+      // 解释不了的记录**不进候选集**：发布器拿不到它，也就发不出它（整批另由 outboxMutationBlocker 拦下）。
+      // 但它仍要进读模型 —— 只读投影靠这份看得见它（P1-2）。
+      if (verdict.state === "pending") recordsUnexplained.push({ ...rec, _file: file, _raw: raw });
+      continue;
     }
     if (verdict.state === "pending") {
       pending += 1;
@@ -993,6 +1025,7 @@ export function readOutboxSnapshot(outboxDir) {
     ok: true,
     files: [...names],
     records,
+    recordsUnexplained,
     audit: { ok: true, pending, unclassified, unexplainable, files: [...names] },
   };
 }
@@ -1031,10 +1064,12 @@ export function auditOutbox(outboxDir) {
     // 这里要的不是"字段齐全"，而是**足以解释它**：是什么、什么时候、哪一类。
     // 真实历史记录（含升级前那批）这四样都有，收紧不会误伤。
     const missing = explainabilityGaps(rec);
-    // P1-2：forward_failed 回执用唯一封闭校验器（写前自证同一份）；不合法 → unexplainable。
+    // P1-2：forward_failed 回执先用唯一封闭校验器，再核**落点**（forward_key 只能从规范文件名解析）；
+    // 不合法 / 落点不对 → unexplainable（整批 fail-closed）。
     if (rec.kind === "forward_failed") {
-      const expectedKey = f.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX) ? f.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length) : null;
-      const rp = forwardFailureReceiptProblem(rec, { expectedKey });
+      const bind = forwardReceiptFileBindingProblem(rec, f);
+      if (bind !== null) missing.push("forward_failed 回执落点不对：" + bind);
+      const rp = forwardFailureReceiptProblem(rec, { expectedKey: forwardReceiptKeyFromFileName(f) });
       if (rp !== null) missing.push("forward_failed 回执不合法：" + rp);
     }
     // **分开报，不并进 unclassified。**

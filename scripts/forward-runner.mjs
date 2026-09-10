@@ -72,7 +72,7 @@ const strOrNull = (v, cap) => (v === null ? true : typeof v === "string" && v.le
  * result.json 的唯一封闭校验器（#141 P1-2）：写端落盘前自校验、doctor 读端共用。
  * problem 非空 → 写端不落盘 / 读端按查不清点名。
  */
-export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null } = {}) {
+export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null, projectRoot = null } = {}) {
   if (!isObj(doc)) return "result 文档不是对象";
   if (keysOf(doc) !== RESULT_KEYS) return "result 字段集不对";
   if (doc.schema !== FORWARD_RESULT_SCHEMA) return "schema 不认识: " + String(doc.schema);
@@ -100,8 +100,20 @@ export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null
   if (!isCanonicalIso(doc.finished_at)) return "finished_at 不是规范化 ISO";
   if (Date.parse(doc.finished_at) > now + 60_000) return "finished_at 晚于写入时刻 +60s";
   if (doc.claude_path !== null && typeof doc.claude_path !== "string") return "claude_path 形状不对";
-  // P1-5：outbox_dir —— 回执所在 outbox 目录（相对 projectRoot 的相对路径），doc 读端据此精确核回执；null 合法。
-  if (doc.outbox_dir !== null && (typeof doc.outbox_dir !== "string" || doc.outbox_dir.length === 0 || doc.outbox_dir.startsWith("/"))) return "outbox_dir 形状不对（须相对路径或 null）";
+  if (doc.outbox_dir !== null) {
+    // P1-4：outbox_dir 必须是**规范的项目内相对路径**。旧版只拦了绝对路径，于是 "../../elsewhere" 过得了自校验，
+    // doctor 又直接 path.join(rootDir, outboxDirRel) 把它拼到项目外去读。四条形状判据（拒绝对、拒 .. 段、
+    // normalize 不动点）住在这里（写端自证与 doctor 共用一份）；给了 projectRoot 时另做 containment 双向核
+    //（path.resolve(root, rel) 必须落在 root + sep 开头）。
+    if (typeof doc.outbox_dir !== "string" || doc.outbox_dir.length === 0) return "outbox_dir 形状不对（须项目内相对路径或 null）";
+    if (doc.outbox_dir.startsWith("/")) return "outbox_dir 不许是绝对路径（须项目内相对路径）";
+    if (doc.outbox_dir.split("/").includes("..")) return "outbox_dir 不许含 .. 段（越界到项目根外）";
+    if (path.normalize(doc.outbox_dir) !== doc.outbox_dir) return "outbox_dir 不是规范相对路径（normalize 后变了：" + path.normalize(doc.outbox_dir) + "）：" + doc.outbox_dir;
+    if (typeof projectRoot === "string" && projectRoot.length > 0) {
+      const resolved = path.resolve(projectRoot, doc.outbox_dir);
+      if (!resolved.startsWith(projectRoot + path.sep)) return "outbox_dir 越界（" + resolved + " 不在 " + projectRoot + " 内）";
+    }
+  }
   return null;
 }
 
@@ -293,8 +305,8 @@ function noteErr(errPath, line) {
 }
 
 /** 写端自校验（#141 P1-2）：problem 非空 → 不落盘、记 stderr.log。 */
-function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expectedKey) {
-  const problem = problemFn(doc, { now: Date.now(), expectedKey });
+function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expectedKey, projectRoot = null) {
+  const problem = problemFn(doc, { now: Date.now(), expectedKey, projectRoot });
   if (problem !== null) { noteErr(errPath, "自校验失败不落盘（" + path.basename(targetPath) + "）：" + problem); return { ok: false }; }
   return writeDocFile(targetPath, errPath, doc, maxBytes);
 }
@@ -333,7 +345,8 @@ function writeFailureReceipt({ spec, doc, errPath, resultSha256 }) {
 
 /** result 落盘后紧跟回执判断 —— 三个结局路径共用这一份，不另抄。 */
 function writeResultAndMaybeReceipt(resultPath, errPath, doc, spec) {
-  const w = writeValidatedDoc(resultPath, errPath, doc, forwardResultProblem, 64 * 1024, spec.key);
+  // P1-4：写端也带 projectRoot 做 containment 双向核（与 doctor 同一份判据）。
+  const w = writeValidatedDoc(resultPath, errPath, doc, forwardResultProblem, 64 * 1024, spec.key, spec.projectRoot ?? null);
   // P1-5：只有 result 受验写成（写回 + fsync + 读回）之后才创建回执；result 写失败 → 不写回执（记 stderr.log）。
   if (w && w.ok === true) writeFailureReceipt({ spec, doc, errPath, resultSha256: w.sha256 });
 }

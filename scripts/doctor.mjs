@@ -810,7 +810,7 @@ export function runDoctor({
         if (!FORWARD_KEY_RE.test(key)) { unclear("key 形状不对（须 64 位十六进制）"); continue; }
         if (parts.result !== undefined) {
           // 有 result：唯一终态来源，不再走孤儿判断
-          const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key }), maxBytes: RESULT_CAP });
+          const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key, projectRoot: root }), maxBytes: RESULT_CAP });
           if (v.ok !== true) { if (v.absent) unclear("result 读不出（并发变化）"); else unclear(String(v.problem ?? "读不出")); continue; }
           const at = Date.parse(v.doc.finished_at ?? "");
           if (now - (Number.isFinite(at) ? at : (v.mtimeMs ?? 0)) > WINDOW) continue; // 窗外积尘

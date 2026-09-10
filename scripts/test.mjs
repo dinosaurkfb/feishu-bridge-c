@@ -40682,7 +40682,8 @@ test("R58 回执原语：O_EXCL 幂等（重放 duplicate、第一条内容不�
 test("R58 失败回执行为（假 claude）：is_error 失败 → outbox 一条 forward_failed；同 key 重跑不写第二条；成功路径不写", () => {
   const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58e-"));
   const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
-  const outbox = path.join(local, "outbox");
+  // R58 返修二 P1-4：outbox 必须在项目根**内**（result 的 outbox_dir 要留在项目内才写得成）。
+  const outbox = path.join(proj, ".runtime-data", "outbound", "outbox");
   fs.mkdirSync(bin); fs.mkdirSync(proj);
   const errBody = "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400\\u0007model not found\\nsecond line', num_turns: 1, duration_ms: 2500 }) + '\\n');";
   const sentBody = [
@@ -40822,7 +40823,9 @@ test("R58 返修一 P1-3：原子 no-replace 发布——既存半截/不合法 
 test("R58 返修一 P1-5：result 受验写失败 → 不建回执（gated：先 result 后回执）", () => {
   const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58p15-"));
   const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
-  const outbox = path.join(local, "outbox");
+  // R58 返修二 P1-4：outbox 在项目根内——夹具的其它前置（代际 / 类别 / resultSha）全部齐备，
+  //   于是下面那个回执的缺席只可能是「result 没写成」这一道 gating。
+  const outbox = path.join(proj, ".runtime-data", "outbound", "outbox");
   fs.mkdirSync(bin); fs.mkdirSync(proj); fs.mkdirSync(runs, { recursive: true }); fs.mkdirSync(outbox, { recursive: true });
   const errBody = "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 boom', num_turns: 1, duration_ms: 2500 }) + '\\n');";
   const key = r54Key(50);
@@ -40840,6 +40843,18 @@ test("R58 返修一 P1-5：result 受验写失败 → 不建回执（gated：先
   while (Date.now() < deadline && fs.existsSync(path.join(runs, key + ".forward.started.json"))) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
   assert.equal(fs.existsSync(path.join(outbox, key + R58_RECEIPT_SUFFIX)), false, "result 写失败 → 无回执文件");
   assert.equal(fs.lstatSync(path.join(runs, key + ".forward.result.json")).isSymbolicLink(), true, "symlink 不被覆盖");
+  // 控制组（P2 行为钉）：**同一个夹具、同一条失败路径**，只把 result 那道写失败拿掉（换一个 key，不预放 symlink）→
+  //   回执必然出现。于是上面那个「无回执」只可能来自 gating，不是别的前置缺了。
+  const key2 = r54Key(52);
+  deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "om_msg" + key2.slice(-4), createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key: key2, outboxDir: outbox, originGenerationId: "gen-r58",
+    env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  const ctl = r58WaitReceipt(path.join(outbox, key2 + R58_RECEIPT_SUFFIX));
+  assert.ok(ctl, "控制组：result 写成了 → 回执出现（证明 gating 是唯一挡点）");
+  assert.equal(ctl.forward_key, key2, "控制组回执绑定该 key");
 });
 
 test("R58 doctor ⑯：失败但回执缺失 → 子计数点名 key；回执在项目级 / 会话级 outbox → 不点名；桶之和不变", () => {
@@ -40851,33 +40866,318 @@ test("R58 doctor ⑯：失败但回执缺失 → 子计数点名 key；回执在
   const failedResult = (key, why, outboxDir) => JSON.stringify(r54FullResult(key, {
     is_error: true, sent: false, exit_code: 0, reason_first_line: why, finished_at: new Date(now - 120e3).toISOString(), outbox_dir: outboxDir,
   })) + "\n";
-  fs.writeFileSync(path.join(runsDir, r54Key(31) + ".forward.result.json"), failedResult(r54Key(31), "API Error: 400 a", ".runtime-data/outbound/outbox"), { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, r54Key(32) + ".forward.result.json"), failedResult(r54Key(32), "API Error: 400 b", null), { mode: 0o600 });
-  fs.writeFileSync(path.join(runsDir, r54Key(34) + ".forward.result.json"), failedResult(r54Key(34), "API Error: 400 c", ".runtime-data/outbound/outbox-11111111-2222-3333-4444-555555555555"), { mode: 0o600 });
+  const b31 = failedResult(r54Key(31), "API Error: 400 a", ".runtime-data/outbound/outbox");
+  const b32 = failedResult(r54Key(32), "API Error: 400 b", null);
+  const b34 = failedResult(r54Key(34), "API Error: 400 c", ".runtime-data/outbound/outbox-11111111-2222-3333-4444-555555555555");
+  const b35 = failedResult(r54Key(35), "API Error: 400 d", ".runtime-data/outbound/outbox");
+  fs.writeFileSync(path.join(runsDir, r54Key(31) + ".forward.result.json"), b31, { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(32) + ".forward.result.json"), b32, { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(34) + ".forward.result.json"), b34, { mode: 0o600 });
+  fs.writeFileSync(path.join(runsDir, r54Key(35) + ".forward.result.json"), b35, { mode: 0o600 });
   fs.writeFileSync(path.join(runsDir, r54Key(33) + ".forward.result.json"), JSON.stringify(r54FullResult(r54Key(33), { finished_at: new Date(now - 120e3).toISOString(), outbox_dir: null })) + "\n", { mode: 0o600 });
-  // 31：回执在项目级 outbox（已发布形状，不给 ⑥ 制造待发积压）；34：回执在会话级 outbox-<sid>；32：无回执；33：成功
-  const receiptDoc = (key) => {
+  // 31：回执在项目级 outbox（已发布形状，不给 ⑥ 制造待发积压）；34：回执在会话级 outbox-<sid>；35：没回执；32：旧版无落点；33：成功
+  // P1-3：result_sha256 必须与**该 key 受验读到的 result 内容**逐字对得上——夹具按真实内容摘要写。
+  const receiptDoc = (key, body) => {
     const createdAt = new Date(now - 90e3).toISOString();
     return JSON.stringify({
       schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal",
       id: "forward-failed-" + key, kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.session_error,
       event_key: "forward-failed:" + key, source: "forward-runner", input_origin: null, input_text: null,
       target_channel_generation_id: "gen-1", run_id: null, forward_key: key, message_id: "om_m1",
-      created_at: createdAt, publish_eligible_at: createdAt, published_at: new Date(now - 60e3).toISOString(), result_sha256: R58_SHA,
+      created_at: createdAt, publish_eligible_at: createdAt, published_at: new Date(now - 60e3).toISOString(), result_sha256: r58ShaOf(body),
     }, null, 2) + "\n";
   };
   const obProj = path.join(root, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(obProj, { recursive: true });
-  fs.writeFileSync(path.join(obProj, r54Key(31) + R58_RECEIPT_SUFFIX), receiptDoc(r54Key(31)), { mode: 0o600 });
+  fs.writeFileSync(path.join(obProj, r54Key(31) + R58_RECEIPT_SUFFIX), receiptDoc(r54Key(31), b31), { mode: 0o600 });
   const obSid = path.join(root, ".runtime-data", "outbound", "outbox-11111111-2222-3333-4444-555555555555");
   fs.mkdirSync(obSid, { recursive: true });
-  fs.writeFileSync(path.join(obSid, r54Key(34) + R58_RECEIPT_SUFFIX), receiptDoc(r54Key(34)), { mode: 0o600 });
+  fs.writeFileSync(path.join(obSid, r54Key(34) + R58_RECEIPT_SUFFIX), receiptDoc(r54Key(34), b34), { mode: 0o600 });
+  // 35：失败、落点就是项目级 outbox，但没写回执 → 失败无回执点名
   const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.equal(c.ok, false, "有失败仍然红：" + c.detail);
-  assert.match(c.detail, /共 4 条：绿 1、红 3/u, "回执核对是红的子计数，不改桶之和：" + c.detail);
-  const miss = c.detail.match(/失败无回执 ([^；]*)/u);
-  assert.ok(miss, "点名失败无回执：" + c.detail);
-  assert.equal(miss[1], "1：00000032", "只点名真正没回执的那个 key：" + JSON.stringify(miss[1]));
+  assert.match(c.detail, /共 5 条：绿 1、红 4/u, "桶之和 = 总数（口径不变）：" + c.detail);
+  assert.match(c.detail, /失败无回执 1：00000035/u, "只点名真正没回执的那个 key：" + c.detail);
   assert.doesNotMatch(c.detail, /失败无回执 [2-9]/u, "有回执（项目级/会话级）与成功都不点名：" + c.detail);
+  // P2：outbox_dir 为 null 的旧版 result **不许**回退到「当前 session outbox」冒充精确定位——单独子计数点名。
+  assert.match(c.detail, /旧版 result 无落点记录/u, "无落点单独说清：" + c.detail);
+  assert.match(c.detail, /无落点[^；]*00000032/u, "无落点点名 key：" + c.detail);
+});
+
+// ── R58 返修二：Codex #149 二轮（4 P1 + 3 P2）──
+
+/** v4 uuid 夹具（封闭 tmp 形状用）。 */
+const r58Uuid = (n) => (String(n).repeat(8) + "-1111-4111-8111-111111111111").slice(0, 36);
+/** 规范 tmp 名（封闭形状）：.<key>.forward-failed.outbox.json.tmp.<正整数 pid>.<v4 uuid>。 */
+const r58TmpName = (key, n = 1) => "." + key + R58_RECEIPT_SUFFIX + ".tmp.4242." + r58Uuid(n);
+/** 合法回执记录（P1-3 起 result_sha256 要与该 key 的 result 内容对得上）。 */
+const r58ReceiptDoc = (key, over = {}) => {
+  const createdAt = new Date().toISOString();
+  return {
+    schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal",
+    id: "forward-failed-" + key, kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.session_error,
+    event_key: "forward-failed:" + key, source: "forward-runner", input_origin: null, input_text: null,
+    target_channel_generation_id: "gen-1", run_id: null, forward_key: key, message_id: "om_m1",
+    created_at: createdAt, publish_eligible_at: createdAt, published_at: null, result_sha256: R58_SHA,
+    ...over,
+  };
+};
+/** result 文档 → 落盘字节（sha 只认这一份；回执的 result_sha256 必须与它相等）。 */
+const r58ResultBody = (key, over = {}) => JSON.stringify(r54FullResult(key, over), null, 2) + "\n";
+const r58ShaOf = (body) => crypto.createHash("sha256").update(body).digest("hex");
+/** 转发失败 result 的落盘字节（回执证据链夹具的默认形状）。 */
+const r58FailedBody = (key, why, outboxDir, now = Date.now()) => r58ResultBody(key, {
+  is_error: true, sent: false, exit_code: 0, reason_first_line: why,
+  finished_at: new Date(now - 120e3).toISOString(), outbox_dir: outboxDir,
+});
+/** R58 发布/体检夹具：项目根 + 绑定 + 出站 outbox + runs 目录。 */
+const r58Project = (tag) => {
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58b-" + tag + "-"));
+  const inbound = path.join(root, ".runtime-data", "inbound");
+  const outbox = path.join(root, ".runtime-data", "outbound", "outbox");
+  const runsDir = path.join(inbound, "runs");
+  fs.mkdirSync(outbox, { recursive: true }); fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(path.join(inbound, "chain-config.json"), JSON.stringify({ task_display_name: "R58T", lark_cli_profile: "claude" }));
+  fs.writeFileSync(path.join(inbound, "active-mapping.json"),
+    JSON.stringify({ status: "active", feishu_root_message_id_reference: "om_x", channel_generation_id: "gen-1" }));
+  return { root, outbox, runsDir, rel: ".runtime-data/outbound/outbox" };
+};
+
+test("R58 返修二 P1-1：回执走受验读（外指 symlink / 多硬链接拒、不跟读）+ 受验恢复（唯一同 inode nlink=2 → 清 tmp；异 inode 候选 → residue 不删）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58v1-"));
+  const dir = path.join(local, "outbox"); fs.mkdirSync(dir);
+  const key = r54Key(60);
+  const file = path.join(dir, key + R58_RECEIPT_SUFFIX);
+  // ① 规范文件名做成**外指 symlink**（指向目录外一份内容合法的回执）→ 受验读拒，不跟读目标。
+  const outside = path.join(local, "outside.json");
+  fs.writeFileSync(outside, JSON.stringify(r58ReceiptDoc(key), null, 2) + "\n", { mode: 0o600 });
+  fs.symlinkSync(outside, file);
+  const r1 = outboxModule.readForwardFailureReceipt({ outboxDir: dir, forwardKey: key });
+  assert.notEqual(r1.ok, true, "外指 symlink 不许当合法回执：" + JSON.stringify(r1));
+  assert.equal(r1.record, undefined, "symlink 不跟读（拿不到记录）");
+  // ② 预造「link 成功到 unlink tmp 之间崩溃」：final 与合法 tmp 同 inode、nlink=2。
+  fs.rmSync(file);
+  const w1 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_v1", targetGenerationId: "gen-1", resultSha256: R58_SHA });
+  assert.equal(w1.ok, true, JSON.stringify(w1));
+  const tmp = path.join(dir, r58TmpName(key, 1));
+  fs.linkSync(file, tmp);
+  assert.equal(fs.lstatSync(file).nlink, 2, "夹具自证：final nlink=2（link 后未 unlink）");
+  const r2 = outboxModule.readForwardFailureReceipt({ outboxDir: dir, forwardKey: key });
+  assert.notEqual(r2.ok, true, "纯读遇精确候选 → fail-closed：" + JSON.stringify(r2));
+  assert.equal(r2.residue?.[0], tmp, "residue 点名 tmp：" + JSON.stringify(r2.residue));
+  assert.equal(fs.existsSync(tmp), true, "纯读不删任何文件");
+  assert.equal(fs.lstatSync(file).nlink, 2, "纯读不恢复（nlink 仍 2）");
+  // 恢复入口（P1-1 导出的受验恢复）→ nlink=1、tmp 被清、回执可读
+  const rec = outboxModule.recoverForwardReceiptTmp({ outboxDir: dir, forwardKey: key });
+  assert.equal(rec.ok, true, "recoverForwardReceiptTmp：" + JSON.stringify(rec));
+  assert.equal(rec.recovered, tmp, "recovered 点名 tmp");
+  assert.equal(fs.lstatSync(file).nlink, 1, "恢复后 nlink=1");
+  assert.equal(fs.existsSync(tmp), false, "恢复后 tmp 被清");
+  assert.equal(outboxModule.readForwardFailureReceipt({ outboxDir: dir, forwardKey: key }).ok, true, "恢复后回执受验读通过");
+  // 写入口自己先做受验恢复：把 tmp 重新造出来（同 inode nlink=2）→ append 不报 residue，先恢复再按 EEXIST 判重。
+  fs.linkSync(file, tmp);
+  const w2 = r58AppendReceipt({ outboxDir: dir, forwardKey: key, category: "session_error", messageId: "om_v1", targetGenerationId: "gen-1", resultSha256: R58_SHA });
+  assert.equal(w2.ok, false, "同 key 重放仍不许写第二条：" + JSON.stringify(w2));
+  assert.equal(w2.reason, "duplicate", "写入口先恢复再判重，不折成 residue");
+  assert.equal(fs.existsSync(tmp), false, "写入口的受验恢复把 tmp 清了");
+  assert.equal(fs.lstatSync(file).nlink, 1, "写入口恢复后 nlink=1");
+  // ③ 异 inode 候选：final 在位 + 另一份独立写下的候选 → residue 列出、两者都不删。
+  const key3 = r54Key(61);
+  const w3 = r58AppendReceipt({ outboxDir: dir, forwardKey: key3, category: "session_error", messageId: "om_v3", targetGenerationId: "gen-1", resultSha256: R58_SHA });
+  assert.equal(w3.ok, true, JSON.stringify(w3));
+  const file3 = path.join(dir, key3 + R58_RECEIPT_SUFFIX);
+  const tmp3 = path.join(dir, r58TmpName(key3, 2));
+  fs.writeFileSync(tmp3, JSON.stringify(r58ReceiptDoc(key3), null, 2) + "\n", { mode: 0o600 });
+  const rec3 = outboxModule.recoverForwardReceiptTmp({ outboxDir: dir, forwardKey: key3 });
+  assert.equal(rec3.ok, false, "异 inode 候选 → 非绿：" + JSON.stringify(rec3));
+  assert.equal(rec3.reason, "residue", "reason 为 residue");
+  assert.ok(Array.isArray(rec3.residue) && rec3.residue.includes(tmp3), "residue 含路径：" + JSON.stringify(rec3.residue));
+  assert.equal(fs.existsSync(tmp3), true, "异 inode 候选不删");
+  assert.equal(fs.lstatSync(file3).nlink, 1, "final 不动");
+  // ④ 多硬链接（nlink≠1）的规范回执文件 → 受验读拒（旧版裸 readFileSync 会当合法）。
+  const key4 = r54Key(62);
+  const w4 = r58AppendReceipt({ outboxDir: dir, forwardKey: key4, category: "session_error", messageId: "om_v4", targetGenerationId: "gen-1", resultSha256: R58_SHA });
+  assert.equal(w4.ok, true, JSON.stringify(w4));
+  const file4 = path.join(dir, key4 + R58_RECEIPT_SUFFIX);
+  const extra4 = path.join(local, "extra-hardlink.json");
+  fs.linkSync(file4, extra4);
+  const r4 = outboxModule.readForwardFailureReceipt({ outboxDir: dir, forwardKey: key4 });
+  assert.notEqual(r4.ok, true, "nlink=2 的回执不许当合法：" + JSON.stringify(r4));
+  assert.match(String(r4.why), /硬链接/u, "why 点名硬链接数：" + r4.why);
+});
+
+test("R58 返修二 P1-2：kind=forward_failed 必须落在规范文件名——自洽记录放 arbitrary.json → audit unexplainable 点名文件名、快照与发布器都不收", () => {
+  const p = r58Project("p12");
+  const key = r54Key(70);
+  // **只坏文件名**：id / event_key / forward_key 三者互相自洽，唯一缺陷是它不叫 <key>.forward-failed.outbox.json。
+  fs.writeFileSync(path.join(p.outbox, "arbitrary.json"), JSON.stringify(r58ReceiptDoc(key), null, 2) + "\n", { mode: 0o600 });
+  const snap = outboxModule.readOutboxSnapshot(p.outbox);
+  assert.equal(snap.records.length, 0, "快照不收非规范文件名的回执：" + JSON.stringify(snap.records.map((r) => path.basename(String(r._file)))));
+  const audit = outboxModule.auditOutbox(p.outbox);
+  const bad = audit.unexplainable.find((u) => u.file === "arbitrary.json");
+  assert.ok(bad, "unexplainable 点名 arbitrary.json：" + JSON.stringify(audit.unexplainable));
+  assert.match(bad.why, /文件名/u, "why 点名文件名：" + bad.why);
+  const d = drainProject({ root: p.root, dryRun: true });
+  assert.equal(d.status, "error", "发布 dry-run fail-closed：" + JSON.stringify({ status: d.status, reason: d.reason }));
+  assert.equal(d.reason, "outbox_unexplainable", "reason 为 outbox_unexplainable：" + JSON.stringify(d));
+  assert.equal(d.count ?? 0, 0, "dry-run count=0（不收进发布队列）");
+});
+
+test("R58 返修二 P1-3：doctor 核回执↔result 证据链——result_sha256 与受验读到的 result 内容不符 → 不算有回执、点名", () => {
+  const m = doctorMachine();
+  const root = m.project("r58sha", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58sha", root, root_message_id: "om_r58sha", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const obProj = path.join(root, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(obProj, { recursive: true });
+  const key = r54Key(41);
+  const body = r58FailedBody(key, "API Error: 400 x", ".runtime-data/outbound/outbox");
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), body, { mode: 0o600 });
+  const file = path.join(obProj, key + R58_RECEIPT_SUFFIX);
+  // ① 任意 64hex 冒充：与 result 内容不符 → 不算有回执 → 点名
+  fs.writeFileSync(file, JSON.stringify(r58ReceiptDoc(key, { result_sha256: R58_SHA }), null, 2) + "\n", { mode: 0o600 });
+  const c1 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c1.ok, false, "有失败仍然红：" + c1.detail);
+  assert.match(c1.detail, /失败无回执 1：00000041/u, "冒充 sha → 不算有回执并点名：" + c1.detail);
+  // ② 同一 key 的 result 被重写后拿旧回执 → 旧 sha 不再对得上 → 仍然不算有
+  fs.writeFileSync(file, JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
+  const c2 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.doesNotMatch(c2.detail, /失败无回执/u, "② 夹具自证：sha 对得上时不算缺回执：" + c2.detail);
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), r58FailedBody(key, "API Error: 400 x 重写", ".runtime-data/outbound/outbox"), { mode: 0o600 });
+  const c3 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c3.detail, /失败无回执 1：00000041/u, "③ result 重写后旧回执不算有：" + c3.detail);
+});
+
+test("R58 返修二 P1-3：发布器挑选时核回执↔result——result_sha256 不符 → 不发（独立 reason）；相符 → 正常进队列", () => {
+  const p = r58Project("p13");
+  const key = r54Key(42);
+  const body = r58FailedBody(key, "API Error: 400 y", p.rel);
+  fs.writeFileSync(path.join(p.runsDir, key + ".forward.result.json"), body, { mode: 0o600 });
+  const file = path.join(p.outbox, key + R58_RECEIPT_SUFFIX);
+  fs.writeFileSync(file, JSON.stringify(r58ReceiptDoc(key, { result_sha256: R58_SHA }), null, 2) + "\n", { mode: 0o600 });
+  const bad = drainProject({ root: p.root, dryRun: true });
+  assert.equal(bad.status, "error", "sha 不符不许发布：" + JSON.stringify({ status: bad.status, reason: bad.reason }));
+  assert.equal(bad.reason, "receipt_result_mismatch", "独立 reason receipt_result_mismatch：" + JSON.stringify(bad));
+  assert.equal(bad.count ?? 0, 0, "不符的回执不被挑选");
+  // 控制：受验读到的 result 内容 sha 写进回执 → 正常进队列
+  fs.writeFileSync(file, JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
+  const ok = drainProject({ root: p.root, dryRun: true });
+  assert.equal(ok.status, "dry_run", "对得上就照发：" + JSON.stringify({ status: ok.status, reason: ok.reason }));
+  assert.equal(ok.count, 1, "受验核过的回执进队列");
+});
+
+test("R58 返修二 P1-3：result 目录 fsync 失败 → 不建回执（没写成＝没写成），诊断进 stderr.log", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58df-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj, { recursive: true }); fs.mkdirSync(runs, { recursive: true });
+  // 目录 fsync 一律 EIO；runner 是**独立进程**，所以用 NODE_OPTIONS --require 注入（不改产品代码）。
+  const hook = path.join(local, "dir-fsync-fail.cjs");
+  fs.writeFileSync(hook, [
+    "const fs = require('node:fs');",
+    "const orig = fs.fsyncSync;",
+    "fs.fsyncSync = function (fd) {",
+    "  let isDir = false;",
+    "  try { isDir = fs.fstatSync(fd).isDirectory(); } catch { /* 已闭 */ }",
+    "  if (isDir) { const e = new Error('EIO: i/o error'); e.code = 'EIO'; throw e; }",
+    "  return orig.call(fs, fd);",
+    "};",
+  ].join("\n") + "\n");
+  const outbox = path.join(proj, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(outbox, { recursive: true });
+  const key = r54Key(43);
+  const errBody = "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 boom', num_turns: 1, duration_ms: 2500 }) + '\\n');";
+  fs.writeFileSync(path.join(bin, "claude"), r54Shim(null, errBody), { mode: 0o700 });
+  deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key, outboxDir: outbox, originGenerationId: "gen-r58",
+    env: { PATH: bin + path.delimiter + process.env.PATH, NODE_OPTIONS: "--require " + hook },
+  });
+  const errPath = path.join(runs, key + ".forward.stderr.log");
+  const resultPath = path.join(runs, key + ".forward.result.json");
+  // 等到 result 真的落盘（说明已经走到收口那一步）再看回执在不在。
+  const deadline = Date.now() + 8000;
+  while (!fs.existsSync(resultPath) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  assert.equal(fs.existsSync(resultPath), true, "result 本体已 rename 落盘（只是持久性不确定）");
+  const settle = Date.now() + 500;
+  while (Date.now() < settle) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  assert.equal(fs.existsSync(path.join(outbox, key + R58_RECEIPT_SUFFIX)), false, "目录 fsync 失败 → 没有回执");
+  assert.match(fs.readFileSync(errPath, "utf-8"), /目录 fsync 失败/u, "诊断进 stderr.log：" + fs.readFileSync(errPath, "utf-8"));
+});
+
+test("R58 返修二 P1-4：outbox_dir 必须是规范的项目内相对路径——越界形状进 forwardResultProblem；doctor 遇越界归 unclear 不去读", () => {
+  const now = Date.now();
+  const root = path.join(fs.realpathSync(os.tmpdir()), "r58p14-root");
+  const good = r54FullResult(r54Key(50), { finished_at: new Date(now).toISOString() });
+  const withOutbox = (v) => ({ ...good, outbox_dir: v });
+  assert.equal(FORWARD_RESULT_PROBLEM(withOutbox(".runtime-data/outbound/outbox"), { now, projectRoot: root }), null, "规范相对路径通过");
+  assert.equal(FORWARD_RESULT_PROBLEM(withOutbox(null), { now, projectRoot: root }), null, "null 仍合法（旧版无落点记录）");
+  for (const bad of ["../../elsewhere", "/abs/path", "..", "a/../../b", "foo/../bar", "./x", ".", "", "a/.."]) {
+    assert.notEqual(FORWARD_RESULT_PROBLEM(withOutbox(bad), { now, projectRoot: root }), null, "越界/不规范形状拒：" + JSON.stringify(bad));
+  }
+  const m = doctorMachine();
+  const projRoot = m.project("r58p14", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58p14", root: projRoot, root_message_id: "om_r58p14", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(projRoot, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const key = r54Key(51);
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), r58FailedBody(key, "API Error: 400 q", "../../elsewhere"), { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c.ok, false, "越界 result 仍然红：" + c.detail);
+  assert.match(c.detail, /查不清/u, "越界落点归查不清：" + c.detail);
+  assert.match(c.detail, /outbox_dir|越界/u, "点名 outbox_dir 越界：" + c.detail);
+  assert.doesNotMatch(c.detail, /失败无回执/u, "越界不冒充核对过（不报缺回执）：" + c.detail);
+});
+
+test("R58 返修二 P2：doctor ⑯ 回执核对两个存活变异各有独立行为钉——坏 JSON / 不合法不算有；目录读失败归查不清", () => {
+  const m = doctorMachine();
+  const root = m.project("r58p2", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58p2", root, root_message_id: "om_r58p2", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const obProj = path.join(root, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(obProj, { recursive: true });
+  const sha = (key) => r58ShaOf(r58FailedBody(key, "API Error: 400 r", ".runtime-data/outbound/outbox"));
+  // ① 半截 JSON：不算有回执（不许当有）
+  const k1 = r54Key(44);
+  fs.writeFileSync(path.join(runsDir, k1 + ".forward.result.json"), r58FailedBody(k1, "API Error: 400 r", ".runtime-data/outbound/outbox"), { mode: 0o600 });
+  fs.writeFileSync(path.join(obProj, k1 + R58_RECEIPT_SUFFIX), "{", { mode: 0o600 });
+  // ② 完整 JSON 但不合法（多一个键）：同样不算有回执
+  const k2 = r54Key(45);
+  fs.writeFileSync(path.join(runsDir, k2 + ".forward.result.json"), r58FailedBody(k2, "API Error: 400 r", ".runtime-data/outbound/outbox"), { mode: 0o600 });
+  fs.writeFileSync(path.join(obProj, k2 + R58_RECEIPT_SUFFIX), JSON.stringify({ ...r58ReceiptDoc(k2, { result_sha256: sha(k2) }), extra: 1 }), { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.match(c.detail, /失败无回执 2：00000044、00000045/u, "坏 JSON 与不合法都不算有回执并点名：" + c.detail);
+  // ③ 落点存在但对它做不了受验读（路径是普通文件 → ENOTDIR）→ 归查不清，不冒充核对过
+  const m2 = doctorMachine();
+  const root2 = m2.project("r58p2b", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m2.writeTables({ projects: [{ id: "r58p2b", root: root2, root_message_id: "om_r58p2b", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir2 = path.join(root2, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir2, { recursive: true });
+  const notADir = path.join(root2, ".runtime-data", "outbound", "not-a-dir");
+  fs.mkdirSync(path.dirname(notADir), { recursive: true });
+  fs.writeFileSync(notADir, "我是文件，不是目录\n", { mode: 0o600 });
+  const k3 = r54Key(46);
+  fs.writeFileSync(path.join(runsDir2, k3 + ".forward.result.json"), r58FailedBody(k3, "API Error: 400 s", ".runtime-data/outbound/not-a-dir"), { mode: 0o600 });
+  const c2 = checkOf(doctorReport(m2.run()), "inbound_forward_result");
+  assert.match(c2.detail, /查不清/u, "目录读失败归查不清：" + c2.detail);
+  assert.match(c2.detail, /失败回执核对不了/u, "why 说不能核对：" + c2.detail);
+  assert.doesNotMatch(c2.detail, /失败无回执/u, "读不出 ≠ 没有（不冒充核对过）：" + c2.detail);
+});
+
+test("R58 返修二 P2：spawn 异步 error 归 spawn_failed（按结构化 subtype/origin 分类，不靠 reason 首行）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58sp-"));
+  const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
+  fs.mkdirSync(bin); fs.mkdirSync(proj, { recursive: true }); fs.mkdirSync(runs, { recursive: true });
+  const outbox = path.join(proj, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(outbox, { recursive: true });
+  const key = r54Key(47);
+  // resolveOnPath 只看「是不是可执行文件」；解释器不存在 → spawn 成功、随即 error 事件（起不来）。
+  fs.writeFileSync(path.join(bin, "claude"), "#!/nonexistent/interp\n", { mode: 0o700 });
+  deliverToLiveSession({
+    target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+    instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
+    projectRoot: proj, runsDir: runs, key, outboxDir: outbox, originGenerationId: "gen-r58",
+    env: { PATH: bin + path.delimiter + process.env.PATH },
+  });
+  const r47 = r54WaitResult(path.join(runs, key + ".forward.result.json"));
+  assert.ok(r47 && r47.sent === false, "夹具自证：这次转发是失败：" + JSON.stringify(r47));
+  assert.equal(r47.subtype, "spawn_error", "异步 spawn error 的结构化 subtype 是 spawn_error：" + JSON.stringify(r47));
+  const d47 = r58WaitReceipt(path.join(outbox, key + R58_RECEIPT_SUFFIX));
+  assert.ok(d47, "失败后有回执");
+  assert.equal(d47.text, outboxModule.FORWARD_FAILURE_TEXT.spawn_failed, "类别归 spawn_failed（不靠 reason 首行）：" + JSON.stringify(d47.text));
 });
 
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──

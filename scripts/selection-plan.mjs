@@ -82,7 +82,18 @@ export function selectionPlanProblem(plan, key) {
   // osh / orh：action/basis 封闭 + cas 按 action 封闭键集（键集封闭由 keysOf 保证；值形状逐键核）。
   if (plan.kind === "osh" && plan.action !== "activate" && plan.action !== "anchor") return "osh 的 action 是 activate/anchor";
   if (plan.kind === "orh" && plan.action !== "rebind") return "orh 的 action 是 rebind";
-  if (plan.basis !== "explicit_handle" && plan.basis !== "resolved") return "basis 是 explicit_handle/resolved";
+  // P1-A（返修五）：basis 按 kind/action 封闭 —— 解析器（select-resolve.mjs SELECTION_BASES）只产出
+  //   explicit_handle / unique_candidate / rebind：activate/anchor 认前两个（显式 osh → explicit_handle；
+  //   省略 handle 的唯一候选 → unique_candidate），rebind 只认 rebind。旧码认的是 `explicit_handle|resolved`：
+  //   resolved 根本不存在（合法省略 osh 反而被拒 → 合法路径不可达），而 rebind 支的真实值同样被拒。
+  const basisOk = plan.action === "rebind"
+    ? plan.basis === "rebind"
+    : (plan.basis === "explicit_handle" || plan.basis === "unique_candidate");
+  if (!basisOk) {
+    return plan.action === "rebind"
+      ? "rebind 支的 basis 必须是 rebind（当前 " + String(plan.basis) + "）"
+      : plan.action + " 支的 basis 是 explicit_handle/unique_candidate（当前 " + String(plan.basis) + "）";
+  }
   if (!isObj(cas) || keysOf(cas) !== PLAN_CAS_KEYS[plan.action]) return "cas 键集不对（" + plan.action + "）";
   for (const [k, v] of Object.entries(cas)) {
     if (v === null || typeof v !== "string" || v.length === 0) return "cas." + k + " 须非空字符串";

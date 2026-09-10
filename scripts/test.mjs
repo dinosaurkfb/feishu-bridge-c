@@ -46224,7 +46224,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.notEqual(SP.selectionPlanProblem({ ...plan1, action: "activate", basis: "rebind" }, keyA), null, "④ activate + rebind basis 拒");
     assert.notEqual(SP.selectionPlanProblem({ ...plan2, basis: "explicit_handle" }, keyB), null, "④ rebind + explicit_handle 拒");
     assert.notEqual(SP.selectionPlanProblem({ ...plan1, action: "rebind" }, keyA), null, "④ osh 写 rebind 动作拒");
-    assert.equal(SP.selectionPlanProblem({ ...plan1, action: "activate", basis: "explicit_handle" }, keyA), null, "④ activate + explicit_handle 合法");
+    assert.equal(SP.selectionPlanProblem({ ...plan1, action: "activate", basis: "explicit_handle", cas: { selected_session_id: plan1.cas.selected_session_id, selected_root_om: plan1.cas.selected_root_om, selection_handle: plan1.cas.expected_handle } }, keyA), null, "④ activate + explicit_handle 合法（只换 action 与 cas 键集，不换 basis 值域）");
   }));
 
   test("R57d 返修五 P1-C：修复收口统一逐字核 plan↔op（basis/session/handle 漂移 → unverifiable）+ 前向补不 clean 不闭合", () => withLedgerD((root, dir, ids) => {

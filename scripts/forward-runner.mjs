@@ -17,7 +17,11 @@
  * 再 fsync 目录；失败清自己建的 tmp，诊断记一行到 stderr.log，绝不抛。读回 jsonl 只读
  * 末尾 256 KiB（超大文件不整读）。
  *
- * 结果文件是「跑完的事实」，不是回执：给不给 Frank 发失败回执要单独授权（另单），这里只落盘。
+ * 结果文件是「跑完的事实」；明确失败（is_error / 非零退出 / 起不来 → sent ≠ true）时，
+ * runner 再写一条 outbox 回执项 kind=forward_failed（R58，issue #140 后半；Frank
+ * 2026-09-10 已预授权这类自动写入），让 owner 知道那条消息没送达 —— 发布走既有
+ * 出站发布器（同一身份、同一话题选择规则），本模块不新增任何发送代码。成功不写；
+ * 超时（started 有、result 无）语义不变，仍归 doctor ⑯ 的「结果缺失」，不发回执。
  */
 
 import { spawn } from "node:child_process";
@@ -27,7 +31,9 @@ import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
+import { appendForwardFailureReceipt } from "./outbox.mjs";
 import { ROLE_ENV } from "./live-session.mjs";
+import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 
 export const FORWARD_RESULT_SCHEMA = "forward_result_v1";
 export const FORWARD_STARTED_SCHEMA = "forward_started_v1";
@@ -38,8 +44,11 @@ export const FORWARD_KEY_RE = /^[0-9a-f]{64}$/u;
 const RUNNER_STARTED_AT = new Date().toISOString();
 
 /** result.json 键集（封闭）：写端投影与读端校验共用这一份。 */
-const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,final_text_sha256,finished_at,is_error,key,model,num_turns,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
+const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,final_text_sha256,finished_at,is_error,key,model,num_turns,outbox_dir,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
 const STARTED_KEYS = "claude_pid,key,runner_pid,runner_start_at,started_at,schema".split(",").sort().join(",");
+/** result 文件的封闭后缀（回执证据链按 <key> + 它取文件）。 */
+export const FORWARD_RESULT_SUFFIX = ".forward.result.json";
+const RESULT_MAX_BYTES = 64 * 1024;
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
@@ -63,7 +72,7 @@ const strOrNull = (v, cap) => (v === null ? true : typeof v === "string" && v.le
  * result.json 的唯一封闭校验器（#141 P1-2）：写端落盘前自校验、doctor 读端共用。
  * problem 非空 → 写端不落盘 / 读端按查不清点名。
  */
-export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null } = {}) {
+export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null, projectRoot = null } = {}) {
   if (!isObj(doc)) return "result 文档不是对象";
   if (keysOf(doc) !== RESULT_KEYS) return "result 字段集不对";
   if (doc.schema !== FORWARD_RESULT_SCHEMA) return "schema 不认识: " + String(doc.schema);
@@ -91,7 +100,57 @@ export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null
   if (!isCanonicalIso(doc.finished_at)) return "finished_at 不是规范化 ISO";
   if (Date.parse(doc.finished_at) > now + 60_000) return "finished_at 晚于写入时刻 +60s";
   if (doc.claude_path !== null && typeof doc.claude_path !== "string") return "claude_path 形状不对";
+  if (doc.outbox_dir !== null) {
+    // P1-4：outbox_dir 必须是**规范的项目内相对路径**。旧版只拦了绝对路径，于是 "../../elsewhere" 过得了自校验，
+    // doctor 又直接 path.join(rootDir, outboxDirRel) 把它拼到项目外去读。四条形状判据（拒绝对、拒 .. 段、
+    // normalize 不动点）住在这里（写端自证与 doctor 共用一份）；给了 projectRoot 时另做 containment 双向核
+    //（path.resolve(root, rel) 必须落在 root + sep 开头）。
+    if (typeof doc.outbox_dir !== "string" || doc.outbox_dir.length === 0) return "outbox_dir 形状不对（须项目内相对路径或 null）";
+    if (doc.outbox_dir.startsWith("/")) return "outbox_dir 不许是绝对路径（须项目内相对路径）";
+    if (doc.outbox_dir.split("/").includes("..")) return "outbox_dir 不许含 .. 段（越界到项目根外）";
+    if (path.normalize(doc.outbox_dir) !== doc.outbox_dir) return "outbox_dir 不是规范相对路径（normalize 后变了：" + path.normalize(doc.outbox_dir) + "）：" + doc.outbox_dir;
+    if (typeof projectRoot === "string" && projectRoot.length > 0) {
+      const resolved = path.resolve(projectRoot, doc.outbox_dir);
+      if (!resolved.startsWith(projectRoot + path.sep)) return "outbox_dir 越界（" + resolved + " 不在 " + projectRoot + " 内）";
+    }
+  }
   return null;
+}
+
+/**
+ * 回执↔result 的**唯一**证据链判据（P1-3）：发布器挑选时与 doctor 共用这一份。
+ * 回执里的 result_sha256 必须等于该 key 受验读到的 result 内容 sha256 —— 旧版只验 64hex 形状，
+ * 任意 64hex 都能冒充；result 重写后旧回执也照样算“有”。
+ * 返回 null（对得上 / 不是回执）或问题短句。
+ */
+export function forwardReceiptResultProblem(record, resultSha256) {
+  if (record?.kind !== "forward_failed") return null;
+  if (typeof resultSha256 !== "string" || !FORWARD_KEY_RE.test(resultSha256)) return "该 key 的 result 内容摘要不可得（受验读不通过）";
+  if (record.result_sha256 !== resultSha256) {
+    return "回执与 result 不符（result_sha256 " + String(record.result_sha256).slice(0, 12) + "… ≠ 受验 result " + resultSha256.slice(0, 12) + "…）";
+  }
+  return null;
+}
+
+/**
+ * 发布器挑选时用的证据核对器（P1-3）：对 forward_failed 记录，**受验读**该 key 的 result
+ *（fd 绑定 + 封闭校验 + 同 fd sha256）再与回执的 result_sha256 逐字比。
+ * 返回一个 (record) => null|string ；非 forward_failed 记录一律返 null（不归它管）。
+ */
+export function forwardReceiptEvidenceReader({ runsDir, maxBytes = RESULT_MAX_BYTES }) {
+  return (record) => {
+    if (record?.kind !== "forward_failed") return null;
+    const key = record.forward_key;
+    if (typeof key !== "string" || !FORWARD_KEY_RE.test(key)) return "回执的 forward_key 形状不对（无法定位 result）";
+    if (typeof runsDir !== "string" || runsDir.length === 0) return "runs 目录不可用（无法定位 result）";
+    const v = readVerifiedDoc({
+      file: path.join(runsDir, key + FORWARD_RESULT_SUFFIX),
+      docValidator: (doc) => forwardResultProblem(doc, { now: Date.now(), expectedKey: key }),
+      maxBytes,
+    });
+    if (v.ok !== true) return "该 key 的 result 读不出或不合规（" + (v.absent ? "result 缺席" : String(v.problem ?? "读不出")) + "）";
+    return forwardReceiptResultProblem(record, v.sha256);
+  };
 }
 
 /** started.json 的封闭校验器（#141 P1-4）。 */
@@ -140,15 +199,20 @@ function parseRunLines(lines) {
  *              且 is_error=false 且 exit_code=0（#141 P1-2：不从 assistant 文本补造）；
  *   result 报错（#140 的 400）→ is_error=true，reason_first_line 取错误文本第一行；
  *   崩溃     → 无 result 行（进程起不来 / 秒退 / jsonl 只有半截行）→ is_error=true、
- *              subtype="crash"、duration_ms 用 wall clock（#140 里那 2–4 秒本身就是证据）。
+ *              subtype="crash"、duration_ms 用 wall clock（#140 里那 2–4 秒本身就是证据）；
+ *   起不来   → 同步（PATH 上找不到 claude）subtype="claude_not_found"；异步（spawn 成功但 exec 失败，
+ *              如解释器缺失）subtype="spawn_error"（R58 返修二 P2：失败类别按**结构化 subtype** 分，
+ *              不再只看 reason_first_line 那一条字符串）。
  */
-function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false }) {
+function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false, spawnError = false }) {
   const { resultLine, initLine } = parseRunLines(lines);
   const malformed = resultLine !== null && resultLineProblem(resultLine) !== null; // #141 二轮 P1-1：坏形状绝不进成功公式
-  const crashed = !notFound && resultLine === null;
+  const crashed = !notFound && !spawnError && resultLine === null;
   const resultText = !malformed && resultLine !== null && typeof resultLine.result === "string" ? resultLine.result : "";
-  const is_error = notFound || crashed || malformed || resultLine.is_error === true;
+  // resultLine 为 null 时不许读它的字段（起不来 / 崩溃两条路径）——短路判据要显式。
+  const is_error = notFound || spawnError || crashed || malformed || (resultLine !== null && resultLine.is_error === true);
   const reason_first_line = notFound ? "claude_not_found"
+    : spawnError ? "spawn_error"
     : malformed ? "malformed_result"
     : crashed ? "no_result_line" + (exitCode === null ? "" : "(exit=" + exitCode + ")")
     : resultText.split("\n", 1)[0];
@@ -159,10 +223,10 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     pid,
     exit_code: exitCode,
     is_error,
-    subtype: notFound ? "claude_not_found" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
-    num_turns: crashed || notFound || malformed || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
+    subtype: notFound ? "claude_not_found" : spawnError ? "spawn_error" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
+    num_turns: crashed || notFound || spawnError || malformed || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
     duration_ms: notFound ? null
-      : crashed ? Math.max(0, finishedAt - startedAt)
+      : (crashed || spawnError) ? Math.max(0, finishedAt - startedAt)
       : (malformed || !Number.isFinite(resultLine.duration_ms)) ? null : resultLine.duration_ms,
     claude_code_version: initLine?.claude_code_version ?? initLine?.version ?? null,
     model: initLine?.model ?? resultLine?.model ?? null,
@@ -171,6 +235,7 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     final_text_sha256: sha256Hex(resultText), // 源最终文本的 SHA（#141 三轮 P1-4：sent=true 时必须 === sha256("sent")）
     finished_at: new Date(finishedAt).toISOString(),
     claude_path: claudePath,
+    outbox_dir: (typeof spec.outboxDir === "string" && typeof spec.projectRoot === "string") ? path.relative(spec.projectRoot, spec.outboxDir) : null,
   };
 }
 
@@ -197,12 +262,12 @@ function fsyncDirOf(dir) {
  */
 function writeDocFile(targetPath, errPath, doc, maxBytes) {
   const bytes = Buffer.from(JSON.stringify(doc, null, 2) + "\n", "utf-8");
-  if (bytes.length > maxBytes) { noteErr(errPath, "result 超过大小上限（" + bytes.length + "），不落盘"); return; }
+  if (bytes.length > maxBytes) { noteErr(errPath, "result 超过大小上限（" + bytes.length + "），不落盘"); return { ok: false }; }
   try {
     try {
-      if (fs.lstatSync(targetPath).isSymbolicLink()) { noteErr(errPath, "目标已是符号链接，不跟随不覆盖：" + targetPath); return; }
+      if (fs.lstatSync(targetPath).isSymbolicLink()) { noteErr(errPath, "目标已是符号链接，不跟随不覆盖：" + targetPath); return { ok: false }; }
     } catch (err) {
-      if (err?.code !== "ENOENT") { noteErr(errPath, "目标 lstat 失败（" + String(err?.code ?? err?.message ?? err) + "），停止写入：" + targetPath); return; } // #141 三轮 P2-5：只有 ENOENT 算缺席
+      if (err?.code !== "ENOENT") { noteErr(errPath, "目标 lstat 失败（" + String(err?.code ?? err?.message ?? err) + "），停止写入：" + targetPath); return { ok: false }; } // #141 三轮 P2-5：只有 ENOENT 算缺席
     }
     const tmp = targetPath + ".tmp." + process.pid;
     let fd = null;
@@ -211,7 +276,6 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
       fs.writeFileSync(fd, bytes);
       fs.fsyncSync(fd);
     } catch (err) {
-      // rename 之前失败：清自己建的 tmp（#141 二轮 P2-5），再上抛走统一记診断
       try { fs.rmSync(tmp, { force: true }); } catch { /* 清不掉就留着交盘点 */ }
       throw err;
     }
@@ -225,12 +289,19 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
     const back = fs.readFileSync(targetPath);
     if (crypto.createHash("sha256").update(back).digest("hex") !== crypto.createHash("sha256").update(bytes).digest("hex")) {
       noteErr(errPath, "落盘读回 SHA 不等：" + targetPath);
-      return;
+      return { ok: false };
     }
     const dirErr = fsyncDirOf(path.dirname(targetPath));
-    if (dirErr !== null) noteErr(errPath, "目录 fsync 失败（" + dirErr + "）：" + path.dirname(targetPath));
+    // P1-3：目录 fsync 失败 = **没写成**（rename 落了但目录项不持久）。旧版只记一行日志仍返 ok:true，
+    // 于是 result 实际上可能丢、回执却已经发出去了。现在 ok:false —— 调用方不建回执（P1-5 gating）。
+    if (dirErr !== null) {
+      noteErr(errPath, "目录 fsync 失败（" + dirErr + "）：" + path.dirname(targetPath));
+      return { ok: false, sha256: null };
+    }
+    return { ok: true, sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
   } catch (err) {
     noteErr(errPath, String(err?.code ?? err?.message ?? err).slice(0, 200));
+    return { ok: false };
   }
 }
 
@@ -239,10 +310,55 @@ function noteErr(errPath, line) {
 }
 
 /** 写端自校验（#141 P1-2）：problem 非空 → 不落盘、记 stderr.log。 */
-function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expectedKey) {
-  const problem = problemFn(doc, { now: Date.now(), expectedKey });
-  if (problem !== null) { noteErr(errPath, "自校验失败不落盘（" + path.basename(targetPath) + "）：" + problem); return; }
-  writeDocFile(targetPath, errPath, doc, maxBytes);
+function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expectedKey, projectRoot = null) {
+  const problem = problemFn(doc, { now: Date.now(), expectedKey, projectRoot });
+  if (problem !== null) { noteErr(errPath, "自校验失败不落盘（" + path.basename(targetPath) + "）：" + problem); return { ok: false }; }
+  return writeDocFile(targetPath, errPath, doc, maxBytes);
+}
+
+/**
+ * 失败 → outbox 回执（R58）。判据只有一条：result 投影 sent !== true（doctor ⑯ 的红
+ * 同源 —— is_error / 非零退出 / 崩溃 / 起不来全都落在这里，回执与体检不打架）。
+ * 未给 outboxDir 的调用方（旧 spec / 不想测回执的路径）跳过，由 doctor ⑯ 点名回执缺失。
+ * 幂等靠回执原语里的 O_EXCL；写不成记一行 stderr.log，绝不抛（runner 纪律）。
+ */
+/**
+ * 失败类别（P1-4 + 返修二 P2）：结果投影 → 封闭四类之一。reason_first_line 只留在本地 result，不进回执正文。
+ * **按结构化 subtype 分**：起不来的两条路（同步 claude_not_found / 异步 spawn_error）都归 spawn_failed。
+ * 旧版只认 reason_first_line === "claude_not_found" 这一条字符串，于是异步 spawn error（进程起来了、
+ * exec 失败）被折成 session_error —— owner 收到的说法与事实不符。
+ */
+function failureCategory(doc) {
+  if (doc.sent === true) return null;
+  if (doc.subtype === "claude_not_found" || doc.subtype === "spawn_error") return "spawn_failed";
+  if (doc.is_error === true) return "session_error";
+  if (doc.exit_code !== null && doc.exit_code !== 0) return "exit_nonzero";
+  return "unknown";
+}
+
+function writeFailureReceipt({ spec, doc, errPath, resultSha256 }) {
+  if (doc.sent === true) return; // 成功不写；失败 = is_error / 非零退出 / 崩溃 / 起不来（sent 必为 false）
+  if (typeof spec.outboxDir !== "string" || spec.outboxDir.length === 0) return;
+  const r = appendForwardFailureReceipt({
+    outboxDir: spec.outboxDir,
+    forwardKey: spec.key,
+    category: failureCategory(doc),
+    messageId: spec.messageId ?? null,
+    targetGenerationId: spec.originGenerationId ?? null,
+    resultSha256,
+  });
+  // duplicate = 同 key 的回执已经在（重放）：正是想要的结果，不算失败。
+  if (!r.ok && r.reason !== "duplicate") {
+    noteErr(errPath, "失败回执没写成（" + r.reason + (r.error ? "：" + r.error : "") + "）");
+  }
+}
+
+/** result 落盘后紧跟回执判断 —— 三个结局路径共用这一份，不另抄。 */
+function writeResultAndMaybeReceipt(resultPath, errPath, doc, spec) {
+  // P1-4：写端也带 projectRoot 做 containment 双向核（与 doctor 同一份判据）。
+  const w = writeValidatedDoc(resultPath, errPath, doc, forwardResultProblem, 64 * 1024, spec.key, spec.projectRoot ?? null);
+  // P1-5：只有 result 受验写成（写回 + fsync + 读回）之后才创建回执；result 写失败 → 不写回执（记 stderr.log）。
+  if (w && w.ok === true) writeFailureReceipt({ spec, doc, errPath, resultSha256: w.sha256 });
 }
 
 /** 有界读：只取文件末尾 256 KiB（O_NOFOLLOW 打开、同 fd fstat），逐行 JSON 解析，坏行跳过。 */
@@ -279,9 +395,9 @@ function runForwardRunner(spec) {
 
   const claudePath = resolveOnPath("claude", process.env.PATH);
   if (claudePath === null) {
-    writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, startedAt: Date.now(), finishedAt: Date.now(), notFound: true,
-    }), forwardResultProblem, 64 * 1024, spec.key);
+    }), spec);
     return;
   }
 
@@ -300,9 +416,9 @@ function runForwardRunner(spec) {
     );
   } catch {
     // spawn 同步抛（罕见：参数形不对）：也按 crash 落盘，不许 runner 崩了不写结果
-    writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, lines: readJsonlLines(jsonlPath), claudePath, startedAt, finishedAt: Date.now(),
-    }), forwardResultProblem, 64 * 1024, spec.key);
+    }), spec);
     return;
   } finally {
     fs.closeSync(out);
@@ -316,16 +432,17 @@ function runForwardRunner(spec) {
 
   let done = false;
   const keepalive = setInterval(() => {}, 60_000);
-  const finish = (exitCode) => {
+  const finish = (exitCode, spawnError = false) => {
     if (done) return; // spawn 失败时 error 与 close 可能都来：结果只写一份
     done = true;
     clearInterval(keepalive);
-    writeValidatedDoc(resultPath, errPath, summarizeForwardRun({
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, pid: child.pid, exitCode, lines: readJsonlLines(jsonlPath),
-      claudePath, startedAt, finishedAt: Date.now(),
-    }), forwardResultProblem, 64 * 1024, spec.key);
+      claudePath, startedAt, finishedAt: Date.now(), spawnError,
+    }), spec);
   };
-  child.on("error", () => finish(null));
+  // 异步 spawn error（进程没起来：解释器缺失 / EACCES / ENOEXEC）→ 结构化 subtype=spawn_error（P2）。
+  child.on("error", () => finish(null, true));
   child.on("close", (code) => finish(Number.isFinite(code) ? code : null));
 }
 
@@ -335,7 +452,11 @@ if (isDirectRun(import.meta.url)) {
   const bad = !spec || typeof spec !== "object"
     || typeof spec.key !== "string" || !FORWARD_KEY_RE.test(spec.key)
     || typeof spec.runsDir !== "string" || typeof spec.projectRoot !== "string"
-    || typeof spec.targetName !== "string" || typeof spec.prompt !== "string";
+    || typeof spec.targetName !== "string" || typeof spec.prompt !== "string"
+    // R58 可选字段：给了就必须成形（outboxDir 要拿去写文件， messageId/代际进回执记录）
+    || (spec.outboxDir !== undefined && (typeof spec.outboxDir !== "string" || !path.isAbsolute(spec.outboxDir)))
+    || (spec.messageId !== undefined && (typeof spec.messageId !== "string" || spec.messageId.length === 0))
+    || (spec.originGenerationId !== undefined && (typeof spec.originGenerationId !== "string" || spec.originGenerationId.length === 0));
   if (bad) {
     process.stderr.write("forward-runner：spec 不对（需要 key/runsDir/projectRoot/targetName/prompt 的 JSON）\n");
     process.exit(2);

@@ -152,6 +152,10 @@ export function publishOutboxAttempt({
   outboxDir, lockDir, policy, dryRun = false,
   manualPlan = false, expectPlanDigest = null,
   batchCards, resolveTarget, composeCard, publishBatch, onBatchPublished = null,
+  // P1-3：回执↔result 证据链核对器（(record) => null|why）。
+  // **必须由入口提供**——本批含有 forward_failed 回执而它缺席时，宁可整批拒发（receipt_evidence_unavailable），
+  // 也不静默放行（判据只住一份：forward-runner.mjs 的 forwardReceiptEvidenceReader）。
+  receiptEvidence = null,
 }) {
   if (!POLICY_SET.has(policy)) {
     throw new TypeError("未知候选策略：" + String(policy) +
@@ -220,6 +224,24 @@ export function publishOutboxAttempt({
         };
       }
       return { status: "empty" };
+    }
+
+    // P1-3（挑选时）：forward_failed 回执的证据链——result_sha256 必须对得上该 key 受验读到的 result。
+    // 不信回执里的 sha（那是自述），一律现场受验读。
+    if (selected.some((r) => r?.kind === "forward_failed")) {
+      if (typeof receiptEvidence !== "function") {
+        return { status: "error", reason: "receipt_evidence_unavailable", local: true,
+          detail: "本批含 forward_failed 回执，但入口没给证据核对器（receiptEvidence）——不发布" };
+      }
+      const mismatches = [];
+      for (const r of selected) {
+        const why = receiptEvidence(r);
+        if (why) mismatches.push({ file: path.basename(String(r._file ?? "")), why });
+      }
+      if (mismatches.length > 0) {
+        return { status: "error", reason: "receipt_result_mismatch", local: true,
+          count: mismatches.length, records: mismatches };
+      }
     }
 
     // **切批不许重选、不许换内容、不许跨代际。**batchCards 只有"怎么分组"的权力。

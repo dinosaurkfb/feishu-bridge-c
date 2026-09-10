@@ -21,6 +21,7 @@ import {
 import { composeOutboundCard, outboundCardBatches } from "./outbound-card.mjs";
 import { claudeRotationBatchHook } from "./drain-outbox.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
+import { forwardReceiptEvidenceReader } from "./forward-runner.mjs";
 import { boundedBudgetMs } from "./eligibility-recovery.mjs";
 import { postDeliveryBits } from "./publish-outcome.mjs";
 import { repairCmd } from "./repair-run-claim.mjs";
@@ -422,6 +423,8 @@ while (true) {
           });
         },
         onBatchPublished: rotationHook,
+        // P1-3：同 drain —— 回执必须有对得上的 result 才发。
+        receiptEvidence: forwardReceiptEvidenceReader({ runsDir: RUNS }),
       });
       if (r2.status === "published") {
         console.log("published outbox " + key.slice(0, 8) + " -> " + r2.messageId +

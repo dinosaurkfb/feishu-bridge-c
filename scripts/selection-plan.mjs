@@ -22,13 +22,16 @@
  *   唯一候选、final 存在、同 dev+ino、final nlink===2、open 后 inode 绑定复核全满足时才 unlink。
  *   tmp 命名严格封闭为 <key>.selection-plan.json.tmp.<正整数 pid>.<v4 uuid>，非此形状不算候选。
  *
+ *   **R58 返修二 P1-1：机制搬到叶子 scripts/verified-sidecar.mjs（createVerifiedSidecar），本模块只留
+ *   文件名/大小上限/校验器/文案这一层参数与薄适配。**转发失败回执（outbox.mjs）用同一份机制——
+ *   受验读取与受验恢复只有一份实现，改一处两边一起变。
+ *
  *   注意：本模块只做 sidecar 持久化，不读环境变量、不碰账本、不 import 任何可能反向依赖本模块的模块。
  *   形状常量住叶子 scripts/shapes.mjs（返修六 P2），不 import 大账本模块。
  */
 
 import fs from "node:fs";
-import path from "node:path";
-import crypto from "node:crypto";
+import { createVerifiedSidecar } from "./verified-sidecar.mjs";
 import { isObj, canonKey, sha256 } from "./maintenance/canon.mjs";
 import { ID_SHAPE, REAFFIRM_HANDLE_SHAPE, CLAIM_KEY_SHAPE } from "./shapes.mjs";
 
@@ -40,7 +43,6 @@ const SELECTION_PLAN_KEYS = "action,basis,cas,claim_key,handle,kind,schema_versi
 
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
 const keysOf = (o) => Object.keys(o).sort().join(",");
-
 /** 封闭 schema 校验器：返回 null 或问题短句（真正用 SELECTION_PLAN_SCHEMA 逐字段校验）。 */
 export function selectionPlanProblem(plan, key) {
   if (!isObj(plan)) return "plan 不是对象";
@@ -68,193 +70,68 @@ export function selectionPlanDigest(plan) {
   return sha256(Buffer.from(canonKey(plan), "utf-8"));
 }
 
+/**
+ * 受验 sidecar 原语（R58 返修二 P1-1：机制住在叶子 scripts/verified-sidecar.mjs，两边共用）。
+ * 本模块只提供参数：文件名 `<key>.selection-plan.json`、64 KiB 上限、封闭校验器 selectionPlanProblem、
+ * key 形状 CLAIM_KEY_SHAPE，以及各自的文案。
+ */
+const SIDECAR = createVerifiedSidecar({
+  label: "selection plan",
+  fileNameOf: SELECTION_PLAN_FILE,
+  maxBytes: SELECTION_PLAN_MAX_BYTES,
+  problemOf: (plan, key) => selectionPlanProblem(plan, key),
+  keyShape: CLAIM_KEY_SHAPE,
+  dirMissingReason: "claims_dir_missing",
+  problemReason: "selection_plan_key_mismatch",
+  keyProblem: "key 形状不对（须 64hex）",
+  dirMissingWhy: "claimsDir 缺失",
+});
+
 function planPath(claimsDir, key) {
-  return path.join(claimsDir, SELECTION_PLAN_FILE(key));
+  return SIDECAR.filePath(claimsDir, key);
 }
 
 function validateKey(key) {
-  if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return "key 形状不对（须 64hex）";
-  return null;
+  return SIDECAR.validateKey(key);
 }
 
 /** 本次写临时文件的命名规则（封闭）：.<key>.selection-plan.json.tmp.<pid>.<uuid>，前缀可精确匹配。 */
-export const SELECTION_PLAN_TMP_PREFIX = (key) => "." + SELECTION_PLAN_FILE(key) + ".tmp.";
+export const SELECTION_PLAN_TMP_PREFIX = (key) => SIDECAR.tmpPrefixOf(key);
 function tmpPathFor(claimsDir, key) {
-  return path.join(claimsDir, SELECTION_PLAN_TMP_PREFIX(key) + process.pid + "." + crypto.randomUUID());
-}
-// 封闭形状（返修九 规则 1）：<key>.selection-plan.json.tmp.<正整数 pid>.<v4 uuid>。
-// <uuid> 严格按 crypto.randomUUID() 形状（version 4，variant [89ab]）；<pid> 须正整数。
-// 用 startsWith(精确前缀) 承载 key（key 不是正则、无需转义），rest 用正则字面量封闭。
-const TMP_UUID_V4_RE = /^([1-9]\d*)\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
-function isPlanTmpName(claimsDir, key, name) {
-  if (typeof name !== "string") return false;
-  const prefix = "." + SELECTION_PLAN_FILE(key) + ".tmp.";
-  if (!name.startsWith(prefix)) return false;
-  return TMP_UUID_V4_RE.test(name.slice(prefix.length));
-}
-const statSame = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino;
-
-/** 低层读原始字节（不走单硬链接守卫）：O_NOFOLLOW|O_NONBLOCK、普通文件、0600、大小上限。
- *  传入 expectedStat 时做「open 后 inode 绑定复核」（返修九 规则 2）：open+fstat 的 dev/ino 必须与盘点快照一致，
- *  否则拒（防止 open 后文件被替换的 TOCTOU）。 */
-function readBytesNoNlink(file, expectedStat) {
-  let fd = null;
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-  } catch (err) {
-    if (err?.code === "ENOENT") return { ok: true, absent: true };
-    return { ok: false, problem: "open 失败: " + errCode(err) };
-  }
-  try {
-    const st = fs.fstatSync(fd);
-    if (!st.isFile()) return { ok: false, problem: "不是普通文件" };
-    if ((st.mode & 0o777) !== 0o600) return { ok: false, problem: "mode 不是 0600: " + (st.mode & 0o777).toString(8) };
-    if (st.size > SELECTION_PLAN_MAX_BYTES) return { ok: false, problem: "超过大小上限（" + st.size + " > " + SELECTION_PLAN_MAX_BYTES + "）" };
-    if (expectedStat && !statSame(st, expectedStat)) return { ok: false, problem: "open 后 inode 与盘点快照不一致（可能被替换）" };
-    const buf = Buffer.alloc(st.size);
-    let off = 0;
-    while (off < st.size) {
-      const n = fs.readSync(fd, buf, off, st.size - off, off);
-      if (n <= 0) return { ok: false, problem: "读不满文件（" + off + "/" + st.size + "）" };
-      off += n;
-    }
-    return { ok: true, buf, st };
-  } catch (err) {
-    return { ok: false, problem: errCode(err) };
-  } finally {
-    try { fs.closeSync(fd); } catch { /* 已关 */ }
-  }
+  return SIDECAR.tmpPathFor(claimsDir, key);
 }
 
 /**
- * 盘点（返修九 规则 1）：目录里名字严格匹配精确 tmp 形状的候选。盘点期间不得 unlink；
- * readdir / lstat 的非 ENOENT 异常、异形（非普通文件 / 非 0600 / symlink）→ 整体非绿。
- * 返回 { ok:true, entries:[{name,path,st}] } / { ok:false, residue:[...], why }（residue 为已找到的路径 + 出错路径）。
- * @param {object} _inject 可选：{ readdir } 钩子在测试注入 readdir EIO。
- */
-function scanPlanTmpCandidates({ claimsDir, key, _inject }) {
-  let names;
-  try {
-    names = typeof _inject?.readdir === "function" ? _inject.readdir() : fs.readdirSync(claimsDir);
-  } catch (err) {
-    // 规则 3：只有 ENOENT 折缺席（目录还不存在 = 无候选）；非 ENOENT（如注入的 EIO）→ residue fail-closed。
-    if (err?.code === "ENOENT") return { ok: true, entries: [] };
-    return { ok: false, residue: [], why: "readdir 失败: " + errCode(err) };
-  }
-  const entries = [];
-  for (const name of names) {
-    if (!isPlanTmpName(claimsDir, key, name)) continue;
-    const p = path.join(claimsDir, name);
-    let st;
-    try {
-      st = fs.lstatSync(p);
-    } catch (err) {
-      if (err?.code === "ENOENT") continue;
-      return { ok: false, residue: entries.map((e) => e.path).concat([p]), why: "lstat tmp 失败: " + errCode(err) };
-    }
-    if (!st.isFile() || (st.mode & 0o777) !== 0o600) {
-      return { ok: false, residue: entries.map((e) => e.path).concat([p]), why: "tmp 形状异常（非普通文件或非 0600）：" + path.basename(p) };
-    }
-    entries.push({ name, path: p, st });
-  }
-  return { ok: true, entries };
-}
-
-/**
- * 受验恢复（返修九 规则 2/5）：只在持锁入口被显式调用（writeSelectionPlan / repair）。
- * 规则 2 恢复的充要条件 = 唯一候选 && final 存在 && tmp 与 final 同 dev+ino && final 的 lstat nlink === 2
- * && open tmp 的 fd 后 fstat.dev/ino 与盘点快照一致（open 后 inode 绑定复核）。全部满足 → unlink tmp → fsync 目录。
- * 其余（无候选 / 唯一候选但不满足 / 多于一个候选 / 异常 / 异形 / 异 inode / final 缺席但有候选）→ 按
- * 规则 1/3 fail-closed：返回 { ok:false, reason:"residue", residue:[...], why }，不改动任何文件。
+ * 受验恢复（返修九 规则 2/5）：见 verified-sidecar.mjs 模块头 ③。只在持锁入口被显式调用。
+ * 返回 { ok:true, recovered, residue:null } / { ok:false, reason, residue:[...], why }。
+ * （叶子与旧形同形，无需映射。）
  */
 export function recoverSelectionPlanTmp({ claimsDir, key, _inject = null } = {}) {
-  // P2-2（返修十）：输入错误 fail-closed —— 判决目录缺失 / key 非法拒；目录本身 ENOENT 仍按「无候选」ok。
-  if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: false, reason: "claims_dir_missing", why: "claimsDir 缺失" };
-  const kv = validateKey(key);
-  if (kv !== null) return { ok: false, reason: "key_shape", why: kv };
-  const scan = scanPlanTmpCandidates({ claimsDir, key, _inject });
-  if (!scan.ok) return { ok: false, reason: "residue", residue: scan.residue, why: scan.why };
-  if (scan.entries.length === 0) return { ok: true, recovered: null, residue: null };
-  if (scan.entries.length > 1) return { ok: false, reason: "residue", residue: scan.entries.map((e) => e.path), why: "多于一个精确 tmp 候选（规则 1：不自动清）" };
-  const cand = scan.entries[0];
-  const final = planPath(claimsDir, key);
-  let finalSt;
-  try { finalSt = fs.lstatSync(final); } catch (err) {
-    if (err?.code === "ENOENT") return { ok: false, reason: "residue", residue: [cand.path], why: "final 缺席但精确候选在场（规则 3，非「无窗口」）" };
-    return { ok: false, reason: "residue", residue: [cand.path], why: "lstat final 失败: " + errCode(err) };
-  }
-  if (finalSt.nlink !== 2) return { ok: false, reason: "residue", residue: [cand.path], why: "final nlink 不是 2（当前 " + finalSt.nlink + "，非「link 后未 unlink」态）" };
-  if (!statSame(cand.st, finalSt)) return { ok: false, reason: "residue", residue: [cand.path], why: "tmp 与 final 不同 dev+ino（异 inode）" };
-  if (cand.st.nlink !== 2) return { ok: false, reason: "residue", residue: [cand.path], why: "tmp nlink 不是 2（当前 " + cand.st.nlink + "）" };
-  // open 后 inode 绑定复核（规则 2）：open+readBytesNoNlink 的 fstat.dev/ino 必须与盘点快照一致（防 TOCTOU）。
-  const rb = readBytesNoNlink(cand.path, cand.st);
-  if (!rb.ok) return { ok: false, reason: "residue", residue: [cand.path], why: "tmp 受验读回失败: " + rb.problem };
-  let tmpPlan = null;
-  try { tmpPlan = JSON.parse(rb.buf.toString("utf-8")); } catch (err) { return { ok: false, reason: "residue", residue: [cand.path], why: "tmp JSON 解析失败" }; }
-  if (selectionPlanProblem(tmpPlan, key) !== null) return { ok: false, reason: "residue", residue: [cand.path], why: "tmp 不是合法 selection plan" };
-  try {
-    fs.unlinkSync(cand.path);
-  } catch (err) {
-    return { ok: false, reason: "residue", residue: [cand.path], why: "unlink tmp 失败: " + errCode(err) };
-  }
-  try {
-    let dfd = null;
-    try { dfd = fs.openSync(claimsDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
-    finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch {} } }
-  } catch (err) {
-    return { ok: false, reason: "residue", residue: [cand.path], why: "tmp 已清但目录 fsync 失败: " + errCode(err) };
-  }
-  return { ok: true, recovered: cand.path, residue: null };
+  return SIDECAR.recoverTmp({ dir: claimsDir, key, _inject });
 }
 
 /**
- * 受验读回：fd 绑定、O_NOFOLLOW|O_NONBLOCK、普通文件、单硬链接、0600、大小上限、JSON 封闭 schema。
- * 返回 { ok:true, plan, sha256, bytes, reused } / { ok:true, absent:true } / { ok:false, problem, reason? }。
- * 规则 5：本函数**不删任何文件**。遇到任何精确 tmp 候选（规则 1 全量盘点）→ 报 residue fail-closed，
- * 不自动恢复；恢复（unlink）由 recoverSelectionPlanTmp 在持锁入口调用。
+ * 受验读回：见 verified-sidecar.mjs 模块头 ② ④。
+ * 返回 { ok:true, plan, sha256, bytes } / { ok:true, absent:true } / { ok:false, problem, reason?, residue? }。
+ *
+ * **P2-2（R58 返修三）：返回形是 R57b 十一轮放行的对外契约，逐字保留。** verified-sidecar 是共用叶子，
+ * 它为了别的消费面多带了字段（失败时的 `kind`、成功时的 `raw`）——本薄适配层把它们挡在模块边界外：
+ *   成功 → 恰 {ok, plan, sha256, bytes}
+ *   输入错 / 读不出 → 恰 {ok, problem}
+ *   校验不过 → {ok, problem, reason}
+ *   残骸 / 盘点失败 → {ok, problem, reason:"residue", residue}
+ * 新增字段一律不许漏出去（有键集逐字断言钉着）。
  */
 export function readSelectionPlan({ claimsDir, key, _inject = null }) {
-  if (typeof claimsDir !== "string" || claimsDir.length === 0) return { ok: false, problem: "claimsDir 缺失" };
-  const kv = validateKey(key);
-  if (kv !== null) return { ok: false, problem: kv };
-  // 规则 1：全量盘点；盘点期间不 unlink。异常 / 异形 / 异 inode / 多于一个候选 → 非绿。
-  const scan = scanPlanTmpCandidates({ claimsDir, key, _inject });
-  if (!scan.ok) return { ok: false, reason: "residue", problem: scan.why, residue: scan.residue };
-  if (scan.entries.length > 0) {
-    return { ok: false, reason: "residue", problem: "selection plan tmp 残骸待人工（readSelectionPlan 不自动清）", residue: scan.entries.map((e) => e.path) };
-  }
-  const file = planPath(claimsDir, key);
-  let fd = null;
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-  } catch (err) {
-    if (err?.code === "ENOENT") return { ok: true, absent: true };
-    return { ok: false, problem: "open 失败: " + errCode(err) };
-  }
-  try {
-    const st = fs.fstatSync(fd);
-    if (!st.isFile()) return { ok: false, problem: "不是普通文件" };
-    if (st.nlink !== 1) return { ok: false, problem: "硬链接数不为 1" };
-    if ((st.mode & 0o777) !== 0o600) return { ok: false, problem: "mode 不是 0600: " + (st.mode & 0o777).toString(8) };
-    if (st.size > SELECTION_PLAN_MAX_BYTES) return { ok: false, problem: "超过大小上限（" + st.size + " > " + SELECTION_PLAN_MAX_BYTES + "）" };
-    const buf = Buffer.alloc(st.size);
-    let off = 0;
-    while (off < st.size) {
-      const n = fs.readSync(fd, buf, off, st.size - off, off);
-      if (n <= 0) return { ok: false, problem: "读不满文件（" + off + "/" + st.size + "）" };
-      off += n;
-    }
-    let plan = null;
-    try { plan = JSON.parse(buf.toString("utf-8")); } catch (err) { return { ok: false, problem: "JSON 解析失败: " + errCode(err) }; }
-    const p = selectionPlanProblem(plan, key);
-    if (p !== null) return { ok: false, problem: p, reason: "selection_plan_key_mismatch" };
-    return { ok: true, plan, sha256: sha256(buf), bytes: buf.length };
-  } catch (err) {
-    return { ok: false, problem: errCode(err) };
-  } finally {
-    try { fs.closeSync(fd); } catch { /* 已关 */ }
-  }
+  const r = SIDECAR.read({ dir: claimsDir, key, _inject });
+  if (r.ok === true && r.absent === true) return { ok: true, absent: true };
+  if (r.ok === true) return { ok: true, plan: r.value, sha256: r.sha256, bytes: r.bytes };
+  const out = { ok: false, problem: r.problem };
+  if (r.reason !== undefined) out.reason = r.reason;
+  if (r.residue !== undefined) out.residue = r.residue;
+  return out;
 }
+
 
 /**
  * 写 plan sidecar（原子 no-replace 落盘）。返回：

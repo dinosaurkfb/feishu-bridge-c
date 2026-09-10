@@ -292,7 +292,7 @@ export function forwardPrompt({ targetName, stamped }) {
  * claude（解析仍走 PATH）、等退出、把结果投影成 <key>.forward.result.json 落盘。
  * 返回值多带 resultPath，回执措辞随之改老实（inbound.mjs）。
  */
-export function deliverToLiveSession({ target, instruction, messageId, createdAtMs, projectRoot, runsDir, key, env: extraEnv }) {
+export function deliverToLiveSession({ target, instruction, messageId, createdAtMs, projectRoot, runsDir, key, env: extraEnv, outboxDir, originGenerationId }) {
   fs.mkdirSync(runsDir, { recursive: true });
   const logPath = path.join(runsDir, key + ".forward.jsonl");
   const errPath = path.join(runsDir, key + ".forward.stderr.log");
@@ -305,9 +305,13 @@ export function deliverToLiveSession({ target, instruction, messageId, createdAt
 
   // runner 的 env 默认原样继承（claude 由 runner 用 ROLE_ENV=forwarder 起）；env 参数是测试
   // 注入假 claude 的隔离点，生产路径不传。
+  // outboxDir / originGenerationId / messageId 是 R58 失败回执的落点与绑定信息
+  //（result 失败时 runner 写一条 outbox 回执项；不给 outboxDir 就不写，doctor ⑯ 会点名）。
+  // JSON.stringify 丢 undefined：旧调用方（不传这三样）的 spec 字节形状不变。
   const child = spawn(
     process.execPath,
-    [FORWARD_RUNNER_SCRIPT, JSON.stringify({ key, runsDir, projectRoot, targetName: target.name, prompt })],
+    [FORWARD_RUNNER_SCRIPT, JSON.stringify({ key, runsDir, projectRoot, targetName: target.name, prompt,
+      outboxDir, messageId, originGenerationId })],
     {
       cwd: projectRoot, detached: true, stdio: "ignore",
       env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },

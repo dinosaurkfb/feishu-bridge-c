@@ -20,6 +20,8 @@ import path from "node:path";
 import { normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
+// 失败回执的 outbox 落点与 Stop 钡 / 兑底定时器同一份判据（outbox vs outbox-<sid>），不另写一份
+import { outboxDirOf } from "./drain-outbox.mjs";
 import { effectiveBindingId, pendingGeneration } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
@@ -1000,6 +1002,10 @@ if (target && !replyOnly) {
       projectRoot: config.project_dir,
       runsDir: RUNS,
       key: policyRun.runRequest.runId,
+      // R58：转发明确失败时 runner 写一条 outbox 失败回执（绑定同一 key / 原消息 / 出站代际）；
+      // 落点跟绑定走（会话级绑定 → outbox-<sid>），与该会话 Stop 钡排空的是同一个目录。
+      outboxDir: outboxDirOf(config.project_dir, boundSession),
+      originGenerationId: policyRun.runRequest.origin.channelGenerationId,
     });
   } catch (err) {
     if (dialogueMode) {

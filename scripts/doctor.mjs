@@ -36,7 +36,7 @@ import path from "node:path";
 import { displaySafe } from "./display-safe.mjs";
 import { inspectInstallSurfaceLock } from "./install-surface-lock.mjs";
 import { isDirectRun, moduleDir } from "./direct-run.mjs";
-import { auditOutbox } from "./outbox.mjs";
+import { auditOutbox, readForwardFailureReceipt } from "./outbox.mjs";
 import { inspectRunChannel, outboxDirOf } from "./drain-outbox.mjs";
 import { inventoryRuns } from "./outbound.mjs";
 import { loadRegistryStrict, registryPath } from "./registry.mjs";
@@ -61,7 +61,7 @@ import { inspectInstalledSurface, installedSurfacePath } from "./installed-surfa
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
-import { forwardResultProblem, forwardStartedProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
+import { forwardResultProblem, forwardStartedProblem, forwardReceiptResultProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
@@ -747,6 +747,43 @@ export function runDoctor({
     const redNote = [];
     const missingKeys = [];
     const unclearNote = [];
+    const noReceiptKeys = [];
+    let noReceipt = 0;
+    const noMismatchKeys = [];
+    // P2：outbox_dir 为 null 的旧版 result —— 别拿「当前 session outbox」冒充精确定位（那不是核对过），
+    // 单独子计数说清。
+    const noAnchorKeys = [];
+    let noAnchor = 0;
+    // R58 返修二 P1-1/P1-3：回执核对 = 受验读 <key>.forward-failed.outbox.json（fd 绑定 + 封闭校验 + 残骸 fail-closed）
+    // + 证据链（record.result_sha256 必须等于该 key 受验读到的 result 内容 sha256）。
+    //   坏 JSON / 不合法  → 不算有回执（“有文件但不是回执”，点进失败无回执）
+    //   读不了（symlink / ENOTDIR / EIO / 残骸） → 查不清，不冒充核对过
+    const hasReceipt = (rootDir, key, resultSha256, outboxDirRel) => {
+      const dir = path.join(rootDir, outboxDirRel);
+      // P2-3（返修三）：outbox_dir 的 containment 不只词法 —— 中间目录可以是 symlink，把实际读取引到物理根外。
+      //   合同：outbox 目录是我们自己建的，父链不该有中间 symlink；join 后 realpath 必须仍在 realpath(root) 内。
+      //   （root 自己是个 symlink 仍支持：两边都取 realpath。）不过 → 查不清，不去读那个目录。
+      let realRoot; let realDir;
+      try { realRoot = fs.realpathSync(rootDir); } catch (err) {
+        return { ok: false, why: "项目根 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "），无法核 outbox_dir 落点" };
+      }
+      try { realDir = fs.realpathSync(dir); } catch (err) {
+        // 目录不存在（ENOENT）= 还没有回执，不算“说不清”；其他 IO 错误照样拦。
+        if (err?.code === "ENOENT") return { ok: true, present: false };
+        return { ok: false, why: "outbox 目录 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "）" };
+      }
+      if (realDir !== realRoot && !realDir.startsWith(realRoot + path.sep)) {
+        return { ok: false, why: "outbox_dir 的 realpath（" + realDir + "）不在项目根 realpath（" + realRoot + "）内（父链中间目录是 symlink），不冒充核对过" };
+      }
+      const rt = readForwardFailureReceipt({ outboxDir: dir, forwardKey: key });
+      if (rt.ok === true) {
+        const mismatch = forwardReceiptResultProblem(rt.record, resultSha256);
+        return mismatch === null ? { ok: true, present: true } : { ok: true, present: false, mismatch };
+      }
+      if (rt.absent) return { ok: true, present: false };
+      if (rt.kind === "invalid") return { ok: true, present: false };
+      return { ok: false, why: String(rt.why ?? "读不出来") + (rt.residue ? "（" + rt.residue.join("、") + "）" : "") };
+    };
     // fd 绑定 stat（O_NOFOLLOW|O_NONBLOCK，不读内容）：jsonl 的年龄来源；悬空 symlink/FIFO/并发变化 → problem，不 fail-open
     const fdStat = (file) => {
       let fd = null;
@@ -789,13 +826,32 @@ export function runDoctor({
         if (!FORWARD_KEY_RE.test(key)) { unclear("key 形状不对（须 64 位十六进制）"); continue; }
         if (parts.result !== undefined) {
           // 有 result：唯一终态来源，不再走孤儿判断
-          const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key }), maxBytes: RESULT_CAP });
+          const v = readVerifiedDoc({ file: path.join(runsDir, parts.result), docValidator: (doc) => forwardResultProblem(doc, { now, expectedKey: key, projectRoot: root }), maxBytes: RESULT_CAP });
           if (v.ok !== true) { if (v.absent) unclear("result 读不出（并发变化）"); else unclear(String(v.problem ?? "读不出")); continue; }
           const at = Date.parse(v.doc.finished_at ?? "");
           if (now - (Number.isFinite(at) ? at : (v.mtimeMs ?? 0)) > WINDOW) continue; // 窗外积尘
           if (v.doc.is_error === true || v.doc.sent !== true) {
             buckets.red += 1;
             if (redNote.length < 3) redNote.push(key.slice(-8) + " —— " + String(v.doc.reason_first_line ?? "原因不明") + (v.doc.claude_code_version ? "（claude_code_version " + v.doc.claude_code_version + "）" : "（版本未知）"));
+            // R58：失败的还该有一条 forward_failed 回执（runner 写）—— 没有 = owner 至今
+            // 不知道没送达，点名。P1-3 起还要核证据链（回执的 result_sha256 必须对得上这份 result）。
+            // P2：outbox_dir 为 null（旧版无落点）→ 无法精确核，单独子计数，不冒充核对过。
+            if (v.doc.outbox_dir === null) {
+              noAnchor += 1;
+              if (noAnchorKeys.length < 3) noAnchorKeys.push(key.slice(-8));
+            } else {
+              const hr = hasReceipt(root, key, v.sha256, v.doc.outbox_dir);
+              if (hr.ok === true) {
+                if (!hr.present) {
+                  noReceipt += 1;
+                  if (noReceiptKeys.length < 3) noReceiptKeys.push(key.slice(-8));
+                  if (hr.mismatch && noMismatchKeys.length < 3) noMismatchKeys.push(key.slice(-8) + "：" + hr.mismatch);
+                }
+              } else {
+                buckets.unclear += 1;
+                if (unclearNote.length < 3) unclearNote.push(key.slice(-8) + "：失败回执核对不了（" + hr.why + "）");
+              }
+            }
           } else buckets.green += 1;
           continue;
         }
@@ -846,6 +902,9 @@ export function runDoctor({
     const body = scanned === 0 ? "近 24 小时没有转发结果（只盘 live_session 转发，没有转发就没有条目）"
       : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
         (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
+        (noReceipt > 0 ? "；失败无回执 " + noReceipt + "：" + noReceiptKeys.join("、") : "") +
+        (noMismatchKeys.length > 0 ? "；回执与 result 不符：" + noMismatchKeys.join("；") : "") +
+        (noAnchor > 0 ? "；旧版 result 无落点记录，无法精确核回执 " + noAnchor + "：" + noAnchorKeys.join("、") : "") +
         (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "") +
         (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "") +
         (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "");

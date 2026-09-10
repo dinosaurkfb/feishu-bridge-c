@@ -4,7 +4,9 @@
  * 存在的理由：进展不该只在 Frank 发问时才流出去。长期任务自己干完一件事、
  * 做了一个决定、撞上一个风险，Frank 应该自动收到，而不是需要先想起来去问。
  *
- * 只收五类（与需求一致）：里程碑、决定、风险、待人工拍板、下一步。
+ * 只收五类（与需求一致）：里程碑、决定、风险、待人工拍板、下一步；
+ * 另有机器生成的转发失败回执 `forward_failed`（R58，issue #140 后半）：
+ * forward-runner 在转发明确失败后写入，不走人工判断，所以不占五类的名分。
  * 完整对话、模型思维过程、工具轨迹一律不进 outbox。
  */
 
@@ -17,7 +19,9 @@ import { generationTargetState, usableGeneration } from "./topic-generation.mjs"
 import { isCanonicalIso } from "./canonical-time.mjs";
 // registry 不反向依赖 outbox —— 没有环。
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
+import { canonKey } from "./maintenance/canon.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
+import { createVerifiedSidecar } from "./verified-sidecar.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -33,10 +37,11 @@ import { gateBlocks } from "./maintenance-gate-core.mjs";
  * 五类随之退居二线，只服务**没有对话轮次可依附**的东西 —— 比如绑定到期体检，
  * 那是钩子生成的，不属于任何一轮回答。我不再手写它们。
  */
-export const KINDS = ["reply", "milestone", "decision", "risk", "pending", "next"];
+export const KINDS = ["reply", "forward_failed", "milestone", "decision", "risk", "pending", "next"];
 
 /** reply 没有标签：它不是某一类进展，它就是答复本身。 */
 export const KIND_LABEL = {
+  forward_failed: "转发失败",
   milestone: "里程碑",
   decision: "决定",
   risk: "风险",
@@ -130,6 +135,252 @@ export function appendEvent({
   return { ok: true, id, file };
 }
 
+/** 转发失败回执的正文（R58 P1-4）：Frank 授权的是「失败回执」这一类，不是自动外发任意模型输出——正文只从
+ * 封闭失败类别生成固定文案。**原始 reason_first_line 一个字都不进正文**（只留本地 result / doctor）。
+ * 返回固定文案；传入类别不在四枚举里 → 拒（返回 null，不产出正文）。
+ */
+export const FORWARD_FAILURE_CATEGORIES = Object.freeze(["session_error", "exit_nonzero", "spawn_failed", "unknown"]);
+export const FORWARD_FAILURE_TEXT = Object.freeze({
+  session_error: "转发失败：会话执行报错；本条未送达，请重发或在终端查看 doctor ⑯",
+  exit_nonzero: "转发失败：转发进程异常退出；本条未送达，请重发或在终端查看 doctor ⑯",
+  spawn_failed: "转发失败：转发进程无法启动；本条未送达，请重发或在终端查看 doctor ⑯",
+  unknown: "转发失败：原因见终端 doctor ⑯；本条未送达，请重发或在终端查看 doctor ⑯",
+});
+export function forwardFailureText(category) {
+  if (!FORWARD_FAILURE_CATEGORIES.includes(category)) return null;
+  return FORWARD_FAILURE_TEXT[category];
+}
+
+/** 回执 message_id 形状（与既有 OM_SHAPE 同源），或 null。 */
+const OM_BUILTIN = /^om_[A-Za-z0-9]{1,120}$/u;
+/** 回执的封闭键集（P1-2，多一个键也拒）。result_sha256 在 P1-5 加入后由 P1-5 更新此表。 */
+const FORWARD_RECEIPT_KEYS = "artifact_type,classification,created_at,event_key,forward_key,id,input_origin,input_text,kind,message_id,publish_eligible_at,published_at,result_sha256,run_id,schema_version,source,target_channel_generation_id,text,zone";
+
+/**
+ * forward_failed 回执的**唯一**封闭校验器（P1-2）：写前自证、outbox 快照读取、auditOutbox、发布器挑选、
+ * doctor 五处共用。不合法 → 返回问题短句；合法 → null。
+ * @param {object} record
+ * @param {object} opts
+ * @param {string|null} opts.expectedKey  由文件名 <key>.forward-failed.outbox.json 传入（核 forward_key）
+ */
+export function forwardFailureReceiptProblem(record, { expectedKey = null } = {}) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return "不是记录对象";
+  if (Object.keys(record).sort().join(",") !== FORWARD_RECEIPT_KEYS) return "键集不对（多一个/少一个都拒）";
+  if (record.schema_version !== "1.0") return "schema_version 不是 1.0";
+  if (record.artifact_type !== "codex_feishu_bridge_event") return "artifact_type 不是 codex_feishu_bridge_event";
+  if (record.zone !== "work") return "zone 不是 work";
+  if (record.classification !== "internal") return "classification 不是 internal";
+  if (record.kind !== "forward_failed") return "kind 不是 forward_failed";
+  if (typeof record.forward_key !== "string" || !/^[0-9a-f]{64}$/u.test(record.forward_key)) return "forward_key 不是 64hex";
+  if (expectedKey !== null && record.forward_key !== expectedKey) return "forward_key 与文件名不符";
+  if (record.id !== "forward-failed-" + record.forward_key) return "id 不是 forward-failed-<key>";
+  if (record.event_key !== "forward-failed:" + record.forward_key) return "event_key 不是 forward-failed:<key>";
+  if (record.message_id !== null && (typeof record.message_id !== "string" || !OM_BUILTIN.test(record.message_id))) return "message_id 不是 om_ 形状或 null";
+  if (record.source !== "forward-runner") return "source 不是 forward-runner";
+  if (!usableGeneration(record.target_channel_generation_id)) return "target_channel_generation_id 缺失或不可用（不许 null）";
+  if (!Object.values(FORWARD_FAILURE_TEXT).includes(record.text)) return "text 不是固定文案";
+  if (record.created_at !== record.publish_eligible_at || !isCanonicalIso(record.created_at)) return "created_at !== publish_eligible_at 或非法时间（born eligible）";
+  if (record.published_at !== null && !isCanonicalIso(record.published_at)) return "published_at 不是 null 或规范时间";
+  if (record.input_origin !== null || record.input_text !== null || record.run_id !== null) return "input_origin/input_text/run_id 必须为 null";
+  if (typeof record.result_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(record.result_sha256)) return "result_sha256 不是 64hex";
+  return null;
+}
+
+/**
+ * 回执的受验 sidecar 原语（R58 返修二 P1-1）：**机制与 selection-plan 同一份**
+ *（叶子 scripts/verified-sidecar.mjs 的 createVerifiedSidecar），这里只给参数：
+ * 文件名 `<key>.forward-failed.outbox.json`、64 KiB 上限、封闭校验器 forwardFailureReceiptProblem、
+ * key 形状 64hex。旧版裸 readFileSync 会把外指 symlink 当成合法回执、也看不见 link 后的 tmp 残骸。
+ */
+const RECEIPT_SIDECAR = createVerifiedSidecar({
+  label: "forward_failed 回执",
+  fileNameOf: (key) => key + FORWARD_FAILURE_RECEIPT_SUFFIX,
+  maxBytes: 64 * 1024,
+  problemOf: (rec, key) => forwardFailureReceiptProblem(rec, { expectedKey: key }),
+  keyShape: /^[0-9a-f]{64}$/u,
+  dirMissingReason: "outbox_dir_missing",
+});
+
+/**
+ * 受验恢复（P1-1）：只在写入口（appendForwardFailureReceipt）显式调用。
+ * 充要条件与 selection-plan 逐字一致（见 verified-sidecar.mjs 模块头 ③）：唯一候选 && final 存在 &&
+ * 同 dev+ino && final nlink===2 && 候选 nlink===2 && open 后 inode 复核 && 候选内容过封闭校验
+ * → unlink → fsync 目录。其余一律 residue fail-closed、不动任何文件。
+ */
+export function recoverForwardReceiptTmp({ outboxDir, forwardKey, _inject = null } = {}) {
+  return RECEIPT_SIDECAR.recoverTmp({ dir: outboxDir, key: forwardKey, _inject });
+}
+
+/**
+ * 回执文件名 → forward_key（P1-2）：**只有规范文件名 <key>.forward-failed.outbox.json 才绑得上 key**。
+ * 解析不出（后缀不对、key 不是 64hex、多一层路径）→ null。调用方拿到 null 就必须拒，
+ * **绝不重落成「expectedKey=null」而放过内部自洽的伪造记录**（那条路会让 arbitrary.json 里的记录进待发队列）。
+ */
+export function forwardReceiptKeyFromFileName(name) {
+  if (typeof name !== "string" || !name.endsWith(FORWARD_FAILURE_RECEIPT_SUFFIX)) return null;
+  const key = name.slice(0, -FORWARD_FAILURE_RECEIPT_SUFFIX.length);
+  return /^[0-9a-f]{64}$/u.test(key) ? key : null;
+}
+
+/**
+ * forward_failed 记录的**唯一**落点判据（P1-2）：文件里的 forward_key 必须与文件名逐字一致，
+ * 而文件名必须是规范形状。返回 null（合规）或问题短句。
+ */
+export function forwardReceiptFileBindingProblem(record, fileName) {
+  const fromName = forwardReceiptKeyFromFileName(fileName);
+  if (fromName === null) return "文件名不是 <64hex key>" + FORWARD_FAILURE_RECEIPT_SUFFIX + "（kind=forward_failed 只能住规范文件名）";
+  if (record?.forward_key !== fromName) return "forward_key 与文件名不符（文件名的 key 是 " + fromName + "）";
+  return null;
+}
+
+/**
+ * 受验读回（P1-1/P1-3/doctor 共用）：fd 绑定（O_NOFOLLOW|O_NONBLOCK）、普通文件、单硬链接、0600、
+ * 大小上限、JSON、封闭校验器。**不删任何文件**；遇任何精确 tmp 候选 → residue fail-closed。
+ * 返回：
+ *   { absent:true }                                    —— 规范文件名不存在（ENOENT）
+ *   { ok:true, record, file, sha256 }                  —— 受验读 + 校验全过
+ *   { ok:false, kind:"invalid", why, badPath }         —— 坏 JSON / 封闭校验不过（“有文件但不是回执”）
+ *   { ok:false, kind:"unreadable", why, badPath }      —— 读不了（symlink/权限/ENOTDIR/EIO/nlink≠1…）
+ *   { ok:false, kind:"residue", why, residue, badPath }—— 目录里有精确 tmp 候选，等人处置
+ */
+export function readForwardFailureReceipt({ outboxDir, forwardKey, _inject = null }) {
+  const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
+  const r = RECEIPT_SIDECAR.read({ dir: outboxDir, key: forwardKey, _inject });
+  if (r.ok === true && r.absent === true) return { absent: true };
+  if (r.ok === true) return { ok: true, record: r.value, file, sha256: r.sha256 };
+  if (r.kind === "residue") return { ok: false, kind: "residue", why: r.problem, residue: r.residue, badPath: r.residue[0] ?? file };
+  return { ok: false, kind: r.kind ?? "unreadable", why: r.problem, badPath: file };
+}
+
+/**
+ * **P1-1（R58 返修三）：规范文件名的 forward_failed 一律走受验读取器。**
+ * 消费面（snapshot / audit / listPending）曾各自裸 readFileSync —— 受验直读拒外指 symlink，
+ * 它们却照样把文件当合法待发记录收进候选集，配上 SHA 匹配的 result 后发布事务真的会发出去。
+ * 返回 { ok:true, raw, rec } 或 { ok:false, kind, why }（kind: invalid | unreadable | residue）；
+ * 非规范文件名返回 null（不归这里管，交落点判据）。
+ * `raw` 与 `rec` 出自**同一次 fd 读取**（叶子的 read 一并带回来），调用方不许再读第二次。
+ */
+function readCanonicalForwardReceipt({ outboxDir, name, _inject = null }) {
+  const key = forwardReceiptKeyFromFileName(name);
+  if (key === null) return null;
+  const r = RECEIPT_SIDECAR.read({ dir: outboxDir, key, _inject });
+  if (r.ok === true && r.absent === true) return { ok: false, kind: "unreadable", why: "读不出来（盘点后消失：ENOENT）" };
+  if (r.ok === true) return { ok: true, raw: r.raw, rec: r.value };
+  return { ok: false, kind: r.kind ?? "unreadable", why: r.problem };
+}
+
+/** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
+export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
+
+/**
+ * 转发失败回执入 outbox（R58）。**这是预授权的自动写入**（Frank 2026-09-10 批准
+ * 「失败回执」这一类），所以 born eligible：publish_eligible_at 在创建时即冻结。
+ *
+ * 调用方是 forward-runner（result 落盘后发现明确失败时）；成功路径根本不调这里。
+ * 幂等：文件名 = <key>.forward-failed.outbox.json，O_EXCL|O_NOFOLLOW 原子建 ——
+ * 同一 key 重放输给 EEXIST 就不再写，第一条内容一个字节不动。
+ * key 核 64 位十六进制（与 FORWARD_KEY_RE / CLAIM_KEY_SHAPE 同形状）：
+ * 文件名要拿 key 派生路径，形状不对就拒在写入之前，不产越界文件。
+ * 维护门同 appendEvent：门在或读不出 → 不写（调用方按「没记下」如实说）。
+ */
+export function appendForwardFailureReceipt({
+  outboxDir, forwardKey, category, messageId, targetGenerationId,
+  source = "forward-runner", resultSha256 = null, _inject = null,
+}) {
+  if (typeof outboxDir !== "string" || outboxDir.length === 0) return { ok: false, reason: "outbox_dir_missing" };
+  if (typeof forwardKey !== "string" || !/^[0-9a-f]{64}$/u.test(forwardKey)) return { ok: false, reason: "key_shape" };
+  // P1-1：代际必须可用（可用冻结代际）。缺失 / 不可用 → 不生成回执、不写 null（绝不写 null 令发布器回落当前话题）。
+  if (!usableGeneration(targetGenerationId)) return { ok: false, reason: "generation_unavailable", why: "targetGenerationId 缺失或不可用（不生成回执、不写 null）" };
+  // P1-4：正文封闭 —— 类别必须合法，reasonFirstLine 一个字不进正文。
+  const text = forwardFailureText(category);
+  if (text === null) return { ok: false, reason: "unknown_failure_category", why: "未知失败类别（不接受任意模型输出进正文）" };
+  // P1-5：回执记录带 result_sha256（result 文件内容摘要）；缺失/非 64hex → 拒（证据链不闭合）。
+  if (typeof resultSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(resultSha256)) return { ok: false, reason: "result_sha256_missing", why: "result_sha256 缺失或非 64hex" };
+  { const gate = gateBlocks(); if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, text: gate.text }; }
+  const createdAt = new Date().toISOString();
+  const record = {
+    schema_version: "1.0",
+    artifact_type: "codex_feishu_bridge_event",
+    zone: "work",
+    classification: "internal",
+    id: "forward-failed-" + forwardKey,
+    kind: "forward_failed",
+    text,
+    event_key: "forward-failed:" + forwardKey,
+    source: typeof source === "string" && source ? source : "forward-runner",
+    input_origin: null,
+    input_text: null,
+    target_channel_generation_id: targetGenerationId,
+    run_id: null,
+    forward_key: forwardKey,
+    message_id: typeof messageId === "string" && messageId ? messageId : null,
+    created_at: createdAt,
+    publish_eligible_at: createdAt,
+    published_at: null,
+    result_sha256: resultSha256,
+  };
+  // 写前自证（P1-2）：不合法不落盘。
+  const ip = forwardFailureReceiptProblem(record, { expectedKey: forwardKey });
+  if (ip !== null) return { ok: false, reason: "receipt_invalid", why: ip };
+  fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
+  const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
+  // P1-1：持锁入口先做受验恢复（全量盘点 → 唯一候选 + 同 dev/ino + nlink==2 + open 后复核 → unlink →
+  // fsync 目录）；恢复不了（无候选之外的任何 residue）→ fail-closed，不继续写。
+  const rc = recoverForwardReceiptTmp({ outboxDir, forwardKey });
+  if (rc.ok === false) return { ok: false, reason: "residue", why: rc.why, residue: rc.residue };
+  // P1-3 原子 no-replace 发布（与 selection-plan.mjs 同一套机制）：写 tmp → fsync → linkSync(tmp, final) → unlink tmp →
+  // fsync 目录 → 受验读回。EEXIST：既存完整合法且 canonKey 逐字等 → duplicate；内容不等 → conflict；不合法/半截 → residue（不覆盖）。
+  const bytes = Buffer.from(JSON.stringify(record, null, 2) + "\n", "utf-8");
+  const tmp = RECEIPT_SIDECAR.tmpPathFor(outboxDir, forwardKey);
+  const errCode = (e) => String(e?.code ?? e?.message ?? e);
+  let fd = null;
+  let linked = false;
+  const cleanupTmp = () => { try { fs.unlinkSync(tmp); } catch (err) { if (err?.code !== "ENOENT") throw err; } };
+  try {
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    let off = 0; while (off < bytes.length) { const n = fs.writeSync(fd, bytes, off, bytes.length - off); if (n <= 0) break; off += n; }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = null;
+    if (typeof _inject?.beforeLink === "function") _inject.beforeLink();
+    try { fs.linkSync(tmp, file); }
+    catch (err) {
+      if (err?.code === "EEXIST") {
+        try { cleanupTmp(); } catch (e2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(e2) }; }
+        const existing = readForwardFailureReceipt({ outboxDir, forwardKey });
+        // duplicate：既存完整合法且**内容**与本次逐字等（born-eligible 的 created_at/publish_eligible_at 每次重放都变，
+        //  不参与同内容判定——重放输给 EEXIST 应视为 duplicate 而非 conflict）。
+        if (existing.ok && existing.record && canonKey({ ...existing.record, created_at: null, publish_eligible_at: null }) === canonKey({ ...record, created_at: null, publish_eligible_at: null })) return { ok: false, reason: "duplicate", file };
+        if (existing.ok && existing.record) return { ok: false, reason: "conflict", why: "既存回执与本次期望记录不等（不覆盖）", file };
+        return { ok: false, reason: "residue", residue: existing.badPath ?? file, why: "既存回执不合法/半截（不覆盖）" };
+      }
+      throw err;
+    }
+    linked = true;
+    try { cleanupTmp(); } catch (err2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(err2) }; }
+  } catch (err) {
+    if (fd !== null) { try { fs.closeSync(fd); fd = null; } catch {} }
+    if (!linked) { try { cleanupTmp(); } catch (e2) { return { ok: false, reason: "residue", residue: tmp, why: errCode(e2) }; } return { ok: false, reason: "receipt_write_failed", why: errCode(err) }; }
+    return { ok: false, reason: "commit_uncertain", why: "link 后收口失败: " + errCode(err) };
+  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch {} } }
+  // 发布后目录 fsync
+  try {
+    let dfd = null;
+    try { dfd = fs.openSync(outboxDir, fs.constants.O_RDONLY); fs.fsyncSync(dfd); }
+    finally { if (dfd !== null) { try { fs.closeSync(dfd); } catch {} } }
+  } catch (err) {
+    return { ok: false, reason: "dir_fsync_failed", why: "目录 fsync 失败: " + errCode(err), commit: "committed_durability_uncertain" };
+  }
+  // 受验读回
+  const rb = readForwardFailureReceipt({ outboxDir, forwardKey });
+  // link 已成功这个事实不变；读回碰上 residue（foreign tmp 残骸）**不许折成 readback_failed** ——
+  // 「有残骸等人处置」与「读不回自己刚写的东西」是两回事（selection-plan 那边同一形状、同一分法）。
+  if (rb.ok !== true && rb.kind === "residue") {
+    return { ok: false, reason: "residue", why: rb.why ?? "受验读回发现 tmp 残骸", residue: rb.residue, commit: "committed_durability_uncertain" };
+  }
+  if (rb.ok !== true) return { ok: false, reason: "readback_failed", why: "受验读回未通过: " + (rb.why ?? "说不清"), commit: "committed_durability_uncertain" };
+  return { ok: true, id: record.id, file };
+}
+
 export function listPending({ outboxDir }) {
   let files;
   try {
@@ -140,7 +391,10 @@ export function listPending({ outboxDir }) {
   const out = [];
   for (const f of files.sort()) {
     try {
-      const rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8"));
+      // P1-1：规范文件名的回执先过受验读取器 —— 受验读不过的（symlink / nlink≠1 / 坏 JSON）不列。
+      const vr = readCanonicalForwardReceipt({ outboxDir, name: f });
+      if (vr !== null && vr.ok !== true) continue;
+      const rec = vr !== null ? vr.rec : JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8"));
       if (rec.published_at === null && !rec.publish_suppressed_at) {
         out.push({ ...rec, _file: path.join(outboxDir, f) });
       }
@@ -750,21 +1004,44 @@ export function readOutboxSnapshot(outboxDir) {
   }
   const unclassified = [];
   const unexplainable = [];
+  // records            = **候选集**（解释得了的待发记录）——发布器只认它
+  // recordsUnexplained = 待发但解释不了的记录（不进候选集，但读模型仍要看得见它们，
+  //                      否则只读投影会把这些"等人看"的记录折叠成 0）
   const records = [];
+  const recordsUnexplained = [];
   let pending = 0;
   for (const name of names) {
     const file = path.join(outboxDir, name);
     let raw;
-    try { raw = fs.readFileSync(file); }
-    catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
     let rec;
-    try { rec = JSON.parse(raw.toString("utf-8")); }
-    catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+    // P1-1：规范文件名的 forward_failed 回执一律走受验读取器（_raw 与 record 同一次 fd 读取）。
+    const vr = readCanonicalForwardReceipt({ outboxDir, name });
+    if (vr !== null) {
+      if (vr.ok !== true) { unexplainable.push({ file: name, why: "forward_failed 回执受验读不过：" + vr.why }); continue; }
+      raw = vr.raw; rec = vr.rec;
+    } else {
+      try { raw = fs.readFileSync(file); }
+      catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+      try { rec = JSON.parse(raw.toString("utf-8")); }
+      catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+    }
     const verdict = classifyOutboxRecord(rec);
     if (verdict.unclassified) { unclassified.push({ file: name, why: verdict.why }); continue; }
     const gaps = explainabilityGaps(rec);
+    // P1-2：forward_failed 回执先用唯一封闭校验器（写前自证同一份），再核**落点**——
+    // forward_key 只能从规范文件名解析（解析不出即拒）；不合法 → unexplainable（整批 fail-closed）。
+    if (rec?.kind === "forward_failed") {
+      const bind = forwardReceiptFileBindingProblem(rec, name);
+      if (bind !== null) gaps.push("forward_failed 回执落点不对：" + bind);
+      const rp = forwardFailureReceiptProblem(rec, { expectedKey: forwardReceiptKeyFromFileName(name) });
+      if (rp !== null) gaps.push("forward_failed 回执不合法：" + rp);
+    }
     if (gaps.length > 0) {
       unexplainable.push({ file: name, why: "缺少解释这条记录所必需的字段：" + gaps.join("、") });
+      // 解释不了的记录**不进候选集**：发布器拿不到它，也就发不出它（整批另由 outboxMutationBlocker 拦下）。
+      // 但它仍要进读模型 —— 只读投影靠这份看得见它（P1-2）。
+      if (verdict.state === "pending") recordsUnexplained.push({ ...rec, _file: file, _raw: raw });
+      continue;
     }
     if (verdict.state === "pending") {
       pending += 1;
@@ -775,6 +1052,7 @@ export function readOutboxSnapshot(outboxDir) {
     ok: true,
     files: [...names],
     records,
+    recordsUnexplained,
     audit: { ok: true, pending, unclassified, unexplainable, files: [...names] },
   };
 }
@@ -797,7 +1075,13 @@ export function auditOutbox(outboxDir) {
   const unexplainable = [];
   for (const f of files) {
     let rec;
-    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
+    // P1-1：规范文件名的 forward_failed 回执一律走受验读取器 —— 受验读不过 → unexplainable（不是 unclassified）。
+    const vr = readCanonicalForwardReceipt({ outboxDir, name: f });
+    if (vr !== null && vr.ok !== true) {
+      unexplainable.push({ file: f, why: "forward_failed 回执受验读不过：" + vr.why });
+      continue;
+    }
+    try { rec = vr !== null ? vr.rec : JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
     catch { unclassified.push({ file: f, why: "读不出来" }); continue; }
     if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
       unclassified.push({ file: f, why: "不是记录对象" }); continue;
@@ -813,6 +1097,14 @@ export function auditOutbox(outboxDir) {
     // 这里要的不是"字段齐全"，而是**足以解释它**：是什么、什么时候、哪一类。
     // 真实历史记录（含升级前那批）这四样都有，收紧不会误伤。
     const missing = explainabilityGaps(rec);
+    // P1-2：forward_failed 回执先用唯一封闭校验器，再核**落点**（forward_key 只能从规范文件名解析）；
+    // 不合法 / 落点不对 → unexplainable（整批 fail-closed）。
+    if (rec.kind === "forward_failed") {
+      const bind = forwardReceiptFileBindingProblem(rec, f);
+      if (bind !== null) missing.push("forward_failed 回执落点不对：" + bind);
+      const rp = forwardFailureReceiptProblem(rec, { expectedKey: forwardReceiptKeyFromFileName(f) });
+      if (rp !== null) missing.push("forward_failed 回执不合法：" + rp);
+    }
     // **分开报，不并进 unclassified。**
     // "三态判不出来"和"这条记录解释不了"是两个问题：前者是不知道它处于
     // 什么状态，后者是知道状态但不知道它是什么。混成一个字段，读的人

@@ -33,7 +33,7 @@
 import fs from "node:fs";
 import { createVerifiedSidecar } from "./verified-sidecar.mjs";
 import { isObj, canonKey, sha256 } from "./maintenance/canon.mjs";
-import { ID_SHAPE, REAFFIRM_HANDLE_SHAPE, CLAIM_KEY_SHAPE } from "./shapes.mjs";
+import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, CLAIM_KEY_SHAPE } from "./shapes.mjs";
 
 export const SELECTION_PLAN_SCHEMA = "selection-plan-1";
 export const SELECTION_PLAN_FILE = (key) => key + ".selection-plan.json";
@@ -43,25 +43,66 @@ const SELECTION_PLAN_KEYS = "action,basis,cas,claim_key,handle,kind,schema_versi
 
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
 const keysOf = (o) => Object.keys(o).sort().join(",");
-/** 封闭 schema 校验器：返回 null 或问题短句（真正用 SELECTION_PLAN_SCHEMA 逐字段校验）。 */
+
+/** cas 按 action 的封闭键集（R57d 对齐 P1-4）：与 executeSelectControl 冻结的 CAS 上下文逐字段对应。 */
+const PLAN_CAS_KEYS = Object.freeze({
+  activate: "selected_root_om,selected_session_id,selection_handle",
+  anchor: "expected_anchor_candidate,expected_expires_at,expected_handle,selected_root_om,selected_session_id",
+  rebind: "expected_expires_at,expected_old_session_id,expected_root_om,new_session_id,rebind_handle",
+  reaffirm: "expected_expires_at,intent_id",
+});
+/** handle 形状按 kind 映射（形状常量住 shapes.mjs，同一形状只有一份）。 */
+const PLAN_HANDLE_SHAPE = Object.freeze({ rfh: REAFFIRM_HANDLE_SHAPE, osh: SELECTION_HANDLE_SHAPE, orh: REBIND_HANDLE_SHAPE });
+
+/**
+ * 封闭 schema 校验器：返回 null 或问题短句（真正用 SELECTION_PLAN_SCHEMA 逐字段校验）。
+ * kind 封闭三联合（R57d 对齐 P1-4）：rfh（reaffirm）/ osh（activate|anchor）/ orh（rebind），
+ * action、basis、handle、cas 键集都随 kind/action 分支封闭；rfh 支行为与返修六逐字不变。
+ */
 export function selectionPlanProblem(plan, key) {
   if (!isObj(plan)) return "plan 不是对象";
   if (keysOf(plan) !== SELECTION_PLAN_KEYS) return "plan 键集不对（须 " + SELECTION_PLAN_KEYS + "）";
   if (plan.schema_version !== SELECTION_PLAN_SCHEMA) return "schema_version 不是 " + SELECTION_PLAN_SCHEMA;
-  if (plan.action !== "reaffirm") return "action 不是 reaffirm";
-  if (plan.basis !== "reaffirm") return "basis 不是 reaffirm";
-  if (plan.kind !== "rfh") return "kind 不是 rfh";
+  if (plan.kind !== "rfh" && plan.kind !== "osh" && plan.kind !== "orh") return "kind 不是 rfh/osh/orh";
   if (typeof plan.claim_key !== "string" || !CLAIM_KEY_SHAPE.test(plan.claim_key)) return "claim_key 形状不对";
   if (typeof key === "string" && plan.claim_key !== key) return "claim_key 与文件名不一致";
-  if (typeof plan.handle !== "string" || !REAFFIRM_HANDLE_SHAPE.test(plan.handle)) return "handle 形状不对";
+  if (typeof plan.handle !== "string" || !PLAN_HANDLE_SHAPE[plan.kind].test(plan.handle)) return "handle 形状不对";
   if (typeof plan.target_id !== "string" || !ID_SHAPE.test(plan.target_id)) return "target_id 形状不对";
-  // cas：封闭对象，键集 = expected_expires_at,intent_id；两值形状/自洽。
   const cas = plan.cas;
-  if (!isObj(cas) || keysOf(cas) !== "expected_expires_at,intent_id") return "cas 键集不对";
-  if (typeof cas.intent_id !== "string" || !REAFFIRM_HANDLE_SHAPE.test(cas.intent_id)) return "cas.intent_id 形状不对";
-  if (cas.intent_id !== plan.handle) return "cas.intent_id 与 handle 不一致";
-  if (typeof cas.expected_expires_at !== "string") return "cas.expected_expires_at 不是字符串";
-  if (!Number.isFinite(Date.parse(cas.expected_expires_at))) return "cas.expected_expires_at 不是合法时间";
+  if (plan.kind === "rfh") {
+    if (plan.action !== "reaffirm") return "action 不是 reaffirm";
+    if (plan.basis !== "reaffirm") return "basis 不是 reaffirm";
+    if (!isObj(cas) || keysOf(cas) !== PLAN_CAS_KEYS.reaffirm) return "cas 键集不对";
+    if (typeof cas.intent_id !== "string" || !REAFFIRM_HANDLE_SHAPE.test(cas.intent_id)) return "cas.intent_id 形状不对";
+    if (cas.intent_id !== plan.handle) return "cas.intent_id 与 handle 不一致";
+    if (typeof cas.expected_expires_at !== "string") return "cas.expected_expires_at 不是字符串";
+    if (!Number.isFinite(Date.parse(cas.expected_expires_at))) return "cas.expected_expires_at 不是合法时间";
+    return null;
+  }
+  // osh / orh：action/basis 封闭 + cas 按 action 封闭键集（键集封闭由 keysOf 保证；值形状逐键核）。
+  if (plan.kind === "osh" && plan.action !== "activate" && plan.action !== "anchor") return "osh 的 action 是 activate/anchor";
+  if (plan.kind === "orh" && plan.action !== "rebind") return "orh 的 action 是 rebind";
+  // P1-A（返修五）：basis 按 kind/action 封闭 —— 解析器（select-resolve.mjs SELECTION_BASES）只产出
+  //   explicit_handle / unique_candidate / rebind：activate/anchor 认前两个（显式 osh → explicit_handle；
+  //   省略 handle 的唯一候选 → unique_candidate），rebind 只认 rebind。旧码认的是 `explicit_handle|resolved`：
+  //   resolved 根本不存在（合法省略 osh 反而被拒 → 合法路径不可达），而 rebind 支的真实值同样被拒。
+  const basisOk = plan.action === "rebind"
+    ? plan.basis === "rebind"
+    : (plan.basis === "explicit_handle" || plan.basis === "unique_candidate");
+  if (!basisOk) {
+    return plan.action === "rebind"
+      ? "rebind 支的 basis 必须是 rebind（当前 " + String(plan.basis) + "）"
+      : plan.action + " 支的 basis 是 explicit_handle/unique_candidate（当前 " + String(plan.basis) + "）";
+  }
+  if (!isObj(cas) || keysOf(cas) !== PLAN_CAS_KEYS[plan.action]) return "cas 键集不对（" + plan.action + "）";
+  for (const [k, v] of Object.entries(cas)) {
+    if (v === null || typeof v !== "string" || v.length === 0) return "cas." + k + " 须非空字符串";
+    if (/handle$/u.test(k) && !/^(osh|orh)_[0-9a-f]{32}$/u.test(v)) return "cas." + k + " 形状不对";
+    if (/expires_at$/u.test(k) && !Number.isFinite(Date.parse(v))) return "cas." + k + " 不是合法时间";
+  }
+  // handle 自洽：cas 里冻结的 handle 与 plan.handle 同一（activate/anchor 的 selection_handle、rebind 的 rebind_handle）。
+  const frozen = cas.selection_handle ?? cas.rebind_handle ?? null;
+  if (frozen !== null && frozen !== plan.handle) return "cas 冻结的 handle 与 plan.handle 不一致";
   return null;
 }
 

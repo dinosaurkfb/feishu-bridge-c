@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-10T11:30:49.127Z",
+  "generated_at": "2026-09-10T18:28:25.432Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -147,6 +147,7 @@
       "resumeControlClaim",
       "runControlTransaction",
       "sameControlIntent",
+      "uncleanRecordFields",
       "withControlLock"
     ],
     "control-intent.mjs": [
@@ -321,6 +322,7 @@
       "isPrivateChatTurn",
       "listBindings",
       "loadConsumed",
+      "pendingGenerationIdentity",
       "promoteBinding",
       "shadowClaudeFirstClaim"
     ],
@@ -595,7 +597,10 @@
       "SELECTION_CONTEXT_KEYS",
       "classifySelectOutcome",
       "executeSelectControl",
+      "mintSelectCapability",
       "selectAdmission",
+      "selectAmbiguityReceipt",
+      "selectExecutorSuccessText",
       "selectReaffirmSuccessText",
       "selectReject",
       "selectRejectTextByReason",
@@ -736,11 +741,13 @@
       "attach",
       "attachF4",
       "authorityCutover",
+      "barrierLedgerDurability",
       "buildMintPlan",
       "cRecordKey",
       "cancelRebind",
       "canonKey",
       "clearAnchorHandle",
+      "clearLedgerResidue",
       "createA1",
       "createB1",
       "cutoverPlan",
@@ -751,6 +758,8 @@
       "fingerprintOf",
       "initPlan",
       "initializeShadow",
+      "isLedgerTmpName",
+      "isSidecarTmpName",
       "ledgerRootFor",
       "liveProblem",
       "loadByEndpoint",

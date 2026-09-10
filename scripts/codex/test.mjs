@@ -40,6 +40,8 @@ import { sweepEligible } from "./drain-all.mjs";
 import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
+import * as CODEX from "./inbound.mjs";
+import { selectLegacyUpdate } from "./inbound.mjs";
 import { dispatchControlRepair } from "../repair-control-claim.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
@@ -10213,6 +10215,62 @@ test("bind-task 首次接入：已启用端点强制双写镜像 shadow create_b
   assert.equal(sendCalls.length, 1, "恰好一次 sendToChat（messages-send）：" + JSON.stringify(sendCalls));
 });
 
+test("R57d 返修三 P1-1：codex selectLegacyUpdate——rebind W2 复合（root+session 都相符）/ projectRoot 找不到 → select_legacy_target_missing 不回退 / root·session 任一不符、无 pending → 结构化拒", () => {
+  const home = temp();
+  const projectA = path.join(home, "project-a");
+  const projectB = path.join(home, "project-b");
+  fs.mkdirSync(projectA); fs.mkdirSync(projectB);
+  const taskA = makeTaskEntry({ root: projectA, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  taskA.session_id = "aily_session_a";
+  taskA.inbound_state = "bound";
+  // 每个用例独立新鲜 taskB fixture（避免 activate 后 pending 消失、只钉到 no pending）。
+  const writeB = (flav) => {
+    const taskB = makeTaskEntry({ root: projectB, threadId: THREAD_B, name: "B", rootMessageId: "om_b3root", token: "b" });
+    taskB.session_id = "aily_old";
+    taskB.inbound_state = "bound";
+    const g = taskB.topic_generation_state.generations[0];
+    g.channel_generation_id = "lin_active_b"; g.root_message_id = "om_b3root"; g.session_id = "aily_old"; g.status = "active"; g.pending_token = null;
+    taskB.topic_generation_state.active_generation_id = "lin_active_b";
+    if (flav !== "no-pending") {
+      taskB.topic_generation_state.generations.push({ channel_generation_id: "lin_p2b", generation: 2, status: "pending", root_message_id: "om_newroot", session_id: null, created_at: "2026-09-13T00:00:00.000Z", pending_token: "tok_w2", claim_expires_at: null });
+      taskB.topic_generation_state.rotation = { operation_id: "rot_w2_codex", status: "awaiting_claim", pending_generation_id: "lin_p2b" };
+    }
+    writeRegistryFixtureUnvalidated([taskA, taskB], path.join(home, "registry.json"));
+  };
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  // ① root + session 都相符 → W2 复合成功（激活新代际到事件会话）
+  writeB();
+  const r1 = selectLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_session_new", expectedOldSessionId: "aily_old" }, { task: taskA, home });
+  assert.equal(r1.ok, true, "① W2 复合成功：" + JSON.stringify(r1));
+  const reg1 = loadRegistry(path.join(home, "registry.json"));
+  const taskB1 = reg1.tasks.find((t) => t.root === projectB);
+  const g1 = taskB1.topic_generation_state.generations.find((g) => g.channel_generation_id === "lin_p2b");
+  assert.equal(g1.status, "active", "新代际已激活：" + JSON.stringify(g1));
+  assert.equal(g1.session_id, "aily_session_new", "新代际会话 = 事件会话");
+  // ② projectRoot 找不到 task → select_legacy_target_missing（不回退到事件 task）
+  const r2 = selectLegacyUpdate({ action: "rebind", projectRoot: path.join(home, "nope"), rootOm: "om_x", eventSessionId: "aily_session_a", expectedOldSessionId: "aily_old" }, { task: taskA, home });
+  assert.equal(r2.ok, false, "② target missing 拒：" + JSON.stringify(r2));
+  assert.equal(r2.reason, "select_legacy_target_missing", "② " + r2.reason);
+  // ③ root 不符（pending 在场）→ select_rebind_legacy_root_mismatch
+  writeB();
+  const r3 = selectLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_other", eventSessionId: "aily_session_new", expectedOldSessionId: "aily_old" }, { task: taskA, home });
+  assert.equal(r3.ok, false, "③ root 不符拒：" + JSON.stringify(r3));
+  assert.equal(r3.reason, "select_rebind_legacy_root_mismatch", "③ " + r3.reason);
+  assert.match(r3.why, /root/u, "③ why 点名 root：" + r3.why);
+  // ④ old session 不符（root 相符、pending 在场）→ select_rebind_legacy_session_mismatch
+  writeB();
+  const r4 = selectLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_session_new", expectedOldSessionId: "aily_other" }, { task: taskA, home });
+  assert.equal(r4.ok, false, "④ session 不符拒：" + JSON.stringify(r4));
+  assert.equal(r4.reason, "select_rebind_legacy_session_mismatch", "④ " + r4.reason);
+  assert.match(r4.why, /session/u, "④ why 点名 session：" + r4.why);
+  // ⑤ 无 pending → select_rebind_legacy_unsupported
+  writeB("no-pending");
+  const r5 = selectLegacyUpdate({ action: "rebind", projectRoot: projectB, rootOm: "om_b3root", eventSessionId: "aily_session_new", expectedOldSessionId: "aily_old" }, { task: taskA, home });
+  assert.equal(r5.ok, false, "⑤ 无 pending 拒：" + JSON.stringify(r5));
+  assert.equal(r5.reason, "select_rebind_legacy_unsupported", "⑤ " + r5.reason);
+  assert.match(r5.why, /pending|代际/u, "⑤ why 点名无 pending：" + r5.why);
+});
+
 test("R52a 返修三 P1-1: Codex 真入口 $feishu-select 全路径（claim meta 按 kind 投影、readClaimState 绝不 unreadable、默认 off 拒并落 failed、重放幂等）", () => {
   const home = temp();
   const root = path.join(home, "project");
@@ -10264,6 +10322,37 @@ test("R52a 返修三 P1-1: Codex 真入口 $feishu-select 全路径（claim meta
   const replayRes = run("$feishu-select " + h, "msg_sel_1");
   assert.equal(replayRes.status, 0, replayRes.stdout + replayRes.stderr);
   assert.match(replayRes.stdout, /选择功能未开放/u, "重放回执一致");
+});
+
+test("R57d 返修二 P1-1: Codex select 的 legacy 提交回调（selectLegacyUpdate）——真 promoteTask 激活 pending 代际到事件会话；rebind 结构化拒；lineage CAS 拒", () => {
+  const home = temp();
+  const projectB = path.join(home, "project-b");
+  fs.mkdirSync(projectB, { recursive: true });
+  // 事件 task（bound，无 pending）+ 目标 task B（pending 代际 lin_c1，root = projectB）——跨项目选择的本意
+  const taskA = makeTaskEntry({ root: path.join(home, "project-a"), threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  taskA.session_id = "aily_session_a";
+  taskA.inbound_state = "bound";
+  const taskB = makeTaskEntry({ root: projectB, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "b" });
+  taskB.topic_generation_state.generations[0].channel_generation_id = "lin_c1";
+  taskB.topic_generation_state.generations[0].root_message_id = "om_b";
+  writeRegistryFixtureUnvalidated([taskA, taskB], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // （返修三 P1-1 后 rebind 走 W2 复合，不再一律拒——W2 精确绑定/无 pending/root 不符的反例见返修三 P1-1 专属测试）
+  // ③ lineage CAS：载荷 lineageId 与 pending 代际不符 → promoteTask 自拒（不静默换目标）
+  const r2b = selectLegacyUpdate({ action: "activate", projectRoot: projectB, lineageId: "lin_other", eventSessionId: "aily_session_c" }, { task: taskA, home });
+  assert.equal(r2b.ok, false, "② CAS 拒：" + JSON.stringify(r2b));
+  assert.equal(r2b.reason, "pending_generation_mismatch", "② " + r2b.reason);
+
+  // ① activate：真 promoteTask —— task B 的 pending 代际激活到事件会话
+  const r = selectLegacyUpdate({ action: "activate", projectRoot: projectB, lineageId: "lin_c1", eventSessionId: "aily_session_b" }, { task: taskA, home });
+  assert.equal(r.ok, true, "① activate 成功：" + JSON.stringify(r));
+  const reg1 = loadRegistry(path.join(home, "registry.json"));
+  const taskB1 = reg1.tasks.find((t) => t.root === projectB);
+  const gen1 = taskB1.topic_generation_state.generations[0];
+  assert.equal(gen1.status, "active", "legacy 代际已激活：" + JSON.stringify(gen1));
+  assert.equal(gen1.session_id, "aily_session_b", "legacy 会话 = 事件会话");
+  assert.equal(taskB1.channel_generation_id, "lin_c1", "mapping 代际 = 账本 lineage");
 });
 
 test("R52a 返修三 P1-1: Codex 侧 select in-flight claim 维护恢复（claim 已取、终态未落 → repair 预览与 apply 能收敛）", () => {
@@ -10375,6 +10464,21 @@ test("R52a 返修四 P2: Codex 侧 repair 消费者显式按 kind 穷举（contr
   });
   assert.deepEqual(selectGiven, selTarget);
   assert.equal(selRes.reason, "select_off");
+});
+
+test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext 缺席 → 拒（select_repair_context_missing）；endpoint 漂移 → 拒（select_endpoint_mismatch）", () => {
+  const h = "osh_" + "c".repeat(32);
+  const epClaim = legacyEndpointId({ runtime: "codex", agentUid: "agent_cx" });
+  const ctx = { endpoint: epClaim, chat: "oc_test", session: "aily_ccx", message: "om_p12mismatch", sender: "12345", handle: h, kind: "osh" };
+  const mkClaim = (over = {}) => ({ control: { control: "select", handle: h, handle_kind: "osh" }, selection_context: { ...ctx, ...over }, selection_context_digest_v1: selectionContextDigestV1({ ...ctx, ...over }) });
+  // ① ownerContext 缺席（模板读不出）→ select_repair_context_missing，不铸 capability
+  const missing = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim() });
+  assert.equal(missing.ok, false, "① ownerContext 缺席必须拒：" + JSON.stringify(missing));
+  assert.equal(missing.reason, "select_repair_context_missing", "① " + missing.reason);
+  // ② endpoint 漂移（模板派生 endpoint ≠ claim 的）→ select_endpoint_mismatch（角色/chat 先过，endpoint 不符点出）
+  const drift = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim(), ownerContext: { frankSenderId: "12345", senders: [], chatId: "oc_test", endpoint: "endpoint_" + "9".repeat(24) } });
+  assert.equal(drift.ok, false, "② endpoint 漂移必须拒：" + JSON.stringify(drift));
+  assert.equal(drift.reason, "select_endpoint_mismatch", "② " + drift.reason);
 });
 
 sealSummary();

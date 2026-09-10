@@ -52,14 +52,18 @@ export function describeReapLockRepair(r, { apply }) {
   else if (!r.stale) lines.push("reap 锁还新（" + age + "），可能是活的，不动：" + r.reapDir);
   else if (r.removed) lines.push("已清除 reap 残骸（" + age + "）：" + r.reapDir);
   else lines.push((apply ? "" : "[预览] ") + "reap 残骸（" + age + "）可清除：" + r.reapDir + "\n加 --apply 执行。");
+  if (r.maintUncleared) {
+    lines.push("维护锁释放状态不明（" + (r.maintUncleared.error ?? "?") + "）：" + (r.maintUncleared.path ?? r.maintDir) + "\n确认没有维护者在跑后手动删除再重试。");
+  }
   lines.push(...describeQuarantine(r));
   return lines.join("\n");
 }
 
 /** 退出码：只有"确实没有 / 已清 / 预览"是 0；--apply 没做完的一律非零（评审：未完成也退 0 会被脚本当成功）。 */
 export function repairExitCode(r, { apply }) {
+  if (r.maintUncleared) return 1;
   if (r.reason === "io_error" || r.reason === "unrecognized_artifact" || r.reason === "maintenance_busy"
-    || r.reason === "quarantine_unremoved" || r.reason === "instance_changed") return 1;
+    || r.reason === "quarantine_unremoved" || r.reason === "instance_changed" || r.reason === "maintenance_unreleased") return 1;
   if ((r.quarantine ?? []).some((e) => e.error || (!e.recognized))) return 1;
   if (!apply) return 0;
   if (r.removed || !r.present || r.reason === "already_cleared") return 0;

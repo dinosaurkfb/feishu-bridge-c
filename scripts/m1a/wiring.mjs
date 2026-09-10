@@ -19,7 +19,7 @@ import path from "node:path";
 
 import { acquireOrderLock, requestKeyFor } from "./dual-write.mjs";
 import {
-  createA1, createB1, activate, attach, voidPending, unbind, restore, retarget, rebindSessionAlias,
+  createA1, createB1, activate, anchor, attach, voidPending, unbind, restore, retarget, rebindSessionAlias,
   resolveLiveId, loadByEndpoint, familyOf,
 } from "../topic-agent-ledger.mjs";
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
@@ -293,7 +293,7 @@ export function wirePromoteBinding({
       const k = rk("rebind_session_alias", claimKey, b1Id);
       if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
       // R57a 返修二 P1-2：handle 事务不传数值 now——到期/TTL 由锁内 clock() 读取
-      return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldSessionId: target.aliases.session_id, newSessionId: sessionId, authorizedBy, env }))];
+      return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldSessionId: target.aliases.session_id, expectedRootOm: target.aliases.root_om, newSessionId: sessionId, authorizedBy, env }))];
     }
     if (target.facts.binding !== "pending") return [{ op: "promote", ok: false, reason: "target_not_pending_or_active", why: "target.facts.binding=" + String(target.facts.binding) }];
     // W1 引用码认领（B1 仍 pending）→ create_a1 → activate。P1-2 收尾：**只消费**认领校验处受验的
@@ -467,4 +467,117 @@ export function wireBind({ endpointId, env = process.env, legacy, externalReques
     // R57a 返修二 P1-2：create_b1 不传数值 now（TTL 走锁内 clock()）
     return [capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env }))];
   } });
+}
+
+/* ── R57d 返修一 P1-1：owner_select 执行器的三个具名 wrapper（owner-select-route.md §12 ①）──
+ * 按账本 authority_mode 封闭分派：authoritative → ledger-only（无 legacy、无 outer 锁——没有
+ * legacy 提交就没有排序对象，账本事务自带文件锁）；shadow → runWired 复合双写（m1a-order.lock →
+ * legacy 提交回调 → 账本 op）；其它值 → 拒 fail-closed。owner_select writer on ≠ 账本 authoritative。
+ * 执行器没有第二个入口：outer 锁只由 runWired 取，本组 wrapper 是 select 执行的唯一写面。
+ * anchor 没有 legacy mapping 权威事实可更新 → legacy 显式 no-op（outer 排序保留、不伪造 mapping 写）；
+ * activate / rebind 的 legacy 回调更新 mapping —— 由调用方注入，shadow 期缺席 → 拒（不做无 legacy
+ * 的半笔双写）。request_key 按 §5.1 通式从持久外部 id（事件 message id）+ 目标 id 逐 op 派生。 */
+
+/** 分派前提：账本 authority_mode 三值读取（absent → no_candidate；corrupt → ledger_corrupt；其余 → ledger_unreadable）。 */
+function selectAuthorityMode({ endpointId, env }) {
+  const L = loadByEndpoint(endpointId, { env });
+  if (!L.ok) {
+    const reason = L.granular === "absent" ? "no_candidate" : L.granular === "corrupt" ? "ledger_corrupt" : "ledger_unreadable";
+    return { ok: false, reason, why: L.why ?? null };
+  }
+  const mode = L.doc?.authority_mode;
+  if (mode !== "shadow" && mode !== "authoritative") return { ok: false, reason: "ledger_unreadable", why: "authority_mode=" + String(mode) + " 越界（fail-closed）" };
+  return { ok: true, mode };
+}
+
+/** authoritative 支的 ledger-only 结果：单笔 capture 原样投影（legacy 恒 null、无 outer 锁）。 */
+function selectLedgerOnly(step) {
+  return step.ok === true
+    ? { ok: true, ledgerOnly: true, legacy: null, shadow: [step], release: null }
+    : { ok: false, commit: "not_committed", ledgerOnly: true, reason: step.reason ?? "select_op_failed", why: step.why ?? null, legacy: null, shadow: [step], release: null };
+}
+
+/** shadow 支的前置拒（activate / rebind 必须带 legacy 提交回调；缺席 → 不做无 legacy 的半笔双写）。 */
+const selectLegacyMissing = () => ({ ok: false, commit: "not_committed", reason: "select_legacy_required", why: "shadow 期该动作必须带 legacy 提交回调（更新 mapping）；缺席 → 拒", legacy: null, shadow: null, release: null });
+
+/** R57d 返修一 B 段 P1-2：受验 owner capability 的封闭校验（写层的内层闸）。
+ * 只认 kind=owner_select_control_v1、绑定本次选择上下文的 capability —— 不认通用 full、不收裸 sender；
+ * 任一字段与本次执行不符 → select_capability_invalid。 */
+function verifySelectCapability(capability, want) {
+  if (!capability || typeof capability !== "object" || Array.isArray(capability) || capability.kind !== "owner_select_control_v1") {
+    return { ok: false, reason: "select_capability_required", why: "缺绑定本次选择上下文的受验 owner capability（不认通用 full、不收裸 sender）" };
+  }
+  const mismatch = [];
+  // R57d 返修三 P1-2：写层校验含 endpoint / chat / session / message / sender / handle / kind 全部字段；
+  //   want 中 undefined 的字段（该 wrapper 不掌握）不伪核。
+  for (const [k, v] of Object.entries(want)) {
+    if (v === undefined) continue;
+    if ((capability[k] ?? null) !== (v ?? null)) mismatch.push(k);
+  }
+  if (mismatch.length > 0) return { ok: false, reason: "select_capability_invalid", why: "capability 与本次选择上下文不一致（" + mismatch.join(",") + "）" };
+  return { ok: true };
+}
+
+const selectCapFail = (v) => ({ ok: false, commit: "not_committed", reason: v.reason, why: v.why, legacy: null, shadow: null, release: null });
+
+/** wireSelectActivate —— owner_select activate（B1+A1 归并）的双写分派。
+ * A1 复核在 preflight（outer 锁内、legacy 提交之前，R57d 返修二 P1-6）：缺 → no_a1 整笔拒，
+ * 不再出现「legacy 已提交、shadow no_a1」的半笔。 */
+export function wireSelectActivate({ endpointId, env = process.env, legacy = null, capability, requestedHandle, messageId, _inject = undefined, b1Id, chatId, eventSessionId, authorizedBy, selectedRootOm, selectionHandle, selectionBasis, clock = () => Date.now() }) {
+  const vcap = verifySelectCapability(capability, { endpoint: endpointId, chat: chatId, session: eventSessionId, message: messageId, sender: authorizedBy, handle: requestedHandle, handleKind: requestedHandle === null ? null : "osh" });
+  if (!vcap.ok) return selectCapFail(vcap);
+  const mode = selectAuthorityMode({ endpointId, env });
+  if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
+  // preflight 在 outer 锁内、legacy 之前跑（runWired 的 preflight 槽位）：复核事件会话/chat 上仍存在可归并 A1（§12 ⑥）。
+  const preflight = () => {
+    const l = loadByEndpoint(endpointId, { env });
+    if (!l.ok) return { ok: false, reason: "ledger_unreadable", why: l.why ?? null };
+    const a1 = Object.values(l.doc.records).find((x) => x?.kind === "live" && familyOf(x.facts) === "A1" && x.chat_id === chatId && x.aliases.session_id === eventSessionId);
+    if (!a1) return { ok: false, reason: "no_a1", why: "preflight 复核：事件会话/chat 上无可归并 A1（§12 ⑥）" };
+    return { ok: true, a1Id: a1.topic_agent_id };
+  };
+  const submit = (_legacyRes, pf) => {
+    const k = rk("activate", messageId, b1Id);
+    if (!k.ok) return [{ op: "activate", ...k }];
+    return [capture("activate", activate({ endpointId, requestKey: k.request_key, b1Id, a1Id: pf.a1Id, authorizedBy, selectedSessionId: eventSessionId, selectedRootOm, selectionHandle, selectionMessageId: messageId, selectionBasis, clock, env, _inject }))];
+  };
+  if (mode.mode === "authoritative") {
+    const pf = preflight();
+    if (!pf.ok) return { ok: false, commit: "not_committed", reason: pf.reason, why: pf.why, legacy: null, shadow: [{ op: "activate", ok: false, reason: pf.reason, why: pf.why }], release: null };
+    return selectLedgerOnly(submit(null, pf)[0]);
+  }
+  if (typeof legacy !== "function") return selectLegacyMissing();
+  return runWired({ endpointId, env, legacy, preflight, submit });
+}
+
+/** wireSelectAnchor —— owner_select anchor（A2 → A3 补链路证明）的双写分派。
+ * legacy 恒为显式 no-op：anchor 没有 legacy mapping 权威事实可更新，不伪造 mapping 写；outer 排序照走。 */
+export function wireSelectAnchor({ endpointId, env = process.env, capability, requestedHandle, chatId, messageId, _inject = undefined, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionBasis, clock = () => Date.now() }) {
+  const vcap = verifySelectCapability(capability, { endpoint: endpointId, chat: chatId, session: selectedSessionId, message: messageId, sender: authorizedBy, handle: requestedHandle, handleKind: requestedHandle === null ? null : "osh" });
+  if (!vcap.ok) return selectCapFail(vcap);
+  const mode = selectAuthorityMode({ endpointId, env });
+  if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
+  const submit = () => {
+    const k = rk("anchor", messageId, id);
+    if (!k.ok) return [{ op: "anchor", ...k }];
+    return [capture("anchor", anchor({ endpointId, requestKey: k.request_key, id, authorizedBy, selectedSessionId, selectedRootOm, selectionHandle, expectedExpiresAt, expectedAnchorCandidate, selectionMessageId: messageId, selectionBasis, clock, env, _inject }))];
+  };
+  if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
+  return runWired({ endpointId, env, legacy: () => ({ ok: true, noop: true, why: "anchor 无 legacy mapping 权威事实（§12 ①：显式 no-op，不伪造 mapping 写）" }), submit });
+}
+
+/** wireSelectRebind —— owner_select rebind_session_alias（B3 换绑事件会话）的双写分派。 */
+export function wireSelectRebind({ endpointId, env = process.env, legacy = null, capability, requestedHandle, chatId, messageId, _inject = undefined, id, expectedOldSessionId, expectedRootOm, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
+  const vcap = verifySelectCapability(capability, { endpoint: endpointId, chat: chatId, session: newSessionId, message: messageId, sender: authorizedBy, handle: requestedHandle, handleKind: requestedHandle === null ? null : "orh" });
+  if (!vcap.ok) return selectCapFail(vcap);
+  const mode = selectAuthorityMode({ endpointId, env });
+  if (!mode.ok) return { ok: false, commit: "not_committed", reason: mode.reason, why: mode.why, legacy: null, shadow: null, release: null };
+  const submit = () => {
+    const k = rk("rebind_session_alias", messageId, id);
+    if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
+    return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id, expectedOldSessionId, expectedRootOm, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId: messageId, clock, env, _inject }))];
+  };
+  if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
+  if (typeof legacy !== "function") return selectLegacyMissing();
+  return runWired({ endpointId, env, legacy, submit });
 }

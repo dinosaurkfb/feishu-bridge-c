@@ -52,7 +52,7 @@ import { loadChainTemplate } from "./chain-template.mjs";
 import { appendChannelSample, channelDisposition } from "./channel-samples.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
-  findPendingBinding, promoteBinding, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
+  findPendingBinding, promoteBinding, pendingGenerationIdentity, shadowClaudeFirstClaim, evaluateChatGates, CHAT_FALLBACK_REASONS,
   isPrivateChatTurn,
 } from "./inbound-route.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText } from "./chat-reply.mjs";
@@ -70,7 +70,7 @@ import {
 import { isDirectRun } from "./direct-run.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl, selectionContextDigestV1 } from "./select-admission.mjs";
+import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, executeSelectControl, selectionContextDigestV1, mintSelectCapability } from "./select-admission.mjs";
 /**
  * 整个入站流程包在 main() 里，只有被直接执行时才跑。
  *
@@ -81,6 +81,32 @@ import { selectAdmission, selectRejectTextByReason, selectReaffirmSuccessText, e
  * 刻意**不重排函数体的缩进**：这个文件近七百行，重排会让 diff 完全无法评审，
  * 而这次改动的实质只有"加一道守卫"。可读性代价换评审可读性，是有意的取舍。
  */
+/**
+ * R57d 返修三 P1-1：owner_select 的 legacy 提交回调（Claude 链，$feishu-select shadow 期复合双写的 legacy 半笔）。
+ *   activate → 复用 promoteBinding（W1）；rebind → 存在与所选 B3 精确绑定的 W2 新代际 pending
+ *   （同项目 pending 代际在场 ∧ 其 active 代际 root_om === B3 的 root——B3 正是当前绑定的活跃代际，
+ *   新代际认领构成 W2 换绑继承）时复用 promoteBinding 激活新代际到事件会话；不存在 → 结构化拒
+ *   select_rebind_legacy_unsupported（不得把任意 orh_ 冒充 W2）。
+ */
+export function selectClaudeLegacyUpdate(u, { now = Date.now() } = {}) {
+  if (!u || typeof u !== "object" || (u.action !== "activate" && u.action !== "rebind")) {
+    return { ok: false, reason: "select_rebind_legacy_unsupported", why: "未知 action（" + String(u?.action) + "）" };
+  }
+  const idy = pendingGenerationIdentity({ root: u.projectRoot, now });
+  if (!idy.ok) {
+    return u.action === "activate" ? idy
+      : { ok: false, reason: "select_rebind_legacy_unsupported", why: "所选 B3 的项目没有 pending 新代际（无 W2 继承），shadow 期换绑拒" };
+  }
+  if (u.action === "rebind" && (idy.activeRootOm ?? null) !== (u.rootOm ?? null)) {
+    return { ok: false, reason: "select_rebind_legacy_root_mismatch", why: "active 代际 root（" + (idy.activeRootOm ?? "null") + "）与所选 B3 root（" + (u.rootOm ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+  }
+  if (u.action === "rebind" && (idy.activeSessionId ?? null) !== (u.expectedOldSessionId ?? null)) {
+    return { ok: false, reason: "select_rebind_legacy_session_mismatch", why: "active 代际 session（" + (idy.activeSessionId ?? "null") + "）与所选 B3 的 expectedOldSessionId（" + (u.expectedOldSessionId ?? "null") + "）不符——不是这个 B3 的 W2 继承" };
+  }
+  const generationId = u.action === "activate" ? u.lineageId : idy.generationId;
+  return promoteBinding({ root: u.projectRoot, generationId, operationId: idy.operationId, sessionId: u.eventSessionId, now });
+}
+
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {
 
 // 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放（stdout 就是给运输 agent 的回复）
@@ -741,18 +767,39 @@ const runControl = (replay) => {
   finish("control", { text: controlAckText({ taskName: config.task_display_name, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed, lockUncleared: tx.lockUncleared ?? null }) },
     { control: control.kind, mode: control.mode, changed: tx.changed, replayed: tx.replayed, resumed: tx.resumed });
 };
+
 // ---------- /feishu-select 控制命令事务（R52a）：锁内确定性处置准入，落 failed 终态（执行器未接入期不落 consumed，PR #136 P1-4） ----------
 const runSelect = (replay) => {
   const tx = runControlTransaction({
     claimsDir: CLAIMS, key: claim.key, intent: control ? { control: "select", handle: control.handle, handle_kind: control.handle_kind } : undefined, replay, expect: claimExpect,
-    execute: () => executeSelectControl(control, {
+    // R57d 返修一 B 段 P1-3：现算的 selection context digest 传进事务，终态短路前与 claim 里持久化的逐字比对。
+    contextDigest: selectionContextDigest,
+    execute: (_target, txCtx) => executeSelectControl(control, {
+      txCtx,
       selectAdmissionFn,
-      // R57b §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；chat=链路模板登记群
-      // （账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；messageId=本条命令消息。
+      // R57b/R57d §8.1 消费侧核验的事件事实：sender=入站发送者；endpoint=本映射的账本 endpoint；
+      // chat=链路模板登记群（账本记录的 chat_id 同源派生——wireRotate 建记录用 current.config.chat_id）；
+      // messageId=本条命令消息；eventSessionId=选择五元的 session 输入（R57d 返修一 P1-5：root 改由
+      // 命中记录现场供给，不再传 mapping 的 transport 根 eventRootOm）。
       senderId: event.sender_id ?? null,
       chatId: bootTpl.template?.chat_id ?? null,
       endpointId: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
       messageId: verdict.messageId,
+      eventSessionId: event.session_id ?? null,
+      // R57d 返修三 P1-2：capability 只由 R3 成功分支（此处）铸造并显式传入；执行器不自铸。
+      capability: mintSelectCapability({
+        endpoint: bootTpl.template?.agent_uid ? legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid }) : null,
+        chat: bootTpl.template?.chat_id ?? null,
+        session: event.session_id ?? null,
+        message: verdict.messageId,
+        sender: event.sender_id ?? null,
+        handle: control.handle ?? null,
+        handleKind: control.handle_kind ?? null,
+      }),
+      // R57d 返修二 P1-1：shadow 期的 legacy 提交回调 —— 复用既有 promoteBinding（W1 的 legacy writer），
+      //   载荷由执行器带足 generation/CAS 身份；operationId 从目标绑定的 pending 代际读出。
+      //   换绑（rebind）没有既有 legacy writer（W2 的 legacy 是新代际认领，非原地换绑）→ 结构化拒，shadow 期 fail-closed。
+      mappingUpdate: (u) => selectClaudeLegacyUpdate(u),
       env: process.env,
       // R57b 返修五：真实 claim 写方把 selection plan 落盘到本 claim（账本提交前），repair 才能读回三方绑定。
       claimsDir: CLAIMS,
@@ -786,10 +833,10 @@ const runSelect = (replay) => {
   }
   const rfh = control.handle_kind === "rfh";
   if (!replay && !tx.replayed) {
-    // R57b：rfh 支是真消费 → 落正式 consumed 收据；osh/orh 支仍执行器缺席，收据保持 select_pending 语义。
-    writeReceipt((rfh ? "select-" : "select-pending-") + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_pending", ...base, claim_acquired: true, changed: tx.changed });
+    // R57d：三支都是真消费 → 落正式 consumed 收据。
+    writeReceipt("select-" + verdict.messageId, { status: "consumed", reason: rfh ? "select_reaffirm_consumed" : "select_executed", ...base, claim_acquired: true, changed: tx.changed });
   }
-  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "已收到选择，执行器尚未接入");
+  const doneText = tx.text ?? (rfh ? selectReaffirmSuccessText(null) : "该选择之前已处理（同一条消息的重放）");
   finish("control", { text: doneText + lockNote, taskName: config.task_display_name },
     { control: "select", handle_kind: control.handle_kind, replayed: tx.replayed });
 };

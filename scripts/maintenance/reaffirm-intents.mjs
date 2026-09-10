@@ -33,7 +33,7 @@ import {
   ownerSelectReaffirmClosureDigest, ownerSelectReaffirm,
 } from "../topic-agent-ledger.mjs";
 import { classifySelectOutcome } from "../select-outcome.mjs";
-import { writeSelectionPlan, SELECTION_PLAN_SCHEMA } from "../selection-plan.mjs";
+import { writeSelectionPlan, selectionPlanDigest, SELECTION_PLAN_SCHEMA } from "../selection-plan.mjs";
 import { CLAIM_KEY_SHAPE } from "../shapes.mjs";
 
 export const REAFFIRM_INTENTS_FILE = "reaffirm-intents.json";
@@ -508,6 +508,9 @@ export function consumeReaffirmIntentInner({ endpointId, reaffirmHandle, sender,
       cleared,
       intent_cleanup: cleared ? "cleared" : "unclear",
       ledger_res: res,
+      // P1-5a：sidecar plan 的受验 digest（canonKey 摘要，与 writeSelectionPlan 写下的 plan 同一份）——
+      //   rfh 的 unclean detail 靠它填 plan_ref（重叠后就是 sidecar 的受验 digest）。
+      plan_ref: selectionPlanDigest(plan),
       ...(intentCleanupWhy ? { why: intentCleanupWhy } : {}),
     };
   }, { env });

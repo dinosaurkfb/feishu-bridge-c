@@ -31,7 +31,7 @@ import {
   legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
 } from "./subscription.mjs";
 import {
-  activatePendingTopicGeneration, materializeLegacyTopicFields, pendingGeneration,
+  activatePendingTopicGeneration, activeGeneration, materializeLegacyTopicFields, pendingGeneration,
   topicGenerationStateForLegacy, effectiveBindingId,
   generationForSession,
 } from "./topic-generation.mjs";
@@ -572,5 +572,36 @@ export function promoteBinding({
     return { ok: false, reason: "registry_unwritable", error: String(err.message).slice(0, 200) };
   } finally {
     releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * R57d 返修二 P1-1：读一个绑定（项目映射文件，缺则 registry 条目）里 **pending 代际**的身份 ——
+ *   channel_generation_id（promoteBinding 的 generationId CAS 输入）+ rotation operation id
+ *   （operationId CAS 输入；rotation 缺席 → null，promoteBinding 侧按既有 nonEmpty 规则跳过该 CAS）。
+ * 供 owner_select activate 的 legacy 提交回调带足身份；只读，不写、不取锁（写仍由 promoteBinding 自己做）。
+ */
+export function pendingGenerationIdentity({ root, registryFile = registryPath(), now = Date.now() } = {}) {
+  const readState = (record, bindingId) => {
+    const loaded = topicGenerationStateForLegacy(record, { runtime: "claude", bindingId, now });
+    if (!loaded.ok) return loaded;
+    const pending = pendingGeneration(loaded.state);
+    if (!pending) return { ok: false, reason: "no_pending_generation", why: "目标绑定没有 pending 代际（可能已激活/已轮转）" };
+    const active = activeGeneration(loaded.state);
+    return { ok: true, generationId: pending.channel_generation_id, operationId: loaded.state.rotation?.operation_id ?? null, activeRootOm: active?.root_message_id ?? null, activeSessionId: active?.session_id ?? null };
+  };
+  try {
+    const mapping = JSON.parse(fs.readFileSync(projectMappingPath(root), "utf-8"));
+    return readState(mapping, effectiveBindingId(mapping, { root }));
+  } catch (err) {
+    if (err?.code !== "ENOENT") return { ok: false, reason: "mapping_unreadable", why: String(err.code ?? err.message) };
+  }
+  try {
+    const reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
+    const entry = (reg.projects ?? []).find((p) => p?.root === root);
+    if (!entry) return { ok: false, reason: "entry_gone", why: "registry 里没有这个项目根的条目" };
+    return readState(entry, (entry.id ?? path.basename(root)) + "@registry");
+  } catch (err) {
+    return { ok: false, reason: "registry_unreadable", why: String(err.code ?? err.message) };
   }
 }

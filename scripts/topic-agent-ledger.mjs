@@ -28,7 +28,8 @@ import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
 export { canonKey, sha256 };
 // R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
-import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./shapes.mjs";
+import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE } from "./shapes.mjs";
+import { SIDECAR_TMP_TAIL_RE } from "./verified-sidecar.mjs";
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -44,11 +45,9 @@ const OP_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 // 生产权威形状（评审二 P1-1/P1-6）：endpoint = legacyEndpointId = stableControlId("endpoint",…) = endpoint_<24hex>；
 // 链不可从 opaque endpoint 还原，另存顶层 chain。om_/oc_/session-UUID 各按真实前缀；claim key 复用 CLAIM_KEY_SHAPE。
-const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
-export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：同一形状只住一处
+export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：形状定义住叶子 shapes.mjs，同一形状只住一处
 const CHAIN = ["claude", "codex"];
 const OM_SHAPE = /^om_[A-Za-z0-9]{1,120}$/u;                 // 根消息 / matched om
-const CHAT_SHAPE = /^oc_[A-Za-z0-9]{1,120}$/u;               // 受验群 chat_id
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u; // claude session
 const AILY_SESSION_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;    // aliases.session_id（Aily 会话 locator）
 const CODEX_ID_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;        // codex task/thread
@@ -1866,6 +1865,482 @@ function foldRelease(result, released) {
   return { ...result, lockUncleared };
 }
 
+/* ─────────────────────────── 写残骸清理（R57d 返修六 P1-2；返修八 P2 共享判别器） ─────────────────────────── */
+
+const LEDGER_TMP_PREFIX_RE = /^ledger\.json(?:\.prev)?\./u;
+const SIDECAR_TMP_PREFIX_RE = /^\.[0-9a-f]{64}\.selection-plan\.json\.tmp\./u;
+
+/**
+ * 账本写原语产生的 tmp 名判定（R57d 返修八 P2）：
+ * 与 writeTmpBytes 格式一致（ledger.json[.prev].<正整数 pid>.<v4 uuid>），共用 verified-sidecar 的 SIDECAR_TMP_TAIL_RE。
+ */
+export function isLedgerTmpName(name) {
+  if (typeof name !== "string") return false;
+  const m = LEDGER_TMP_PREFIX_RE.exec(name);
+  if (!m) return false;
+  return SIDECAR_TMP_TAIL_RE.test(name.slice(m[0].length));
+}
+
+/**
+ * selection-plan sidecar 的 tmp 名判定（R57d 返修八 P2）：
+ * 与 selection-plan / verified-sidecar 格式一致（.<64hex key>.selection-plan.json.tmp.<正整数 pid>.<v4 uuid>），共用 SIDECAR_TMP_TAIL_RE。
+ * 若提供 key，则额外校验 key 是否与文件名前缀一致。
+ */
+export function isSidecarTmpName(name, key = null) {
+  if (typeof name !== "string") return false;
+  if (typeof key === "string" && key.length > 0) {
+    const prefix = "." + key + ".selection-plan.json.tmp.";
+    if (!name.startsWith(prefix)) return false;
+    return SIDECAR_TMP_TAIL_RE.test(name.slice(prefix.length));
+  }
+  const m = SIDECAR_TMP_PREFIX_RE.exec(name);
+  if (!m) return false;
+  return SIDECAR_TMP_TAIL_RE.test(name.slice(m[0].length));
+}
+
+function durabilityDirAllowSet({ dir, claimsDir = null } = {}) {
+  const set = new Set();
+  if (typeof dir === "string" && dir.length > 0) {
+    set.add(path.resolve(dir));
+  }
+  if (typeof claimsDir === "string" && claimsDir.length > 0) {
+    set.add(path.resolve(claimsDir));
+  }
+  return set;
+}
+
+function validateDirsPendingFsync(dirsPendingFsync, allowedSet) {
+  if (!Array.isArray(dirsPendingFsync)) {
+    return { ok: false, rejected_dirs: [String(dirsPendingFsync)] };
+  }
+  const seen = new Set();
+  const rejected = [];
+  for (const d of dirsPendingFsync) {
+    if (
+      typeof d !== "string" ||
+      d.length === 0 ||
+      d.includes("\0") ||
+      !path.isAbsolute(d) ||
+      path.normalize(d) !== d ||
+      (d !== "/" && d.endsWith("/")) ||
+      path.resolve(d) !== d ||
+      !allowedSet.has(d)
+    ) {
+      rejected.push(d);
+      continue;
+    }
+    if (seen.has(d)) {
+      rejected.push(d);
+      continue;
+    }
+    seen.add(d);
+  }
+  if (rejected.length > 0) {
+    return { ok: false, rejected_dirs: rejected };
+  }
+  return { ok: true };
+}
+
+function bindAllowedDir(d) {
+  let fd = null;
+  try {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_DIRECTORY ?? 0);
+    try {
+      fd = fs.openSync(d, flags);
+    } catch (err) {
+      if (err?.code === "ELOOP") return { error: "ELOOP" };
+      try {
+        if (fs.lstatSync(d).isSymbolicLink()) return { error: "ELOOP" };
+      } catch {}
+      return { error: String(err?.code ?? err?.message ?? err) };
+    }
+    const fst = fs.fstatSync(fd);
+    if (!fst.isDirectory()) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "ENOTDIR" };
+    }
+    let lst;
+    try {
+      lst = fs.lstatSync(d);
+    } catch (err) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: String(err?.code ?? err?.message ?? err) };
+    }
+    if (lst.isSymbolicLink()) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "ELOOP" };
+    }
+    if (!lst.isDirectory()) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "ENOTDIR" };
+    }
+    if (fst.dev !== lst.dev || fst.ino !== lst.ino) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "identity_mismatch" };
+    }
+    let real = null;
+    try {
+      real = fs.realpathSync(d);
+    } catch (err) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: String(err?.code ?? err?.message ?? err) };
+    }
+    if (real !== d) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "not_canonical", real };
+    }
+    return { fd, dev: fst.dev, ino: fst.ino };
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    return { error: String(err?.code ?? err?.message ?? err) };
+  }
+}
+
+function fsyncDirBound(d) {
+  const bound = bindAllowedDir(d);
+  if (bound.error) {
+    if (bound.error === "not_canonical" && bound.real) {
+      return bound.error + "（" + d + " 的 realpath 是 " + bound.real + "）";
+    }
+    return bound.error;
+  }
+  try {
+    fs.fsyncSync(bound.fd);
+    return null;
+  } catch (err) {
+    return String(err?.code ?? err?.message ?? err);
+  } finally {
+    try { fs.closeSync(bound.fd); } catch {}
+  }
+}
+
+/**
+ * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口；返修八 P2 共享判别器；返修十一 P2-1/P2-2；返修十二 P1；返修十三 P1-1/P1-2/P2-1）：
+ *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（isLedgerTmpName / isSidecarTmpName）且落在获准目录
+ *     （endpoint 目录 + claimsDir 目录）里的那些；其余一律不动、进 residue（先清允许项、再因 left 非空报 ok:false）。
+ *   · **锁家族一律拒**：`<lock>` / `<lock>.reap` / `<lock>.reap.quarantine-<uuid>` 是锁协议自己的资源。在这里删
+ *     等于失去锁的归属证明 —— 旧码拿 `startsWith(lockDir + ".")` 收族、并以 `staleMs: 0` 调维护清理器，把**活**的
+ *     reap 实例（当前进程正持有）删掉还报 ok:true（探针现场）。它们只走 registry 的显式维护入口
+ *     repair-publish-lock.mjs；本原语只报 residue。
+ *   · 删除段在**真正的账本锁栅栏**（acquirePublishLock）内跑：与写方互斥，且只在拿到锁之后才动文件；
+ *     栅栏取不到 / 释放不干净 / 主锁仍在 → 一律不报 ok。
+ *   · **威胁边界**：同 UID 并发恶意替换目录不在威胁模型内（账本与 claims 目录为 0700 属本用户，能做到这一点的对手可直接
+ *     修改账本）；本原语保证的是：删除前受验绑定 + 绑定后最窄窗口 + 事后 inode 检测，检测到越界即 fail-closed 且点名
+ *     （记 foreign_unlink 且 ok:false），但进程内无法撤销已发生的越界删除。
+ *   · **部署前置**：claimsDir 及其祖先链必须是规范绝对路径且整条链路无 symlink（`realpath(d) === d`；真机已核：
+ *     `~/.claude/feishu-bridge/{ledger,maintenance}` 与项目 `.runtime-data` 均 canonical），任何一级为 symlink 则
+ *     判定 not_canonical 且拒。
+ *   · 删除前受验绑定允许目录（bindAllowedDir）：必须 realpath 规范、无 symlink、dev/ino 一致；
+ *     任一不过 → 零删除退出，不许先删再报。绑定失败与删除共用 try/finally 释放折叠，如实带出锁真实状态与 lock_unreadable。
+ *   · 删除循环最窄窗口与事后检测：打开 entry (O_NOFOLLOW) → 校验 dev/ino/nlink==1 → 复核父目录 dev/ino → unlinkSync →
+ *     再次 fstat(fd) 校验 nlink==0。若 nlink 仍为 1 则检测到命中别的 inode，记录 foreign_unlink 且报 ok:false。
+ *   · 主锁仍在（symlink + 受验持有者）→ 本原语**不报 ok**（residue=[] 也一样）：它没有资格替锁协议做决定，交人。
+ *   · tmp 清掉之后补一次目录 fsync（"清掉了"必须落到介质上）。
+ * @returns { ok, cleaned: string[], residue: string[], dirs_pending_fsync: string[], lock_held?, foreign_unlink?: string[], why? }
+ */
+export function clearLedgerResidue({ dir, residue = [], claimsDir = null, dirsPendingFsync = [], env = process.env, _inject = null } = {}) {
+  const allowedDirs = durabilityDirAllowSet({ dir, claimsDir });
+  const val = validateDirsPendingFsync(dirsPendingFsync, allowedDirs);
+  if (!val.ok) {
+    return {
+      ok: false,
+      cleaned: [],
+      residue: Array.isArray(residue) ? [...residue] : [],
+      dirs_pending_fsync: dirsPendingFsync,
+      rejected_dirs: val.rejected_dirs,
+      lock_held: false,
+      why: "dirs_pending_fsync 含允许集外/不规范/重复目录（" + val.rejected_dirs.join("、") + "）：拒绝 fsync，保持 unclean",
+    };
+  }
+  const { lock: lockDir } = ledgerPaths(dir);
+  const pendingDirs = new Set((Array.isArray(dirsPendingFsync) ? dirsPendingFsync : []).filter((x) => typeof x === "string" && x.length > 0));
+  const accepted = [];
+  const left = [];
+  const errors = [];
+  for (const raw of Array.isArray(residue) ? residue : []) {
+    const entry = String(raw);
+    // R57d 返修八 P1-2a：只有 ENOENT 才算缺席；其它错误（EIO 等）保留在 residue、返回 ok:false、why 带错误码
+    try {
+      fs.lstatSync(entry);
+    } catch (err) {
+      if (err?.code === "ENOENT") continue;
+      left.push(entry);
+      errors.push(entry + ": " + String(err?.code ?? err?.message ?? err));
+      continue;
+    }
+    const base = path.basename(entry);
+    const parent = path.dirname(entry);
+    if ((isLedgerTmpName(base) || isSidecarTmpName(base)) && (allowedDirs.has(parent) || allowedDirs.has(path.resolve(parent)))) accepted.push(entry);
+    else left.push(entry);
+  }
+  // 锁家族先看：在场的主锁 / reap 家族一律不由本原语处置 —— 一个交人，一个交显式维护入口。
+  //   （也不去"先取锁再释放"：reap 家族在的时候释放段拿不到 reap 锁，反而会把主锁留在盘上。）
+  // R57d 返修九 P1-1：严格模式区分 absent / present / unreadable；非 ENOENT 保持 unclean。
+  const held = readLockOwner(lockDir, { strict: true });
+  if (held.unreadable) {
+    return { ok: false, cleaned: [], residue: [...left, lockDir], dirs_pending_fsync: Array.from(pendingDirs), lock_held: true, lock_unreadable: true,
+      why: "主锁 " + path.basename(lockDir) + " 盘点异常（" + (held.errorCode ?? held.error) + "）：保持 unclean" };
+  }
+  if (held.present) {
+    return { ok: false, cleaned: [], residue: [...left, lockDir], dirs_pending_fsync: Array.from(pendingDirs), lock_held: true,
+      why: "主锁 " + path.basename(lockDir) + " 仍在（" + (held.owner ? "持有者 pid=" + String(held.owner.pid) : "owner 不可读") + "）：本原语不替锁协议清理，交人" };
+  }
+  let reapPresent = false;
+  let reapErr = null;
+  try {
+    fs.lstatSync(lockDir + ".reap");
+    reapPresent = true;
+  } catch (err) {
+    if (err?.code !== "ENOENT") reapErr = String(err?.code ?? err?.message ?? err);
+  }
+  if (reapPresent || reapErr !== null) {
+    return { ok: false, cleaned: [], residue: [...left, lockDir + ".reap"], dirs_pending_fsync: Array.from(pendingDirs), lock_held: false,
+      why: reapErr !== null
+        ? "reap 家族残骸盘点异常（" + path.basename(lockDir) + ".reap: " + reapErr + "）：保持 unclean"
+        : "reap 家族残骸在场（" + path.basename(lockDir) + ".reap）：交 registry 的显式维护入口 repair-publish-lock.mjs，本原语不动" };
+  }
+  // 真账本锁栅栏：删除段与写方互斥；取不到锁（忙 / 维护门 / reap 残骸）→ 什么都不删。
+  const fence = acquirePublishLock(lockDir, { env, reapUnrecognized: false });
+  if (!fence.ok) {
+    return { ok: false, cleaned: [], residue: [...left, ...accepted], dirs_pending_fsync: Array.from(pendingDirs), lock_held: false, fence: fence.reason ?? "unavailable",
+      why: "账本锁栅栏取不到（" + String(fence.reason ?? "?") + "）：残骸一律不清" };
+  }
+
+  // R57d 返修十三 P1-1 / P1-2：绑定与删除共用同一个 try/finally，集中释放折叠
+  const boundDirs = new Map();
+  let bindFail = null;
+  const cleaned = [];
+  const foreignUnlink = [];
+  let released = null;
+  let dirFsyncErr = null;
+
+  try {
+    for (const d of allowedDirs) {
+      const b = bindAllowedDir(d);
+      if (b.error) {
+        bindFail = { dir: d, error: b.error, real: b.real ?? null };
+        break;
+      }
+      boundDirs.set(d, b);
+      boundDirs.set(path.resolve(d), b);
+    }
+
+    if (bindFail !== null) {
+      left.push(...accepted);
+    } else {
+      if (typeof dir === "string" && dir.length > 0 && boundDirs.has(path.resolve(dir))) {
+        boundDirs.set(dir, boundDirs.get(path.resolve(dir)));
+      }
+      if (typeof claimsDir === "string" && claimsDir.length > 0 && boundDirs.has(path.resolve(claimsDir))) {
+        boundDirs.set(claimsDir, boundDirs.get(path.resolve(claimsDir)));
+      }
+
+      for (const entry of accepted) {
+        const parent = path.dirname(entry);
+        const bound = boundDirs.get(parent) ?? boundDirs.get(path.resolve(parent));
+        if (!bound) {
+          left.push(entry);
+          continue;
+        }
+        let st = null;
+        try { st = fs.lstatSync(entry); }
+        catch (err) { if (err?.code === "ENOENT") { cleaned.push(entry); continue; } left.push(entry); continue; }
+        // 形态不认识的（目录 / symlink / 多硬链接）一律不动 —— 名字像不等于协议写出来的。
+        if (!st.isFile() || st.nlink !== 1) { left.push(entry); continue; }
+
+        let entryFd = null;
+        try {
+          entryFd = fs.openSync(entry, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        } catch {
+          left.push(entry);
+          continue;
+        }
+
+        try {
+          const fst = fs.fstatSync(entryFd);
+          let lst = null;
+          try { lst = fs.lstatSync(entry); } catch { left.push(entry); continue; }
+          if (!fst.isFile() || fst.nlink !== 1 || fst.dev !== lst.dev || fst.ino !== lst.ino) {
+            left.push(entry);
+            continue;
+          }
+
+          let parentSt = null;
+          try { parentSt = fs.lstatSync(parent); } catch { left.push(entry); continue; }
+          if (parentSt.isSymbolicLink() || !parentSt.isDirectory() || parentSt.dev !== bound.dev || parentSt.ino !== bound.ino) {
+            left.push(entry);
+            continue;
+          }
+
+          if (typeof _inject?.beforeUnlink === "function") {
+            _inject.beforeUnlink(entry);
+          }
+
+          try {
+            fs.unlinkSync(entry);
+          } catch {
+            left.push(entry);
+            continue;
+          }
+
+          let postFst = null;
+          try {
+            postFst = fs.fstatSync(entryFd);
+          } catch {
+            left.push(entry);
+            continue;
+          }
+
+          if (postFst.nlink === 0) {
+            try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
+          } else {
+            left.push(entry);
+            foreignUnlink.push(entry);
+          }
+        } finally {
+          if (entryFd !== null) {
+            try { fs.closeSync(entryFd); } catch {}
+          }
+        }
+      }
+
+      // 目录 fsync 改用已绑定的 fd（fsyncSync(fd)）：待补目录逐条映射到绑定 fd；映射不到 → 进 dirs_pending_fsync 保留
+      for (const p of cleaned) pendingDirs.add(path.resolve(path.dirname(p)));
+      const dirsToFsync = Array.from(pendingDirs);
+      if (cleaned.length > 0 && !dirsToFsync.includes(path.resolve(dir))) {
+        dirsToFsync.push(path.resolve(dir));
+        pendingDirs.add(path.resolve(dir));
+      }
+      for (const d of dirsToFsync) {
+        const bound = boundDirs.get(d) ?? boundDirs.get(path.resolve(d));
+        if (!bound) {
+          // 映射不到 → 进 dirs_pending_fsync 保留（不 fsync 别的路径）
+          continue;
+        }
+        try {
+          fs.fsyncSync(bound.fd);
+          pendingDirs.delete(d);
+        } catch (err) {
+          dirFsyncErr = "目录 " + d + " fsync 失败：" + String(err?.code ?? err?.message ?? err);
+          break;
+        }
+      }
+    }
+  } finally {
+    for (const item of new Set(boundDirs.values())) {
+      try { fs.closeSync(item.fd); } catch {}
+    }
+    try { released = releasePublishLock(lockDir); } catch (err) { released = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
+  }
+
+  const releaseClean = released !== null && released.ok === true && released.absent !== true && released.reapUncleared == null;
+  // R57d 返修九 P1-1：严格模式复核主锁，区分 absent / present / unreadable；非 ENOENT 保持 unclean。
+  const after = readLockOwner(lockDir, { strict: true });
+  const remainingPendingDirs = Array.from(pendingDirs);
+  const lockUnclearedResidue = [
+    ...(released?.reapUncleared?.path ? [String(released.reapUncleared.path)] : []),
+    ...(after.present || after.unreadable ? [lockDir] : []),
+  ];
+
+  if (bindFail !== null) {
+    const errorText = bindFail.error === "not_canonical" && bindFail.real
+      ? bindFail.error + "（" + bindFail.dir + " 的 realpath 是 " + bindFail.real + "）"
+      : bindFail.error;
+    let why = "允许目录身份受验不过（" + bindFail.dir + ": " + errorText + "）：零删除";
+    if (!releaseClean) {
+      const relReason = released?.reason ?? released?.why ?? (after.unreadable ? (after.errorCode ?? after.error) : "?");
+      why += "；账本锁释放不干净（" + String(relReason) + "）";
+    }
+    const res = {
+      ok: false,
+      cleaned: [],
+      residue: [...left, ...lockUnclearedResidue],
+      dirs_pending_fsync: dirsPendingFsync,
+      lock_held: after.present || after.unreadable === true,
+      why,
+    };
+    if (after.unreadable === true) {
+      res.lock_unreadable = true;
+    }
+    return res;
+  }
+
+  if (foreignUnlink.length > 0) {
+    return {
+      ok: false,
+      cleaned,
+      residue: [...left, ...lockUnclearedResidue],
+      dirs_pending_fsync: remainingPendingDirs,
+      lock_held: after.present || after.unreadable === true,
+      foreign_unlink: foreignUnlink,
+      why: "删除命中了别的 inode（目录在删除窗口被换）：保持 unclean，需人工核查" + (!releaseClean ? "；账本锁释放不干净（" + String(released?.reason ?? released?.why ?? "?") + "）" : ""),
+    };
+  }
+
+  if (dirFsyncErr !== null || remainingPendingDirs.length > 0) {
+    return { ok: false, cleaned, residue: [...left, ...lockUnclearedResidue], dirs_pending_fsync: remainingPendingDirs, lock_held: after.present || after.unreadable === true, why: "清理后目录 fsync 失败（" + (dirFsyncErr ?? remainingPendingDirs.join("、")) + "）：保持 unclean" };
+  }
+  if (!releaseClean) {
+    return { ok: false, cleaned, dirs_pending_fsync: remainingPendingDirs, lock_held: after.present || after.unreadable === true,
+      residue: [...left, ...lockUnclearedResidue],
+      why: "账本锁释放不干净（" + String(released?.reason ?? released?.why ?? "?") + "）：保持 unclean" };
+  }
+  if (after.unreadable) {
+    return { ok: false, cleaned, residue: [...left, lockDir], dirs_pending_fsync: remainingPendingDirs, lock_held: true, lock_unreadable: true,
+      why: "清理后主锁盘点异常（" + path.basename(lockDir) + ": " + (after.errorCode ?? after.error) + "）：保持 unclean" };
+  }
+  if (after.present) {
+    const ownerDesc = after.owner ? "持有者 pid=" + String(after.owner.pid) : "owner 不可读";
+    return { ok: false, cleaned, residue: [...left, lockDir], dirs_pending_fsync: remainingPendingDirs, lock_held: true, why: "清理后主锁仍在（" + ownerDesc + "）：交人" };
+  }
+  if (left.length > 0) return { ok: false, cleaned, residue: left, dirs_pending_fsync: remainingPendingDirs, lock_held: false, why: "残骸没清干净（" + left.join("、") + (errors.length > 0 ? "，异常：" + errors.join("；") : "") + "）：保持 unclean" };
+  return { ok: true, cleaned, residue: [], dirs_pending_fsync: [], lock_held: false };
+}
+
+/**
+ * **持久化屏障重做**（R57d 返修七 P1-3；返修九 P1-2 补全待补目录耐久；返修十 P1-2 绑定受验目录集与 bound fsync）：
+ *   写原语过提交点之后做的那两步持久化，这里能**再要一次** ——
+ *   ① 账本文件 fsync（rename 之后 inode 内容落介质）；② endpoint 目录 fsync（目录项落介质）；③ 待补目录 fsync。
+ *  loadLedger 只能证明"读得到"，证明不了"耐久"：durability_uncertain 的收口必须重做屏障再受验读回。
+ *  `_inject.failDirFsync`（与 writeLedger 同一注入名）只给测试用。
+ * @returns { ok: true, dirs_pending_fsync: [] } | { ok: false, dirs_pending_fsync: string[], why }
+ */
+export function barrierLedgerDurability({ dir, claimsDir = null, dirsPendingFsync = [], _inject = null } = {}) {
+  const allowedSet = durabilityDirAllowSet({ dir, claimsDir });
+  const val = validateDirsPendingFsync(dirsPendingFsync, allowedSet);
+  if (!val.ok) {
+    return {
+      ok: false,
+      dirs_pending_fsync: dirsPendingFsync,
+      rejected_dirs: val.rejected_dirs,
+      why: "dirs_pending_fsync 含允许集外/不规范/重复目录（" + val.rejected_dirs.join("、") + "）：拒绝 fsync，保持 unclean",
+    };
+  }
+  const { ledger: ledgerPath } = ledgerPaths(dir);
+  const pending = new Set(dirsPendingFsync);
+  let fd = null;
+  try {
+    fd = fs.openSync(ledgerPath, fs.constants.O_RDONLY);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return { ok: false, dirs_pending_fsync: Array.from(pending), why: "账本路径不是普通文件" };
+    fs.fsyncSync(fd);
+  } catch (err) {
+    return { ok: false, dirs_pending_fsync: Array.from(pending), why: "账本文件 fsync 失败：" + String(err?.code ?? err?.message ?? err) };
+  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+  const dirErr = _inject?.failDirFsync ? "injected" : fsyncDirBound(path.resolve(dir));
+  if (dirErr !== null) return { ok: false, dirs_pending_fsync: Array.from(pending), why: "endpoint 目录 fsync 失败：" + dirErr };
+  for (const d of Array.from(pending)) {
+    const err = fsyncDirBound(d);
+    if (err !== null) {
+      return { ok: false, dirs_pending_fsync: Array.from(pending), why: "目录 " + d + " fsync 失败：" + err };
+    }
+    pending.delete(d);
+  }
+  return { ok: true, dirs_pending_fsync: [] };
+}
+
 /* ─────────────────────────── operations 盖章 ─────────────────────────── */
 
 /** §5.1：fingerprint 首字段恒为 op_type（域分隔），再规范 JSON → sha256。 */
@@ -3043,7 +3518,9 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
 
 /** rebind_session_alias（W2 再认领 Phase 1，§5.1）：B3 已 active 换会话 → **只**改当前活记录的 aliases.session_id
  *  （Aily session locator），**不动** binding_target/proof/family/lineage（Phase 2 配对写方再 retarget binding_target）。
- *  CAS：当前 aliases.session_id 必须等于 expectedOldSessionId；新 locator 被另一条 live 记录占用 → fail-closed（alias_occupied，G3 backstop）。
+ *  CAS：当前 aliases.session_id 必须等于 expectedOldSessionId、当前 aliases.root_om 必须等于 **expectedRootOm**
+ *  （R57d 返修七 P1-1：真 CAS —— 锁内、提交前逐字比，两项都进请求指纹）；新 locator 被另一条 live 记录占用 →
+ *  fail-closed（alias_occupied，G3 backstop）。
  *  request_key 身份 = 字面参数（id + old/new session），与状态无关；结果 = {affected_id, old_session_id, new_session_id, authorized_by, authorized_at}。
  *  R57a（§6 rebind 行）owner-select 消费路径：传 rebindHandle + expectedExpiresAt + selectionMessageId 时，
  *  CAS 另核记录的 rebind_handle/rebind_expires_at 逐字相等 + **到期拒**（now ≥ expiry → rebind_handle_expired），
@@ -3051,9 +3528,11 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
  *  否则保留原 binding（preserved）；result = §6 增量键集（selection_basis:"rebind"；同笔归并新 session 上的
  *  A1 时 result.tombstoned_a1_id 点名该 tombstone，无归并则 null）；base 路径在有 pending handle 时拒（rebind_handle_pending），
  *  不许绕过 owner-select 消费。 */
-export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
+export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, expectedRootOm, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const consume = rebindHandle !== undefined;
-  const baseInputs = { request_key: requestKey, topic_agent_id: id, old_session_id: expectedOldSessionId, new_session_id: newSessionId };
+  // R57d 返修七 P1-1：expectedRootOm 进**请求身份**（指纹）—— 否则同 request_key 的重放/前向补
+  //   证不出"提交时的 root 与 plan 时看到的是同一个"。
+  const baseInputs = { request_key: requestKey, topic_agent_id: id, old_session_id: expectedOldSessionId, new_session_id: newSessionId, expected_root_om: expectedRootOm };
   const inputs = consume
     ? { ...baseInputs, rebind_handle: rebindHandle, expected_expires_at: expectedExpiresAt, selection_message_id: selectionMessageId }
     : baseInputs;
@@ -3063,6 +3542,8 @@ export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSess
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(id)) return { ok: false, reason: "bad_id" };
       if (typeof expectedOldSessionId !== "string" || !AILY_SESSION_SHAPE.test(expectedOldSessionId)) return { ok: false, reason: "bad_input", why: "expectedOldSessionId 形状不对" };
+      // R57d 返修七 P1-1：expectedRootOm 是**必填** CAS 项 —— 缺席就等于没有 CAS，静默跳过即可绕过。
+      if (typeof expectedRootOm !== "string" || !OM_SHAPE.test(expectedRootOm)) return { ok: false, reason: "bad_input", why: "expectedRootOm 必填且须 om_ 形状（CAS 不得省略）" };
       if (typeof newSessionId !== "string" || !AILY_SESSION_SHAPE.test(newSessionId)) return { ok: false, reason: "bad_input", why: "newSessionId 形状不对" };
       if (consume && (doc.schema_version === "1.0" || typeof rebindHandle !== "string" || !REBIND_HANDLE_SHAPE.test(rebindHandle) || !isCanonicalIso(expectedExpiresAt) || typeof selectionMessageId !== "string" || !OM_SHAPE.test(selectionMessageId))) {
         return { ok: false, reason: "bad_input", why: "消费路径需 1.1+ 且 rebindHandle/expectedExpiresAt/selectionMessageId 形状合法" };
@@ -3076,6 +3557,9 @@ export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSess
       if (fam !== "B3") return { ok: false, reason: "target_not_current", why: "familyOf=" + String(fam) + "（仅 B3 current 可换会话重绑，B4 历史/其它 fail-closed）" };
       const oldSessionId = rec.aliases.session_id;
       if (oldSessionId !== expectedOldSessionId) return { ok: false, reason: "cas_mismatch", why: "当前 aliases.session_id 与 expectedOldSessionId 不符" };
+      // R57d 返修七 P1-1（真 CAS）：**锁内、提交前**逐字比现场 root。只做事后证据时，前向补会先按漂移后的
+      //   root 提交、再在 repair 里发现不符而永远 unclean。不符 → 结构化拒（点名 root）、不提交。
+      if (rec.aliases.root_om !== expectedRootOm) return { ok: false, reason: "root_cas_mismatch", why: "当前 aliases.root_om（" + String(rec.aliases.root_om) + "）与 expectedRootOm（" + String(expectedRootOm) + "）不符" };
       if (oldSessionId === newSessionId) return { ok: false, reason: "no_change" };
       // 新 locator 被另一条 live 记录占用：owner-select 消费路径下，A1 占位 → 同笔归并（R57c §7.1：
       // tombstoned_a1_id）；A1 之外的占位仍 fail-closed（G3 全局唯一 backstop）。基线路径一律拒。

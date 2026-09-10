@@ -26,15 +26,180 @@
  * 那是合同里明说的唯一「汇总绿但 rc=1」情形。**验收除了 grep 汇总行，必须看退出码。**
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 const isThenable = (v) => v !== null && (typeof v === "object" || typeof v === "function") && typeof v.then === "function";
 
 const isAsyncFunction = (fn) =>
   fn?.constructor?.name === "AsyncFunction" || Object.prototype.toString.call(fn) === "[object AsyncFunction]";
 
 /**
+ * **套件级不变量**（R60 返修一 P1-2）：由 installTestHomeIsolation 装进来，注册器在每个用例之后核。
+ * 边界是**环境**：机器路径 env 是套件绊线（不是"原来没设才设"），用例要么别动，要么 finally 恢复。
+ *   envDrift() → null | 问题短句   （用例改了 env 且没恢复）
+ *   restore()  → 把 env 恢复成套件默认值（点名之后也要恢复，否则污染后面的用例）
+ *   treeProblem() → null | 问题短句（汇总前核绊线目录树与套件开始时一致）
+ */
+let suiteInvariants = null;
+export function setSuiteInvariants(inv) { const prev = suiteInvariants; suiteInvariants = inv; return prev; }
+
+/** 绊线目录树漂移判定（纯函数，便于直接钉）：before/after 都是排序好的相对路径清单。 */
+export function treeDriftProblem(before, after) {
+  const b = new Set(before);
+  const a = new Set(after);
+  const added = after.filter((x) => !b.has(x));
+  const removed = before.filter((x) => !a.has(x));
+  if (added.length === 0 && removed.length === 0) return null;
+  const parts = [];
+  if (added.length > 0) parts.push("新增 " + added.slice(0, 5).join("、"));
+  if (removed.length > 0) parts.push("消失 " + removed.slice(0, 5).join("、"));
+  return "套件绊线目录树与套件开始时不一致（" + parts.join("；") + "）";
+}
+
+/**
  * 未处理的 rejection 兜底：Node 默认也会 exit 1，这里把原因说清 —— 多半是有人
  * 把用例写成了 async 却没从注册器那两道闸过（比如在同步用例里 fire-and-forget）。
  */
+/**
+ * R60：套件级 HOME 隔离 + 真家目录桥配置树写守卫 + 账本根 tripwire。
+ *
+ * 事实：真机 ~/.claude/feishu-bridge/ledger/ 下出现过测试夹具形状的 endpoint 空目录 ——
+ * 账本根由 topic-agent-ledger 的 ledgerRoot 解析：**优先 FEISHU_BRIDGE_LEDGER_DIR，
+ * 否则 os.userInfo().homedir（passwd 家目录，绕过 $HOME）**——所以仅移 HOME 护不住账本根，
+ * 没带 env 的用例就会把账本根写进真 HOME。
+ *
+ * 做法（三件套，套件启动时、第一条 test 之前调一次）：
+ *   ① 把 process.env.HOME 指到套件私有的 mkdtemp —— 子进程继承、进程内 HOME 派生全部落到临时目录；
+ *      原值在改之前记下（不用 os.homedir()——它随 $HOME 走，改后就不是原值了）。
+ *   ② 给 FEISHU_BRIDGE_LEDGER_DIR / FEISHU_CODEX_BRIDGE_HOME 设**套件级默认值**（tripwire，
+ *      套件 HOME 下的私有目录）：没用例级隔离的账本调用全部落到这里，而不是真家目录；
+ *      用例自己设置并恢复的照常生效（恢复模式是「保存了就回写」，回到 tripwire）。
+ *   ③ 包装 fs.mkdirSync：落在「原 HOME」桥配置树里的建目录当场抛（真家不可写）；
+ *      落在 tripwire 里的建目录也抛，并带**当前用例名** —— 泄漏源当场红、当场点名。
+ *
+ * 返回 realHome() / suiteHome() 给行为钉用例用（故意把 HOME 指回真家目录调建根原语 → 被拒）。
+ */
+let activeTestName = null;
+export function installTestHomeIsolation({ env = process.env, passwdHome = null, registerInvariants = true } = {}) {
+  const originalEnvHome = env.HOME || ""; // 原值：改 HOME 之前记下
+  // R60 返修一 P1-1：passwd home（os.userInfo().homedir）**也**要守 —— 账本根解析绕过 $HOME 走这条信息源。
+  //   可注入：反向探针一律用双临时 home 夹具，绝不拿真 passwd home 做实验。
+  const pwHome = passwdHome ?? os.userInfo().homedir;
+  const suiteHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-suite-home-")));
+  env.HOME = suiteHome;
+  const rawMkdir = fs.mkdirSync;
+  // 机器路径 env：**无条件**指向套件绊线（R60 返修一 P1-2）。旧版"原来没设才设"——
+  // ambient 一旦指到真家目录就整条绕过守卫；而且 mkdirSync 包装既不覆盖子进程也不覆盖
+  // symlinkSync/openSync/writeFileSync，真正能当边界的是**环境**。
+  // 用例要自定义就自己 mkdtemp 并在 finally 恢复（注册器每测后核这三件事）。
+  const tripwire = {
+    ledger: path.join(suiteHome, "tripwire-ledger"),
+    maintenance: path.join(suiteHome, "tripwire-maintenance"),
+    // FEISHU_BRIDGE_MAINTENANCE_GATE 是**文件路径**（gate symlink 本身），不是目录 —— 放进维护目录里。
+    gate: path.join(suiteHome, "tripwire-maintenance", "maintenance.gate"),
+    codexHome: path.join(suiteHome, "tripwire-codex-bridge"),
+    installedSurface: path.join(suiteHome, "tripwire-installed-surface.json"),
+    installSurfaceLock: path.join(suiteHome, "tripwire-install-surface.lock"),
+  };
+  rawMkdir(tripwire.ledger, { recursive: true, mode: 0o700 });
+  rawMkdir(tripwire.maintenance, { recursive: true, mode: 0o700 });
+  rawMkdir(tripwire.codexHome, { recursive: true, mode: 0o700 });
+  // 无条件覆盖的是**绕过 $HOME 的那四条**：账本根 / 维护目录 / 门 / Codex 桥根 —— 它们的默认派生都走
+  //   os.userInfo().homedir（passwd home），只移 $HOME 护不住。安装面（FEISHU_BRIDGE_INSTALLED_SURFACE /
+  //   ..._INSTALL_SURFACE_LOCK）**不**在这里无条件覆盖：它是"这台机器上装着什么"的**事实**，测试要靠它
+  //   与当前 runtime 自洽（无条件指到一个不存在的绊线会让 30+ 条安装器/启动源用例把"事实缺席"当成故障）；
+  //   它的默认派生走 HOME/realUserHome 两者，$HOME 已移到套件私有目录 + passwd home 进 guardedRoots，
+  //   所以真家目录那条路仍然关着。用例要自定义就自己 mkdtemp 并在 finally 恢复（注册器会核）。
+  const machineEnv = Object.freeze({
+    FEISHU_BRIDGE_LEDGER_DIR: tripwire.ledger,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: tripwire.maintenance,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: tripwire.gate,
+    FEISHU_CODEX_BRIDGE_HOME: tripwire.codexHome,
+  });
+  for (const [name, value] of Object.entries(machineEnv)) env[name] = value;
+  const guardedRoots = [
+    originalEnvHome && path.join(originalEnvHome, ".claude", "feishu-bridge"),
+    originalEnvHome && path.join(originalEnvHome, ".codex", "feishu-bridge"),
+    pwHome && path.join(pwHome, ".claude", "feishu-bridge"),
+    pwHome && path.join(pwHome, ".codex", "feishu-bridge"),
+    path.join(suiteHome, ".claude", "feishu-bridge"),
+    path.join(suiteHome, ".codex", "feishu-bridge"),
+  ].filter(Boolean);
+  // **进程内诊断**（不是安全证明）：它只覆盖本进程直接调 fs.mkdirSync 的那条路 ——
+  //   不覆盖子进程，也不覆盖 symlinkSync / openSync / writeFileSync。边界是上面那组 env。
+  fs.mkdirSync = (p, opts) => {
+    const abs = path.resolve(String(p ?? ""));
+    const hit = guardedRoots.find((root) => abs === root || abs.startsWith(root + path.sep));
+    if (hit) {
+      throw new Error("test-home-isolation：测试试图在「" + hit + "」下建目录（" + abs + "）——" +
+        "真家目录的桥配置树不许被测试写（R60 泄漏）。隔离做法：每测 mkdtemp 当 HOME，或显式 FEISHU_BRIDGE_LEDGER_DIR / FEISHU_BRIDGE_MAINTENANCE_DIR。");
+    }
+    const trip = [tripwire.ledger, tripwire.maintenance, tripwire.codexHome]
+      .find((root) => abs === root || abs.startsWith(root + path.sep));
+    if (trip) {
+      // tripwire 里只有「套件根目录本身」的初建是合法的（上面那几次）；此后任何建目录都是泄漏。
+      if (abs !== trip) {
+        throw new Error("test-home-isolation：用例「" + (activeTestName ?? "?") + "」往绊线（" + trip +
+          "）下建目录（" + abs + "）—— 该用例没做隔离（R60 泄漏源）。隔离做法：显式 FEISHU_BRIDGE_LEDGER_DIR 指向用例自己的 mkdtemp。");
+      }
+    }
+    return rawMkdir(p, opts);
+  };
+  // 绊线树快照（汇总前核）：只盘绊线根，不盘套件 HOME 全体（临时产物本就该在套件 HOME 下）
+  const snapshotTree = () => {
+    const roots = [tripwire.ledger, tripwire.maintenance, tripwire.codexHome];
+    const out = [];
+    const walk = (d) => {
+      let names = [];
+      try { names = fs.readdirSync(d); } catch { return; }
+      for (const n of names) {
+        const full = path.join(d, n);
+        out.push(path.relative(suiteHome, full));
+        let st = null;
+        try { st = fs.lstatSync(full); } catch { continue; }
+        if (st.isDirectory()) walk(full);
+      }
+    };
+    for (const r of roots) walk(r);
+    return out.sort();
+  };
+  const before = snapshotTree();
+  const rawRm = fs.rmSync;
+  // 清绊线（套件自己的 scratch）：每条用例之后把上一轮留下的制品清掉 —— 否则下一条用例看到的是
+  // 别人的 maintenance 收据 / ledger 记录（那会让 67 条真入口用例级联失败），而 suite 的语义是
+  // 「绊线默认值是干净的」。现场先点名再清（诊断不丢）。
+  const cleanTree = () => {
+    for (const root of [tripwire.ledger, tripwire.maintenance, tripwire.codexHome]) {
+      let names = [];
+      try { names = fs.readdirSync(root); } catch { continue; }
+      for (const n of names) {
+        try { rawRm(path.join(root, n), { recursive: true, force: true }); } catch { /* 清不掉就留给 treeProblem 点名 */ }
+      }
+    }
+  };
+  if (registerInvariants) {
+    setSuiteInvariants({
+      envDrift: () => {
+        const drifted = Object.entries(machineEnv).filter(([name, value]) => env[name] !== value);
+        if (drifted.length === 0) return null;
+        return "改了套件机器路径 env 且没恢复：" + drifted.map(([name, value]) => name + "=" + String(env[name]) + "（应为 " + value + "）").join("、");
+      },
+      restore: () => { for (const [name, value] of Object.entries(machineEnv)) env[name] = value; },
+      treeProblem: () => treeDriftProblem(before, snapshotTree()),
+      cleanTree,
+    });
+  }
+  return {
+    realHome: () => originalEnvHome,
+    suiteHome: () => suiteHome,
+    passwdHome: () => pwHome,
+    machineEnv: () => machineEnv,
+    tripwire: () => tripwire,
+  };
+}
+
 export function installUnhandledRejectionGuard() {
   process.on("unhandledRejection", (reason) => {
     console.error("\n✗ 汇总已作废（汇总后发生未处理的 rejection）——多半是 async 用例（注册器不 await，断言不会计入）：\n    " +
@@ -54,6 +219,7 @@ export function createTestHarness({ onFail = () => {} } = {}) {
   let registered = 0;   // 注册进来的条数（含被过滤掉的）—— 汇总里的"总 M"
   let executed = 0;     // 命中并真的跑的 —— "命中 N"
   const failures = [];
+  const failedEnvDrift = [];
   const TEST_FILTER = (process.env.TEST_FILTER ?? "").split(",")
     .map((s) => s.trim()).filter((s) => s.length > 0);
 
@@ -82,6 +248,8 @@ export function createTestHarness({ onFail = () => {} } = {}) {
     // 没命中的**不调用 fn()**：被跳过的测试不许留下副作用（夹具会往真 tmp 写东西）。
     if (TEST_FILTER.length > 0 && !TEST_FILTER.some((needle) => name.includes(needle))) return;
     executed += 1;
+    // R60：tripwire 守卫要点名泄漏源 —— 记录当前正在跑的用例名（finally 清掉，异步逃逸的不背）。
+    activeTestName = name;
     let r;
     try {
       r = fn();
@@ -89,12 +257,27 @@ export function createTestHarness({ onFail = () => {} } = {}) {
       failed += 1;
       onFail(name, err, failures);
       return;
+    } finally {
+      activeTestName = null;
     }
     // ② 调用后：thenable 返回值同样拒绝 —— 断言此刻已经不在计数窗口里了。
     if (isThenable(r)) {
       console.error("\n✗ 测试「" + name + "」是 async——注册器不 await，断言不会计入；改成同步（顶层 await import）");
       process.exit(1);
     }
+    // ③ R60 返修一 P1-2：用例之后核套件机器路径 env 仍是绊线默认值 —— 边界是环境，
+    //    用例 finally 没恢复就当场红、点名它，并恢复默认值（否则污染后面的用例）。
+    const drift = suiteInvariants && typeof suiteInvariants.envDrift === "function" ? suiteInvariants.envDrift() : null;
+    const treeHit = suiteInvariants && typeof suiteInvariants.treeProblem === "function" ? suiteInvariants.treeProblem() : null;
+    if (drift || treeHit) {
+      failed += 1;
+      failedEnvDrift.push(name);
+      if (typeof suiteInvariants.restore === "function") suiteInvariants.restore();
+      if (suiteInvariants.cleanTree) suiteInvariants.cleanTree(); // 先点名再清：不让它级联污染后面的用例
+      onFail(name, new Error("套件环境边界被破坏（R60 P1-2）：" + (drift ?? treeHit) + "；隔离做法：用例自己 mkdtemp 指过去、finally 恢复/清理"), failures);
+      return;
+    }
+    if (suiteInvariants && typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree();
     passed += 1;
   }
 
@@ -108,6 +291,12 @@ export function createTestHarness({ onFail = () => {} } = {}) {
    * 措辞与失败清单的呈现不同（suiteLabel / printFailures 两个参数表达，不改行为）。
    */
   function printSummary({ suiteLabel = "", printFailures = false } = {}) {
+    // R60 返修一 P1-2：汇总前核绊线目录树与套件开始时一致（有新增制品 → 点名并标记失败）。
+    const treeProblem = suiteInvariants && typeof suiteInvariants.treeProblem === "function" ? suiteInvariants.treeProblem() : null;
+    if (treeProblem) {
+      console.error("\n✗ " + treeProblem + " —— 有测试往绊线里写了东西（R60 泄漏源），点名不了具体用例就整批停在这里");
+      process.exitCode = 1;
+    }
     // 合同：退出码权威，汇总行是它的投影，两者不许矛盾。打印前先形成唯一最终判决。
     const exitNow = process.exitCode ?? 0;
     const verdictFailed = failed > 0 || exitNow !== 0;
@@ -135,5 +324,5 @@ export function createTestHarness({ onFail = () => {} } = {}) {
     }
   }
 
-  return { test, sealSummary, printSummary, TEST_FILTER, failures };
+  return { test, sealSummary, printSummary, TEST_FILTER, failures, failedEnvDrift };
 }

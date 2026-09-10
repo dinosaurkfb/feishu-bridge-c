@@ -29,16 +29,14 @@ const GATE_KEYS = ["at", "pid", "reason", "schema_version", "token"].join(",");
  * 真实用户 home：passwd 里的那一份，不跟会话 HOME 走。**取不到就是 null**（不退回 os.homedir()：
  * 那会把"权威门路径说不清"折成"去会话 HOME 读门"—— fail-open；说不清要投影成 unreadable 并阻断）。
  */
-export function realUserHome() {
-  try { const h = os.userInfo().homedir; if (typeof h === "string" && path.isAbsolute(h)) return h; } catch { /* 说不清 */ }
-  return null;
-}
+import { realUserHome } from "./real-home.mjs";
+export { realUserHome };
 
 /** 门的路径：测试隔离点优先，否则真实 home 下的固定位置；真实 home 说不清 → null（readGate 报 unreadable）。 */
-export function maintenanceGatePath(env = process.env) {
+export function maintenanceGatePath(env = process.env, { _inject } = {}) {
   const override = env[MAINTENANCE_GATE_ENV];
   if (typeof override === "string" && override.length > 0) return override;
-  const home = realUserHome();
+  const home = realUserHome({ _inject });
   return home === null ? null : path.join(home, ".claude", "feishu-bridge", "maintenance.gate");
 }
 

@@ -430,9 +430,17 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
 
       if (threw) {
         failed += 1;
-        const errToReport = invariantProblem
-          ? new Error(String(testErr?.message ?? testErr) + "；且套件环境边界被破坏（R60 P1-2）：" + invariantProblem + "；隔离做法：用例自己 mkdtemp 指过去、finally 恢复/清理")
-          : testErr;
+        let errToReport = testErr;
+        if (invariantProblem) {
+          // R60 返修三 P2：并发时 new Error 保留 cause 与原始 stack（防止原断言位置丢失）
+          errToReport = new Error(
+            String(testErr?.message ?? testErr) + "；且套件环境边界被破坏（R60 P1-2）：" + invariantProblem + "；隔离做法：用例自己 mkdtemp 指过去、finally 恢复/清理",
+            { cause: testErr }
+          );
+          if (testErr?.stack && errToReport.stack && !errToReport.stack.includes("Caused by:")) {
+            errToReport.stack += "\nCaused by: " + testErr.stack;
+          }
+        }
         onFail(name, errToReport, failures);
       } else {
         // ② 调用后：thenable 返回值同样拒绝 —— 断言此刻已经不在计数窗口里了。

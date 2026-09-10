@@ -621,7 +621,10 @@ function suppressAll(dir, { reason = "t", generation = "gen-1", digest } = {}) {
 const { test, sealSummary, printSummary, TEST_FILTER, failures } = createTestHarness({
   onFail: (name, err, failures) => {
     failures.push(`${name}\n    ${err.message.split("\n")[0]}`);
-    if (process.env.TEST_TRACE) console.error("\n✗ " + name + "\n" + (err.stack ?? err.message));
+    if (process.env.TEST_TRACE) {
+      const causeTrace = err.cause?.stack && !err.stack?.includes(err.cause.stack) ? "\nCaused by: " + err.cause.stack : "";
+      console.error("\n✗ " + name + "\n" + (err.stack ?? err.message) + causeTrace);
+    }
   },
 });
 installUnhandledRejectionGuard();
@@ -7966,6 +7969,49 @@ test("R60 返修三 P1：绊线根纳入不可变基线——根被删/根换外
   } finally {
     try { fs.rmSync(tmpBase, { recursive: true, force: true }); } catch {}
   }
+});
+
+test("R60 返修三 P2：并发时 new Error 保留 cause 与原始 stack——失败信息含原断言位置", () => {
+  const seen = [];
+  const h = createTestHarness({
+    filter: [],
+    onFail: (name, err) => {
+      seen.push({
+        name,
+        err,
+        message: err.message,
+        stack: err.stack,
+        cause: err.cause,
+        causeStack: err.cause?.stack,
+      });
+    },
+  });
+
+  const savedInv = setSuiteInvariants({
+    envDrift: () => "R60_CONCURRENT_DRIFT 环境变量漂移",
+    restore: () => {},
+  });
+
+  try {
+    h.test("并发断言失败与漂移用例", () => {
+      assert.equal(1 + 1, 3, "故意失败的原断言");
+    });
+  } finally {
+    setSuiteInvariants(savedInv);
+  }
+
+  assert.equal(seen.length, 1, "只记录了一条失败：" + JSON.stringify(seen));
+  const failure = seen[0];
+  assert.equal(failure.name, "并发断言失败与漂移用例");
+  assert.match(failure.message, /故意失败的原断言/u, "message 含原断言文案");
+  assert.match(failure.message, /R60_CONCURRENT_DRIFT/u, "message 含漂移文案");
+
+  // P2 核心断言：原异常作为 cause 保留，且失败信息（cause/stack）含原断言位置
+  assert.ok(failure.cause, "原异常必须作为 cause 保留（旧实现未传 cause，丢失原异常）");
+  assert.match(String(failure.cause.message), /故意失败的原断言/u, "cause.message 是原断言错误");
+  assert.ok(failure.cause.stack, "cause 必须包含原始 stack");
+  assert.match(failure.cause.stack, /test\.mjs/u, "cause.stack 必须包含原断言所在文件位置（test.mjs）");
+  assert.match(failure.stack, /test\.mjs/u, "err.stack 必须包含原断言所在位置（test.mjs）");
 });
 
 

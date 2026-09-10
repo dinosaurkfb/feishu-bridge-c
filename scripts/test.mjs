@@ -44040,7 +44040,14 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
     // ① P1-5a：校验器封闭 detail 联合 —— 缺 legacy/键 → unreadable；完整结构化 detail → valid
     const keyA = "a" + "b".repeat(63);
-    const goodRec = { schema_version: "1.0", claim_key: keyA, state: "control-committed-unclean", recorded_at: "2026-09-13T09:00:00.000Z", detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "b1_x", request_key: "rkx", plan_ref: "shax", ledger_reason: "ledger skip" } };
+    // P1-5a（返修五）后：顶层记录与 detail 都精确键集，形状/枚举/判别联合缺一不可 —— 手写一份**完整**合法记录。
+    const goodRec = {
+      schema_version: "1.0", claim_key: keyA, state: "control-committed-unclean", recorded_at: "2026-09-13T09:00:00.000Z",
+      control: "select", handle: "osh_" + "1".repeat(32), handle_kind: "osh", reason: "control_committed_unclean",
+      status: "control-committed-unclean", error: "账本未提交", why: "账本未提交", ledger: "not_committed",
+      intent_cleanup: "unclear", locks: null, changed: false, result: null,
+      detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "ta_" + "1".repeat(32), request_key: "m1a_" + "b".repeat(40), plan_ref: "c".repeat(64), ledger_reason: "ledger skip" },
+    };
     const badRec = { ...goodRec, detail: { ledger: "not_committed" } };
     const uf = path.join(claimsDir, keyA + ".control-committed-unclean.json");
     fs.writeFileSync(uf, JSON.stringify(goodRec));
@@ -46317,7 +46324,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const key = acq.key;
     const tx = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
       execute: () => ({ ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why: "账本未提交",
-        detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id, request_key: "c".repeat(64), plan_ref: "d".repeat(64), ledger_reason: "ledger skip" } }) });
+        detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "c".repeat(40), plan_ref: "d".repeat(64), ledger_reason: "ledger skip" } }) });
     assert.equal(tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(tx).slice(0, 200));
     const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
     const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
@@ -46330,7 +46337,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       ["plan_ref:not-a-sha", detailOf({ plan_ref: "not-a-sha" })],
       ["plan_ref:null（activate 支）", detailOf({ plan_ref: null })],
       ["request_key:null（osh 支）", detailOf({ request_key: null })],
-      ["request_key 非 64hex", detailOf({ request_key: "rkx" })],
+      ["request_key 形状不对（rkx）", detailOf({ request_key: "rkx" })],
+      ["request_key 64hex 但不是 m1a 形", detailOf({ request_key: "c".repeat(64) })],
       ["target_id:null", detailOf({ target_id: null })],
       ["target_id 形状不对", detailOf({ target_id: "b1_x" })],
       ["rfh 支 legacy 漂移（committed）", detailOf({ action: "reaffirm", legacy: "committed" })],
@@ -46342,7 +46350,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(put(mut), "unreadable", tag + " → 必须拒读：" + JSON.stringify(readControlCommittedUncleanRecord({ claimsDir, key })));
     }
     // rfh 支合法形（legacy=not_applicable + 两个 64hex）→ valid
-    assert.equal(put((d) => ({ ...d, detail: { ...d.detail, action: "reaffirm", legacy: "not_applicable", request_key: "e".repeat(64), plan_ref: "f".repeat(64) } })), "valid", "rfh 支合法形过校验器");
+    assert.equal(put((d) => ({ ...d, detail: { ...d.detail, action: "reaffirm", legacy: "not_applicable", request_key: "osr:" + ids.b1Id + ":" + "rfh_" + "e".repeat(32), plan_ref: "f".repeat(64) } })), "valid", "rfh 支合法形过校验器");
   }));
 
   test("R57d 返修五 P1-5b：consumed 写失败先落 unclean 记录（repair 读得到）；unclean 也写不成 → unclean_unwritten 且文案不许声称可恢复", () => withLedgerD((root, dir, ids) => {
@@ -46357,7 +46365,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(acq.ok, true);
       return acq.key;
     };
-    const ev = { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: "a".repeat(64), plan_ref: "b".repeat(64), ledger_reason: "clean" };
+    const ev = { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "a".repeat(40), plan_ref: "b".repeat(64), ledger_reason: "clean" };
     // ① consumed 写失败（<key>.consumed.json 是目录）→ 先落 unclean 记录：可读、detail 完整、repair 能读到
     const key1 = mkAcq("om_f5b1");
     fs.mkdirSync(path.join(claimsDir, key1 + ".consumed.json"), { recursive: true });
@@ -46368,9 +46376,10 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(rec1.status, "valid", "① unclean 记录必须落盘且可读（旧码只返对象、不落盘）：" + JSON.stringify(rec1));
     assert.equal(rec1.record.detail.legacy, "committed", "① detail.legacy=committed");
     assert.match(String(tx1.text ?? ""), /repair/u, "① 写成时文案可以说可由 repair 收尾：" + tx1.text);
-    // repair 读得到（走盘上记录，不靠调用方传对象）
+    // repair 读得到（走盘上记录，不靠调用方传对象）；夹具里那条坏 consumed 路径与它共存 → 盘点归 conflict（fail-closed，不静默择一）
     const inspected1 = inspectControlClaim({ claimsDir, key: key1 });
-    assert.equal(inspected1.state, "control-committed-unclean", "① 盘点认这条 unclean：" + inspected1.state);
+    assert.equal(inspected1.state, "conflict", "① 坏 consumed 路径与 unclean 共存 → conflict：" + inspected1.state);
+    assert.equal(readControlCommittedUncleanRecord({ claimsDir, key: key1 }).status, "valid", "① repair 侧读得到这条 unclean（不靠调用方传对象）");
     // ② unclean 也写不成（同名路径也是目录）→ 外显 unclean_unwritten，claim 无终态记录，文案不许声称可恢复
     const key2 = mkAcq("om_f5b2");
     fs.mkdirSync(path.join(claimsDir, key2 + ".consumed.json"), { recursive: true });
@@ -46420,7 +46429,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(tx.status, "control-committed-unclean", "(b) 前置 unclean");
       const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
       const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
-      fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, request_key: "0".repeat(64) } }, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, request_key: "m1a_" + "0".repeat(40) } }, null, 2) + "\n", { mode: 0o600 });
       const bad = repairIt(key);
       assert.equal(bad.ok, false, "(b) request_key 不符不许转 consumed（旧码用 plan+claim 现算、不核 detail）：" + JSON.stringify(bad).slice(0, 200));
       assert.equal(bad.reason, "ledger_commit_unverifiable", "(b) reason：" + bad.reason);

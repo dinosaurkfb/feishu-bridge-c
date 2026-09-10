@@ -14,7 +14,7 @@
 //   （显式 orh 时二者相等）——原实现恒传原始 handle（省略分支恒 null）→ 必失败。
 
 import { createHash } from "node:crypto";
-import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint } from "./topic-agent-ledger.mjs";
+import { REAFFIRM_HANDLE_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE, AUTHORIZED_BY_SHAPE, OM_SHAPE, AILY_SESSION_SHAPE, loadByEndpoint, ownerSelectReaffirmRequestKey } from "./topic-agent-ledger.mjs";
 import { readOwnerSelectAdmission } from "./maintenance/owner-select-state.mjs";
 import { consumeReaffirmIntent } from "./maintenance/reaffirm-intents.mjs";
 import fs from "node:fs";
@@ -292,7 +292,9 @@ function wiredOutcome(w, action, info = {}) {
     return {
       ok: false, status: "control-committed-unclean", reason: "control_committed_unclean",
       text: "已写入但收口不干净（" + String(outcome.why ?? "账本已写入但未收净") + "）",
-      detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "committed", ledger_reason: String(outcome.why ?? "") }),
+      // P1-5a：authoritative 模式是 ledger-only（w.legacy === null / ledgerOnly）—— 事实是「没有 legacy 提交」，
+      //   写 committed 是谎报；shape 之外还要按 authority_mode 分档。
+      detail: uncleanDetail({ action, ...info, legacy: w.ledgerOnly === true ? "not_applicable" : "committed", ledger: "committed", ledger_reason: String(outcome.why ?? "") }),
       ledger: outcome.ledger, intent_cleanup: outcome.intent_cleanup, locks: outcome.locks, why: outcome.why,
     };
   }
@@ -342,7 +344,20 @@ export function executeSelectControl(intent, {
         status: "control-committed-unclean",
         reason: "control_committed_unclean",
         text: "已写入但收口不干净（" + (res.why ?? "账本已写入但未收净，请联系管理员修复") + "）",
-        detail: { legacy: "committed", ledger: (res.ledger === "committed" ? "committed" : "unknown"), action: "reaffirm", target_id: res.result?.target_id ?? null, request_key: null, plan_ref: planRefVal, ledger_reason: (typeof res.why === "string" ? res.why : "") },
+        // P1-5a：rfh 支（action=reaffirm）的 detail 判别联合——legacy 恒 not_applicable（rfh 不做 legacy 提交，
+        //   谎报 committed 会被校验器拒读）；request_key 用与账本写入同一派生（ownerSelectReaffirmRequestKey），
+        //   plan_ref 取 sidecar 受验 digest（由 mutation 层带出，它才是写 sidecar 的那一方）。
+        detail: {
+          legacy: "not_applicable",
+          ledger: (res.ledger === "committed" ? "committed" : (res.ledger === "unclean" ? "unknown" : "not_committed")),
+          action: "reaffirm",
+          target_id: res.result?.target_id ?? null,
+          request_key: (typeof res.result?.target_id === "string" && typeof intent.handle === "string")
+            ? ownerSelectReaffirmRequestKey({ target: res.result.target_id, handle: intent.handle })
+            : null,
+          plan_ref: res.plan_ref ?? planRefVal ?? null,
+          ledger_reason: (typeof res.why === "string" ? res.why : ""),
+        },
         ledger: res.ledger,
         intent_cleanup: res.intent_cleanup,
         locks: res.locks,

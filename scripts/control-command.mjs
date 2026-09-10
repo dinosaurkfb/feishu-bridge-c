@@ -16,6 +16,7 @@ import { isCanonicalIso } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE, readClaimState, recordClaimState } from "./claim.mjs";
 import { controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
 import { SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./topic-agent-ledger.mjs";
+import { ID_SHAPE } from "./shapes.mjs";
 
 export { CONTROL_MODES, controlIntentProblem, sameControlIntent } from "./control-intent.mjs";
 
@@ -158,23 +159,71 @@ export function readControlFailedRecord({ claimsDir, key }) {
 }
 
 const UNCLEAN_DETAIL_KEYS = "action,ledger,ledger_reason,legacy,plan_ref,request_key,target_id";
-const UNCLEAN_LEGACY_VALUES = Object.freeze(["committed", "not_committed", "unknown"]);
+/** 顶层记录（recordClaimState 把 detail 铺平到顶层，结构化证据住在 doc.detail）：精确键集，多一个/少一个都拒。 */
+const UNCLEAN_RECORD_KEYS = "changed,claim_key,control,detail,error,handle,handle_kind,intent_cleanup,ledger,locks,reason,recorded_at,result,schema_version,state,status,why";
+const UNCLEAN_ACTIONS = Object.freeze(["activate", "anchor", "rebind", "reaffirm"]);
+/** legacy 只有这三种提交事实 + not_applicable（authoritative 模式与 rfh 支没有 legacy 提交，不许谎报 committed）。 */
+const UNCLEAN_LEGACY_VALUES = Object.freeze(["committed", "not_committed", "unknown", "not_applicable"]);
 const UNCLEAN_LEDGER_VALUES = Object.freeze(["committed", "not_committed", "unknown"]);
+const SHA64_SHAPE = /^[0-9a-f]{64}$/u;
+// request_key 的两支**真实**形状（不是 64hex —— 写成 64hex 会让每条真链路的 unclean 记录都读不出，
+//   repair 从此无从下手）：
+//   · osh/orh：m1a/wiring 的通式派生 `m1a_<40hex>`（dual-write.requestKeyFor，同一函数写/读共用）；
+//   · rfh：`osr:<target_id>:<rfh_handle>`（topic-agent-ledger.ownerSelectReaffirmRequestKey）。
+const M1A_REQUEST_KEY_SHAPE = /^m1a_[0-9a-f]{40}$/u;
+const RFH_REQUEST_KEY_SHAPE = /^osr:ta_[0-9a-f]{32}:rfh_[0-9a-f]{32}$/u;
 
 export function controlCommittedUncleanRecordProblem(doc, key) {
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return "doc 不是对象";
+  // P1-5a（返修五）：顶层记录也精确键集 —— 否则一份「结构合法但谁都读不懂」的记录照样过校验。
+  if (Object.keys(doc).sort().join(",") !== UNCLEAN_RECORD_KEYS) return "记录字段集不对（须 " + UNCLEAN_RECORD_KEYS + "）";
   if (doc.schema_version !== "1.0") return "schema_version 不认识";
   if (doc.claim_key !== key) return "claim_key 跟文件名对不上";
   if (doc.state !== "control-committed-unclean") return "state 不是 control-committed-unclean";
   if (!isCanonicalIso(doc.recorded_at)) return "recorded_at 不是规范时间";
-  // P1-5a：持久证据的 detail 联合封闭 —— 键集 + 枚举值，缺一 → 拒读为 unreadable。
+  if (doc.control !== "select") return "control 不是 select";
+  if (doc.handle_kind !== null && doc.handle_kind !== "osh" && doc.handle_kind !== "orh" && doc.handle_kind !== "rfh") return "handle_kind 不在 osh/orh/rfh";
+  // P1-5a：持久证据的 detail 按 action 判别联合封闭 —— 键集 + 枚举值 + 形状 + 必非 null 项，缺一 → 拒读为 unreadable。
   const d = doc.detail;
   if (d === null || typeof d !== "object" || Array.isArray(d)) return "detail 不是对象";
   if (Object.keys(d).sort().join(",") !== UNCLEAN_DETAIL_KEYS) return "detail 键集不对（须 " + UNCLEAN_DETAIL_KEYS + "）";
-  if (!UNCLEAN_LEGACY_VALUES.includes(d.legacy)) return "detail.legacy 枚举不在 committed/not_committed/unknown";
+  if (!UNCLEAN_ACTIONS.includes(d.action)) return "detail.action 不在 activate/anchor/rebind/reaffirm";
+  if (typeof d.target_id !== "string" || !ID_SHAPE.test(d.target_id)) return "detail.target_id 不是账本 id 形状（ta_<32hex>）";
+  if (d.request_key !== null && (typeof d.request_key !== "string" || !(d.action === "reaffirm" ? RFH_REQUEST_KEY_SHAPE : M1A_REQUEST_KEY_SHAPE).test(d.request_key))) {
+    return "detail.request_key 形状不对（osh/orh 须 m1a_<40hex>、rfh 须 osr:<target>:<rfh_>，或 null）";
+  }
+  if (d.plan_ref !== null && (typeof d.plan_ref !== "string" || !SHA64_SHAPE.test(d.plan_ref))) return "detail.plan_ref 不是 64hex 或 null";
+  if (!UNCLEAN_LEGACY_VALUES.includes(d.legacy)) return "detail.legacy 枚举不在 committed/not_committed/unknown/not_applicable";
   if (!UNCLEAN_LEDGER_VALUES.includes(d.ledger)) return "detail.ledger 枚举不在 committed/not_committed/unknown";
   if (typeof d.ledger_reason !== "string") return "detail.ledger_reason 不是字符串";
+  // 判别联合：两条 64hex 一份 plan 证据，osh/orh 三支都必非 null；rfh 支同款（重叠后取 sidecar 受验 digest +
+  // ownerSelectReaffirmRequestKey 派生）；rfh 没有 legacy 提交 → legacy 必须是 not_applicable。
+  if (d.request_key === null) return d.action + " 支 detail.request_key 必非 null";
+  if (d.plan_ref === null) return d.action + " 支 detail.plan_ref 必非 null";
+  if (d.action === "reaffirm" && d.legacy !== "not_applicable") return "reaffirm 支 detail.legacy 必须是 not_applicable（rfh 没有 legacy 提交）";
   return null;
+}
+
+/**
+ * unclean 记录的**唯一写面**（P1-5a）：顶层键集与 detail 位置只在这里定，两个写入点（执行器 unclean / 终态写失败）
+ * 共用同一个形状 —— 不然「顶层精确键集」这条判据会在两个写入点之间分叉。
+ */
+export function uncleanRecordFields({ control, handle, handleKind, why, ledger, intentCleanup, locks, changed, result, evidence }) {
+  return {
+    control,
+    handle: handle ?? null,
+    handle_kind: handleKind ?? null,
+    reason: "control_committed_unclean",
+    status: "control-committed-unclean",
+    error: why,
+    why,
+    ledger: ledger ?? null,
+    intent_cleanup: intentCleanup ?? null,
+    locks: locks ?? null,
+    changed: changed === true,
+    result: result ?? null,
+    detail: evidence,
+  };
 }
 export function readControlCommittedUncleanRecord({ claimsDir, key }) {
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) return { status: "unreadable", why: "key 形状不对" };
@@ -407,26 +456,16 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
       const why = done.why ?? done.reason ?? done.error ?? "committed_unclean";
       if (consumed.status === "absent") {
         try {
+          // P1-5a：结构化持久证据（legacy / ledger / action / target_id / request_key / plan_ref / ledger_reason）。
           recordClaimState({
             claimsDir,
             key,
             state: "control-committed-unclean",
-            detail: {
-              control: intent.control,
-              handle: intent.handle ?? null,
-              handle_kind: intent.handle_kind ?? null,
-              reason: "control_committed_unclean",
-              status: "control-committed-unclean",
-              error: why,
-              why,
-              ledger: done.ledger ?? null,
-              intent_cleanup: done.intent_cleanup ?? null,
-              locks: done.locks ?? null,
-              changed: done.changed ?? false,
-              result: done.result ?? null,
-              // P1-5a：持久化结构化持久证据（legacy / ledger / action / target_id / request_key / plan_ref / ledger_reason）。
-              detail: done.detail ?? null,
-            },
+            detail: uncleanRecordFields({
+              control: intent.control, handle: intent.handle, handleKind: intent.handle_kind, why,
+              ledger: done.ledger, intentCleanup: done.intent_cleanup, locks: done.locks,
+              changed: done.changed, result: done.result, evidence: done.detail,
+            }),
           });
         } catch (err) {
           return { ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why, ledger: "unclean_unwritten：" + String(err?.code ?? err?.message ?? err), quarantined };
@@ -452,14 +491,38 @@ function runLockedTransaction({ claimsDir, key, intent: caller, execute, replay,
     //   不是「未执行」—— 而是 control-committed-unclean（detail.legacy/ledger=committed，why=终态记录写失败），
     //   回执按 unclean 口径，记录可被 repair 读到。
     if (intent.control === "select" && done.ok === true && done.status === "consumed") {
-      const ucDetail = done.detail ?? { legacy: "committed", ledger: "committed", action: done.action ?? null, target_id: null, request_key: null, plan_ref: null, ledger_reason: "终态记录写失败" };
+      const why = "终态记录写失败（legacy 与 ledger 均已提交）：" + String(err?.code ?? err?.message ?? err);
+      const evidence = done.detail ?? null;
+      // P1-5b（返修五）：**先把 unclean 记录写下来**（repair 才读得到）——旧码只返回一个 unclean 对象，
+      //   盘上什么都没有，repair 无从下手（而 consumed 已被证明写不进）。写不成才降级为 unclean_unwritten。
+      let unwritten = evidence === null ? "missing_evidence" : null;
+      if (unwritten === null) {
+        try {
+          recordClaimState({
+            claimsDir,
+            key,
+            state: "control-committed-unclean",
+            detail: uncleanRecordFields({
+              control: intent.control, handle: intent.handle, handleKind: intent.handle_kind, why,
+              ledger: "committed", intentCleanup: "unclear", locks: done.locks,
+              changed: done.changed, result: done.result, evidence,
+            }),
+          });
+        } catch (err2) {
+          unwritten = String(err2?.code ?? err2?.message ?? err2);
+        }
+      }
       return {
         ok: false,
         status: "control-committed-unclean",
         reason: "control_committed_unclean",
-        why: "终态记录写失败（legacy 与 ledger 均已提交）：" + String(err?.code ?? err?.message ?? err),
-        detail: ucDetail,
-        ledger: "committed",
+        why,
+        detail: evidence,
+        // 文案分两支：写成了才说「可由 repair 按 plan 收尾」；写不成必须说清**无法自动恢复**。
+        text: unwritten === null
+          ? "已写入但收口不干净（" + why + "）——unclean 记录已落盘，可由 repair 按 plan 收尾"
+          : "已写入但收口不干净（" + why + "）——unclean 记录也写不成（" + unwritten + "）：无法自动恢复，请人工核对账本与该 claim 目录（不要删）",
+        ledger: unwritten === null ? "committed" : "unclean_unwritten：" + unwritten,
         intent_cleanup: "unclear",
         locks: done.locks ?? null,
         quarantined,

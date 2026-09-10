@@ -170,11 +170,23 @@ const SHA64_SHAPE = /^[0-9a-f]{64}$/u;
 const LEDGER_EVIDENCE_KEYS = "commit,dirs_pending_fsync,lock_uncleared,residue";
 const EVIDENCE_COMMITS = Object.freeze(["committed_clean", "committed_with_residue", "committed_durability_uncertain", "not_committed", "unknown"]);
 const REPAIR_ATTEMPT_KEYS = "at,commit,dirs_pending_fsync,lock_uncleared,reason,residue";
+const isCanonicalAbsoluteDir = (x) => {
+  if (typeof x !== "string" || x.length === 0) return false;
+  if (x.includes("\0")) return false;
+  if (!path.isAbsolute(x)) return false;
+  if (path.normalize(x) !== x) return false;
+  if (x !== "/" && x.endsWith("/")) return false;
+  if (path.resolve(x) !== x) return false;
+  return true;
+};
+
 const evidenceProblem = (ev) => {
   if (ev === null || typeof ev !== "object" || Array.isArray(ev)) return "ledger_evidence 不是对象";
   if (Object.keys(ev).sort().join(",") !== LEDGER_EVIDENCE_KEYS) return "ledger_evidence 键集不对（须 " + LEDGER_EVIDENCE_KEYS + "）";
   if (!EVIDENCE_COMMITS.includes(ev.commit)) return "ledger_evidence.commit 不在 " + EVIDENCE_COMMITS.join("/");
   if (!Array.isArray(ev.dirs_pending_fsync) || ev.dirs_pending_fsync.some((x) => typeof x !== "string" || x.length === 0)) return "ledger_evidence.dirs_pending_fsync 不是非空字符串数组";
+  if (ev.dirs_pending_fsync.some((x) => !isCanonicalAbsoluteDir(x))) return "ledger_evidence.dirs_pending_fsync 条目不是规范绝对路径";
+  if (new Set(ev.dirs_pending_fsync).size !== ev.dirs_pending_fsync.length) return "ledger_evidence.dirs_pending_fsync 有重复";
   if (!Array.isArray(ev.residue) || ev.residue.some((x) => typeof x !== "string" || x.length === 0)) return "ledger_evidence.residue 不是非空字符串数组";
   if (typeof ev.lock_uncleared !== "boolean") return "ledger_evidence.lock_uncleared 不是布尔";
   return null;

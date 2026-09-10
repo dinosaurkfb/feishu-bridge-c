@@ -241,7 +241,7 @@ function settleCommittedLedger({ dir, claimsDir, endpointId, evidence, env = pro
     }
     pendingDirs = Array.isArray(cr.dirs_pending_fsync) ? cr.dirs_pending_fsync : [];
   }
-  const b = barrierLedgerDurability({ dir, dirsPendingFsync: pendingDirs, _inject });
+  const b = barrierLedgerDurability({ dir, claimsDir, dirsPendingFsync: pendingDirs, _inject });
   if (!b.ok) {
     return {
       ok: false, reason: "ledger_durability_unconfirmed",

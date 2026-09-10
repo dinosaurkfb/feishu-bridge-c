@@ -7,7 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
-import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem, readControlCommittedUncleanRecord } from "./control-command.mjs";
+import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem, readControlCommittedUncleanRecord, controlCommittedUncleanRecordProblem } from "./control-command.mjs";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -47564,14 +47564,14 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const rec1 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
       assert.equal(rec1.status, "valid", "① 记录仍受验可读");
       assert.ok(Array.isArray(rec1.record.detail.ledger_evidence.dirs_pending_fsync), "① 证据带 dirs_pending_fsync 数组");
-      assert.ok(rec1.record.detail.ledger_evidence.dirs_pending_fsync.includes(claimsDir), "① dirs_pending_fsync 含 claimsDir：" + JSON.stringify(rec1.record.detail.ledger_evidence));
+      assert.ok(rec1.record.detail.ledger_evidence.dirs_pending_fsync.includes(path.resolve(claimsDir)), "① dirs_pending_fsync 含 claimsDir：" + JSON.stringify(rec1.record.detail.ledger_evidence));
 
       // 第 2 轮 repair（tmp 已不在）：再次注入 claimsDir fsync 失败 → 必须仍保持 unclean，不得谎报 consumed
       const r2 = f7Repair(claimsDir, s.key);
       assert.equal(r2.ok, false, "② tmp 已不在但 claimsDir fsync 仍失败，必须保持 unclean：" + JSON.stringify(r2));
       assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), false, "② 不写 consumed");
       const rec2 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
-      assert.ok(rec2.record.detail.ledger_evidence.dirs_pending_fsync.includes(claimsDir), "② dirs_pending_fsync 仍含 claimsDir");
+      assert.ok(rec2.record.detail.ledger_evidence.dirs_pending_fsync.includes(path.resolve(claimsDir)), "② dirs_pending_fsync 仍含 claimsDir");
 
       // 第 3 轮 repair：fsync 成功 → 清空 dirs_pending_fsync 后才转 consumed
       injectClaimsDirFail = false;
@@ -47726,6 +47726,195 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       fs.lstatSync = origLstat;
       try { releasePublishLock(lockDir); } catch {}
       try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-2 T5：校验器 dirs_pending_fsync 形状校验——相对路径、含..、尾斜杠、重复条目各自被拒且读回 unreadable", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const h = ids.b1Handle;
+    const msgId = "om_p12t5";
+    const ltk = "ltk_p12t5";
+    const selCtx = { endpoint: EP57D, chat: CHAT_D, session: SESSION_D, message: msgId, sender: "ou_owner57d", handle: h, kind: "osh" };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const acq = acquireClaim({ claimsDir, messageId: msgId, logicalTaskKey: ltk, meta: {
+      control: { control: "select", handle: h, handle_kind: "osh" }, selection_context: selCtx, selection_context_digest_v1: digest,
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_t5" } });
+    assert.equal(acq.ok, true);
+    const key = acq.key;
+    const tx = runControlTransaction({
+      claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
+      execute: () => ({
+        ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why: "账本未提交",
+        detail: {
+          legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id,
+          request_key: "m1a_" + "c".repeat(40), plan_ref: "d".repeat(64), ledger_reason: "ledger skip",
+          ledger_evidence: { commit: "not_committed", dirs_pending_fsync: [], residue: [], lock_uncleared: false }
+        }
+      })
+    });
+    assert.equal(tx.status, "control-committed-unclean", "前置 unclean");
+    const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
+    const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
+    const dValid = path.resolve(claimsDir);
+
+    const cases = [
+      ["rel/dir", ["rel/dir"], /ledger_evidence\.dirs_pending_fsync 条目不是规范绝对路径/u],
+      ["/a/../b", ["/a/../b"], /ledger_evidence\.dirs_pending_fsync 条目不是规范绝对路径/u],
+      ["/x/", ["/x/"], /ledger_evidence\.dirs_pending_fsync 条目不是规范绝对路径/u],
+      ["[d, d]", [dValid, dValid], /ledger_evidence\.dirs_pending_fsync 有重复/u],
+    ];
+
+    for (const [tag, dirs, problemPattern] of cases) {
+      const mutatedDoc = { ...raw, detail: { ...raw.detail, ledger_evidence: { ...raw.detail.ledger_evidence, dirs_pending_fsync: dirs } } };
+      const prob = controlCommittedUncleanRecordProblem(mutatedDoc, key);
+      assert.ok(prob !== null, tag + " 必须被 controlCommittedUncleanRecordProblem 拒绝");
+      assert.match(prob, problemPattern, tag + " problem 文案匹配：" + prob);
+      fs.writeFileSync(uf, JSON.stringify(mutatedDoc, null, 2) + "\n", { mode: 0o600 });
+      const readBack = readControlCommittedUncleanRecord({ claimsDir, key });
+      assert.equal(readBack.status, "unreadable", tag + " 读回 status 必须为 unreadable");
+      assert.match(readBack.why, problemPattern, tag + " readBack.why 匹配：" + readBack.why);
+    }
+  }));
+
+  test("R57d 返修十 P1-2 T6：barrierLedgerDurability 对指向根外目录的 symlink 拒绝且不打开 fd", () => withLedgerD((root, dir) => {
+    const claimsDir = path.join(root, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const outsideDir = path.join(root, "outside_t6");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const symlinkDir = path.join(claimsDir, "symlink_outside");
+    fs.symlinkSync(outsideDir, symlinkDir, "dir");
+
+    const openedPaths = [];
+    const origOpenSync = fs.openSync;
+    try {
+      fs.openSync = (p, flags, mode) => {
+        openedPaths.push(String(p));
+        return origOpenSync(p, flags, mode);
+      };
+
+      const res = TAL.barrierLedgerDurability({ dir, claimsDir, dirsPendingFsync: [symlinkDir] });
+      assert.equal(res.ok, false, "symlinkDir 必须 ok:false");
+      assert.ok(Array.isArray(res.rejected_dirs) && res.rejected_dirs.includes(symlinkDir), "rejected_dirs 必须包含 symlinkDir：" + JSON.stringify(res.rejected_dirs));
+      assert.deepEqual(res.dirs_pending_fsync, [symlinkDir], "dirs_pending_fsync 原样返回");
+      assert.equal(openedPaths.includes(symlinkDir), false, "探针断言从未以 symlinkDir 为路径 openSync");
+      assert.equal(openedPaths.includes(outsideDir), false, "探针断言从未以 outsideDir 为路径 openSync");
+    } finally {
+      fs.openSync = origOpenSync;
+      try { fs.unlinkSync(symlinkDir); } catch {}
+      try { fs.rmdirSync(outsideDir); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-2 T7a：barrierLedgerDurability 根外真实目录被拒绝且未被打开", () => withLedgerD((root, dir) => {
+    const claimsDir = path.join(root, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const outsideDir = path.join(root, "outside_t7a");
+    fs.mkdirSync(outsideDir, { recursive: true });
+
+    const openedPaths = [];
+    const origOpenSync = fs.openSync;
+    try {
+      fs.openSync = (p, flags, mode) => {
+        openedPaths.push(String(p));
+        return origOpenSync(p, flags, mode);
+      };
+
+      const res = TAL.barrierLedgerDurability({ dir, claimsDir, dirsPendingFsync: [outsideDir] });
+      assert.equal(res.ok, false, "根外真实目录必须 ok:false");
+      assert.ok(Array.isArray(res.rejected_dirs) && res.rejected_dirs.includes(outsideDir), "rejected_dirs 必须包含 outsideDir");
+      assert.deepEqual(res.dirs_pending_fsync, [outsideDir], "dirs_pending_fsync 原样返回");
+      assert.equal(openedPaths.includes(outsideDir), false, "从未以 outsideDir 打开 fd");
+    } finally {
+      fs.openSync = origOpenSync;
+      try { fs.rmdirSync(outsideDir); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-2 T7b：barrierLedgerDurability 允许集内路径本身被换成 symlink → 校验过但 fsyncDirBound 以 ELOOP 拒且目标目录未被 fsync", () => withLedgerD((root, dir) => {
+    const claimsDir = path.join(root, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const outsideDir = path.join(root, "outside_t7b");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const claimsDirReal = claimsDir + ".real";
+    fs.renameSync(claimsDir, claimsDirReal);
+    fs.symlinkSync(outsideDir, claimsDir, "dir");
+
+    let outsideFsynced = false;
+    const origOpenSync = fs.openSync;
+    const origFsyncSync = fs.fsyncSync;
+    const outsideFds = new Set();
+    try {
+      fs.openSync = (p, flags, mode) => {
+        const fd = origOpenSync(p, flags, mode);
+        try {
+          const st = fs.fstatSync(fd);
+          const outSt = fs.statSync(outsideDir);
+          if (st.dev === outSt.dev && st.ino === outSt.ino) {
+            outsideFds.add(fd);
+          }
+        } catch {}
+        return fd;
+      };
+      fs.fsyncSync = (fd) => {
+        if (outsideFds.has(fd)) outsideFsynced = true;
+        return origFsyncSync(fd);
+      };
+
+      const res = TAL.barrierLedgerDurability({ dir, claimsDir, dirsPendingFsync: [path.resolve(claimsDir)] });
+      assert.equal(res.ok, false, "symlink 化的 claimsDir 必须 ok:false");
+      assert.match(String(res.why), /ELOOP/u, "why 必须包含 ELOOP：" + res.why);
+      assert.equal(outsideFsynced, false, "目标目录绝未被 fsync");
+    } finally {
+      fs.openSync = origOpenSync;
+      fs.fsyncSync = origFsyncSync;
+      try { fs.unlinkSync(claimsDir); } catch {}
+      try { fs.renameSync(claimsDirReal, claimsDir); } catch {}
+      try { fs.rmdirSync(outsideDir); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-2 T8：clearLedgerResidue dirsPendingFsync 含根外目录立即 ok:false 且残骸 tmp 不被删除", () => withLedgerD((root, dir) => {
+    const claimsDir = path.join(root, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const tmp = path.join(dir, "ledger.json.tmp.8.8");
+    fs.writeFileSync(tmp, "residue content", { mode: 0o600 });
+    const outsideDir = path.join(root, "outside_t8");
+    fs.mkdirSync(outsideDir, { recursive: true });
+
+    try {
+      const res = TAL.clearLedgerResidue({ dir, claimsDir, residue: [tmp], dirsPendingFsync: [outsideDir] });
+      assert.equal(res.ok, false, "含根外目录必须 ok:false");
+      assert.ok(Array.isArray(res.rejected_dirs) && res.rejected_dirs.includes(outsideDir), "rejected_dirs 含 outsideDir");
+      assert.equal(fs.existsSync(tmp), true, "残骸 tmp 文件绝不可被删除（仍存在）");
+    } finally {
+      try { fs.unlinkSync(tmp); } catch {}
+      try { fs.rmdirSync(outsideDir); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-2 T9：端到端 repair 拒绝根外目录 dirs_pending_fsync、不写 consumed、记录仍在；改回规范 claimsDir 闭合 consumed", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const s = f7OshScene(dir, claimsDir, "ltk_p12t9", "om_p12t9", { failDirFsync: true });
+    assert.equal(s.tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(s.tx));
+
+    const outsideDir = path.join(root, "outside_t9");
+    fs.mkdirSync(outsideDir, { recursive: true });
+
+    try {
+      // 改写记录为根外目录
+      f7RewriteEvidence(claimsDir, s.key, { commit: "committed_durability_uncertain", dirs_pending_fsync: [outsideDir], residue: [], lock_uncleared: false });
+      const r1 = f7Repair(claimsDir, s.key);
+      assert.equal(r1.ok, false, "dirs_pending_fsync 含根外目录必须 repair 失败：" + JSON.stringify(r1));
+      assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), false, "绝不得写 consumed.json");
+      assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".control-committed-unclean.json")), true, "unclean 记录文件仍在盘上");
+
+      // 改回规范 claimsDir → 闭合 consumed
+      f7RewriteEvidence(claimsDir, s.key, { commit: "committed_durability_uncertain", dirs_pending_fsync: [path.resolve(claimsDir)], residue: [], lock_uncleared: false });
+      const r2 = f7Repair(claimsDir, s.key);
+      assert.equal(r2.ok, true, "改回规范 claimsDir 后 repair 成功：" + JSON.stringify(r2));
+      assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), true, "成功写入 consumed.json");
+    } finally {
+      try { fs.rmdirSync(outsideDir); } catch {}
     }
   }));
 

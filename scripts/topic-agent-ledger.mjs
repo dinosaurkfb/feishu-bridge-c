@@ -1898,14 +1898,88 @@ export function isSidecarTmpName(name, key = null) {
   return SIDECAR_TMP_TAIL_RE.test(name.slice(m[0].length));
 }
 
+function durabilityDirAllowSet({ dir, claimsDir = null } = {}) {
+  const set = new Set();
+  if (typeof dir === "string" && dir.length > 0) {
+    set.add(path.resolve(dir));
+  }
+  if (typeof claimsDir === "string" && claimsDir.length > 0) {
+    set.add(path.resolve(claimsDir));
+  }
+  return set;
+}
+
+function validateDirsPendingFsync(dirsPendingFsync, allowedSet) {
+  if (!Array.isArray(dirsPendingFsync)) {
+    return { ok: false, rejected_dirs: [String(dirsPendingFsync)] };
+  }
+  const seen = new Set();
+  const rejected = [];
+  for (const d of dirsPendingFsync) {
+    if (
+      typeof d !== "string" ||
+      d.length === 0 ||
+      d.includes("\0") ||
+      !path.isAbsolute(d) ||
+      path.normalize(d) !== d ||
+      (d !== "/" && d.endsWith("/")) ||
+      path.resolve(d) !== d ||
+      !allowedSet.has(d)
+    ) {
+      rejected.push(d);
+      continue;
+    }
+    if (seen.has(d)) {
+      rejected.push(d);
+      continue;
+    }
+    seen.add(d);
+  }
+  if (rejected.length > 0) {
+    return { ok: false, rejected_dirs: rejected };
+  }
+  return { ok: true };
+}
+
+function fsyncDirBound(d) {
+  let fd = null;
+  try {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_DIRECTORY ?? 0);
+    try {
+      fd = fs.openSync(d, flags);
+    } catch (err) {
+      if (err?.code === "ELOOP") return "ELOOP";
+      try {
+        if (fs.lstatSync(d).isSymbolicLink()) return "ELOOP";
+      } catch {}
+      return String(err?.code ?? err?.message ?? err);
+    }
+    const fst = fs.fstatSync(fd);
+    if (!fst.isDirectory()) return "ENOTDIR";
+    let lst;
+    try {
+      lst = fs.lstatSync(d);
+    } catch (err) {
+      return String(err?.code ?? err?.message ?? err);
+    }
+    if (lst.isSymbolicLink()) return "ELOOP";
+    if (!lst.isDirectory()) return "ENOTDIR";
+    if (fst.dev !== lst.dev || fst.ino !== lst.ino) return "identity_mismatch";
+    fs.fsyncSync(fd);
+    return null;
+  } catch (err) {
+    return String(err?.code ?? err?.message ?? err);
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
 /**
- * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口；返修八 P2 共享判别器）。
- *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（isLedgerTmpName / isSidecarTmpName）且落在获准目录
- *     （endpoint 目录 + 调用方点名的 sidecar 目录）里的那些；其余一律不动、进 residue。
- *   · **锁家族一律拒**：`<lock>` / `<lock>.reap` / `<lock>.reap.quarantine-<uuid>` 是锁协议自己的资源。在这里删
- *     等于失去锁的归属证明 —— 旧码拿 `startsWith(lockDir + ".")` 收族、并以 `staleMs: 0` 调维护清理器，把**活**的
- *     reap 实例（当前进程正持有）删掉还报 ok:true（探针现场）。它们只走 registry 的显式维护入口
- *     repair-publish-lock.mjs；本原语只报 residue。
+ * 账本侧残骸清理（R57d 返修七 P1-2；返修九 P1-1/P1-2 严格锁盘点与目录 fsync 义务传递）：
+ *   · 路径集合封闭：只认受验 allowedDirs 下符合 isLedgerTmpName / isSidecarTmpName 的单硬链接普通文件；
+ *   · 只要 residue 含任何非上述白名单的路径（如主锁、目录、多硬链接、越界路径、symlink）→ 立即 ok:false 保持 unclean；
  *   · 删除段在**真正的账本锁栅栏**（acquirePublishLock）内跑：与写方互斥，且只在拿到锁之后才动文件；
  *     栅栏取不到 / 释放不干净 / 主锁仍在 → 一律不报 ok。
  *   · 主锁仍在（symlink + 受验持有者）→ 本原语**不报 ok**（residue=[] 也一样）：它没有资格替锁协议做决定，交人。
@@ -1913,6 +1987,19 @@ export function isSidecarTmpName(name, key = null) {
  * @returns { ok, cleaned: string[], residue: string[], lock_held?, why? }
  */
 export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = null, dirsPendingFsync = [], env = process.env, _inject = null } = {}) {
+  const allowedSet = durabilityDirAllowSet({ dir, claimsDir });
+  const val = validateDirsPendingFsync(dirsPendingFsync, allowedSet);
+  if (!val.ok) {
+    return {
+      ok: false,
+      cleaned: [],
+      residue: Array.isArray(residue) ? [...residue] : [],
+      dirs_pending_fsync: dirsPendingFsync,
+      rejected_dirs: val.rejected_dirs,
+      lock_held: false,
+      why: "dirs_pending_fsync 含允许集外/不规范/重复目录（" + val.rejected_dirs.join("、") + "）：拒绝 fsync，保持 unclean",
+    };
+  }
   const { lock: lockDir } = ledgerPaths(dir);
   const allowedDirs = new Set([dir, path.resolve(dir)]);
   if (claimsDir !== null && typeof claimsDir === "string" && claimsDir.length > 0) {
@@ -1990,15 +2077,15 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
       try { fs.unlinkSync(entry); } catch { left.push(entry); continue; }
       try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
     }
-    // R57d 返修八 P1-2b / 返修九 P1-2：按实际删除项的所有父目录 + 待补耐久目录逐一 fsync，失败者记入 dirs_pending_fsync
-    for (const p of cleaned) pendingDirs.add(path.dirname(p));
+    // R57d 返修八 P1-2b / 返修九 P1-2 / 返修十 P1-2：按实际删除项的所有父目录规范化 + 待补耐久目录逐一 bound fsync，失败者记入 dirs_pending_fsync
+    for (const p of cleaned) pendingDirs.add(path.resolve(path.dirname(p)));
     const dirsToFsync = Array.from(pendingDirs);
     if (cleaned.length > 0 && !dirsToFsync.includes(path.resolve(dir))) {
       dirsToFsync.push(path.resolve(dir));
       pendingDirs.add(path.resolve(dir));
     }
     for (const d of dirsToFsync) {
-      const err = fsyncDir(d);
+      const err = fsyncDirBound(d);
       if (err !== null) {
         dirFsyncErr = "目录 " + d + " fsync 失败：" + err;
         break;
@@ -2033,15 +2120,26 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
 }
 
 /**
- * **持久化屏障重做**（R57d 返修七 P1-3；返修九 P1-2 补全待补目录耐久）：写原语过提交点之后做的那两步持久化，这里能**再要一次** ——
+ * **持久化屏障重做**（R57d 返修七 P1-3；返修九 P1-2 补全待补目录耐久；返修十 P1-2 绑定受验目录集与 bound fsync）：
+ *   写原语过提交点之后做的那两步持久化，这里能**再要一次** ——
  *   ① 账本文件 fsync（rename 之后 inode 内容落介质）；② endpoint 目录 fsync（目录项落介质）；③ 待补目录 fsync。
  *  loadLedger 只能证明"读得到"，证明不了"耐久"：durability_uncertain 的收口必须重做屏障再受验读回。
  *  `_inject.failDirFsync`（与 writeLedger 同一注入名）只给测试用。
  * @returns { ok: true, dirs_pending_fsync: [] } | { ok: false, dirs_pending_fsync: string[], why }
  */
-export function barrierLedgerDurability({ dir, dirsPendingFsync = [], _inject = null } = {}) {
+export function barrierLedgerDurability({ dir, claimsDir = null, dirsPendingFsync = [], _inject = null } = {}) {
+  const allowedSet = durabilityDirAllowSet({ dir, claimsDir });
+  const val = validateDirsPendingFsync(dirsPendingFsync, allowedSet);
+  if (!val.ok) {
+    return {
+      ok: false,
+      dirs_pending_fsync: dirsPendingFsync,
+      rejected_dirs: val.rejected_dirs,
+      why: "dirs_pending_fsync 含允许集外/不规范/重复目录（" + val.rejected_dirs.join("、") + "）：拒绝 fsync，保持 unclean",
+    };
+  }
   const { ledger: ledgerPath } = ledgerPaths(dir);
-  const pending = new Set((Array.isArray(dirsPendingFsync) ? dirsPendingFsync : []).filter((x) => typeof x === "string" && x.length > 0));
+  const pending = new Set(dirsPendingFsync);
   let fd = null;
   try {
     fd = fs.openSync(ledgerPath, fs.constants.O_RDONLY);
@@ -2051,10 +2149,10 @@ export function barrierLedgerDurability({ dir, dirsPendingFsync = [], _inject = 
   } catch (err) {
     return { ok: false, dirs_pending_fsync: Array.from(pending), why: "账本文件 fsync 失败：" + String(err?.code ?? err?.message ?? err) };
   } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
-  const dirErr = _inject?.failDirFsync ? "injected" : fsyncDir(dir);
+  const dirErr = _inject?.failDirFsync ? "injected" : fsyncDirBound(path.resolve(dir));
   if (dirErr !== null) return { ok: false, dirs_pending_fsync: Array.from(pending), why: "endpoint 目录 fsync 失败：" + dirErr };
   for (const d of Array.from(pending)) {
-    const err = fsyncDir(d);
+    const err = fsyncDirBound(d);
     if (err !== null) {
       return { ok: false, dirs_pending_fsync: Array.from(pending), why: "目录 " + d + " fsync 失败：" + err };
     }

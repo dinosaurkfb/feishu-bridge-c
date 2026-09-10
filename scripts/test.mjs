@@ -41187,6 +41187,163 @@ test("R58 返修二 P2：spawn 异步 error 归 spawn_failed（按结构化 subt
   assert.equal(d47.text, outboxModule.FORWARD_FAILURE_TEXT.spawn_failed, "类别归 spawn_failed（不靠 reason 首行）：" + JSON.stringify(d47.text));
 });
 
+// ── R58 返修三：受验读取接进消费面 + 两条常驻钉 + outbox_dir 的 realpath 受验 ──
+
+test("R58 返修三 P1-1：规范文件名的 forward_failed 一律走受验读取器——外指 symlink 在 snapshot/audit/listPending/发布事务四处都不算数", () => {
+  const p = r58Project("p11");
+  const key = r54Key(90);
+  const file = path.join(p.outbox, key + R58_RECEIPT_SUFFIX);
+  // 外指 symlink：目标内容完全合法（连 SHA 都对得上），只是 final 不是普通文件。
+  const outside = path.join(p.root, "outside-receipt.json");
+  fs.writeFileSync(outside, JSON.stringify(r58ReceiptDoc(key), null, 2) + "\n", { mode: 0o600 });
+  fs.symlinkSync(outside, file);
+  // ① 受验直读本身就拒（对照组已存在，这条是「消费面必须共用同一份判据」的前置）
+  const direct = outboxModule.readForwardFailureReceipt({ outboxDir: p.outbox, forwardKey: key });
+  assert.notEqual(direct.ok, true, "受验直读拒：" + JSON.stringify(direct));
+  // ② 快照：候选集 0；读模型仍看得见它（recordsUnexplained 点名）
+  const snap = outboxModule.readOutboxSnapshot(p.outbox);
+  assert.equal(snap.records.length, 0, "快照候选集不收 symlink 回执：" + JSON.stringify(snap.records.map((r) => path.basename(String(r._file)))));
+  assert.deepEqual(snap.recordsUnexplained.map((r) => path.basename(String(r._file))), [key + R58_RECEIPT_SUFFIX], "读模型点名（不折叠成 0）");
+  // ③ audit：unexplainable 含它、pending 不计它
+  const audit = outboxModule.auditOutbox(p.outbox);
+  assert.ok(audit.unexplainable.some((u) => u.file === key + R58_RECEIPT_SUFFIX), "unexplainable 点名：" + JSON.stringify(audit.unexplainable));
+  assert.equal(audit.pending, 0, "pending 不计它");
+  // ④ listPending 不列
+  assert.deepEqual(outboxModule.listPending({ outboxDir: p.outbox }).map((r) => path.basename(String(r._file))), [], "listPending 不列");
+  // ⑤ 发布事务：把 result 也配好（SHA 对得上）→ 一条候选都没有、发布回调调用数 0
+  const resultBody = r58FailedBody(key, "API Error: 400 sym", p.rel);
+  fs.writeFileSync(path.join(p.runsDir, key + ".forward.result.json"), resultBody, { mode: 0o600 });
+  fs.writeFileSync(outside, JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(resultBody) }), null, 2) + "\n", { mode: 0o600 });
+  let publishes = 0;
+  const r = publishOutboxAttempt({
+    outboxDir: p.outbox, lockDir: path.join(p.root, "pub.lock"), policy: "all_unpaused",
+    batchCards: (x) => [x], resolveTarget: () => ({ ok: true, rootMessageId: "om_x", channelGenerationId: "gen-1" }),
+    composeCard: () => ({}), publishBatch: () => { publishes += 1; return "om_x"; },
+  });
+  assert.equal(publishes, 0, "发布回调调用数 0（status=" + r.status + " reason=" + String(r.reason) + "）");
+  assert.equal(r.status, "empty", "候选集为空：" + JSON.stringify({ status: r.status, reason: r.reason }));
+  // ⑥ 发布 dry-run 也不许把它算成待发
+  const d = drainProject({ root: p.root, dryRun: true });
+  assert.equal(d.runs?.published?.length ?? 0, 0, "dry-run 不收进队列：" + JSON.stringify({ status: d.status, reason: d.reason }));
+  assert.equal(d.count ?? 0, 0, "dry-run count=0");
+});
+
+test("R58 返修三 P2-1：本批含 forward_failed 而入口不给核对器 → receipt_evidence_unavailable 整批拒，发布回调调用数 0", () => {
+  const p = r58Project("p21");
+  const key = r54Key(91);
+  const resultBody = r58FailedBody(key, "API Error: 400 ev", p.rel);
+  fs.writeFileSync(path.join(p.runsDir, key + ".forward.result.json"), resultBody, { mode: 0o600 });
+  fs.writeFileSync(path.join(p.outbox, key + R58_RECEIPT_SUFFIX),
+    JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(resultBody) }), null, 2) + "\n", { mode: 0o600 });
+  let publishes = 0;
+  const args = {
+    outboxDir: p.outbox, lockDir: path.join(p.root, "pub.lock"), policy: "all_unpaused",
+    batchCards: (x) => [x], resolveTarget: () => ({ ok: true, rootMessageId: "om_x", channelGenerationId: "gen-1" }),
+    composeCard: () => ({}), publishBatch: () => { publishes += 1; return "om_x"; },
+  };
+  // ① 不给 receiptEvidence → 整批拒（不许静默跳过证据链）
+  const noEvidence = publishOutboxAttempt(args);
+  assert.equal(noEvidence.status, "error", "缺核对器必须整批拒：" + JSON.stringify({ status: noEvidence.status, reason: noEvidence.reason }));
+  assert.equal(noEvidence.reason, "receipt_evidence_unavailable", "reason：" + noEvidence.reason);
+  assert.equal(publishes, 0, "① 发布回调调用数 0");
+  // ② 给了核对器且证据对得上 → 照常发布（证明 ① 拒的是「核对器缺席」而不是别的）
+  const withEvidence = publishOutboxAttempt({ ...args, receiptEvidence: (rec) => (rec?.kind === "forward_failed" ? null : null) });
+  assert.equal(withEvidence.status, "published", "② 给了核对器就该发：" + JSON.stringify({ status: withEvidence.status, reason: withEvidence.reason }));
+  assert.equal(publishes, 1, "② 发布回调被调一次");
+});
+
+test("R58 返修三 P2-2：selection-plan 的返回形逐字保留（薄适配层不许把 verified-sidecar 的新字段漏出去）", () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-spshape-"));
+  const key = "a".repeat(64);
+  const handle = "rfh_" + "b".repeat(32);
+  const target = "ta_" + "c".repeat(32);
+  const mkPlan = (over = {}) => ({
+    schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: target, basis: "reaffirm",
+    handle, kind: "rfh", claim_key: key, cas: { intent_id: handle, expected_expires_at: "2026-09-18T09:00:00.000Z" }, ...over,
+  });
+  const shape = (o) => Object.keys(o).sort();
+  const rd = (claimsDir, k = key) => SP.readSelectionPlan({ claimsDir, key: k });
+  // ① 输入错：旧形是 {ok, problem}（不带 reason / residue / kind）
+  assert.deepEqual(shape(rd("")), ["ok", "problem"], "目录缺失只回 ok/problem");
+  assert.equal(rd("").problem, "claimsDir 缺失", "文案逐字");
+  assert.deepEqual(shape(rd(dir, "../evil")), ["ok", "problem"], "key 形状只回 ok/problem");
+  assert.equal(rd(dir, "../evil").problem, "key 形状不对（须 64hex）", "文案逐字");
+  // ② 缺席：恰 {ok, absent}
+  assert.deepEqual(rd(dir), { ok: true, absent: true }, "缺席形逐字");
+  // ③ 成功：恰 {ok, plan, sha256, bytes}（不许出现 raw / value / kind）
+  const w = SP.writeSelectionPlan({ claimsDir: dir, key, plan: mkPlan() });
+  assert.equal(w.ok, true, JSON.stringify(w));
+  const ok = rd(dir);
+  assert.deepEqual(shape(ok), ["bytes", "ok", "plan", "sha256"], "成功形逐字：" + JSON.stringify(shape(ok)));
+  assert.equal(ok.plan.claim_key, key, "plan 带出");
+  assert.equal(typeof ok.sha256, "string", "sha256 带出");
+  // ④ 坏 JSON：{ok, problem}
+  const file = path.join(dir, SP.SELECTION_PLAN_FILE(key));
+  const good = fs.readFileSync(file, "utf-8");
+  fs.writeFileSync(file, "{", { mode: 0o600 });
+  const badJson = rd(dir);
+  assert.deepEqual(shape(badJson), ["ok", "problem"], "坏 JSON 只回 ok/problem：" + JSON.stringify(shape(badJson)));
+  assert.match(String(badJson.problem), /^JSON 解析失败/u, "文案：" + badJson.problem);
+  // ⑤ 封闭校验不过：{ok, problem, reason}，reason 逐字
+  fs.writeFileSync(file, JSON.stringify(mkPlan({ target_id: "ta_" + "9".repeat(32) }), null, 2) + "\n", { mode: 0o600 });
+  const badPlan = rd(dir);
+  assert.deepEqual(shape(badPlan), ["ok", "problem", "reason"], "校验不过的形：" + JSON.stringify(shape(badPlan)));
+  fs.writeFileSync(file, good, { mode: 0o600 });
+  // ⑥ mode 不是 0600：{ok, problem}
+  fs.chmodSync(file, 0o644);
+  const badMode = rd(dir);
+  assert.deepEqual(shape(badMode), ["ok", "problem"], "mode 不过只回 ok/problem");
+  assert.equal(badMode.problem, "mode 不是 0600: 644", "文案逐字：" + badMode.problem);
+  fs.chmodSync(file, 0o600);
+  // ⑦ 合法 linked tmp（纯读不删）：{ok, problem, reason, residue}，reason === "residue"
+  const tmp = path.join(dir, SP.SELECTION_PLAN_TMP_PREFIX(key) + "4242.11111111-2222-4333-8444-555555555555");
+  fs.linkSync(file, tmp);
+  const residue = rd(dir);
+  assert.deepEqual(shape(residue), ["ok", "problem", "reason", "residue"], "残骸形：" + JSON.stringify(shape(residue)));
+  assert.equal(residue.reason, "residue", "reason 逐字");
+  assert.ok(residue.residue.includes(tmp), "residue 列路径");
+  // ⑧ 盘点失败（readdir EIO）：同为 residue 形、residue 为空数组（旧形如此）
+  const eio = SP.readSelectionPlan({ claimsDir: dir, key, _inject: { readdir: () => { const e = new Error("EIO: i/o error"); e.code = "EIO"; throw e; } } });
+  assert.deepEqual(shape(eio), ["ok", "problem", "reason", "residue"], "盘点失败形：" + JSON.stringify(shape(eio)));
+  assert.equal(eio.reason, "residue", "盘点失败也归 residue（旧形如此）");
+  assert.deepEqual(eio.residue, [], "residue 为空数组");
+  // ⑨ 恢复入口：正常 {ok, recovered, residue}；目录缺失 {ok, reason, why} 且文案逐字
+  const rec = SP.recoverSelectionPlanTmp({ claimsDir: dir, key });
+  assert.equal(rec.ok, true, JSON.stringify(rec));
+  assert.deepEqual(shape(rec), ["ok", "recovered", "residue"], "恢复形：" + JSON.stringify(shape(rec)));
+  const recBad = SP.recoverSelectionPlanTmp({ claimsDir: "", key });
+  assert.deepEqual(shape(recBad), ["ok", "reason", "why"], "缺目录形：" + JSON.stringify(shape(recBad)));
+  assert.equal(recBad.why, "claimsDir 缺失", "恢复文案逐字：" + recBad.why);
+});
+
+test("R58 返修三 P2-3：outbox_dir 的 realpath 必须仍在 realpath(root) 内——中间 symlink 指外 → 查不清，不冒充核对过", () => {
+  const m = doctorMachine();
+  const root = m.project("r58p23", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r58p23", root, root_message_id: "om_r58p23", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const key = r54Key(92);
+  const body = r58FailedBody(key, "API Error: 400 rp", ".runtime-data/outbound/outbox");
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), body, { mode: 0o600 });
+  const receiptBody = JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(body), published_at: new Date().toISOString() }), null, 2) + "\n";
+  // 物理目录建在项目**外**，再把 <root>/.runtime-data/outbound 做成指过去的 symlink
+  const elsewhere = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-r58p23-"));
+  fs.mkdirSync(path.join(elsewhere, "outbox"), { recursive: true });
+  fs.writeFileSync(path.join(elsewhere, "outbox", key + R58_RECEIPT_SUFFIX), receiptBody, { mode: 0o600 });
+  fs.symlinkSync(elsewhere, path.join(root, ".runtime-data", "outbound"));
+  const c1 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.equal(c1.ok, false, "有失败仍然红：" + c1.detail);
+  assert.match(c1.detail, /查不清/u, "中间 symlink 指外 → 查不清：" + c1.detail);
+  assert.match(c1.detail, /失败回执核对不了/u, "why 说不能核对：" + c1.detail);
+  assert.doesNotMatch(c1.detail, /失败无回执/u, "不许把外指 symlink 当成「核对过且没有」：" + c1.detail);
+  // 对照组：把 symlink 换成真目录（同一份内容）→ 回执算有，不归查不清
+  fs.rmSync(path.join(root, ".runtime-data", "outbound"));
+  fs.mkdirSync(path.join(root, ".runtime-data", "outbound", "outbox"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".runtime-data", "outbound", "outbox", key + R58_RECEIPT_SUFFIX), receiptBody, { mode: 0o600 });
+  const c2 = checkOf(doctorReport(m.run()), "inbound_forward_result");
+  assert.doesNotMatch(c2.detail, /查不清/u, "对照组不许归查不清：" + c2.detail);
+  assert.doesNotMatch(c2.detail, /失败无回执/u, "对照组：回执在且证据链对得上：" + c2.detail);
+});
+
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──
 
 const R56_T0 = "2026-09-07T10:00:00.000Z";

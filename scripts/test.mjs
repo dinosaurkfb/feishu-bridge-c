@@ -46575,6 +46575,34 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.match(String(reread.why ?? ""), /not_applicable/u, "why 点名：" + String(reread.why));
   });
 
+  test("R64 钉二：前向补 ledger 带 residue 不当干净——不转 consumed、unclean 记录的 ledger_evidence 落 committed_with_residue+residue、repair_attempts 追加", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const msgId = "om_r64a"; const session = SESSION_D + "-a2";
+    const selCtx = { endpoint: EP57D, chat: CHAT_D, session, message: msgId, sender: "ou_owner57d", handle: ids.a2Handle, kind: "osh" };
+    const digest = SA.selectionContextDigestV1(selCtx);
+    const acq = acquireClaim({ claimsDir, messageId: msgId, logicalTaskKey: "ltk_r64", meta: {
+      control: { control: "select", handle: ids.a2Handle, handle_kind: "osh" }, selection_context: selCtx, selection_context_digest_v1: digest,
+      policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_r64" } });
+    assert.equal(acq.ok, true, "claim 取得");
+    // 前置：beforeLedgerRename 注入 → legacy 已提交、ledger 未提交（前向补场景）
+    const tx = runControlTransaction({ claimsDir, key: acq.key, intent: { control: "select", handle: ids.a2Handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(ids.a2Handle, "osh", { message: msgId, session }), messageId: msgId, eventSessionId: session, mappingUpdate: mappingStub([]), txCtx: ctx, _inject: { beforeLedgerRename: () => { throw new Error("injected"); } } })) });
+    assert.equal(tx.status, "control-committed-unclean", "前置 unclean（legacy 已提交、ledger 未提交）：" + JSON.stringify(tx).slice(0, 200));
+    assert.equal(readControlCommittedUncleanRecord({ claimsDir, key: acq.key }).record?.detail?.ledger, "not_committed", "前置 detail.ledger=not_committed");
+    // 前向补时删锁目录 → 补写成功但收口不净（committed_with_residue）→ 不许转 consumed
+    const repaired = resumeControlClaim({ claimsDir, key: acq.key, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, { ...ctx, _inject: { afterLedgerRename: () => { try { fs.rmSync(path.join(dir, "ledger.lock"), { recursive: true, force: true }); } catch { /* 已不在 */ } } } }) });
+    assert.equal(repaired.ok, false, "带 residue 不闭合：" + JSON.stringify(repaired).slice(0, 300));
+    assert.match(String(repaired.why ?? repaired.reason), /residue|unclean/u, "点名不干净收口：" + (repaired.why ?? repaired.reason));
+    assert.equal(fs.existsSync(path.join(claimsDir, acq.key + ".consumed.json")), false, "不写 consumed");
+    // 记录保持 unclean 且受验可读；持久证据与修复尝试如实落盘
+    const un = readControlCommittedUncleanRecord({ claimsDir, key: acq.key });
+    assert.equal(un.status, "valid", "unclean 记录仍受验可读：" + JSON.stringify(un).slice(0, 200));
+    assert.equal(un.record.detail.ledger_evidence.commit, "committed_with_residue", "证据 commit 落盘：" + JSON.stringify(un.record.detail.ledger_evidence));
+    assert.equal(un.record.detail.ledger_evidence.lock_uncleared, true, "锁未清如实落盘：" + JSON.stringify(un.record.detail.ledger_evidence));
+    assert.ok(un.record.repair_attempts.length >= 1, "repair_attempts 追加：" + JSON.stringify(un.record.repair_attempts));
+    assert.equal(un.record.repair_attempts.at(-1).commit, "committed_with_residue", "attempts 尾条 commit：" + JSON.stringify(un.record.repair_attempts.at(-1)));
+  }));
+
   test("R57d 返修六 P1-3：consumed 写失败的证据联合闭合——authoritative osh 落 not_applicable 合法 unclean；rfh 成功返回自带完整 detail", () => withLedgerD((root, dir, ids) => {
     const claimsDir = txDirD(root);
     // ① authoritative（ledger-only）osh：consumed 写失败 → 落**合法** unclean（legacy=not_applicable），repair 读得到

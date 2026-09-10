@@ -298,7 +298,12 @@ export function appendForwardFailureReceipt({
   }
   // 受验读回
   const rb = readForwardFailureReceipt({ outboxDir, forwardKey });
-  if (!rb.ok) return { ok: false, reason: "readback_failed", why: "受验读回未通过: " + rb.why, commit: "committed_durability_uncertain" };
+  // link 已成功这个事实不变；读回碰上 residue（foreign tmp 残骸）**不许折成 readback_failed** ——
+  // 「有残骸等人处置」与「读不回自己刚写的东西」是两回事（selection-plan 那边同一形状、同一分法）。
+  if (rb.ok !== true && rb.kind === "residue") {
+    return { ok: false, reason: "residue", why: rb.why ?? "受验读回发现 tmp 残骸", residue: rb.residue, commit: "committed_durability_uncertain" };
+  }
+  if (rb.ok !== true) return { ok: false, reason: "readback_failed", why: "受验读回未通过: " + (rb.why ?? "说不清"), commit: "committed_durability_uncertain" };
   return { ok: true, id: record.id, file };
 }
 

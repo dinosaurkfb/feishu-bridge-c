@@ -201,18 +201,19 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
 const EVIDENCE_COMMIT_VALUES = Object.freeze(["committed_clean", "committed_with_residue", "committed_durability_uncertain", "not_committed", "unknown"]);
 
 /** 证据的**唯一**投影（写回记录 / repair_attempts 前必须成形；不成形的记录会被校验器拒读，repair 就再也进不来）。 */
-function evidenceOf(commit, residue, lockUncleared) {
+function evidenceOf(commit, residue, lockUncleared, dirsPendingFsync = []) {
   return {
     commit: EVIDENCE_COMMIT_VALUES.includes(commit) ? commit : "unknown",
-    residue: (Array.isArray(residue) ? residue : []).filter((x) => typeof x === "string" && x.length > 0),
+    dirs_pending_fsync: (Array.isArray(dirsPendingFsync) ? dirsPendingFsync : []).filter((x) => typeof x === "string" && x.length > 0),
     lock_uncleared: lockUncleared === true,
+    residue: (Array.isArray(residue) ? residue : []).filter((x) => typeof x === "string" && x.length > 0),
   };
 }
 
 /**
- * 「账本已提交」支的**共同**收口（R57d 返修七 P1-2/P1-3）：osh/orh 与 rfh 走同一条路径 ——
+ * 「账本已提交」支的**共同**收口（R57d 返修七 P1-2/P1-3；返修九 P1-2）：osh/orh 与 rfh 走同一条路径 ——
  *   ① 按 unclean 记录的持久证据清账本侧残骸（只删形状封闭、逐字列出的 tmp；主锁/reap 家族在场 → 不清、不闭合）；
- *   ② **重做持久化屏障**（账本文件 fsync + endpoint 目录 fsync）——loadLedger 只能证明"读得到"，证不了耐久；
+ *   ② **重做持久化屏障**（账本文件 fsync + endpoint 目录 fsync + 待补耐久目录 fsync）——loadLedger 只能证明"读得到"，证不了耐久；
  *   ③ 受验读回账本，交调用方的 reverify 逐字复核本笔 op 仍在且对得上。
  * 任一步不过 → { ok:false, reason, why[, ledger_evidence] }，保持 control-committed-unclean。
  * evidence 为 null（旧形记录没有 detail）时跳过 ① —— 它没有任何"有残骸/锁未清"的声明，但屏障与读回**照做**。
@@ -221,22 +222,35 @@ function settleCommittedLedger({ dir, claimsDir, endpointId, evidence, env = pro
   const ev = (evidence !== null && typeof evidence === "object") ? evidence : null;
   const residue = ev && Array.isArray(ev.residue) ? ev.residue : [];
   const lockUncleared = ev?.lock_uncleared === true;
+  const dirsPendingFsync = ev && Array.isArray(ev.dirs_pending_fsync) ? ev.dirs_pending_fsync : [];
+  let pendingDirs = [...dirsPendingFsync];
   if (residue.length > 0 || lockUncleared) {
-    const cr = clearLedgerResidue({ dir, dirs: [claimsDir], residue, env });
+    const cr = clearLedgerResidue({ dir, dirs: [claimsDir], claimsDir, residue, dirsPendingFsync, env, _inject });
     if (!cr.ok) {
       return {
         ok: false, reason: "ledger_residue_uncleared",
         // 残骸/锁没收拾干净：证据按"确实还有残骸"落笔（原证据说 clean 就抬成 with_residue，别把脏说成干净）。
-        ledger_evidence: evidenceOf(ev?.commit === "committed_clean" ? "committed_with_residue" : (ev?.commit ?? "unknown"), cr.residue, cr.lock_held === true || lockUncleared),
+        ledger_evidence: evidenceOf(
+          ev?.commit === "committed_clean" ? "committed_with_residue" : (ev?.commit ?? "unknown"),
+          cr.residue ?? residue,
+          cr.lock_held === true || lockUncleared,
+          cr.dirs_pending_fsync ?? dirsPendingFsync
+        ),
         why: "账本侧残骸/主锁没收拾干净（" + (Array.isArray(cr.residue) && cr.residue.length > 0 ? cr.residue.join("、") : String(cr.why ?? "?")) + "）：保持 control-committed-unclean",
       };
     }
+    pendingDirs = Array.isArray(cr.dirs_pending_fsync) ? cr.dirs_pending_fsync : [];
   }
-  const b = barrierLedgerDurability({ dir, _inject });
+  const b = barrierLedgerDurability({ dir, dirsPendingFsync: pendingDirs, _inject });
   if (!b.ok) {
     return {
       ok: false, reason: "ledger_durability_unconfirmed",
-      ledger_evidence: evidenceOf("committed_durability_uncertain", [], false),
+      ledger_evidence: evidenceOf(
+        ev?.commit === "committed_clean" ? "committed_durability_uncertain" : (ev?.commit ?? "committed_durability_uncertain"),
+        [],
+        false,
+        b.dirs_pending_fsync ?? pendingDirs
+      ),
       why: "持久化屏障重做失败（" + String(b.why ?? "?") + "）：读回不能替代耐久，保持 control-committed-unclean",
     };
   }
@@ -361,7 +375,7 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
       },
     });
     if (!settled.ok) return settled;
-    return { ok: true, changed: true, ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } };
+    return { ok: true, changed: true, ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false } };
   }
   // 分支二：legacy 已提交、账本未提交 → outer 锁内按 plan 前向补 ledger（同 request_key / 冻结 CAS，幂等）。
   if (detail.ledger === "not_committed" && detail.legacy === "committed") {
@@ -400,11 +414,7 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
       && !r.lockUncleared && r.lock_state !== "unclear";
     if (!cleanCommit) {
       return {
-        ledger_evidence: {
-          commit: (typeof r.commit === "string" && r.commit.length > 0) ? r.commit : "unknown",
-          residue: Array.isArray(r.residue) ? r.residue.map((x) => String(x)) : [],
-          lock_uncleared: r.lockUncleared != null,
-        },
+        ledger_evidence: evidenceOf(r.commit, r.residue, r.lockUncleared != null, r.dirs_pending_fsync),
         ok: false,
         reason: "ledger_forward_fill_unclean",
         why: "前向补 " + opType + " 未干净收口（commit=" + String(r.commit ?? "?") + (r.residue && r.residue.length > 0 ? "，with_residue" : "") + (r.lockUncleared ? "，lockUncleared" : "") + (String(r.commit ?? "") === "committed_durability_uncertain" ? "，durability_uncertain" : "") + "）：保持 control-committed-unclean",

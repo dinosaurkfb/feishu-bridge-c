@@ -246,7 +246,7 @@ const planRefDigest = (plan) => (plan && typeof plan === "object") ? createHash(
 const actionOpType = (action) => (action === "anchor" ? "anchor" : action === "rebind" ? "rebind_session_alias" : "activate");
 /** P1-5a：结构化 uncleanness 证据（legacy / ledger 枚举 + action / target_id / request_key / plan_ref / ledger_reason）。
  *  <key>.control-committed-unclean.json 持久化这份 detail，校验器按它封闭联合；repair 读到才知道走哪支。 */
-const UNKNOWN_EVIDENCE = Object.freeze({ commit: "unknown", residue: [], lock_uncleared: false });
+const UNKNOWN_EVIDENCE = Object.freeze({ commit: "unknown", dirs_pending_fsync: [], residue: [], lock_uncleared: false });
 function uncleanDetail({ action, targetId, messageId, planRef, legacy, ledger, ledger_reason, ledgerEvidence }) {
   const k = requestKeyFor({ opType: actionOpType(action), externalRequestId: messageId, entityId: targetId });
   return {
@@ -258,6 +258,7 @@ function uncleanDetail({ action, targetId, messageId, planRef, legacy, ledger, l
 /** 三份结果 → ledger_evidence 的**唯一**投影（执行器 unclean 支与成功支共用一份）。 */
 const ledgerEvidenceOf = (ledger) => ({
   commit: (typeof ledger?.commit === "string" && ledger.commit.length > 0) ? ledger.commit : "unknown",
+  dirs_pending_fsync: Array.isArray(ledger?.dirs_pending_fsync) ? ledger.dirs_pending_fsync.map((x) => String(x)) : [],
   residue: Array.isArray(ledger?.residue) ? ledger.residue.map((x) => String(x)) : [],
   lock_uncleared: ledger?.lockUncleared != null,
 });
@@ -269,6 +270,8 @@ const ledgerEvidenceOf = (ledger) => ({
 function rfhLedgerEvidence(res) {
   const residue = Array.isArray(res?.residue) ? res.residue.filter((x) => typeof x === "string" && x.length > 0)
     : (Array.isArray(res?.ledger_res?.residue) ? res.ledger_res.residue.filter((x) => typeof x === "string" && x.length > 0) : []);
+  const dirsPendingFsync = Array.isArray(res?.dirs_pending_fsync) ? res.dirs_pending_fsync.filter((x) => typeof x === "string" && x.length > 0)
+    : (Array.isArray(res?.ledger_res?.dirs_pending_fsync) ? res.ledger_res.dirs_pending_fsync.filter((x) => typeof x === "string" && x.length > 0) : []);
   const lockUncleared = res?.lockUncleared != null || res?.lock_state === "unclear"
     || (res?.locks != null && (res.locks.outer !== "released" || res.locks.intent !== "released"));
   const commit = res?.commit === "committed_clean" || res?.commit === "replayed" || res?.commit === "already" ? "committed_clean"
@@ -277,7 +280,7 @@ function rfhLedgerEvidence(res) {
         : res?.ledger === "clean" ? "committed_clean"
           : res?.ledger === "unclean" ? "committed_with_residue"
             : "unknown";
-  return { commit, residue, lock_uncleared: lockUncleared };
+  return { commit, dirs_pending_fsync: dirsPendingFsync, residue, lock_uncleared: lockUncleared };
 }
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
@@ -320,7 +323,7 @@ function wiredOutcome(w, action, info = {}) {
     // R57d 返修六 P1-3：authoritative 模式是 ledger-only —— 成功支也不许把 legacy 写成 committed（与 unclean 支同口径）。
     return { ok: true, status: "consumed", changed: step.idempotent !== true, action, locks: { outer, intent: "released" },
       detail: uncleanDetail({ action, ...info, legacy: w.ledgerOnly === true ? "not_applicable" : "committed", ledger: "committed", ledger_reason: "clean",
-        ledgerEvidence: { commit: "committed_clean", residue: [], lock_uncleared: false } }),
+        ledgerEvidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false } }),
       text: selectExecutorSuccessText(action) };
   }
   if (outcome.status === "control-committed-unclean") {
@@ -423,7 +426,7 @@ export function executeSelectControl(intent, {
           ? ownerSelectReaffirmRequestKey({ target: res.result.target_id, handle: intent.handle }) : null,
         plan_ref: res.plan_ref ?? null,
         ledger_reason: "clean",
-        ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false },
+        ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false },
       },
     };
   }

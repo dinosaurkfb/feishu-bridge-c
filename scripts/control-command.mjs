@@ -166,14 +166,15 @@ const UNCLEAN_ACTIONS = Object.freeze(["activate", "anchor", "rebind", "reaffirm
 const UNCLEAN_LEGACY_VALUES = Object.freeze(["committed", "not_committed", "unknown", "not_applicable"]);
 const UNCLEAN_LEDGER_VALUES = Object.freeze(["committed", "not_committed", "unknown"]);
 const SHA64_SHAPE = /^[0-9a-f]{64}$/u;
-/** R57d 返修六 P2：ledger_evidence / repair_attempts 的封闭形状。 */
-const LEDGER_EVIDENCE_KEYS = "commit,lock_uncleared,residue";
+/** R57d 返修六 P2 / 返修九 P1-2：ledger_evidence / repair_attempts 的封闭形状。 */
+const LEDGER_EVIDENCE_KEYS = "commit,dirs_pending_fsync,lock_uncleared,residue";
 const EVIDENCE_COMMITS = Object.freeze(["committed_clean", "committed_with_residue", "committed_durability_uncertain", "not_committed", "unknown"]);
-const REPAIR_ATTEMPT_KEYS = "at,commit,lock_uncleared,reason,residue";
+const REPAIR_ATTEMPT_KEYS = "at,commit,dirs_pending_fsync,lock_uncleared,reason,residue";
 const evidenceProblem = (ev) => {
   if (ev === null || typeof ev !== "object" || Array.isArray(ev)) return "ledger_evidence 不是对象";
   if (Object.keys(ev).sort().join(",") !== LEDGER_EVIDENCE_KEYS) return "ledger_evidence 键集不对（须 " + LEDGER_EVIDENCE_KEYS + "）";
   if (!EVIDENCE_COMMITS.includes(ev.commit)) return "ledger_evidence.commit 不在 " + EVIDENCE_COMMITS.join("/");
+  if (!Array.isArray(ev.dirs_pending_fsync) || ev.dirs_pending_fsync.some((x) => typeof x !== "string" || x.length === 0)) return "ledger_evidence.dirs_pending_fsync 不是非空字符串数组";
   if (!Array.isArray(ev.residue) || ev.residue.some((x) => typeof x !== "string" || x.length === 0)) return "ledger_evidence.residue 不是非空字符串数组";
   if (typeof ev.lock_uncleared !== "boolean") return "ledger_evidence.lock_uncleared 不是布尔";
   return null;
@@ -233,7 +234,7 @@ export function controlCommittedUncleanRecordProblem(doc, key) {
     if (a === null || typeof a !== "object" || Array.isArray(a) || Object.keys(a).sort().join(",") !== REPAIR_ATTEMPT_KEYS) return "repair_attempts 条目键集不对（须 " + REPAIR_ATTEMPT_KEYS + "）";
     if (!isCanonicalIso(a.at)) return "repair_attempts.at 不是规范时间";
     if (typeof a.reason !== "string") return "repair_attempts.reason 不是字符串";
-    const p2 = evidenceProblem({ commit: a.commit, residue: a.residue, lock_uncleared: a.lock_uncleared });
+    const p2 = evidenceProblem({ commit: a.commit, dirs_pending_fsync: a.dirs_pending_fsync, residue: a.residue, lock_uncleared: a.lock_uncleared });
     if (p2 !== null) return "repair_attempts 条目：" + p2;
   }
   return null;
@@ -673,8 +674,9 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
               at: new Date().toISOString(),
               reason: String(tx.reason ?? "control_committed_unclean"),
               commit: tx.ledger_evidence.commit ?? "unknown",
-              residue: Array.isArray(tx.ledger_evidence.residue) ? tx.ledger_evidence.residue : [],
+              dirs_pending_fsync: Array.isArray(tx.ledger_evidence.dirs_pending_fsync) ? tx.ledger_evidence.dirs_pending_fsync : [],
               lock_uncleared: tx.ledger_evidence.lock_uncleared === true,
+              residue: Array.isArray(tx.ledger_evidence.residue) ? tx.ledger_evidence.residue : [],
             });
             recordClaimState({ claimsDir, key, state: "control-committed-unclean",
               detail: { ...prev, detail: { ...prev.detail, ledger_evidence: tx.ledger_evidence }, repair_attempts: attempts } });

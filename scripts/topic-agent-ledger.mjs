@@ -1912,7 +1912,7 @@ export function isSidecarTmpName(name, key = null) {
  *   · tmp 清掉之后补一次目录 fsync（"清掉了"必须落到介质上）。
  * @returns { ok, cleaned: string[], residue: string[], lock_held?, why? }
  */
-export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = null, env = process.env } = {}) {
+export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = null, dirsPendingFsync = [], env = process.env, _inject = null } = {}) {
   const { lock: lockDir } = ledgerPaths(dir);
   const allowedDirs = new Set([dir, path.resolve(dir)]);
   if (claimsDir !== null && typeof claimsDir === "string" && claimsDir.length > 0) {
@@ -1925,6 +1925,7 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
       allowedDirs.add(path.resolve(d));
     }
   }
+  const pendingDirs = new Set((Array.isArray(dirsPendingFsync) ? dirsPendingFsync : []).filter((x) => typeof x === "string" && x.length > 0));
   const accepted = [];
   const left = [];
   const errors = [];
@@ -1949,11 +1950,11 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
   // R57d 返修九 P1-1：严格模式区分 absent / present / unreadable；非 ENOENT 保持 unclean。
   const held = readLockOwner(lockDir, { strict: true });
   if (held.unreadable) {
-    return { ok: false, cleaned: [], residue: [...left, lockDir], lock_held: true, lock_unreadable: true,
+    return { ok: false, cleaned: [], residue: [...left, lockDir], dirs_pending_fsync: Array.from(pendingDirs), lock_held: true, lock_unreadable: true,
       why: "主锁 " + path.basename(lockDir) + " 盘点异常（" + (held.errorCode ?? held.error) + "）：保持 unclean" };
   }
   if (held.present) {
-    return { ok: false, cleaned: [], residue: [...left, lockDir], lock_held: true,
+    return { ok: false, cleaned: [], residue: [...left, lockDir], dirs_pending_fsync: Array.from(pendingDirs), lock_held: true,
       why: "主锁 " + path.basename(lockDir) + " 仍在（" + (held.owner ? "持有者 pid=" + String(held.owner.pid) : "owner 不可读") + "）：本原语不替锁协议清理，交人" };
   }
   let reapPresent = false;
@@ -1965,7 +1966,7 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
     if (err?.code !== "ENOENT") reapErr = String(err?.code ?? err?.message ?? err);
   }
   if (reapPresent || reapErr !== null) {
-    return { ok: false, cleaned: [], residue: [...left, lockDir + ".reap"], lock_held: false,
+    return { ok: false, cleaned: [], residue: [...left, lockDir + ".reap"], dirs_pending_fsync: Array.from(pendingDirs), lock_held: false,
       why: reapErr !== null
         ? "reap 家族残骸盘点异常（" + path.basename(lockDir) + ".reap: " + reapErr + "）：保持 unclean"
         : "reap 家族残骸在场（" + path.basename(lockDir) + ".reap）：交 registry 的显式维护入口 repair-publish-lock.mjs，本原语不动" };
@@ -1973,7 +1974,7 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
   // 真账本锁栅栏：删除段与写方互斥；取不到锁（忙 / 维护门 / reap 残骸）→ 什么都不删。
   const fence = acquirePublishLock(lockDir, { env, reapUnrecognized: false });
   if (!fence.ok) {
-    return { ok: false, cleaned: [], residue: [...left, ...accepted], lock_held: false, fence: fence.reason ?? "unavailable",
+    return { ok: false, cleaned: [], residue: [...left, ...accepted], dirs_pending_fsync: Array.from(pendingDirs), lock_held: false, fence: fence.reason ?? "unavailable",
       why: "账本锁栅栏取不到（" + String(fence.reason ?? "?") + "）：残骸一律不清" };
   }
   const cleaned = [];
@@ -1989,17 +1990,20 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
       try { fs.unlinkSync(entry); } catch { left.push(entry); continue; }
       try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
     }
-    if (cleaned.length > 0) {
-      // R57d 返修八 P1-2b：按实际删除项的所有父目录逐一 fsync（去重），任一失败 → ok:false
-      const dirsToFsync = Array.from(new Set(cleaned.map((p) => path.dirname(p))));
-      if (!dirsToFsync.includes(path.resolve(dir))) dirsToFsync.push(path.resolve(dir));
-      for (const d of dirsToFsync) {
-        const err = fsyncDir(d);
-        if (err !== null) {
-          dirFsyncErr = "目录 " + d + " fsync 失败：" + err;
-          break;
-        }
+    // R57d 返修八 P1-2b / 返修九 P1-2：按实际删除项的所有父目录 + 待补耐久目录逐一 fsync，失败者记入 dirs_pending_fsync
+    for (const p of cleaned) pendingDirs.add(path.dirname(p));
+    const dirsToFsync = Array.from(pendingDirs);
+    if (cleaned.length > 0 && !dirsToFsync.includes(path.resolve(dir))) {
+      dirsToFsync.push(path.resolve(dir));
+      pendingDirs.add(path.resolve(dir));
+    }
+    for (const d of dirsToFsync) {
+      const err = fsyncDir(d);
+      if (err !== null) {
+        dirFsyncErr = "目录 " + d + " fsync 失败：" + err;
+        break;
       }
+      pendingDirs.delete(d);
     }
   } finally {
     try { released = releasePublishLock(lockDir); } catch (err) { released = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
@@ -2007,45 +2011,56 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
   const releaseClean = released !== null && released.ok === true && released.absent !== true && released.reapUncleared == null;
   // R57d 返修九 P1-1：严格模式复核主锁，区分 absent / present / unreadable；非 ENOENT 保持 unclean。
   const after = readLockOwner(lockDir, { strict: true });
-  if (dirFsyncErr !== null) return { ok: false, cleaned, residue: left, lock_held: false, why: "清理后目录 fsync 失败（" + dirFsyncErr + "）：保持 unclean" };
+  const remainingPendingDirs = Array.from(pendingDirs);
+  if (dirFsyncErr !== null || remainingPendingDirs.length > 0) {
+    return { ok: false, cleaned, residue: left, dirs_pending_fsync: remainingPendingDirs, lock_held: false, why: "清理后目录 fsync 失败（" + (dirFsyncErr ?? remainingPendingDirs.join("、")) + "）：保持 unclean" };
+  }
   if (!releaseClean) {
-    return { ok: false, cleaned, lock_held: after.present || after.unreadable === true,
+    return { ok: false, cleaned, dirs_pending_fsync: remainingPendingDirs, lock_held: after.present || after.unreadable === true,
       residue: [...left, ...(released?.reapUncleared?.path ? [String(released.reapUncleared.path)] : []), ...(after.present || after.unreadable ? [lockDir] : [])],
       why: "账本锁释放不干净（" + String(released?.reason ?? released?.why ?? "?") + "）：保持 unclean" };
   }
   if (after.unreadable) {
-    return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, lock_unreadable: true,
+    return { ok: false, cleaned, residue: [...left, lockDir], dirs_pending_fsync: remainingPendingDirs, lock_held: true, lock_unreadable: true,
       why: "清理后主锁盘点异常（" + path.basename(lockDir) + ": " + (after.errorCode ?? after.error) + "）：保持 unclean" };
   }
   if (after.present) {
     const ownerDesc = after.owner ? "持有者 pid=" + String(after.owner.pid) : "owner 不可读";
-    return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, why: "清理后主锁仍在（" + ownerDesc + "）：交人" };
+    return { ok: false, cleaned, residue: [...left, lockDir], dirs_pending_fsync: remainingPendingDirs, lock_held: true, why: "清理后主锁仍在（" + ownerDesc + "）：交人" };
   }
-  if (left.length > 0) return { ok: false, cleaned, residue: left, lock_held: false, why: "残骸没清干净（" + left.join("、") + (errors.length > 0 ? "，异常：" + errors.join("；") : "") + "）：保持 unclean" };
-  return { ok: true, cleaned, residue: [], lock_held: false };
+  if (left.length > 0) return { ok: false, cleaned, residue: left, dirs_pending_fsync: remainingPendingDirs, lock_held: false, why: "残骸没清干净（" + left.join("、") + (errors.length > 0 ? "，异常：" + errors.join("；") : "") + "）：保持 unclean" };
+  return { ok: true, cleaned, residue: [], dirs_pending_fsync: [], lock_held: false };
 }
 
 /**
- * **持久化屏障重做**（R57d 返修七 P1-3）：写原语过提交点之后做的那两步持久化，这里能**再要一次** ——
- *   ① 账本文件 fsync（rename 之后 inode 内容落介质）；② endpoint 目录 fsync（目录项落介质）。
+ * **持久化屏障重做**（R57d 返修七 P1-3；返修九 P1-2 补全待补目录耐久）：写原语过提交点之后做的那两步持久化，这里能**再要一次** ——
+ *   ① 账本文件 fsync（rename 之后 inode 内容落介质）；② endpoint 目录 fsync（目录项落介质）；③ 待补目录 fsync。
  *  loadLedger 只能证明"读得到"，证明不了"耐久"：durability_uncertain 的收口必须重做屏障再受验读回。
  *  `_inject.failDirFsync`（与 writeLedger 同一注入名）只给测试用。
- * @returns { ok: true } | { ok: false, why }
+ * @returns { ok: true, dirs_pending_fsync: [] } | { ok: false, dirs_pending_fsync: string[], why }
  */
-export function barrierLedgerDurability({ dir, _inject = null } = {}) {
+export function barrierLedgerDurability({ dir, dirsPendingFsync = [], _inject = null } = {}) {
   const { ledger: ledgerPath } = ledgerPaths(dir);
+  const pending = new Set((Array.isArray(dirsPendingFsync) ? dirsPendingFsync : []).filter((x) => typeof x === "string" && x.length > 0));
   let fd = null;
   try {
     fd = fs.openSync(ledgerPath, fs.constants.O_RDONLY);
     const st = fs.fstatSync(fd);
-    if (!st.isFile()) return { ok: false, why: "账本路径不是普通文件" };
+    if (!st.isFile()) return { ok: false, dirs_pending_fsync: Array.from(pending), why: "账本路径不是普通文件" };
     fs.fsyncSync(fd);
   } catch (err) {
-    return { ok: false, why: "账本文件 fsync 失败：" + String(err?.code ?? err?.message ?? err) };
+    return { ok: false, dirs_pending_fsync: Array.from(pending), why: "账本文件 fsync 失败：" + String(err?.code ?? err?.message ?? err) };
   } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
   const dirErr = _inject?.failDirFsync ? "injected" : fsyncDir(dir);
-  if (dirErr !== null) return { ok: false, why: "endpoint 目录 fsync 失败：" + dirErr };
-  return { ok: true };
+  if (dirErr !== null) return { ok: false, dirs_pending_fsync: Array.from(pending), why: "endpoint 目录 fsync 失败：" + dirErr };
+  for (const d of Array.from(pending)) {
+    const err = fsyncDir(d);
+    if (err !== null) {
+      return { ok: false, dirs_pending_fsync: Array.from(pending), why: "目录 " + d + " fsync 失败：" + err };
+    }
+    pending.delete(d);
+  }
+  return { ok: true, dirs_pending_fsync: [] };
 }
 
 /* ─────────────────────────── operations 盖章 ─────────────────────────── */

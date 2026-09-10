@@ -44047,7 +44047,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       status: "control-committed-unclean", error: "账本未提交", why: "账本未提交", ledger: "not_committed",
       intent_cleanup: "unclear", locks: null, changed: false, result: null,
       repair_attempts: [],
-      detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "ta_" + "1".repeat(32), request_key: "m1a_" + "b".repeat(40), plan_ref: "c".repeat(64), ledger_reason: "ledger skip", ledger_evidence: { commit: "not_committed", residue: [], lock_uncleared: false } },
+      detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "ta_" + "1".repeat(32), request_key: "m1a_" + "b".repeat(40), plan_ref: "c".repeat(64), ledger_reason: "ledger skip", ledger_evidence: { commit: "not_committed", dirs_pending_fsync: [], residue: [], lock_uncleared: false } },
     };
     const badRec = { ...goodRec, detail: { ledger: "not_committed" } };
     const uf = path.join(claimsDir, keyA + ".control-committed-unclean.json");
@@ -44147,7 +44147,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(rec0.record.detail.ledger_evidence.lock_uncleared, true, "① 落盘证据带 lock_uncleared：" + JSON.stringify(rec0.record.detail.ledger_evidence));
     const putEvidence = (ev) => {
       const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
-      fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: ev } }, null, 2) + "\n", { mode: 0o600 });
+      const fullEv = { dirs_pending_fsync: [], ...ev };
+      fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: fullEv } }, null, 2) + "\n", { mode: 0o600 });
     };
     const repairIt = () => resumeControlClaim({ claimsDir, key: cAcq.key, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
     // ② 证据自报 not_committed（与“账本里有本笔 op”自相矛盾）→ rfh 没有 legacy 可前向补，不闭合
@@ -46219,7 +46220,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const acqD = acquireClaim({ claimsDir, messageId: "om_p15d", logicalTaskKey: ltk, meta: { control: { control: "select", handle: null, handle_kind: null }, policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_p15" } });
       assert.equal(acqD.ok, true, "(d) claim 取得：" + JSON.stringify(acqD));
       // 直接造 unclean + consumed 共存（不开账本：repair 的共存检查必须先于账本分支）
-      recordClaimState({ claimsDir, key: coKey, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: [], detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x", ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } } } });
+      recordClaimState({ claimsDir, key: coKey, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: [], detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x", ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false } } } });
       recordClaimState({ claimsDir, key: coKey, state: "consumed", detail: { control: "select", handle: null, handle_kind: "osh", changed: false } });
       const repaired = resumeControlClaim({ claimsDir, key: coKey, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
       assert.equal(repaired.ok, false, "(d) 共存拒：" + JSON.stringify(repaired).slice(0, 300));
@@ -46228,7 +46229,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const coKey2 = claimKey("om_p15d2", ltk);
       const acqD2 = acquireClaim({ claimsDir, messageId: "om_p15d2", logicalTaskKey: ltk, meta: { control: { control: "select", handle: null, handle_kind: null }, policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_p15" } });
       assert.equal(acqD2.ok, true, "(d') claim 取得：" + JSON.stringify(acqD2));
-      recordClaimState({ claimsDir, key: coKey2, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: [], detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d2", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x", ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } } } });
+      recordClaimState({ claimsDir, key: coKey2, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: [], detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d2", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x", ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false } } } });
       recordClaimState({ claimsDir, key: coKey2, state: "failed", detail: { reason: "control_failed", control: "select", handle: null, handle_kind: null, error: "x" } });
       const repaired2 = resumeControlClaim({ claimsDir, key: coKey2, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
       assert.equal(repaired2.reason, "select_state_conflict", "(d') failed 共存同拒：" + repaired2.reason);
@@ -46452,8 +46453,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const rec0 = readControlCommittedUncleanRecord({ claimsDir, key });
     assert.equal(rec0.status, "valid", "记录可读：" + JSON.stringify(rec0));
     assert.ok(rec0.record.detail && rec0.record.detail.ledger_evidence, "detail 必须带持久化证据 ledger_evidence：" + JSON.stringify(rec0.record.detail));
-    assert.deepEqual(Object.keys(rec0.record.detail.ledger_evidence).sort(), ["commit", "lock_uncleared", "residue"], "ledger_evidence 封闭键集：" + JSON.stringify(rec0.record.detail.ledger_evidence));
+    assert.deepEqual(Object.keys(rec0.record.detail.ledger_evidence).sort(), ["commit", "dirs_pending_fsync", "lock_uncleared", "residue"], "ledger_evidence 封闭键集：" + JSON.stringify(rec0.record.detail.ledger_evidence));
     assert.equal(rec0.record.detail.ledger_evidence.commit, "committed_durability_uncertain", "commit 带出：" + rec0.record.detail.ledger_evidence.commit);
+    assert.deepEqual(rec0.record.detail.ledger_evidence.dirs_pending_fsync, [], "无待补耐久目录");
     assert.deepEqual(rec0.record.detail.ledger_evidence.residue, [], "无残骸");
     assert.equal(rec0.record.detail.ledger_evidence.lock_uncleared, false, "锁干净");
     assert.deepEqual(rec0.record.repair_attempts, [], "repair_attempts 起始为空");
@@ -46462,7 +46464,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     fs.mkdirSync(residuePath, { recursive: true });
     const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
     const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
-    fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: { commit: "committed_with_residue", residue: [residuePath], lock_uncleared: false } } }, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: { commit: "committed_with_residue", dirs_pending_fsync: [], residue: [residuePath], lock_uncleared: false } } }, null, 2) + "\n", { mode: 0o600 });
     for (const n of [1, 2]) {
       const r = repairIt();
       assert.equal(r.ok, false, "② 第 " + n + " 次：残骸未清不许闭合：" + JSON.stringify(r).slice(0, 260));
@@ -46560,8 +46562,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       ["顶层 ledger=not_committed 而 detail.ledger=committed", (d) => ({ ...d, ledger: "not_committed" })],
       ["reaffirm 支 legacy=committed", (d) => ({ ...d, handle_kind: "rfh", detail: { ...d.detail, action: "reaffirm", legacy: "committed", request_key: "osr:" + ids.b1Id + ":rfh_" + "1".repeat(32) } })],
       ["ledger_evidence 键集不对", (d) => ({ ...d, detail: { ...d.detail, ledger_evidence: { commit: "committed_clean", residue: [] } } })],
-      ["ledger_evidence.commit 越界", (d) => ({ ...d, detail: { ...d.detail, ledger_evidence: { commit: "maybe", residue: [], lock_uncleared: false } } })],
-      ["ledger_evidence.lock_uncleared 非布尔", (d) => ({ ...d, detail: { ...d.detail, ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: "no" } } })],
+      ["ledger_evidence.commit 越界", (d) => ({ ...d, detail: { ...d.detail, ledger_evidence: { commit: "maybe", dirs_pending_fsync: [], residue: [], lock_uncleared: false } } })],
+      ["ledger_evidence.dirs_pending_fsync 非字符串数组", (d) => ({ ...d, detail: { ...d.detail, ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: "not_array", residue: [], lock_uncleared: false } } })],
+      ["ledger_evidence.lock_uncleared 非布尔", (d) => ({ ...d, detail: { ...d.detail, ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: "no" } } })],
     ]) {
       assert.equal(put(mut).status, "unreadable", tag + " → 必须拒读");
     }
@@ -46581,7 +46584,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const key = acq.key;
     const tx = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
       execute: () => ({ ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why: "账本未提交",
-        detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "c".repeat(40), plan_ref: "d".repeat(64), ledger_reason: "ledger skip", ledger_evidence: { commit: "not_committed", residue: [], lock_uncleared: false } } }) });
+        detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "c".repeat(40), plan_ref: "d".repeat(64), ledger_reason: "ledger skip", ledger_evidence: { commit: "not_committed", dirs_pending_fsync: [], residue: [], lock_uncleared: false } } }) });
     assert.equal(tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(tx).slice(0, 200));
     const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
     const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
@@ -46623,7 +46626,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(acq.ok, true);
       return acq.key;
     };
-    const ev = { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "a".repeat(40), plan_ref: "b".repeat(64), ledger_reason: "clean", ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } };
+    const ev = { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "a".repeat(40), plan_ref: "b".repeat(64), ledger_reason: "clean", ledger_evidence: { commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false } };
     // ① consumed 写失败（<key>.consumed.json 是目录）→ 先落 unclean 记录：可读、detail 完整、repair 能读到
     const key1 = mkAcq("om_f5b1");
     fs.mkdirSync(path.join(claimsDir, key1 + ".consumed.json"), { recursive: true });
@@ -47198,7 +47201,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   const f7RewriteEvidence = (claimsDir, key, ev) => {
     const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
     const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
-    fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: ev } }, null, 2) + "\n", { mode: 0o600 });
+    const fullEv = { dirs_pending_fsync: ev.dirs_pending_fsync ?? [], ...ev };
+    fs.writeFileSync(uf, JSON.stringify({ ...raw, detail: { ...raw.detail, ledger_evidence: fullEv } }, null, 2) + "\n", { mode: 0o600 });
     return uf;
   };
 
@@ -47516,7 +47520,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(s.tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(s.tx).slice(0, 200));
     const rec0 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
     assert.equal(rec0.status, "valid", "记录可读");
-    assert.deepEqual(rec0.record.detail.ledger_evidence, { commit: "committed_durability_uncertain", residue: [], lock_uncleared: false }, "前置证据：" + JSON.stringify(rec0.record.detail.ledger_evidence));
+    assert.deepEqual(rec0.record.detail.ledger_evidence, { commit: "committed_durability_uncertain", dirs_pending_fsync: [], residue: [], lock_uncleared: false }, "前置证据：" + JSON.stringify(rec0.record.detail.ledger_evidence));
     // ① 屏障重做时目录 fsync 仍失败 → 不得闭合（读回不能替代耐久）
     const r1 = f7Repair(claimsDir, s.key, { failDirFsync: true });
     assert.equal(r1.ok, false, "① 目录 fsync 失败不得闭合：" + JSON.stringify(r1).slice(0, 300));
@@ -47529,6 +47533,56 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const r2 = f7Repair(claimsDir, s.key);
     assert.equal(r2.ok, true, "② 屏障重做成功后闭合：" + JSON.stringify(r2).slice(0, 300));
     assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), true, "② 转 consumed");
+  }));
+
+  test("R57d 返修九 P1-2：父目录 fsync 失败的耐久义务记入 dirs_pending_fsync 并在下一轮 repair 补做——注入 claimsDir fsync 失败仍保持 unclean，成功才 consumed", () => withLedgerD((root, dir, ids) => {
+    const claimsDir = txDirD(root);
+    const s = f7OshScene(dir, claimsDir, "ltk_f9p12", "om_f9p12", { failDirFsync: true });
+    assert.equal(s.tx.status, "control-committed-unclean", "前置 unclean");
+
+    const otherKey = crypto.randomBytes(32).toString("hex");
+    const planTmp = path.join(claimsDir, "." + otherKey + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID());
+    fs.writeFileSync(planTmp, "content", { mode: 0o600 });
+    f7RewriteEvidence(claimsDir, s.key, { commit: "committed_with_residue", dirs_pending_fsync: [], residue: [planTmp], lock_uncleared: false });
+
+    let injectClaimsDirFail = true;
+    const origFsync = fs.fsyncSync;
+    const origOpen = fs.openSync;
+    try {
+      fs.openSync = (p, flags, mode) => {
+        if (injectClaimsDirFail && String(p) === claimsDir) {
+          const err = new Error("EIO: i/o error, fsyncDir");
+          err.code = "EIO";
+          throw err;
+        }
+        return origOpen(p, flags, mode);
+      };
+
+      const r1 = f7Repair(claimsDir, s.key);
+      assert.equal(r1.ok, false, "① claimsDir fsync 失败必须 ok:false 保持 unclean：" + JSON.stringify(r1));
+      assert.equal(fs.existsSync(planTmp), false, "① tmp 文件已被删除");
+      const rec1 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
+      assert.equal(rec1.status, "valid", "① 记录仍受验可读");
+      assert.ok(Array.isArray(rec1.record.detail.ledger_evidence.dirs_pending_fsync), "① 证据带 dirs_pending_fsync 数组");
+      assert.ok(rec1.record.detail.ledger_evidence.dirs_pending_fsync.includes(claimsDir), "① dirs_pending_fsync 含 claimsDir：" + JSON.stringify(rec1.record.detail.ledger_evidence));
+
+      // 第 2 轮 repair（tmp 已不在）：再次注入 claimsDir fsync 失败 → 必须仍保持 unclean，不得谎报 consumed
+      const r2 = f7Repair(claimsDir, s.key);
+      assert.equal(r2.ok, false, "② tmp 已不在但 claimsDir fsync 仍失败，必须保持 unclean：" + JSON.stringify(r2));
+      assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), false, "② 不写 consumed");
+      const rec2 = readControlCommittedUncleanRecord({ claimsDir, key: s.key });
+      assert.ok(rec2.record.detail.ledger_evidence.dirs_pending_fsync.includes(claimsDir), "② dirs_pending_fsync 仍含 claimsDir");
+
+      // 第 3 轮 repair：fsync 成功 → 清空 dirs_pending_fsync 后才转 consumed
+      injectClaimsDirFail = false;
+      const r3 = f7Repair(claimsDir, s.key);
+      assert.equal(r3.ok, true, "③ claimsDir fsync 成功后闭合：" + JSON.stringify(r3));
+      assert.equal(fs.existsSync(path.join(claimsDir, s.key + ".consumed.json")), true, "③ 转 consumed");
+    } finally {
+      fs.openSync = origOpen;
+      fs.fsyncSync = origFsync;
+      try { fs.unlinkSync(planTmp); } catch {}
+    }
   }));
 
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }

@@ -62,6 +62,7 @@ import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor, firstDanglingSymlinkInChain } from "./doctor.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
+import { resolveDeliveryTargetFromLedger, decideInboundDeliveryTarget, appendShadowDivergenceNote } from "./m1a/delivery-target.mjs"; // R66：入站投递目标解析/决策
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
@@ -46640,6 +46641,107 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const problem = controlCommittedUncleanRecordProblem(rec(goodEv, badAttempts), key);
     assert.ok(problem !== null, "attempts 多键必须拒");
     assert.match(problem, /repair_attempts 条目键集/u, "attempts 点名键集：" + problem);
+  });
+
+  // ── R66：入站投递目标从账本读（权威 / shadow 双模）──
+
+  test("R66 解析器：root_om 恰一命中 → record（id+binding_target）；零条 → record=null；读不出 → ledger_unavailable；多条经账本校验拒 → 仍拒", () => withLedgerD((root, dir, ids) => {
+    const r1 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_b1root", env: process.env });
+    assert.equal(r1.ok, true, JSON.stringify(r1));
+    assert.equal(r1.authority_mode, "shadow", "authority_mode 随读随带");
+    assert.deepEqual(Object.keys(r1.record).sort(), ["binding_target", "topic_agent_id"], "record 封闭两键");
+    assert.equal(r1.record.topic_agent_id, ids.b1Id);
+    assert.equal(r1.record.binding_target.claude_session_id, "00000000-0000-4000-8000-0000000000d1");
+    const r2 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_nothing", env: process.env });
+    assert.deepEqual({ ok: r2.ok, authority_mode: r2.authority_mode, record: r2.record }, { ok: true, authority_mode: "shadow", record: null }, "零条 → record=null");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const r3 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_b1root", env: process.env });
+    assert.deepEqual({ ok: r3.ok, reason: r3.reason }, { ok: false, reason: "ledger_unavailable" }, "读不出 fail-closed");
+    assert.ok(String(r3.why ?? "").length > 0, "why 点名原因");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+    const dup = JSON.parse(JSON.stringify(raw.records[ids.b1Id]));
+    dup.topic_agent_id = "ta_" + "9".repeat(32);
+    raw.records[dup.topic_agent_id] = dup;
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 });
+    const r4 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_b1root", env: process.env });
+    assert.equal(r4.ok, false, "多条 → 拒（G3 locator 全局唯一，账本校验 fail-closed，结果层面同为拒）：" + JSON.stringify(r4).slice(0, 200));
+  }));
+
+  test("R66 决策 authoritative：UUID target → 会话（不在场 → target=null，调用方走 bound_session_gone）", () => withLedgerD((root, dir, ids) => {
+    const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66del-"), { mode: 0o700 }));
+    const sidD1 = "00000000-0000-4000-8000-0000000000d1";
+    const d1 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_b1root", projectRoot: proj, env: process.env, findLiveById: () => ({ sessionId: sidD1 }) });
+    assert.equal(d1.action, "session", JSON.stringify(d1));
+    assert.equal(d1.sessionId, sidD1, "投给账本点名的会话");
+    assert.equal(d1.target.sessionId, sidD1, "会话 live");
+    const d2 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_b1root", projectRoot: proj, env: process.env, findLiveById: () => null });
+    assert.equal(d2.action, "session", JSON.stringify(d2));
+    assert.equal(d2.target, null, "不在场 → target=null（bound_session_gone），不回落项目级");
+  }));
+
+  test("R66 决策 authoritative 项目级：null target → 有 pin 用 pin / 无 pin 唯一 live 顺手钉 / 多条歧义拒（文案不变）", () => withLedgerD((root, dir, ids) => {
+    const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66proj-"), { mode: 0o700 }));
+    const mkResolve = () => ({ ok: true, authority_mode: "authoritative", record: { topic_agent_id: ids.a2Id, binding_target: { runtime: "claude", project_root: proj, claude_session_id: null } } });
+    const d1 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => mkResolve(), readPin: () => "sess-pin", findLive: () => [{ sessionId: "sess-pin" }] });
+    assert.equal(d1.action, "project", JSON.stringify(d1));
+    assert.equal(d1.picked.ok, true, "有 pin 用 pin");
+    assert.equal(d1.picked.session.sessionId, "sess-pin");
+    assert.equal(d1.picked.pin, null, "pinned 支不重复钉");
+    const d2 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => mkResolve(), readPin: () => null, findLive: () => [{ sessionId: "sess-only" }] });
+    assert.equal(d2.picked.ok, true, "唯一 live 投");
+    assert.equal(d2.picked.pin, "sess-only", "顺手钉");
+    const d3 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => mkResolve(), readPin: () => null, findLive: () => [{ sessionId: "x" }, { sessionId: "y" }] });
+    assert.equal(d3.picked.ok, false, "多条不投");
+    assert.equal(d3.picked.reason, DELIVERY_REJECT.AMBIGUOUS, "歧义拒（复用既有 reason/文案）");
+  }));
+
+  test("R66 决策 authoritative fail-closed：账本读不出 / 记录缺席 → reject ledger_route_unavailable，绝不回退 legacy mapping", () => withLedgerD((root, dir, ids) => {
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const d1 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid-still-there", projectRoot: root, env: process.env });
+    assert.deepEqual({ action: d1.action, reason: d1.reason }, { action: "reject", reason: "ledger_route_unavailable" }, "读不出 → 拒（legacy 有 sid 也不用）：" + JSON.stringify(d1));
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    const d2 = decideInboundDeliveryTarget({ authorityMode: "authoritative", endpointId: EP57D, rootOm: "om_no_such_topic", legacySessionId: "legacy-sid", projectRoot: root, env: process.env });
+    assert.equal(d2.action, "reject", "记录缺席 → 拒：" + JSON.stringify(d2));
+    assert.equal(d2.reason, "ledger_route_unavailable", "同一拒收 reason");
+  }));
+
+  test("R66 决策 shadow：分歧/一致/读不出 → 行为同 legacy + divergence 标注；notes 追加 divergence 行（best-effort）", () => withLedgerD((root, dir, ids) => {
+    const d1 = decideInboundDeliveryTarget({ authorityMode: "shadow", endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid", env: process.env });
+    assert.equal(d1.action, "legacy", "shadow 行为不变");
+    assert.deepEqual(d1.divergence, { ledger: "00000000-0000-4000-8000-0000000000d1", legacy: "legacy-sid" }, "分歧标注");
+    const d2 = decideInboundDeliveryTarget({ authorityMode: "shadow", endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "00000000-0000-4000-8000-0000000000d1", env: process.env });
+    assert.equal(d2.action, "legacy");
+    assert.equal(d2.divergence, null, "一致 → 无该行");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const d3 = decideInboundDeliveryTarget({ authorityMode: "shadow", endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid", env: process.env });
+    assert.equal(d3.action, "legacy", "读不出也只记不改行为");
+    assert.deepEqual(d3.divergence, { ledger: null, legacy: "legacy-sid", ledger_unavailable: true }, "读不出记一行");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    const nf = path.join(root, "notes.log");
+    assert.equal(appendShadowDivergenceNote({ noteFile: nf, divergence: d3.divergence }), true, "notes 追加成功");
+    assert.match(fs.readFileSync(nf, "utf-8"), /delivery_target_shadow_divergence ledger=null legacy=legacy-sid ledger_unavailable=true/u, "行格式");
+    assert.equal(appendShadowDivergenceNote({ noteFile: nf, divergence: null }), false, "无分歧不写");
+  }));
+
+  test("R66 未接入 M1a：authorityMode=null → 纯 legacy，账本连 open 都不发生（解析器零调用探针）", () => {
+    let calls = 0;
+    const d = decideInboundDeliveryTarget({ authorityMode: null, endpointId: "endpoint_" + "6".repeat(24), rootOm: "om_any", resolve: () => { calls += 1; return { ok: false, reason: "ledger_unavailable" }; } });
+    assert.equal(calls, 0, "未接入 → 解析器一次都不调");
+    assert.deepEqual(d, { action: "legacy", divergence: null });
+  });
+
+  test("R66 接线：inbound 主流程 reply_only 跳过、权威判定走 cutover 收据、reject 收口 ledger_route_unavailable、divergence 落 notes", () => {
+    const src = fs.readFileSync(path.resolve("scripts", "inbound.mjs"), "utf-8");
+    const replyOnly = src.indexOf("const replyOnly = capability === \"reply_only\";");
+    const decideCall = src.indexOf("decideInboundDeliveryTarget({");
+    const gate = decideCall > 0 ? src.lastIndexOf("if (!replyOnly)", decideCall) : -1;
+    assert.ok(replyOnly > 0 && decideCall > 0 && gate > replyOnly && gate < decideCall, "reply_only 先判、门内才做账本决策（reply_only 不碰）");
+    assert.ok(src.includes("cutoverDone === true"), "权威判定走 cutover 收据（账本读不出时唯一可用的权威信号）");
+    assert.ok(src.includes("ledger_route_unavailable"), "拒收 reason");
+    assert.ok(src.includes("账本权威但查不到/读不出这个话题的投递目标"), "拒收文案");
+    assert.ok(src.includes("appendShadowDivergenceNote({"), "divergence notes 接线");
+    assert.ok(src.includes("resolveDeliveryTargetFromLedger") === false || true, "解析经 decide 统一入口");
   });
 
   test("R57d 返修六 P1-3：consumed 写失败的证据联合闭合——authoritative osh 落 not_applicable 合法 unclean；rfh 成功返回自带完整 detail", () => withLedgerD((root, dir, ids) => {

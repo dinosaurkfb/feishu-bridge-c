@@ -17,7 +17,7 @@ import { expectationFromMapping, claudeControlPrecondition } from "./control-ide
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext, mintSelectCapability } from "./select-admission.mjs";
 import { senderRole } from "./sender-roles.mjs";
-import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias, fingerprintOf, clearLedgerResidue } from "./topic-agent-ledger.mjs";
+import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias, fingerprintOf, clearLedgerResidue, barrierLedgerDurability } from "./topic-agent-ledger.mjs";
 import { CHAT_SHAPE, ENDPOINT_SHAPE } from "./shapes.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
@@ -197,6 +197,58 @@ export function repairControlCommittedUnclean({ claim, claimsDir, key, uncleanRe
   return innerRes;
 }
 
+/** ledger_evidence.commit 的封闭枚举（与 control-command.mjs 的校验器同一份值域）。 */
+const EVIDENCE_COMMIT_VALUES = Object.freeze(["committed_clean", "committed_with_residue", "committed_durability_uncertain", "not_committed", "unknown"]);
+
+/** 证据的**唯一**投影（写回记录 / repair_attempts 前必须成形；不成形的记录会被校验器拒读，repair 就再也进不来）。 */
+function evidenceOf(commit, residue, lockUncleared) {
+  return {
+    commit: EVIDENCE_COMMIT_VALUES.includes(commit) ? commit : "unknown",
+    residue: (Array.isArray(residue) ? residue : []).filter((x) => typeof x === "string" && x.length > 0),
+    lock_uncleared: lockUncleared === true,
+  };
+}
+
+/**
+ * 「账本已提交」支的**共同**收口（R57d 返修七 P1-2/P1-3）：osh/orh 与 rfh 走同一条路径 ——
+ *   ① 按 unclean 记录的持久证据清账本侧残骸（只删形状封闭、逐字列出的 tmp；主锁/reap 家族在场 → 不清、不闭合）；
+ *   ② **重做持久化屏障**（账本文件 fsync + endpoint 目录 fsync）——loadLedger 只能证明"读得到"，证不了耐久；
+ *   ③ 受验读回账本，交调用方的 reverify 逐字复核本笔 op 仍在且对得上。
+ * 任一步不过 → { ok:false, reason, why[, ledger_evidence] }，保持 control-committed-unclean。
+ * evidence 为 null（旧形记录没有 detail）时跳过 ① —— 它没有任何"有残骸/锁未清"的声明，但屏障与读回**照做**。
+ */
+function settleCommittedLedger({ dir, claimsDir, endpointId, evidence, env = process.env, _inject = undefined, reverify }) {
+  const ev = (evidence !== null && typeof evidence === "object") ? evidence : null;
+  const residue = ev && Array.isArray(ev.residue) ? ev.residue : [];
+  const lockUncleared = ev?.lock_uncleared === true;
+  if (residue.length > 0 || lockUncleared) {
+    const cr = clearLedgerResidue({ dir, dirs: [claimsDir], residue, env });
+    if (!cr.ok) {
+      return {
+        ok: false, reason: "ledger_residue_uncleared",
+        // 残骸/锁没收拾干净：证据按"确实还有残骸"落笔（原证据说 clean 就抬成 with_residue，别把脏说成干净）。
+        ledger_evidence: evidenceOf(ev?.commit === "committed_clean" ? "committed_with_residue" : (ev?.commit ?? "unknown"), cr.residue, cr.lock_held === true || lockUncleared),
+        why: "账本侧残骸/主锁没收拾干净（" + (Array.isArray(cr.residue) && cr.residue.length > 0 ? cr.residue.join("、") : String(cr.why ?? "?")) + "）：保持 control-committed-unclean",
+      };
+    }
+  }
+  const b = barrierLedgerDurability({ dir, _inject });
+  if (!b.ok) {
+    return {
+      ok: false, reason: "ledger_durability_unconfirmed",
+      ledger_evidence: evidenceOf("committed_durability_uncertain", [], false),
+      why: "持久化屏障重做失败（" + String(b.why ?? "?") + "）：读回不能替代耐久，保持 control-committed-unclean",
+    };
+  }
+  const L = loadLedger(dir, { endpointId });
+  if (!L.ok) return { ok: false, reason: "ledger_unreadable", why: "重读账本失败（" + String(L.why ?? L.reason ?? "?") + "）" };
+  const problem = typeof reverify === "function" ? reverify(L.doc) : null;
+  if (problem !== null && problem !== undefined) {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: String(problem) + "，保持 control-committed-unclean" };
+  }
+  return { ok: true };
+}
+
 /**
  * osh/orh 的 unclean 收尾（R57d 对齐 P1-5）。前提：verifySelectionContext 已过、outer 锁已持。
  * 分支判据 = uncleanRecord.detail（P1-5a 结构化持久证据）+ sidecar plan（P1-4），不重执行选择：
@@ -297,34 +349,18 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
     if (mismatch !== null) {
       return { ok: false, reason: "ledger_commit_unverifiable", why: "账本 " + opType + " op 与 plan 逐字核不过：" + mismatch + "，保持 control-committed-unclean" };
     }
-    // R57d 返修六 P1-2：**转 consumed 前必须重做持久化屏障** ——
-    //   旧码只要核得出匹配 op 就放行：前向补返回 committed_with_residue 后第一次保持 unclean，
-    //   第二次因 op 已存在直接转 consumed（残骸还在）；原始 dirty-commit 也首次 repair 即放行。
-    //   现在：先读 unclean 记录里的证据；residue 非空 / 锁未清 → 先调账本侧残骸清理原语（只删已知路径、受验读回）；
-    //   清干净后重读账本受验核 op 仍在且逐字对得上，才闭合；否则保持 unclean 并把最新证据带回去写回记录。
-    const ev = detail.ledger_evidence ?? null;
-    let nextEvidence = null;
-    if (ev !== null && ((Array.isArray(ev.residue) && ev.residue.length > 0) || ev.lock_uncleared === true)) {
-      const cr = clearLedgerResidue({ dir: d.dir, residue: ev.residue ?? [] });
-      nextEvidence = {
-        commit: cr.ok ? "committed_clean" : "committed_with_residue",
-        residue: Array.isArray(cr.residue) ? cr.residue : [],
-        lock_uncleared: cr.ok ? false : ev.lock_uncleared === true,
-      };
-      if (!cr.ok) {
-        return { ok: false, reason: "ledger_residue_uncleared", ledger_evidence: nextEvidence,
-          why: "账本侧残骸没清干净（" + nextEvidence.residue.join("、") + "），保持 control-committed-unclean" };
-      }
-    }
-    // 重做持久化屏障：受验重读账本，op 必须仍在且逐字对得上。
-    const L3 = loadLedger(d.dir, { endpointId: sc.endpoint });
-    if (!L3.ok) return { ok: false, reason: "ledger_unreadable", why: "清理后重读账本失败（" + String(L3.why ?? L3.reason ?? "?") + "）" };
-    const again = findCommitted(L3.doc);
-    if (!again) return { ok: false, reason: "ledger_commit_unverifiable", why: "清理后重读核不出本笔 op（request_key " + wantKey.request_key + "），保持 control-committed-unclean" };
-    const againMismatch = committedMismatch(again);
-    if (againMismatch !== null) {
-      return { ok: false, reason: "ledger_commit_unverifiable", why: "清理后重读的 op 与 plan 逐字核不过：" + againMismatch + "，保持 control-committed-unclean" };
-    }
+    // R57d 返修七 P1-2/P1-3：**共同收口**（与 rfh 同一函数）——按持久证据清账本侧残骸（残骸/主锁没收拾干净
+    //   就不闭合）→ 重做持久化屏障（账本文件 fsync + endpoint 目录 fsync）→ 受验读回逐字复核本笔 op 仍在且对得上。
+    const settled = settleCommittedLedger({
+      dir: d.dir, claimsDir, endpointId: sc.endpoint, evidence: detail.ledger_evidence ?? null, env, _inject,
+      reverify: (docAfterCleanup) => {
+        const again = findCommitted(docAfterCleanup);
+        if (!again) return "清理后重读核不出本笔 op（request_key " + wantKey.request_key + "）";
+        const m = committedMismatch(again);
+        return m === null ? null : "清理后重读的 op 与 plan 逐字核不过：" + m;
+      },
+    });
+    if (!settled.ok) return settled;
     return { ok: true, changed: true, ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } };
   }
   // 分支二：legacy 已提交、账本未提交 → outer 锁内按 plan 前向补 ledger（同 request_key / 冻结 CAS，幂等）。
@@ -434,17 +470,34 @@ function repairControlCommittedUncleanInner({ claim, claimsDir, key, uncleanReco
     return { ok: false, reason: "ledger_commit_unverifiable", why: "selection plan.kind 与 claim.kind 不一致，保持 control-committed-unclean" };
   }
   // 精确绑定的 request_key 与写入侧共用同一派生函数（P2）；不再保留本地字面拼接。
-  const matches = Object.values(L.doc.operations).filter((op) =>
+  const findRfhMatches = (docu) => Object.values(docu.operations).filter((op) =>
     op.op_type === "owner_select_reaffirm" &&
     op.result && typeof op.result.target_id === "string" &&
     op.request_key === ownerSelectReaffirmRequestKey({ target: op.result.target_id, handle: sc.handle }) &&
     op.result.target_id === unTarget &&
     op.result.selection_message_id === unMessage
   );
+  const matches = findRfhMatches(L.doc);
   if (matches.length !== 1) {
     return { ok: false, reason: "ledger_commit_unverifiable", why: "账本中核不出 handle " + sc.handle + " 的唯一提交记录（命中 " + matches.length + " 笔），保持 control-committed-unclean" };
   }
   const priorOp = matches[0];
+
+  // 1b. R57d 返修七 P1-2/P1-3：rfh 也**消费** unclean 记录里的持久证据 —— 与 osh/orh 同一条收口路径
+  //     （清残骸 → 重做持久化屏障 → 受验读回逐字复核本笔 op）。证据自报 not_committed 与"账本里有本笔 op"
+  //     自相矛盾（rfh 没有 legacy 可前向补）→ 交人，不闭合。
+  const rfhEvidence = uncleanRecord?.detail?.ledger_evidence ?? null;
+  if (rfhEvidence !== null && rfhEvidence.commit === "not_committed") {
+    return { ok: false, reason: "ledger_commit_unverifiable", why: "unclean 证据自报 not_committed 而账本里有本笔 op（自相矛盾；rfh 无 legacy 可前向补），保持 control-committed-unclean" };
+  }
+  const settledRfh = settleCommittedLedger({
+    dir: d.dir, claimsDir, endpointId: sc.endpoint, evidence: rfhEvidence, env, _inject,
+    reverify: (docAfterCleanup) => {
+      const n = findRfhMatches(docAfterCleanup).length;
+      return n === 1 ? null : "账本中核不出 handle " + sc.handle + " 的唯一提交记录（命中 " + n + " 笔）";
+    },
+  });
+  if (!settledRfh.ok) return settledRfh;
 
   // 2. 只做清理/释放收尾
   const cl = cleanReaffirmIntent({ endpointDir: d.dir, reaffirmHandle: sc.handle, env, _inject });

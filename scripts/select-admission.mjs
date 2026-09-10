@@ -262,6 +262,23 @@ const ledgerEvidenceOf = (ledger) => ({
   lock_uncleared: ledger?.lockUncleared != null,
 });
 
+/** rfh 支的持久化证据（R57d 返修七 P1-3）：consumeReaffirmIntent 的分类值是 clean / unclean / not_committed，
+ *  **不是** "committed" —— 旧码拿 res.ledger === "committed" 比，恒不成立，于是一笔 dirty commit 被折成
+ *  unknown / [] / false，repair 拿到"不知道"的证据就无从按证据清残骸。这里按**真实分类值**映射，并把账本
+ *  原语的真实 commit / residue / lockUncleared 带出来（枚举外的值按分类兜底，绝不写出校验器读不出的形状）。 */
+function rfhLedgerEvidence(res) {
+  const residue = Array.isArray(res?.residue) ? res.residue.filter((x) => typeof x === "string" && x.length > 0)
+    : (Array.isArray(res?.ledger_res?.residue) ? res.ledger_res.residue.filter((x) => typeof x === "string" && x.length > 0) : []);
+  const lockUncleared = res?.lockUncleared != null || res?.lock_state === "unclear"
+    || (res?.locks != null && (res.locks.outer !== "released" || res.locks.intent !== "released"));
+  const commit = res?.commit === "committed_clean" || res?.commit === "replayed" || res?.commit === "already" ? "committed_clean"
+    : res?.commit === "committed_with_residue" || res?.commit === "committed_durability_uncertain" ? res.commit
+      : res?.ledger === "not_committed" ? "not_committed"
+        : res?.ledger === "clean" ? "committed_clean"
+          : res?.ledger === "unclean" ? "committed_with_residue"
+            : "unknown";
+  return { commit, residue, lock_uncleared: lockUncleared };
+}
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
 function wiredOutcome(w, action, info = {}) {
@@ -378,7 +395,7 @@ export function executeSelectControl(intent, {
             : null,
           plan_ref: res.plan_ref ?? planRefVal ?? null,
           ledger_reason: (typeof res.why === "string" ? res.why : ""),
-          ledger_evidence: ledgerEvidenceOf({ commit: res.ledger === "committed" ? "committed_clean" : null, residue: null, lockUncleared: null }),
+          ledger_evidence: rfhLedgerEvidence(res),
         },
         ledger: res.ledger,
         intent_cleanup: res.intent_cleanup,

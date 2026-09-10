@@ -1951,6 +1951,29 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
   return { ok: true, cleaned, residue: [], lock_held: false };
 }
 
+/**
+ * **持久化屏障重做**（R57d 返修七 P1-3）：写原语过提交点之后做的那两步持久化，这里能**再要一次** ——
+ *   ① 账本文件 fsync（rename 之后 inode 内容落介质）；② endpoint 目录 fsync（目录项落介质）。
+ *  loadLedger 只能证明"读得到"，证明不了"耐久"：durability_uncertain 的收口必须重做屏障再受验读回。
+ *  `_inject.failDirFsync`（与 writeLedger 同一注入名）只给测试用。
+ * @returns { ok: true } | { ok: false, why }
+ */
+export function barrierLedgerDurability({ dir, _inject = null } = {}) {
+  const { ledger: ledgerPath } = ledgerPaths(dir);
+  let fd = null;
+  try {
+    fd = fs.openSync(ledgerPath, fs.constants.O_RDONLY);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return { ok: false, why: "账本路径不是普通文件" };
+    fs.fsyncSync(fd);
+  } catch (err) {
+    return { ok: false, why: "账本文件 fsync 失败：" + String(err?.code ?? err?.message ?? err) };
+  } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } } }
+  const dirErr = _inject?.failDirFsync ? "injected" : fsyncDir(dir);
+  if (dirErr !== null) return { ok: false, why: "endpoint 目录 fsync 失败：" + dirErr };
+  return { ok: true };
+}
+
 /* ─────────────────────────── operations 盖章 ─────────────────────────── */
 
 /** §5.1：fingerprint 首字段恒为 op_type（域分隔），再规范 JSON → sha256。 */

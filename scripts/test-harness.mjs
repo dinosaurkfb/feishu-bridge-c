@@ -136,6 +136,83 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
   rawMkdir(tripwire.ledger, { recursive: true, mode: 0o700 });
   rawMkdir(tripwire.maintenance, { recursive: true, mode: 0o700 });
   rawMkdir(tripwire.codexHome, { recursive: true, mode: 0o700 });
+
+  // R60 返修三 P1：三个绊线根（ledger / maintenance / codex bridge home）本身纳入不可变基线
+  // 安装守卫时记录各根的 lstat 身份（非 symlink 的普通目录、mode、dev+ino、realpath）
+  const tripwireRoots = [tripwire.ledger, tripwire.maintenance, tripwire.codexHome];
+  const inspectRootIdentity = (root) => {
+    let st;
+    try {
+      st = fs.lstatSync(root);
+    } catch (err) {
+      if (err?.code === "ENOENT") return { ok: false, root, problem: "绊线根缺席（被删）：" + root };
+      return { ok: false, root, problem: "绊线根 lstat 异常（" + String(err?.code ?? err?.message ?? err) + "）：" + root };
+    }
+    if (st.isSymbolicLink()) return { ok: false, root, problem: "绊线根被换成 symlink：" + root };
+    if (!st.isDirectory()) return { ok: false, root, problem: "绊线根不是普通目录：" + root };
+    let real;
+    try {
+      real = fs.realpathSync(root);
+    } catch (err) {
+      return { ok: false, root, problem: "绊线根 realpath 异常（" + String(err?.code ?? err?.message ?? err) + "）：" + root };
+    }
+    return {
+      ok: true,
+      root,
+      type: "dir",
+      mode: st.mode & 0o7777,
+      dev: st.dev,
+      ino: st.ino,
+      real,
+    };
+  };
+
+  const rootBaselines = new Map();
+  for (const r of tripwireRoots) {
+    const info = inspectRootIdentity(r);
+    if (!info.ok) throw new Error("无法初始化绊线根基线：" + info.problem);
+    rootBaselines.set(r, info);
+  }
+
+  const verifyRootIdentity = (root) => {
+    const base = rootBaselines.get(root);
+    if (!base) return "未知绊线根：" + root;
+    let st;
+    try {
+      st = fs.lstatSync(root);
+    } catch (err) {
+      if (err?.code === "ENOENT") return "绊线根缺席（被删）：" + root;
+      return "绊线根 lstat 异常（" + String(err?.code ?? err?.message ?? err) + "）：" + root;
+    }
+    if (st.isSymbolicLink()) return "绊线根被换成 symlink：" + root;
+    if (!st.isDirectory()) return "绊线根不是普通目录：" + root;
+    if (st.dev !== base.dev || st.ino !== base.ino) {
+      return "绊线根 dev/ino 发生变化（原 " + base.dev + ":" + base.ino + "，现 " + st.dev + ":" + st.ino + "）：" + root;
+    }
+    const currentMode = st.mode & 0o7777;
+    if (currentMode !== base.mode) {
+      return "绊线根 mode 发生变化（原 0" + base.mode.toString(8) + "，现 0" + currentMode.toString(8) + "）：" + root;
+    }
+    let real;
+    try {
+      real = fs.realpathSync(root);
+    } catch (err) {
+      return "绊线根 realpath 异常（" + String(err?.code ?? err?.message ?? err) + "）：" + root;
+    }
+    if (real !== base.real) {
+      return "绊线根 realpath 发生变化（原 " + base.real + "，现 " + real + "）：" + root;
+    }
+    return null;
+  };
+
+  const checkAllRoots = () => {
+    const problems = [];
+    for (const r of tripwireRoots) {
+      const p = verifyRootIdentity(r);
+      if (p) problems.push(p);
+    }
+    return problems.length > 0 ? problems.join("；") : null;
+  };
   // 无条件覆盖的是**绕过 $HOME 的那四条**：账本根 / 维护目录 / 门 / Codex 桥根 —— 它们的默认派生都走
   //   os.userInfo().homedir（passwd home），只移 $HOME 护不住。安装面（FEISHU_BRIDGE_INSTALLED_SURFACE /
   //   ..._INSTALL_SURFACE_LOCK）**不**在这里无条件覆盖：它是"这台机器上装着什么"的**事实**，测试要靠它
@@ -179,8 +256,9 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
   };
   // 绊线树快照（汇总前核）：只盘绊线根，不盘套件 HOME 全体（临时产物本就该在套件 HOME 下）
   // R60 返修二 P2：快照包含路径、类型、大小、mode 与小文件 sha 内容
+  // R60 返修三 P1：快照前先核根身份；根身份不符时绝不遍历其子项（fail-closed）
   const snapshotTree = () => {
-    const roots = [tripwire.ledger, tripwire.maintenance, tripwire.codexHome];
+    const roots = tripwireRoots;
     const out = [];
     const walk = (d) => {
       let names = [];
@@ -207,7 +285,18 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
         if (st.isDirectory()) walk(full);
       }
     };
-    for (const r of roots) walk(r);
+    for (const r of roots) {
+      const prob = verifyRootIdentity(r);
+      if (prob) {
+        out.push({
+          path: path.relative(suiteHome, r),
+          type: "corrupted_root",
+          problem: prob,
+        });
+        continue;
+      }
+      walk(r);
+    }
     return out.sort((a, b) => a.path.localeCompare(b.path));
   };
   const before = snapshotTree();
@@ -215,8 +304,13 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
   // 清绊线（套件自己的 scratch）：每条用例之后把上一轮留下的制品清掉 —— 否则下一条用例看到的是
   // 别人的 maintenance 收据 / ledger 记录（那会让 67 条真入口用例级联失败），而 suite 的语义是
   // 「绊线默认值是干净的」。现场先点名再清（诊断不丢）。
+  // R60 返修三 P1：清理前先核根身份；根身份不符时绝不遍历或清理其子项（零删除）
   const cleanTree = () => {
-    for (const root of [tripwire.ledger, tripwire.maintenance, tripwire.codexHome]) {
+    for (const root of tripwireRoots) {
+      const prob = verifyRootIdentity(root);
+      if (prob) {
+        continue; // 根身份不符时跳过：绝不遍历或删除
+      }
       let names = [];
       try { names = fs.readdirSync(root); } catch { continue; }
       for (const n of names) {
@@ -239,7 +333,11 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
         env.HOME = suiteHome;
         for (const [name, value] of Object.entries(machineEnv)) env[name] = value;
       },
-      treeProblem: () => treeDriftProblem(before, snapshotTree()),
+      treeProblem: () => {
+        const rootProb = checkAllRoots();
+        if (rootProb) return "套件绊线根身份被破坏（" + rootProb + "）";
+        return treeDriftProblem(before, snapshotTree());
+      },
       cleanTree,
     });
   }
@@ -249,6 +347,10 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
     passwdHome: () => pwHome,
     machineEnv: () => machineEnv,
     tripwire: () => tripwire,
+    checkRoots: () => checkAllRoots(),
+    verifyRoot: (r) => verifyRootIdentity(r),
+    cleanTree: () => cleanTree(),
+    snapshotTree: () => snapshotTree(),
   };
 }
 

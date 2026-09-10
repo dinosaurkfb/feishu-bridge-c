@@ -7872,6 +7872,102 @@ test("R60 返修二 P2：treeDriftProblem 校验路径、类型、大小、mode 
   assert.match(String(treeDriftProblem(["x"], ["x", "y"])), /新增/u, "向后兼容纯路径字符串新增");
 });
 
+test("R60 返修三 P1：绊线根纳入不可变基线——根被删/根换外指symlink/根被chmod各自点名且零删除", () => {
+  const tmpBase = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-p1-roots-")));
+  try {
+    // 反例 1：根被删 → 点名且零删除
+    {
+      const env1 = { HOME: path.join(tmpBase, "home1") };
+      const iso1 = installTestHomeIsolation({ env: env1, registerInvariants: false });
+      const ledgerRoot = iso1.tripwire().ledger;
+      assert.equal(iso1.checkRoots(), null, "初始根身份完整");
+
+      fs.rmSync(ledgerRoot, { recursive: true });
+      const prob = iso1.checkRoots();
+      assert.match(String(prob), /绊线根缺席（被删）/u, "根被删必须点名缺席：" + prob);
+      assert.match(String(prob), new RegExp(ledgerRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体被删的根");
+      assert.doesNotThrow(() => iso1.cleanTree(), "根被删时 cleanTree 零删除不报错");
+    }
+
+    // 反例 2：根换成外指 symlink（目标带哨兵文件 → 哨兵必须仍在）→ 点名且零删除
+    {
+      const env2 = { HOME: path.join(tmpBase, "home2") };
+      const iso2 = installTestHomeIsolation({ env: env2, registerInvariants: false });
+      const ledgerRoot = iso2.tripwire().ledger;
+
+      const externalDir = path.join(tmpBase, "external-target");
+      fs.mkdirSync(externalDir, { recursive: true });
+      const sentinelFile = path.join(externalDir, "sentinel.txt");
+      fs.writeFileSync(sentinelFile, "precious-external-data", { mode: 0o600 });
+
+      fs.rmSync(ledgerRoot, { recursive: true });
+      fs.symlinkSync(externalDir, ledgerRoot);
+
+      const prob = iso2.checkRoots();
+      assert.match(String(prob), /绊线根被换成 symlink/u, "根换成 symlink 必须点名：" + prob);
+      assert.match(String(prob), new RegExp(ledgerRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体根");
+
+      iso2.cleanTree();
+
+      assert.equal(fs.existsSync(sentinelFile), true, "外指 symlink 目标下的哨兵文件绝不可被 cleanTree 误删（零删除）！");
+      assert.equal(fs.readFileSync(sentinelFile, "utf-8"), "precious-external-data", "哨兵文件内容完整");
+
+      const emptyExtDir = path.join(tmpBase, "empty-external");
+      fs.mkdirSync(emptyExtDir, { recursive: true });
+      const maintenanceRoot = iso2.tripwire().maintenance;
+      fs.rmSync(maintenanceRoot, { recursive: true });
+      fs.symlinkSync(emptyExtDir, maintenanceRoot);
+      const probEmpty = iso2.checkRoots();
+      assert.match(String(probEmpty), /绊线根被换成 symlink/u, "外指空目录同样必须点名：" + probEmpty);
+    }
+
+    // 反例 3：根被 chmod → 点名且零删除
+    {
+      const env3 = { HOME: path.join(tmpBase, "home3") };
+      const iso3 = installTestHomeIsolation({ env: env3, registerInvariants: false });
+      const codexRoot = iso3.tripwire().codexHome;
+
+      fs.chmodSync(codexRoot, 0o755);
+      const prob = iso3.checkRoots();
+      assert.match(String(prob), /绊线根 mode 发生变化/u, "根被 chmod 必须点名 mode 变化：" + prob);
+      assert.match(String(prob), /0700.*0755/u, "明确指出原 mode 和现 mode：" + prob);
+      assert.match(String(prob), new RegExp(codexRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体根");
+      assert.doesNotThrow(() => iso3.cleanTree(), "mode 异常时 cleanTree 跳过该根");
+    }
+
+    // 注册器级端到端验证：用例内部把根换成外指 symlink → 注册器捕获并在 onFail 中点名，且外部哨兵仍在
+    {
+      const externalDir4 = path.join(tmpBase, "external-target4");
+      fs.mkdirSync(externalDir4, { recursive: true });
+      const sentinelFile4 = path.join(externalDir4, "sentinel4.txt");
+      fs.writeFileSync(sentinelFile4, "keep-me-safe", { mode: 0o600 });
+
+      const env4 = { HOME: path.join(tmpBase, "home4") };
+      const savedInv = setSuiteInvariants(null);
+      try {
+        const iso4 = installTestHomeIsolation({ env: env4, registerInvariants: true });
+        const seen = [];
+        const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
+
+        h.test("用例偷换根为外指symlink", () => {
+          fs.rmSync(iso4.tripwire().ledger, { recursive: true });
+          fs.symlinkSync(externalDir4, iso4.tripwire().ledger);
+        });
+
+        assert.equal(seen.length, 1, "注册器点名违规用例：" + JSON.stringify(seen));
+        assert.equal(seen[0][0], "用例偷换根为外指symlink");
+        assert.match(String(seen[0][1]), /绊线根被换成 symlink/u, "错误信息明确点名根被换成 symlink：" + seen[0][1]);
+        assert.equal(fs.existsSync(sentinelFile4), true, "用例结束后的 cleanTree 绝不能删除外部哨兵文件！");
+        assert.equal(fs.readFileSync(sentinelFile4, "utf-8"), "keep-me-safe", "哨兵内容完整无损");
+      } finally {
+        setSuiteInvariants(savedInv);
+      }
+    }
+  } finally {
+    try { fs.rmSync(tmpBase, { recursive: true, force: true }); } catch {}
+  }
+});
+
 
 test("R60 返修一 P2：证据层级改正——套件 HOME ≠ passwd home；passwd 路径由双临时 home 夹具单独证一次", () => {
   assert.notEqual(process.env.HOME, SUITE_HOME.passwdHome(), "套件 HOME ≠ passwd home（旧措辞把两者混为一谈）");

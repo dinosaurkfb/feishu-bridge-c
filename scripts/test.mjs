@@ -40812,7 +40812,7 @@ test("R58 返修一 P1-2：forward_failed 封闭校验器五处共用——伪�
   fs.writeFileSync(path.join(inbound, "active-mapping.json"), JSON.stringify({ status: "active", feishu_root_message_id_reference: "om_x", channel_generation_id: "gen-1" }));
   const createdAt = new Date().toISOString();
   // ① 伪造只含最小字段的记录 → audit unexplainable（整批 fail-closed）
-  fs.writeFileSync(path.join(outbox, r54Key(30) + R58_RECEIPT_SUFFIX), JSON.stringify({ forwarded: true, published_at: null }));
+  fs.writeFileSync(path.join(outbox, r54Key(30) + R58_RECEIPT_SUFFIX), JSON.stringify({ forwarded: true, published_at: null }), { mode: 0o600 });
   const audit1 = auditOutbox(outbox);
   assert.ok(audit1.unexplainable.some((u) => u.file === r54Key(30) + R58_RECEIPT_SUFFIX), "伪造最小记录 → unexplainable：" + JSON.stringify(audit1.unexplainable));
   const d1 = drainProject({ root: dir, dryRun: true });
@@ -40821,7 +40821,7 @@ test("R58 返修一 P1-2：forward_failed 封闭校验器五处共用——伪�
   fs.rmSync(path.join(outbox, r54Key(30) + R58_RECEIPT_SUFFIX), { force: true });
   // ② 篡改 forward_key 与文件名不符 → 拒（unexplainable），发布 dry-run 不挑它
   const goodRec = { schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal", id: "forward-failed-" + r54Key(31), kind: "forward_failed", text: outboxModule.FORWARD_FAILURE_TEXT.unknown, event_key: "forward-failed:" + r54Key(31), source: "forward-runner", input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null, forward_key: "0".repeat(63) + "f", message_id: "om_m1", created_at: createdAt, publish_eligible_at: createdAt, published_at: null, result_sha256: R58_SHA };
-  fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(goodRec));
+  fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(goodRec), { mode: 0o600 });
   const audit2 = auditOutbox(outbox);
   assert.ok(audit2.unexplainable.some((u) => u.file === r54Key(31) + R58_RECEIPT_SUFFIX), "forward_key 与文件名不符 → unexplainable：" + JSON.stringify(audit2.unexplainable));
   const d2 = drainProject({ root: dir, dryRun: true });
@@ -40830,7 +40830,7 @@ test("R58 返修一 P1-2：forward_failed 封闭校验器五处共用——伪�
   fs.rmSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), { force: true });
   // ③ 合法完整记录（forward_key 与文件名一致）→ audit 不 unexplainable、发布 count=1
   const good2 = { ...goodRec, forward_key: r54Key(31) };
-  fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(good2));
+  fs.writeFileSync(path.join(outbox, r54Key(31) + R58_RECEIPT_SUFFIX), JSON.stringify(good2), { mode: 0o600 });
   const audit3 = auditOutbox(outbox);
   assert.ok(!audit3.unexplainable.some((u) => u.file === r54Key(31) + R58_RECEIPT_SUFFIX), "合法记录不 unexplainable");
   const d3 = drainProject({ root: dir, dryRun: true });
@@ -41203,7 +41203,8 @@ test("R58 返修三 P1-1：规范文件名的 forward_failed 一律走受验读�
   // ② 快照：候选集 0；读模型仍看得见它（recordsUnexplained 点名）
   const snap = outboxModule.readOutboxSnapshot(p.outbox);
   assert.equal(snap.records.length, 0, "快照候选集不收 symlink 回执：" + JSON.stringify(snap.records.map((r) => path.basename(String(r._file)))));
-  assert.deepEqual(snap.recordsUnexplained.map((r) => path.basename(String(r._file))), [key + R58_RECEIPT_SUFFIX], "读模型点名（不折叠成 0）");
+  assert.deepEqual(snap.recordsUnexplained, [], "受验读不过的记录判不出三态，不进 recordsUnexplained");
+  assert.ok(snap.audit.unexplainable.some((u) => u.file === key + R58_RECEIPT_SUFFIX), "但读模型必须点名它（不折叠成 0）：" + JSON.stringify(snap.audit.unexplainable));
   // ③ audit：unexplainable 含它、pending 不计它
   const audit = outboxModule.auditOutbox(p.outbox);
   assert.ok(audit.unexplainable.some((u) => u.file === key + R58_RECEIPT_SUFFIX), "unexplainable 点名：" + JSON.stringify(audit.unexplainable));
@@ -41221,11 +41222,13 @@ test("R58 返修三 P1-1：规范文件名的 forward_failed 一律走受验读�
     composeCard: () => ({}), publishBatch: () => { publishes += 1; return "om_x"; },
   });
   assert.equal(publishes, 0, "发布回调调用数 0（status=" + r.status + " reason=" + String(r.reason) + "）");
-  assert.equal(r.status, "empty", "候选集为空：" + JSON.stringify({ status: r.status, reason: r.reason }));
+  assert.equal(r.status, "error", "整批 fail-closed：" + JSON.stringify({ status: r.status, reason: r.reason }));
+  assert.equal(r.reason, "outbox_unexplainable", "点名 unexplainable（不是静默跳过）：" + r.reason);
   // ⑥ 发布 dry-run 也不许把它算成待发
   const d = drainProject({ root: p.root, dryRun: true });
   assert.equal(d.runs?.published?.length ?? 0, 0, "dry-run 不收进队列：" + JSON.stringify({ status: d.status, reason: d.reason }));
-  assert.equal(d.count ?? 0, 0, "dry-run count=0");
+  assert.equal(d.status, "error", "dry-run 也 fail-closed：" + JSON.stringify({ status: d.status, reason: d.reason }));
+  assert.equal(d.reason, "outbox_unexplainable", "dry-run 点名：" + d.reason);
 });
 
 test("R58 返修三 P2-1：本批含 forward_failed 而入口不给核对器 → receipt_evidence_unavailable 整批拒，发布回调调用数 0", () => {

@@ -252,6 +252,23 @@ export function readForwardFailureReceipt({ outboxDir, forwardKey, _inject = nul
   return { ok: false, kind: r.kind ?? "unreadable", why: r.problem, badPath: file };
 }
 
+/**
+ * **P1-1（R58 返修三）：规范文件名的 forward_failed 一律走受验读取器。**
+ * 消费面（snapshot / audit / listPending）曾各自裸 readFileSync —— 受验直读拒外指 symlink，
+ * 它们却照样把文件当合法待发记录收进候选集，配上 SHA 匹配的 result 后发布事务真的会发出去。
+ * 返回 { ok:true, raw, rec } 或 { ok:false, kind, why }（kind: invalid | unreadable | residue）；
+ * 非规范文件名返回 null（不归这里管，交落点判据）。
+ * `raw` 与 `rec` 出自**同一次 fd 读取**（叶子的 read 一并带回来），调用方不许再读第二次。
+ */
+function readCanonicalForwardReceipt({ outboxDir, name, _inject = null }) {
+  const key = forwardReceiptKeyFromFileName(name);
+  if (key === null) return null;
+  const r = RECEIPT_SIDECAR.read({ dir: outboxDir, key, _inject });
+  if (r.ok === true && r.absent === true) return { ok: false, kind: "unreadable", why: "读不出来（盘点后消失：ENOENT）" };
+  if (r.ok === true) return { ok: true, raw: r.raw, rec: r.value };
+  return { ok: false, kind: r.kind ?? "unreadable", why: r.problem };
+}
+
 /** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
 export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
 
@@ -374,7 +391,10 @@ export function listPending({ outboxDir }) {
   const out = [];
   for (const f of files.sort()) {
     try {
-      const rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8"));
+      // P1-1：规范文件名的回执先过受验读取器 —— 受验读不过的（symlink / nlink≠1 / 坏 JSON）不列。
+      const vr = readCanonicalForwardReceipt({ outboxDir, name: f });
+      if (vr !== null && vr.ok !== true) continue;
+      const rec = vr !== null ? vr.rec : JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8"));
       if (rec.published_at === null && !rec.publish_suppressed_at) {
         out.push({ ...rec, _file: path.join(outboxDir, f) });
       }
@@ -993,11 +1013,18 @@ export function readOutboxSnapshot(outboxDir) {
   for (const name of names) {
     const file = path.join(outboxDir, name);
     let raw;
-    try { raw = fs.readFileSync(file); }
-    catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
     let rec;
-    try { rec = JSON.parse(raw.toString("utf-8")); }
-    catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+    // P1-1：规范文件名的 forward_failed 回执一律走受验读取器（_raw 与 record 同一次 fd 读取）。
+    const vr = readCanonicalForwardReceipt({ outboxDir, name });
+    if (vr !== null) {
+      if (vr.ok !== true) { unexplainable.push({ file: name, why: "forward_failed 回执受验读不过：" + vr.why }); continue; }
+      raw = vr.raw; rec = vr.rec;
+    } else {
+      try { raw = fs.readFileSync(file); }
+      catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+      try { rec = JSON.parse(raw.toString("utf-8")); }
+      catch { unclassified.push({ file: name, why: "读不出来" }); continue; }
+    }
     const verdict = classifyOutboxRecord(rec);
     if (verdict.unclassified) { unclassified.push({ file: name, why: verdict.why }); continue; }
     const gaps = explainabilityGaps(rec);
@@ -1048,7 +1075,13 @@ export function auditOutbox(outboxDir) {
   const unexplainable = [];
   for (const f of files) {
     let rec;
-    try { rec = JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
+    // P1-1：规范文件名的 forward_failed 回执一律走受验读取器 —— 受验读不过 → unexplainable（不是 unclassified）。
+    const vr = readCanonicalForwardReceipt({ outboxDir, name: f });
+    if (vr !== null && vr.ok !== true) {
+      unexplainable.push({ file: f, why: "forward_failed 回执受验读不过：" + vr.why });
+      continue;
+    }
+    try { rec = vr !== null ? vr.rec : JSON.parse(fs.readFileSync(path.join(outboxDir, f), "utf-8")); }
     catch { unclassified.push({ file: f, why: "读不出来" }); continue; }
     if (rec === null || typeof rec !== "object" || Array.isArray(rec)) {
       unclassified.push({ file: f, why: "不是记录对象" }); continue;

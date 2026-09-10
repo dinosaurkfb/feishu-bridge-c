@@ -42009,6 +42009,22 @@ test("#154 三轮 P2-2：helper 直调——词法越界返回 outside_root 且�
   assert.notEqual(present?.reason, "outside_root", "..foo 在场也不许判越界");
 });
 
+test("R63 outbox snapshot：受验读不过的规范命名回执（外指 symlink）不进 listPending——独立断言（R58 返修三 K1 存活钉）", () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r63snap-"), { mode: 0o700 }));
+  // 待发形状：published_at=null 且无 publish_suppressed_at——若跳过受验读，这文件会被当成待发记录收进
+  // （内容与文件名的 forward_key 一致、本身是完全合法的回执——刀口下会被照常收进，红有区分度）
+  const goodKey = "a".repeat(64);
+  const badKey = "b".repeat(64);
+  const body = JSON.stringify(r58ReceiptDoc(goodKey, { result_sha256: R58_SHA }), null, 2) + "\n";
+  fs.writeFileSync(path.join(dir, goodKey + R58_RECEIPT_SUFFIX), body, { mode: 0o600 });
+  const targetFile = path.join(path.dirname(dir), "r63snap-target.json");
+  fs.writeFileSync(targetFile, JSON.stringify(r58ReceiptDoc(badKey, { result_sha256: R58_SHA }), null, 2) + "\n", { mode: 0o600 });
+  fs.symlinkSync(targetFile, path.join(dir, badKey + R58_RECEIPT_SUFFIX));
+  const out = listPending({ outboxDir: dir });
+  assert.ok(out.some((r) => r._file.endsWith(goodKey + R58_RECEIPT_SUFFIX)), "对照：受验通过的回执计入：" + JSON.stringify(out.map((r) => r._file)));
+  assert.equal(out.some((r) => r._file.endsWith(badKey + R58_RECEIPT_SUFFIX)), false, "受验读不过（外指 symlink）→ 不列、不抛：" + JSON.stringify(out.map((r) => r._file)));
+});
+
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──
 
 const R56_T0 = "2026-09-07T10:00:00.000Z";

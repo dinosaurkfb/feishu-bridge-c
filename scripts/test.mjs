@@ -7803,6 +7803,27 @@ test("R60 返修二 P1-2a：用例抛错时注册器必须在 finally 中核验�
   assert.match(String(seen[0][1]), /R60_PROBE_THROW_ENV/u, "失败信息附带了漂移点名");
 });
 
+test("R60 返修二 P1-2b：HOME 纳入每测不变量——用例改 HOME 不恢复当场点名且后续用例 HOME 恢复", () => {
+  const seen = [];
+  const h = createTestHarness({ onFail: (name, err) => seen.push([name, err.message]) });
+  const fakeHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-p12b-fakehome-")));
+  const savedHome = process.env.HOME;
+  try {
+    h.test("改HOME不恢复用例", () => {
+      process.env.HOME = fakeHome;
+    });
+    h.test("后续正常用例", () => {
+      assert.equal(process.env.HOME, savedHome, "后续用例开始前 HOME 已被恢复");
+    });
+  } finally {
+    process.env.HOME = savedHome;
+  }
+  assert.equal(seen.length, 1, "改 HOME 的用例被点名：" + JSON.stringify(seen));
+  assert.equal(seen[0][0], "改HOME不恢复用例");
+  assert.match(String(seen[0][1]), /HOME/u, "why 点名 HOME 漂移：" + seen[0][1]);
+  assert.equal(process.env.HOME, savedHome, "套件当前 HOME 已恢复");
+});
+
 test("R60 返修一 P2：证据层级改正——套件 HOME ≠ passwd home；passwd 路径由双临时 home 夹具单独证一次", () => {
   assert.notEqual(process.env.HOME, SUITE_HOME.passwdHome(), "套件 HOME ≠ passwd home（旧措辞把两者混为一谈）");
   const envHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60p2-envhome-")));

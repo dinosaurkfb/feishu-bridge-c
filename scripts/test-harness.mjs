@@ -182,11 +182,18 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
   if (registerInvariants) {
     setSuiteInvariants({
       envDrift: () => {
-        const drifted = Object.entries(machineEnv).filter(([name, value]) => env[name] !== value);
+        // R60 返修二 P1-2b：HOME === suiteHome 纳入每测不变量。
+        // 注释：Node.js 在 POSIX 环境下 os.homedir() 随 process.env.HOME 走（并非只在启动时采样一次），
+        // 故 HOME 漂移会导致进程内所有基于 os.homedir() 的派生路径一同漂移。
+        const all = { HOME: suiteHome, ...machineEnv };
+        const drifted = Object.entries(all).filter(([name, value]) => env[name] !== value);
         if (drifted.length === 0) return null;
-        return "改了套件机器路径 env 且没恢复：" + drifted.map(([name, value]) => name + "=" + String(env[name]) + "（应为 " + value + "）").join("、");
+        return "改了套件机器路径 env/HOME 且没恢复：" + drifted.map(([name, value]) => name + "=" + String(env[name]) + "（应为 " + value + "）").join("、");
       },
-      restore: () => { for (const [name, value] of Object.entries(machineEnv)) env[name] = value; },
+      restore: () => {
+        env.HOME = suiteHome;
+        for (const [name, value] of Object.entries(machineEnv)) env[name] = value;
+      },
       treeProblem: () => treeDriftProblem(before, snapshotTree()),
       cleanTree,
     });

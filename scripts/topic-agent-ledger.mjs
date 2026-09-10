@@ -1980,8 +1980,9 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
       residue: [...left, ...(released?.reapUncleared?.path ? [String(released.reapUncleared.path)] : []), ...(after.present ? [lockDir] : [])],
       why: "账本锁释放不干净（" + String(released?.reason ?? released?.why ?? "?") + "）：保持 unclean" };
   }
-  if (after.present && after.owner !== null) {
-    return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, why: "清理后主锁仍在（持有者 pid=" + String(after.owner.pid) + "）：交人" };
+  if (after.present) {
+    const ownerDesc = after.owner ? "持有者 pid=" + String(after.owner.pid) : "owner 不可读";
+    return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, why: "清理后主锁仍在（" + ownerDesc + "）：交人" };
   }
   if (left.length > 0) return { ok: false, cleaned, residue: left, lock_held: false, why: "残骸没清干净（" + left.join("、") + (errors.length > 0 ? "，异常：" + errors.join("；") : "") + "）：保持 unclean" };
   return { ok: true, cleaned, residue: [], lock_held: false };

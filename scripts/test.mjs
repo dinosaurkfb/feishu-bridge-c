@@ -47350,6 +47350,30 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
   }));
 
+  test("R57d 返修八 P1-2c：clearLedgerResidue 释放后任何 present 主锁（即使 owner 不可读）都必须保持 unclean 交人", () => withLedgerD((root, dir) => {
+    const lockDir = path.join(dir, "ledger.lock");
+    const origRm = fs.rmSync;
+    try {
+      fs.rmSync = (p, opts) => {
+        if (String(p) === lockDir) {
+          origRm(p, opts);
+          fs.symlinkSync("corrupted-owner-json", lockDir);
+          return;
+        }
+        return origRm(p, opts);
+      };
+      const r = TAL.clearLedgerResidue({ dir, residue: [] });
+      assert.equal(r.ok, false, "释放后主锁仍在（即便 owner 不可读）必须返回 ok:false：" + JSON.stringify(r));
+      assert.equal(r.lock_held, true, "必须标记 lock_held:true");
+      assert.ok(Array.isArray(r.residue) && r.residue.includes(lockDir), "residue 必须包含 lockDir：" + JSON.stringify(r.residue));
+      assert.match(String(r.why), /主锁.*仍在.*owner 不可读/u, "why 说明主锁仍在且 owner 不可读：" + r.why);
+    } finally {
+      fs.rmSync = origRm;
+      try { fs.unlinkSync(lockDir); } catch {}
+    }
+  }));
+
+
 
   test("R57d 返修七 P1-2（常驻反例）：lock_uncleared:true/residue:[] 在主锁仍在时不得闭合、不得把证据清成 false；residue 里的活 reap 不得删也不得闭合", () => withLedgerD((root, dir, ids) => {
     const claimsDir = txDirD(root);

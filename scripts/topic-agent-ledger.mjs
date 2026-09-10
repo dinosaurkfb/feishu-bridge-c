@@ -29,6 +29,7 @@ import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
 export { canonKey, sha256 };
 // R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
 import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE } from "./shapes.mjs";
+import { SIDECAR_TMP_TAIL_RE } from "./verified-sidecar.mjs";
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -1864,16 +1865,42 @@ function foldRelease(result, released) {
   return { ...result, lockUncleared };
 }
 
-/* ─────────────────────────── 写残骸清理（R57d 返修六 P1-2） ─────────────────────────── */
+/* ─────────────────────────── 写残骸清理（R57d 返修六 P1-2；返修八 P2 共享判别器） ─────────────────────────── */
 
-/** 账本写原语自己产生的 tmp 残骸名（封闭形状）：ledger.json[.prev].<正整数 pid>.<v4 uuid>。 */
-const LEDGER_TMP_RE = /^ledger\.json(?:\.prev)?\.[1-9]\d*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-/** 同侧 sidecar 的 tmp 残骸名（封闭形状：verified-sidecar 的 `.` + 文件名 + `.<正整数 pid>.<v4 uuid>`）。 */
-const SIDECAR_TMP_RE = /^\.[0-9a-f]{64}\.selection-plan\.json\.tmp\.[1-9]\d*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const LEDGER_TMP_PREFIX_RE = /^ledger\.json(?:\.prev)?\./u;
+const SIDECAR_TMP_PREFIX_RE = /^\.[0-9a-f]{64}\.selection-plan\.json\.tmp\./u;
 
 /**
- * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口）。
- *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（LEDGER_TMP_RE / SIDECAR_TMP_RE）且落在获准目录
+ * 账本写原语产生的 tmp 名判定（R57d 返修八 P2）：
+ * 与 writeTmpBytes 格式一致（ledger.json[.prev].<正整数 pid>.<v4 uuid>），共用 verified-sidecar 的 SIDECAR_TMP_TAIL_RE。
+ */
+export function isLedgerTmpName(name) {
+  if (typeof name !== "string") return false;
+  const m = LEDGER_TMP_PREFIX_RE.exec(name);
+  if (!m) return false;
+  return SIDECAR_TMP_TAIL_RE.test(name.slice(m[0].length));
+}
+
+/**
+ * selection-plan sidecar 的 tmp 名判定（R57d 返修八 P2）：
+ * 与 selection-plan / verified-sidecar 格式一致（.<64hex key>.selection-plan.json.tmp.<正整数 pid>.<v4 uuid>），共用 SIDECAR_TMP_TAIL_RE。
+ * 若提供 key，则额外校验 key 是否与文件名前缀一致。
+ */
+export function isSidecarTmpName(name, key = null) {
+  if (typeof name !== "string") return false;
+  if (typeof key === "string" && key.length > 0) {
+    const prefix = "." + key + ".selection-plan.json.tmp.";
+    if (!name.startsWith(prefix)) return false;
+    return SIDECAR_TMP_TAIL_RE.test(name.slice(prefix.length));
+  }
+  const m = SIDECAR_TMP_PREFIX_RE.exec(name);
+  if (!m) return false;
+  return SIDECAR_TMP_TAIL_RE.test(name.slice(m[0].length));
+}
+
+/**
+ * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口；返修八 P2 共享判别器）。
+ *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（isLedgerTmpName / isSidecarTmpName）且落在获准目录
  *     （endpoint 目录 + 调用方点名的 sidecar 目录）里的那些；其余一律不动、进 residue。
  *   · **锁家族一律拒**：`<lock>` / `<lock>.reap` / `<lock>.reap.quarantine-<uuid>` 是锁协议自己的资源。在这里删
  *     等于失去锁的归属证明 —— 旧码拿 `startsWith(lockDir + ".")` 收族、并以 `staleMs: 0` 调维护清理器，把**活**的
@@ -1914,7 +1941,7 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
     }
     const base = path.basename(entry);
     const parent = path.dirname(entry);
-    if ((LEDGER_TMP_RE.test(base) || SIDECAR_TMP_RE.test(base)) && (allowedDirs.has(parent) || allowedDirs.has(path.resolve(parent)))) accepted.push(entry);
+    if ((isLedgerTmpName(base) || isSidecarTmpName(base)) && (allowedDirs.has(parent) || allowedDirs.has(path.resolve(parent)))) accepted.push(entry);
     else left.push(entry);
   }
   // 锁家族先看：在场的主锁 / reap 家族一律不由本原语处置 —— 一个交人，一个交显式维护入口。

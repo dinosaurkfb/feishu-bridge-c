@@ -47373,6 +47373,38 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     }
   }));
 
+  test("R57d 返修八 P2：残骸文件名判定共用 verified-sidecar 判别器，导出 isLedgerTmpName/isSidecarTmpName 防命名漂移", () => {
+    assert.equal(typeof TAL.isLedgerTmpName, "function", "TAL 必须导出 isLedgerTmpName 判别器");
+    assert.equal(typeof TAL.isSidecarTmpName, "function", "TAL 必须导出 isSidecarTmpName 判别器");
+
+    const validUuid = "12345678-1234-4234-8234-123456789abc";
+    const invalidUuid = "12345678-1234-3234-8234-123456789abc";
+    const validHexKey = "a".repeat(64);
+
+    assert.equal(TAL.isLedgerTmpName(`ledger.json.123.${validUuid}`), true, "ledger.json 正例");
+    assert.equal(TAL.isLedgerTmpName(`ledger.json.prev.456.${validUuid}`), true, "ledger.json.prev 正例");
+
+    assert.equal(TAL.isLedgerTmpName("ledger.json"), false, "缺少 pid.uuid");
+    assert.equal(TAL.isLedgerTmpName("ledger.json.prev"), false, "prev 缺少 pid.uuid");
+    assert.equal(TAL.isLedgerTmpName("ledger.json.tmp"), false, "非 pid.uuid 尾巴");
+    assert.equal(TAL.isLedgerTmpName(`ledger.json.0.${validUuid}`), false, "pid 为 0 必须拒");
+    assert.equal(TAL.isLedgerTmpName(`ledger.json.-1.${validUuid}`), false, "负数 pid 必须拒");
+    assert.equal(TAL.isLedgerTmpName(`ledger.json.123.${invalidUuid}`), false, "非 v4 uuid 必须拒");
+    assert.equal(TAL.isLedgerTmpName(`other.json.123.${validUuid}`), false, "非 ledger.json 前缀必须拒");
+    assert.equal(TAL.isLedgerTmpName(null), false, "null 必须拒");
+
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.selection-plan.json.tmp.789.${validUuid}`), true, "selection-plan tmp 正例");
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.selection-plan.json.tmp.789.${validUuid}`, validHexKey), true, "带匹配 key 的正例");
+
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.selection-plan.json`), false, "缺少 tmp.pid.uuid");
+    assert.equal(TAL.isSidecarTmpName(`.${"a".repeat(63)}.selection-plan.json.tmp.789.${validUuid}`), false, "63 字节 key 必须拒");
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.other.json.tmp.789.${validUuid}`), false, "非 selection-plan 必须拒");
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.selection-plan.json.tmp.0.${validUuid}`), false, "sidecar pid 为 0 必须拒");
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.selection-plan.json.tmp.789.${invalidUuid}`), false, "sidecar 非 v4 uuid 必须拒");
+    assert.equal(TAL.isSidecarTmpName(`.${validHexKey}.selection-plan.json.tmp.789.${validUuid}`, "b".repeat(64)), false, "key 不匹配必须拒");
+    assert.equal(TAL.isSidecarTmpName(null), false, "null 必须拒");
+  });
+
 
 
   test("R57d 返修七 P1-2（常驻反例）：lock_uncleared:true/residue:[] 在主锁仍在时不得闭合、不得把证据清成 false；residue 里的活 reap 不得删也不得闭合", () => withLedgerD((root, dir, ids) => {

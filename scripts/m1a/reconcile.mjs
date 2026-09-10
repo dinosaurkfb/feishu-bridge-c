@@ -174,10 +174,10 @@ export function projectShadowBFamily(shadowDoc) {
   return records;
 }
 
-const C_FIELDS = Object.freeze(["aliases", "binding_target", "chat_id", "facts", "generation_lineage_id", "topic_agent_id"]);
+export const C_FIELDS = Object.freeze(["aliases", "binding_target", "chat_id", "facts", "generation_lineage_id", "topic_agent_id"]);
 
 /** 逐字段不等清单（比较域 = C 的六个字段；canonKey 比较保证键序无关）。 */
-function fieldMismatches(id, e, s) {
+export function fieldMismatches(id, e, s) {
   const out = [];
   for (const field of C_FIELDS) {
     if (canonKey(e[field]) !== canonKey(s[field])) {

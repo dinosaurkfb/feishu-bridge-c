@@ -21,9 +21,7 @@
 - **严格读取**：任一在场文件读不出 / JSON 坏 / `validateTopicGenerationState` 不过 →
   `{ ok:false, reason:"legacy_unreadable", source }`；
 - **双投影**（同一 binding_id 两次）→ `{ ok:false, reason:"legacy_conflict" }`；
-- **严格 target 采集**：binding_target 全字段受验（Claude 需 UUID 形态 claude_session_id；
-  Codex 需逐项受验 root/task/thread）；缺任一 → 该代际列待修 `target_incomplete`，**绝不临时
-  选目标或填默认值**。
+- **严格 target 采集**：binding_target 全字段受验：Claude 形态支持三态（UUID 字符串 = 会话级目标；`null` = 项目级目标，会话未选；字段整体缺席 / 不全 / 非受验值 → 该代际列待修 `target_incomplete`，绝不临时选目标或填默认值；由持有真实本地 Claude UUID 的显式 retarget 补；owner_select 的 Aily session 不能填这个字段）；Codex 需逐项受验 root/task/thread，缺任一 → 该代际列待修 `target_incomplete`。
 
 **`collectCodexLegacySnapshot({ home, now })`**：只读 Codex task registry（`mappingForTask`
 物化：binding_id=`<taskId>@codex-registry`、status、session_id、inbound_state、pending_token）；
@@ -81,7 +79,7 @@ shadow 账本跑 G1–G15，再仅对 **live B 族子集**双射；M1a 期间入
 | `aliases.session_id` | generation 的 Aily session（≠ 本地 claude_session_id） |
 | `generation_lineage_id` | effectiveBindingId（= binding_id） |
 | `facts` 五元组 | §2 完整给值 |
-| `binding_target` | §1 严格采集受验值 |
+| `binding_target` | §1 严格采集受验值（Claude 允许 claude_session_id: null 为项目级目标；由持有真实本地 Claude UUID 的显式 retarget 补；owner_select 的 Aily session 不能填这个字段） |
 | `binding_proof` / `locator_link_proof_ref` | §3.1（B1 均 null） |
 | `anchor_candidate` | null |
 | 不进双射比较 | created_at / updated_at / origin_operation_id |
@@ -396,6 +394,14 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 
 终端命令：owner 逐次授权、preview/apply、精确对象 id、expected-before CAS、operation 审计
 留痕；`session_missing` 只能由真实 owner 配对（@ + F4）补绑，终端不得直接填 session。
+
+### 8.2 影子补种与会话未选补齐（scripts/m1a-seed.mjs + owner_select）
+
+对尚未完成影子初始补种的 endpoint，提供 `scripts/m1a-seed.mjs` 工具：
+- 仅作用于影子账本（`authority_mode==="shadow"`），受维护门管控；
+- 默认预览模式列出待补种的 B 族候选，严格核验双射与 blocker，零写入副作用；
+- `--apply` 需终端授权身份，调用 `migrateSeed` 幂等写入，并后置对账核验；
+- 对带有 `claude_session_id: null` 的项目级绑定记录，允许进账本（不报 `target_incomplete`），null→UUID 的 retarget 只留给将来持有真实本地 UUID 的显式 owner retarget；UUID→null 继续拒。权威投递消费路径（从账本 binding_target 读、项目级走 legacy 同款规则：有 delivery pin 用 pin，否则唯一 live 会话才投、多条拒）尚未接通，cutover 前由后续单 R66 补——本单只宣称 shadow 补种。
 
 ## 9. 排期影响
 

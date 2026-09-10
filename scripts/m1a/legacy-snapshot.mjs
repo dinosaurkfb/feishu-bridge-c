@@ -160,6 +160,22 @@ const bindingEvidence = ({ bindingId, enabled, root, sessionId, chatId, target, 
 
 /* ─────────────────────────── Claude 侧 ─────────────────────────── */
 
+function claudeTarget(root, src) {
+  if (!src || typeof src !== "object" || !Object.hasOwn(src, "claude_session_id")) {
+    return { runtime: "claude", project_root: root, claude_session_id: null, complete: true };
+  }
+  const sid = src.claude_session_id;
+  if (typeof sid === "string" && UUID_SHAPE.test(sid)) {
+    return { runtime: "claude", project_root: root, claude_session_id: sid, complete: true };
+  }
+  return {
+    runtime: "claude",
+    project_root: root,
+    claude_session_id: typeof sid === "string" ? sid : null,
+    complete: false,
+  };
+}
+
 /**
  * Claude legacy 快照：registry.json 的 projects[] 是项目集合唯一来源；
  * chat_id 取机器链模板（链路级字段以模板为准，与 resolveProject 同一语义）。
@@ -249,11 +265,7 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
         chatId,
         state: evolved.state,
         generationSource: evolved.projection,
-        target: {
-          runtime: "claude", project_root: root,
-          claude_session_id: typeof sid === "string" ? sid : null,
-          complete: typeof sid === "string" && UUID_SHAPE.test(sid),
-        },
+        target: claudeTarget(root, mapping),
         sourceFiles: [registryFile, templateFile, mapPath],
         sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile, mapPath]),
         expiresAt: evolved.mapping.expires_at,
@@ -275,11 +287,7 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
         chatId,
         state: evolved.state,
         generationSource: evolved.projection,
-        target: {
-          runtime: "claude", project_root: root,
-          claude_session_id: typeof sid === "string" ? sid : null,
-          complete: typeof sid === "string" && UUID_SHAPE.test(sid),
-        },
+        target: claudeTarget(root, entry),
         sourceFiles: [registryFile, templateFile],
         sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile]),
         expiresAt: evolved.mapping.expires_at,

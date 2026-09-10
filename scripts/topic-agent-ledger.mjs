@@ -1891,11 +1891,18 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
   for (const d of Array.isArray(dirs) ? dirs : []) if (typeof d === "string" && d.length > 0) allowedDirs.add(d);
   const accepted = [];
   const left = [];
+  const errors = [];
   for (const raw of Array.isArray(residue) ? residue : []) {
     const entry = String(raw);
-    // 已经不在盘上的路径不是残骸（也不删）—— 证据是**快照**：一次 repair 把主锁写进 residue、人工删掉之后，
-    //   下一次 repair 必须能凭"主锁不在了"收口（钉：主锁不在 → 才可清 lock_uncleared）。
-    try { fs.lstatSync(entry); } catch { continue; }
+    // R57d 返修八 P1-2a：只有 ENOENT 才算缺席；其它错误（EIO 等）保留在 residue、返回 ok:false、why 带错误码
+    try {
+      fs.lstatSync(entry);
+    } catch (err) {
+      if (err?.code === "ENOENT") continue;
+      left.push(entry);
+      errors.push(entry + ": " + String(err?.code ?? err?.message ?? err));
+      continue;
+    }
     const base = path.basename(entry);
     if ((LEDGER_TMP_RE.test(base) || SIDECAR_TMP_RE.test(base)) && allowedDirs.has(path.dirname(entry))) accepted.push(entry);
     else left.push(entry);
@@ -1908,10 +1915,18 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
       why: "主锁 " + path.basename(lockDir) + " 仍在（" + (held.owner ? "持有者 pid=" + String(held.owner.pid) : "owner 不可读") + "）：本原语不替锁协议清理，交人" };
   }
   let reapPresent = false;
-  try { fs.lstatSync(lockDir + ".reap"); reapPresent = true; } catch { /* ENOENT = 没有 */ }
-  if (reapPresent) {
+  let reapErr = null;
+  try {
+    fs.lstatSync(lockDir + ".reap");
+    reapPresent = true;
+  } catch (err) {
+    if (err?.code !== "ENOENT") reapErr = String(err?.code ?? err?.message ?? err);
+  }
+  if (reapPresent || reapErr !== null) {
     return { ok: false, cleaned: [], residue: [...left, lockDir + ".reap"], lock_held: false,
-      why: "reap 家族残骸在场（" + path.basename(lockDir) + ".reap）：交 registry 的显式维护入口 repair-publish-lock.mjs，本原语不动" };
+      why: reapErr !== null
+        ? "reap 家族残骸盘点异常（" + path.basename(lockDir) + ".reap: " + reapErr + "）：保持 unclean"
+        : "reap 家族残骸在场（" + path.basename(lockDir) + ".reap）：交 registry 的显式维护入口 repair-publish-lock.mjs，本原语不动" };
   }
   // 真账本锁栅栏：删除段与写方互斥；取不到锁（忙 / 维护门 / reap 残骸）→ 什么都不删。
   const fence = acquirePublishLock(lockDir, { env, reapUnrecognized: false });
@@ -1947,7 +1962,7 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
   if (after.present && after.owner !== null) {
     return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, why: "清理后主锁仍在（持有者 pid=" + String(after.owner.pid) + "）：交人" };
   }
-  if (left.length > 0) return { ok: false, cleaned, residue: left, lock_held: false, why: "残骸没清干净（" + left.join("、") + "）：保持 unclean" };
+  if (left.length > 0) return { ok: false, cleaned, residue: left, lock_held: false, why: "残骸没清干净（" + left.join("、") + (errors.length > 0 ? "，异常：" + errors.join("；") : "") + "）：保持 unclean" };
   return { ok: true, cleaned, residue: [], lock_held: false };
 }
 

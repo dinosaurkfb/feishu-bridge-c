@@ -47299,6 +47299,29 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(fs.existsSync(outside), true, "⑦ 越界路径未动");
   }));
 
+  test("R57d 返修八 P1-2a：clearLedgerResidue 盘点只有 ENOENT 才折缺席——注入 lstat EIO 必须 ok:false 且 residue 含该路径", () => withLedgerD((root, dir) => {
+    const tmp = path.join(dir, "ledger.json.5555.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(tmp, "eio", { mode: 0o600 });
+    const origLstat = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, opts) => {
+        if (String(p) === tmp) {
+          const err = new Error("EIO: i/o error, lstat");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat(p, opts);
+      };
+      const r = TAL.clearLedgerResidue({ dir, residue: [tmp] });
+      assert.equal(r.ok, false, "注入 lstat EIO 绝不可当成缺席返回 ok:true：" + JSON.stringify(r));
+      assert.ok(Array.isArray(r.residue) && r.residue.includes(tmp), "residue 必须保留该路径：" + JSON.stringify(r.residue));
+      assert.match(String(r.why), /EIO|残骸/u, "why 说明异常：" + r.why);
+    } finally {
+      fs.lstatSync = origLstat;
+      try { fs.unlinkSync(tmp); } catch {}
+    }
+  }));
+
   test("R57d 返修七 P1-2（常驻反例）：lock_uncleared:true/residue:[] 在主锁仍在时不得闭合、不得把证据清成 false；residue 里的活 reap 不得删也不得闭合", () => withLedgerD((root, dir, ids) => {
     const claimsDir = txDirD(root);
     const lockPath = path.join(dir, "ledger.lock");

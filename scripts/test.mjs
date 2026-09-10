@@ -48389,6 +48389,46 @@ fs.lstatSync = function(p, ...rest) {
     assert.equal(fs.existsSync(planTmp), false, "文件已被正常删除");
   }));
 
+  test("R57d 返修十三 P2-2 T4：beforeUnlink 里换成根内另一真实目录（并发重建场景）同样被事后 nlink 检测捕获，ok:false 且记录 foreign_unlink", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const tmpName = "." + "d".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID();
+    const targetFile = path.join(claimsDir, tmpName);
+    fs.writeFileSync(targetFile, "original data", { mode: 0o600 });
+
+    const otherDir = path.join(root, "concurrent_rebuilt_claims");
+    fs.mkdirSync(otherDir, { recursive: true });
+    const concurrentFile = path.join(otherDir, tmpName);
+    fs.writeFileSync(concurrentFile, "other data", { mode: 0o600 });
+
+    const realClaimsDir = claimsDir + ".orig";
+
+    try {
+      const res = TAL.clearLedgerResidue({
+        dir,
+        claimsDir,
+        residue: [targetFile],
+        _inject: {
+          beforeUnlink: () => {
+            fs.renameSync(claimsDir, realClaimsDir);
+            fs.renameSync(otherDir, claimsDir);
+          },
+        },
+      });
+
+      assert.equal(res.ok, false, "根内换目录同样必须 ok:false");
+      assert.ok(Array.isArray(res.foreign_unlink) && res.foreign_unlink.includes(targetFile), "foreign_unlink 必须包含 targetFile");
+      assert.match(String(res.why), /别的 inode/u, "why 必须包含「别的 inode」");
+      const origFile = path.join(realClaimsDir, tmpName);
+      assert.equal(fs.existsSync(origFile), true, "原目录里的文件仍在");
+    } finally {
+      try { fs.unlinkSync(concurrentFile); } catch {}
+      try { fs.rmdirSync(otherDir); } catch {}
+      try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch {}
+      try { fs.renameSync(realClaimsDir, claimsDir); } catch {}
+      try { fs.unlinkSync(targetFile); } catch {}
+    }
+  }));
+
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }
 

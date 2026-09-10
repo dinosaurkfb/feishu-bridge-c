@@ -49437,6 +49437,55 @@ fs.lstatSync = function(p, ...rest) {
     }
   });
 
+  test("R67 T18: seedShadowEndpoint already_consistent 分支 outer 释放失败 → 文案为「未写入；排序锁释放不干净（<lock_state>）：先 doctor」、commit 为 already_consistent", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      // 先跑一次 apply 补种成功，使后续对账成为 already_consistent
+      const seed1 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: fx.frank_sender_id, env: fx.env });
+      assert.equal(seed1.ok, true);
+
+      // 再次运行 apply，注入 outer release 失败
+      const res = seedShadowEndpoint({
+        endpointId: fx.ep,
+        apply: true,
+        authorizedBy: fx.frank_sender_id,
+        env: fx.env,
+        _inject: {
+          outerRelease: () => ({ ok: false, reason: "lock_unreadable" }),
+        },
+      });
+      assert.equal(res.ok, false, "already_consistent 释放失败必非绿");
+      assert.equal(res.status, "seeded_unclean");
+      assert.equal(res.commit, "already_consistent", "commit 状态字段必须为 already_consistent");
+      assert.equal(res.lock_state, "unclear");
+      assert.match(res.why, /^未写入；排序锁释放不干净（unclear）：先 doctor$/u, "文案必须校准为未写入及先 doctor");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R67 T19: seedShadowEndpoint post_reconcile_failed → 文案为「已写成但后置对账失败（commit=<commit>）：不要重跑 apply，先 doctor」、带出 commit 字段", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const res = seedShadowEndpoint({
+        endpointId: fx.ep,
+        apply: true,
+        authorizedBy: fx.frank_sender_id,
+        env: fx.env,
+        _inject: {
+          postReconcile: () => ({ ok: false, mismatches: [{ kind: "mock_mismatch" }], cutover_blockers: [] }),
+        },
+      });
+      assert.equal(res.ok, false, "后置对账失败必非绿");
+      assert.equal(res.reason, "post_reconcile_failed");
+      assert.equal(res.commit, "committed_clean", "必须带出 commit=committed_clean 状态字段");
+      assert.equal(res.lock_state, "released");
+      assert.match(res.why, /^已写成但后置对账失败（commit=committed_clean）：不要重跑 apply，先 doctor$/u, "文案必须校准为已写成但后置对账失败");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
   test("R65 T14: outer 锁被别的持有者占着 → apply 拒（reason 含 busy/unavailable）且零写入", () => {
     const fx = setupR65SeedFixture();
     try {

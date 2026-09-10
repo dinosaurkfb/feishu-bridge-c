@@ -229,7 +229,7 @@ export function seedShadowEndpoint({
           commit: "already_consistent",
           residue: Array.isArray(residue) ? residue : [residue],
           lock_state: lockState,
-          why: `已写但收口不干净（already_consistent/${lockState}）：不要重跑 apply，先 doctor`,
+          why: `未写入；排序锁释放不干净（${lockState}）：先 doctor`,
         };
       }
       return {
@@ -286,12 +286,14 @@ export function seedShadowEndpoint({
     // 后置核验：必须 ok 且 cutover_blockers 空
     let post = null;
     if (seedRes.commit === "committed_clean") {
-      post = reconcileLegacyEndpoint({
-        endpointId,
-        chain: L1.doc.chain,
-        collectLegacy: () => S1,
-        loadLedgerFn: () => loadByEndpoint(endpointId, { env }),
-      });
+      post = _inject?.postReconcile
+        ? _inject.postReconcile()
+        : reconcileLegacyEndpoint({
+            endpointId,
+            chain: L1.doc.chain,
+            collectLegacy: () => S1,
+            loadLedgerFn: () => loadByEndpoint(endpointId, { env }),
+          });
     }
 
     const rel = releaseOuter();
@@ -320,9 +322,10 @@ export function seedShadowEndpoint({
       return {
         ok: false,
         reason: "post_reconcile_failed",
+        commit: seedRes.commit,
         mismatches: post.mismatches,
         blockers: post.cutover_blockers,
-        why: "后置对账未通过",
+        why: `已写成但后置对账失败（commit=${seedRes.commit}）：不要重跑 apply，先 doctor`,
         lock_state: lockState,
       };
     }

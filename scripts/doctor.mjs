@@ -108,6 +108,54 @@ export function machineContext({ home = os.homedir() } = {}) {
 /** 默认不执行状态入口脚本时给 collectConnectivity 的替身：统一报"未探测"。 */
 const NOT_PROBED = () => ({ ok: false, reason: "not_probed" });
 
+/**
+ * 从 root 到 target 逐级核父链，返回第一个**跳不过去或越出根的组件**（悬空 symlink / 指向根外 / 非目录 / I/O 错），否则 null。
+ * 只在 target 的 realpath 已经 ENOENT 时用：区分「目录真不存在」（→ 缺回执）与
+ * 「父链指到不存在的地方或越出根」（→ 查不清，Codex #149 四轮 P2 / #154 返修一 P1、返修二 P1-1/P1-2）。
+ * 末组件与中间组件同一套判定（#154 返修二 P1-2），唯一差别：末组件 lstat ENOENT = 目录真缺席（null）。
+ * 全链逐级都在（末组件 lstat 到了、可解析、在根内）却走到这里 → 不是缺席而是「刚刚还不在」
+ * —— 并发变化，返回 { reason: "concurrent_change" }（#154 三轮 P2-1）。
+ */
+export function firstDanglingSymlinkInChain(root, target, realRoot = null) {
+const rel = path.relative(root, target);
+if (rel === "") return null;
+if (rel === ".." || rel.startsWith(".." + path.sep)) {
+  // #154 返修二 P1-1：越界判据只认完整组件。startsWith("..") 会把根内合法的 ..foo 目录名误伤成越界；
+  // 真越界时返回问题对象（无 realPath——target 词法上就不在 root 下），由调用点出 why。
+  return { path: target, reason: "outside_root" };
+}
+let resolvedRealRoot = realRoot;
+if (!resolvedRealRoot) {
+  try { resolvedRealRoot = fs.realpathSync(root); } catch { return null; }
+}
+const parts = rel.split(path.sep).filter((x) => x.length > 0);
+let cur = root;
+for (const part of parts) {
+  cur = path.join(cur, part);
+  let st;
+  try { st = fs.lstatSync(cur); }
+  catch (err) { return err?.code === "ENOENT" ? null : { path: cur, reason: "lstat_error", error: err }; }
+  if (!st.isSymbolicLink()) {
+    if (!st.isDirectory()) return { path: cur, reason: "not_a_directory" };
+    continue;
+  }
+  let targetStat;
+  try { targetStat = fs.statSync(cur); }
+  catch { return { path: cur, reason: "dangling" }; }
+  if (!targetStat.isDirectory()) {
+    return { path: cur, reason: "not_a_directory" };
+  }
+  let realCur;
+  try { realCur = fs.realpathSync(cur); }
+  catch (err) { return { path: cur, reason: "realpath_error", error: err }; }
+  if (realCur !== resolvedRealRoot && !realCur.startsWith(resolvedRealRoot + path.sep)) {
+    return { path: cur, reason: "outside_root", realPath: realCur };
+  }
+}
+// 能走完全链说明 target 现在确实存在——与调用点的 realpath ENOENT 合看，只可能是并发变化
+return { path: target, reason: "concurrent_change" };
+}
+
 export function runDoctor({
   now = Date.now(),
   home = os.homedir(),
@@ -730,50 +778,7 @@ export function runDoctor({
     }
   }
 
-  /**
- * 从 root 到 target 逐级核父链，返回第一个**跳不过去或越出根的组件**（悬空 symlink / 指向根外 / 非目录 / I/O 错），否则 null。
- * 只在 target 的 realpath 已经 ENOENT 时用：区分「目录真不存在」（→ 缺回执）与
- * 「父链指到不存在的地方或越出根」（→ 查不清，Codex #149 四轮 P2 / #154 返修一 P1、返修二 P1-1/P1-2）。
- * 末组件与中间组件同一套判定（#154 返修二 P1-2），唯一差别：末组件 lstat ENOENT = 目录真缺席（null）。
- */
-function firstDanglingSymlinkInChain(root, target, realRoot = null) {
-  const rel = path.relative(root, target);
-  if (rel === "") return null;
-  if (rel === ".." || rel.startsWith(".." + path.sep)) {
-    // #154 返修二 P1-1：越界判据只认完整组件。startsWith("..") 会把根内合法的 ..foo 目录名误伤成越界；
-    // 真越界时返回问题对象（无 realPath——target 词法上就不在 root 下），由调用点出 why。
-    return { path: target, reason: "outside_root" };
-  }
-  let resolvedRealRoot = realRoot;
-  if (!resolvedRealRoot) {
-    try { resolvedRealRoot = fs.realpathSync(root); } catch { return null; }
-  }
-  const parts = rel.split(path.sep).filter((x) => x.length > 0);
-  let cur = root;
-  for (const part of parts) {
-    cur = path.join(cur, part);
-    let st;
-    try { st = fs.lstatSync(cur); }
-    catch (err) { return err?.code === "ENOENT" ? null : { path: cur, reason: "lstat_error", error: err }; }
-    if (!st.isSymbolicLink()) {
-      if (!st.isDirectory()) return { path: cur, reason: "not_a_directory" };
-      continue;
-    }
-    let targetStat;
-    try { targetStat = fs.statSync(cur); }
-    catch { return { path: cur, reason: "dangling" }; }
-    if (!targetStat.isDirectory()) {
-      return { path: cur, reason: "not_a_directory" };
-    }
-    let realCur;
-    try { realCur = fs.realpathSync(cur); }
-    catch (err) { return { path: cur, reason: "realpath_error", error: err }; }
-    if (realCur !== resolvedRealRoot && !realCur.startsWith(resolvedRealRoot + path.sep)) {
-      return { path: cur, reason: "outside_root", realPath: realCur };
-    }
-  }
-  return null;
-}
+
 
 // ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
   // forward-runner 落在 <root>/.runtime-data/inbound/runs/<key>.forward.*（issue #140）。
@@ -823,10 +828,13 @@ function firstDanglingSymlinkInChain(root, target, realRoot = null) {
               // #154 返修二 P1-1：词法越界那支没有 realPath，不打印 undefined
               return { ok: false, why: dangling.realPath
                 ? "outbox_dir 父链中间 symlink（" + dangling.path + "）的 realpath（" + dangling.realPath + "）不在项目根 realpath（" + realRoot + "）内，不冒充核对过"
-                : "outbox_dir（" + dangling.path + "）在项目根（" + realRoot + "）词法范围外，无 realPath 可点名，不冒充核对过" };
+                : "outbox_dir（" + dangling.path + "）在项目根（" + rootDir + "）词法范围外，无 realPath 可点名，不冒充核对过" };
             }
             if (dangling.reason === "dangling") {
               return { ok: false, why: "outbox_dir 父链有悬空 symlink（" + dangling.path + "），不冒充核对过" };
+            }
+            if (dangling.reason === "concurrent_change") {
+              return { ok: false, why: "outbox_dir 在核对期间发生变化（" + dangling.path + "），不冒充核对过" };
             }
             return { ok: false, why: "outbox_dir 父链中间组件异常（" + dangling.path + "），不冒充核对过" };
           }

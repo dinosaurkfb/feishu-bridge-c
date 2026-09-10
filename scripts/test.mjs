@@ -60,7 +60,7 @@ import {
   recordClaimState, watcherExpectEnv, CLAIM_STATE } from "./claim.mjs";
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
-import { machineContext, runDoctor } from "./doctor.mjs";
+import { machineContext, runDoctor, firstDanglingSymlinkInChain } from "./doctor.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
 import {
@@ -41959,6 +41959,70 @@ test("Codex #154 返修二 T3 末组件自身悬空：outbox 本身指不存在�
   const c3b = checkOf(doctorReport(m.run()), "inbound_forward_result");
   assert.doesNotMatch(c3b.detail, /查不清/u, "对照：末组件指根内存在目录 → 不查不清：" + c3b.detail);
   assert.doesNotMatch(c3b.detail, /失败无回执/u, "对照：回执在 symlink 目标里 → 正常核对：" + c3b.detail);
+});
+
+test("#154 三轮 P2-1：realpath 首次 ENOENT、随后逐级复查全在 → 并发变化归查不清，不冒充「失败无回执」（fs 注入 --require 钩子）", () => {
+  const m = doctorMachine();
+  const root = m.project("r63cc", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r63cc", root, root_message_id: "om_r63cc", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const ob = path.join(root, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(ob, { recursive: true });
+  const key = r54Key(99);
+  const body = r58FailedBody(key, "API Error: 400 cc", ".runtime-data/outbound/outbox");
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), body, { mode: 0o600 });
+  // 回执就在场（目录实际存在）——钩子只让首次 realpathSync(…/outbox) 报 ENOENT，模拟「核对期间才出现」
+  fs.writeFileSync(path.join(ob, key + R58_RECEIPT_SUFFIX), JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
+  const hook = path.join(root, "r63cc-hook.cjs");
+  fs.writeFileSync(hook, [
+    "const fs = require('node:fs');",
+    "const orig = fs.realpathSync;",
+    "let hit = false;",
+    "fs.realpathSync = function (p, ...a) {",
+    "  const s = String(p);",
+    "  if (!hit && s.endsWith('outbox') && s.includes('r63cc')) {",
+    "    hit = true;",
+    "    const e = new Error('ENOENT simulated by r63 test hook');",
+    "    e.code = 'ENOENT'; e.path = s; throw e;",
+    "  }",
+    "  return orig.call(fs, p, ...a);",
+    "};",
+  ].join("\n"), { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run({ NODE_OPTIONS: "--require " + hook })), "inbound_forward_result");
+  assert.match(c.detail, /查不清/u, "并发变化 → 查不清：" + c.detail);
+  assert.match(c.detail, /期间发生变化/u, "点名核对期间变化：" + c.detail);
+  assert.doesNotMatch(c.detail, /失败无回执/u, "不许折成「核对过且没有」：" + c.detail);
+});
+
+test("#154 三轮 P2-2：helper 直调——词法越界返回 outside_root 且无 realPath；根内 ..foo 组件不误伤（缺席=null，在场=concurrent_change）", () => {
+  // 词法越界：target 不在 root 词法下（判据依据是 rootDir 本身，不是 realpath）
+  const esc = firstDanglingSymlinkInChain("/x/root", "/x/root/../esc/outbox");
+  assert.deepEqual(esc, { path: "/x/root/../esc/outbox", reason: "outside_root" }, "词法越界 → outside_root 问题对象：" + JSON.stringify(esc));
+  assert.equal(esc.realPath, undefined, "词法越界那支没有 realPath（调用点文案不打印 undefined）");
+  // 根内 ..foo 组件：真目录名以两个点开头，不许被越界判据误伤
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r63esc-"), { mode: 0o700 }));
+  fs.mkdirSync(path.join(root, "..foo"), { recursive: true });
+  const absent = firstDanglingSymlinkInChain(root, path.join(root, "..foo", "outbox"));
+  assert.equal(absent, null, "..foo 组件 + 叶子缺席 → 真缺席 null（不是 outside_root）：" + JSON.stringify(absent));
+  fs.mkdirSync(path.join(root, "..foo", "outbox"), { recursive: true });
+  const present = firstDanglingSymlinkInChain(root, path.join(root, "..foo", "outbox"));
+  assert.equal(present?.reason, "concurrent_change", "..foo 组件 + 叶子在场 → 不是越界（无 realpath 首报时归并发变化）：" + JSON.stringify(present));
+  assert.notEqual(present?.reason, "outside_root", "..foo 在场也不许判越界");
+});
+
+test("R63 listPending：受验读不过的规范命名回执（外指 symlink）不进待发集——独立断言（R58 返修三 K1 存活钉）", () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r63snap-"), { mode: 0o700 }));
+  // 待发形状：published_at=null 且无 publish_suppressed_at——若跳过受验读，这文件会被当成待发记录收进
+  // （内容与文件名的 forward_key 一致、本身是完全合法的回执——刀口下会被照常收进，红有区分度）
+  const goodKey = "a".repeat(64);
+  const badKey = "b".repeat(64);
+  const body = JSON.stringify(r58ReceiptDoc(goodKey, { result_sha256: R58_SHA }), null, 2) + "\n";
+  fs.writeFileSync(path.join(dir, goodKey + R58_RECEIPT_SUFFIX), body, { mode: 0o600 });
+  const targetFile = path.join(path.dirname(dir), "r63snap-target.json");
+  fs.writeFileSync(targetFile, JSON.stringify(r58ReceiptDoc(badKey, { result_sha256: R58_SHA }), null, 2) + "\n", { mode: 0o600 });
+  fs.symlinkSync(targetFile, path.join(dir, badKey + R58_RECEIPT_SUFFIX));
+  const out = listPending({ outboxDir: dir });
+  assert.ok(out.some((r) => r._file.endsWith(goodKey + R58_RECEIPT_SUFFIX)), "对照：受验通过的回执计入：" + JSON.stringify(out.map((r) => r._file)));
+  assert.equal(out.some((r) => r._file.endsWith(badKey + R58_RECEIPT_SUFFIX)), false, "受验读不过（外指 symlink）→ 不列、不抛：" + JSON.stringify(out.map((r) => r._file)));
 });
 
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──

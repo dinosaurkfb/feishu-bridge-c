@@ -267,23 +267,62 @@ function ownerShapeOk(owner) {
     && typeof owner.token === "string" && owner.token.length > 0;
 }
 
-export function readLockOwner(lockDir) {
+export function readLockOwner(lockDir, { strict = false } = {}) {
   let st;
-  try { st = fs.lstatSync(lockDir); } catch { return { present: false, owner: null }; }
+  try { st = fs.lstatSync(lockDir); }
+  catch (err) {
+    if (err?.code === "ENOENT") return { present: false, absent: true, owner: null };
+    if (strict) {
+      return {
+        present: false,
+        absent: false,
+        unreadable: true,
+        error: String(err?.code ?? err?.message ?? err),
+        errorCode: err?.code ?? "UNKNOWN",
+        owner: null,
+      };
+    }
+    return { present: false, owner: null };
+  }
   if (st.isSymbolicLink()) {
     let owner = null;
     try { owner = JSON.parse(fs.readlinkSync(lockDir)); }
     catch (err) {
       // 持锁者正在释放（rename 走了）：lstat 看见、readlink 时已消失 —— 这是「锁不在了」，不是残骸。
       // 误判成 owner:null 会让 reapUnrecognized:false 的调用方（安装收据锁）把活躍竞争报成 lock_residue 且不重试。
-      if (err?.code === "ENOENT") return { present: false, owner: null };
+      if (err?.code === "ENOENT") return { present: false, absent: true, owner: null };
+      if (strict && err?.code && err.code !== "SYNTAX_ERROR" && !(err instanceof SyntaxError)) {
+        return {
+          present: true,
+          absent: false,
+          unreadable: true,
+          error: String(err?.code ?? err?.message ?? err),
+          errorCode: err?.code ?? "UNKNOWN",
+          owner: null,
+          mtimeMs: st.mtimeMs,
+        };
+      }
       owner = null;
     }
-    return { present: true, owner: ownerShapeOk(owner) ? owner : null, mtimeMs: st.mtimeMs };
+    return { present: true, absent: false, unreadable: false, owner: ownerShapeOk(owner) ? owner : null, mtimeMs: st.mtimeMs };
   }
   // 旧版目录锁：owner.json 在目录里。
-  try { return { present: true, owner: JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")), mtimeMs: st.mtimeMs, legacy: true }; }
-  catch { return { present: true, owner: null, mtimeMs: st.mtimeMs, legacy: true }; }
+  try { return { present: true, absent: false, unreadable: false, owner: JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf-8")), mtimeMs: st.mtimeMs, legacy: true }; }
+  catch (err) {
+    if (strict && err?.code && err.code !== "ENOENT" && !(err instanceof SyntaxError)) {
+      return {
+        present: true,
+        absent: false,
+        unreadable: true,
+        error: String(err?.code ?? err?.message ?? err),
+        errorCode: err?.code ?? "UNKNOWN",
+        owner: null,
+        mtimeMs: st.mtimeMs,
+        legacy: true,
+      };
+    }
+    return { present: true, absent: false, unreadable: false, owner: null, mtimeMs: st.mtimeMs, legacy: true };
+  }
 }
 
 function ownerStale(owner, { staleMs, now }) {

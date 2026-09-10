@@ -76,7 +76,7 @@ import { describeReminderSweep, describeWaited, remindClaudePendingClaims, remin
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome, REPLY_ONLY_ARGS, releaseSessionLockIfOwnedBy } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, clearStaleReapLock, exactProjectsForRoot, fileContainsAny, isUnder,
-  loadRegistry, loadRegistryStrict, normalizeRoot, releasePublishLock,
+  loadRegistry, loadRegistryStrict, normalizeRoot, readLockOwner, releasePublishLock,
   routableProjectsForRoot,
 } from "./registry.mjs";
 import * as outboxModule from "./outbox.mjs";
@@ -47370,6 +47370,73 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     } finally {
       fs.rmSync = origRm;
       try { fs.unlinkSync(lockDir); } catch {}
+    }
+  }));
+
+  test("R57d 返修九 P1-1：clearLedgerResidue 释放后主锁复核区分 absent/present/unreadable——注入 lstat EIO 绝不可折成缺席，必须 ok:false、residue 含 lockDir、why 含 EIO", () => withLedgerD((root, dir) => {
+    const lockDir = path.join(dir, "ledger.lock");
+
+    // ① 严格模式下的 readLockOwner 盘点能力
+    const nonexistent = path.join(dir, "no-such.lock");
+    const rAbsent = readLockOwner(nonexistent, { strict: true });
+    assert.equal(rAbsent.present, false, "不存在时 present:false");
+    assert.equal(rAbsent.absent, true, "不存在时 absent:true");
+    assert.equal(rAbsent.unreadable, undefined, "不存在时非 unreadable");
+
+    const origLstat = fs.lstatSync;
+    const origRm = fs.rmSync;
+
+    // ② readLockOwner 注入 EIO 返回 unreadable 带错误码
+    try {
+      fs.lstatSync = (p, opts) => {
+        if (String(p) === lockDir) {
+          const err = new Error("EIO: i/o error, lstat");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat(p, opts);
+      };
+      const rUnreadable = readLockOwner(lockDir, { strict: true });
+      assert.equal(rUnreadable.present, false, "EIO 时 present:false");
+      assert.equal(rUnreadable.absent, false, "EIO 时 absent:false（不可折成缺席）");
+      assert.equal(rUnreadable.unreadable, true, "EIO 时 unreadable:true");
+      assert.equal(rUnreadable.errorCode, "EIO", "带错误码 EIO");
+
+      // ③ 主锁首检注入 EIO：保持 unclean
+      const rInitial = TAL.clearLedgerResidue({ dir, residue: [] });
+      assert.equal(rInitial.ok, false, "首检注入 lstat EIO 必须 ok:false");
+      assert.ok(Array.isArray(rInitial.residue) && rInitial.residue.includes(lockDir), "首检 residue 必须包含 lockDir");
+      assert.match(String(rInitial.why), /EIO/u, "首检 why 包含 EIO");
+      assert.equal(rInitial.lock_held, true, "首检 lock_held:true");
+    } finally {
+      fs.lstatSync = origLstat;
+    }
+
+    // ④ 释放后复核注入 EIO：必须 ok:false、residue 含 lockDir、why 含 EIO
+    let afterRelease = false;
+    try {
+      fs.rmSync = (p, opts) => {
+        if (String(p) === lockDir) {
+          afterRelease = true;
+        }
+        return origRm(p, opts);
+      };
+      fs.lstatSync = (p, opts) => {
+        if (afterRelease && String(p) === lockDir) {
+          const err = new Error("EIO: i/o error, lstat");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat(p, opts);
+      };
+      const r = TAL.clearLedgerResidue({ dir, residue: [] });
+      assert.equal(r.ok, false, "注入释放后 lstat EIO 绝不可当成缺席返回 ok:true：" + JSON.stringify(r));
+      assert.ok(Array.isArray(r.residue) && r.residue.includes(lockDir), "residue 必须包含 lockDir：" + JSON.stringify(r.residue));
+      assert.match(String(r.why), /EIO/u, "why 必须包含 EIO：" + r.why);
+      assert.equal(r.lock_held, true, "必须保持 lock_held:true");
+    } finally {
+      fs.lstatSync = origLstat;
+      fs.rmSync = origRm;
     }
   }));
 

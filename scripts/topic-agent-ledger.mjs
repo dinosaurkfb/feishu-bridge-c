@@ -1946,7 +1946,12 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
   }
   // 锁家族先看：在场的主锁 / reap 家族一律不由本原语处置 —— 一个交人，一个交显式维护入口。
   //   （也不去"先取锁再释放"：reap 家族在的时候释放段拿不到 reap 锁，反而会把主锁留在盘上。）
-  const held = readLockOwner(lockDir);
+  // R57d 返修九 P1-1：严格模式区分 absent / present / unreadable；非 ENOENT 保持 unclean。
+  const held = readLockOwner(lockDir, { strict: true });
+  if (held.unreadable) {
+    return { ok: false, cleaned: [], residue: [...left, lockDir], lock_held: true, lock_unreadable: true,
+      why: "主锁 " + path.basename(lockDir) + " 盘点异常（" + (held.errorCode ?? held.error) + "）：保持 unclean" };
+  }
   if (held.present) {
     return { ok: false, cleaned: [], residue: [...left, lockDir], lock_held: true,
       why: "主锁 " + path.basename(lockDir) + " 仍在（" + (held.owner ? "持有者 pid=" + String(held.owner.pid) : "owner 不可读") + "）：本原语不替锁协议清理，交人" };
@@ -2000,12 +2005,17 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], claimsDir = n
     try { released = releasePublishLock(lockDir); } catch (err) { released = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }
   const releaseClean = released !== null && released.ok === true && released.absent !== true && released.reapUncleared == null;
-  const after = readLockOwner(lockDir);
+  // R57d 返修九 P1-1：严格模式复核主锁，区分 absent / present / unreadable；非 ENOENT 保持 unclean。
+  const after = readLockOwner(lockDir, { strict: true });
   if (dirFsyncErr !== null) return { ok: false, cleaned, residue: left, lock_held: false, why: "清理后目录 fsync 失败（" + dirFsyncErr + "）：保持 unclean" };
   if (!releaseClean) {
-    return { ok: false, cleaned, lock_held: after.present,
-      residue: [...left, ...(released?.reapUncleared?.path ? [String(released.reapUncleared.path)] : []), ...(after.present ? [lockDir] : [])],
+    return { ok: false, cleaned, lock_held: after.present || after.unreadable === true,
+      residue: [...left, ...(released?.reapUncleared?.path ? [String(released.reapUncleared.path)] : []), ...(after.present || after.unreadable ? [lockDir] : [])],
       why: "账本锁释放不干净（" + String(released?.reason ?? released?.why ?? "?") + "）：保持 unclean" };
+  }
+  if (after.unreadable) {
+    return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, lock_unreadable: true,
+      why: "清理后主锁盘点异常（" + path.basename(lockDir) + ": " + (after.errorCode ?? after.error) + "）：保持 unclean" };
   }
   if (after.present) {
     const ownerDesc = after.owner ? "持有者 pid=" + String(after.owner.pid) : "owner 不可读";

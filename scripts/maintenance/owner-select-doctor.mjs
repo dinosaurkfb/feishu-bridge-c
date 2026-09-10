@@ -32,7 +32,7 @@
 import fs from "node:fs";
 
 import { isCanonicalIso } from "../canonical-time.mjs";
-import { loadByEndpoint, validateLedger, familyOf, migrationInventory, validateLedgerRoot, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { loadByEndpoint, validateLedger, familyOf, migrationInventory, validateLedgerRoot, resolveEndpointDir, ownerSelectReaffirmClosureDigest } from "../topic-agent-ledger.mjs";
 import { aggregateEndpointReceipts } from "./ledger-receipt.mjs";
 import { readCampaignState, readWriterState, readOwnerSelectAdmission } from "./owner-select-state.mjs";
 import { readActive, readJournal, OWNER_SELECT_OPERATION_KINDS } from "./journal.mjs";
@@ -60,9 +60,10 @@ function checkHandleExpiry(rec, now, problems) {
  * ⑰ 对账主入口（只读）。返回：
  * {
  *   endpoints: [{ endpointId, status: "ok"|"block"|"unclear", problems: [...], counts: {...}|null,
- *                 intents: { count, expired }|null }],   // intents：initDone 且受验读过才算；读不出/没对上 = null
+ *                 intents: { count, expired, stale }|null }],   // intents：initDone 且受验读过才算；读不出/没对上 = null
  *   chain: { state: "off"|"partial"|"on"|null, problems: [...], unclear: string|null, note: string|null },
- *   intentNote: "intent：共 n 条（过期 m）" | "intent：k 个 endpoint 读不出" | "intent：未能对账（endpoint 未盘点）",
+ *   intentNote: "intent：已对账 n 条（过期 m、失效 s）" +（"，另 k 个 endpoint 未对账"）
+ *               | "intent：未能对账（endpoint 未盘点）",
  *   notApplicable: string|null,   // P1-4：零收据 + 根缺席 → 「尚未接入」
  *   summary: { total, green, block, unclear },
  * }
@@ -71,12 +72,13 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
   const endpoints = [];
   const summary = { total: 0, green: 0, block: 0, unclear: 0 };
   const chain = { state: null, problems: [], unclear: null, note: null };
-  // R62：intent 对账汇总——没对上账的 endpoint（store 读不出或账本不可用）与已对上的计数。
+  // R62：intent 对账汇总——没对上账的 endpoint（store 读不出、账本不可用、收据非 ok）与已对上的计数。
   const intentUnreconciled = new Set();
-  const intentTotals = { count: 0, expired: 0 };
-  const intentNoteOf = () => intentUnreconciled.size > 0
-    ? "intent：" + intentUnreconciled.size + " 个 endpoint 读不出"
-    : "intent：共 " + intentTotals.count + " 条（过期 " + intentTotals.expired + "）";
+  const intentTotals = { count: 0, expired: 0, stale: 0 };
+  const intentNoteOf = () => {
+    const base = "intent：已对账 " + intentTotals.count + " 条（过期 " + intentTotals.expired + "、失效 " + intentTotals.stale + "）";
+    return intentUnreconciled.size > 0 ? base + "，另 " + intentUnreconciled.size + " 个 endpoint 未对账" : base;
+  };
   if (typeof maintenanceDir !== "string" || maintenanceDir.length === 0) {
     return { endpoints, chain: { ...chain, unclear: "维护目录说不清" }, summary, intentNote: "intent：未能对账（endpoint 未盘点）" };
   }
@@ -95,12 +97,15 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
   const rootAbsent = !rootV.ok && rootV.reason === "root_absent";
   // P1-4：全新机器——无任何收据且账本根缺席 → 本项不适用（尚未接入），不算红也不算查不清
   if (agg.endpoints.length === 0 && rootAbsent) {
-    return { endpoints, chain: { state: "off", problems: [], unclear: null, note: null }, summary, intentNote: "intent：共 0 条（过期 0）", notApplicable: "尚未接入（没有任何 init 收据，账本根也未建）" };
+    return { endpoints, chain: { state: "off", problems: [], unclear: null, note: null }, summary, intentNote: "intent：已对账 0 条（过期 0、失效 0）", notApplicable: "尚未接入（没有任何 init 收据，账本根也未建）" };
   }
   // P1-3：只认 state === "ok" && initDone === true；conflict / in-flight 只进「查不清」一次，
   // 不进 initDone 集、不参与 campaign 成员关系（下面 extras 检查自然点名）。
   const initDone = agg.endpoints.filter((e) => e.state === "ok" && e.initDone === true);
   const initDoneSet = new Set(initDone.map((e) => e.endpointId));
+  // R62 返修一 P2-2：收据非 ok 的 endpoint（conflict / in-flight / never_initialized）intent 同样没对上账，
+  // 一律计入未对账——不许在「已对账 n 条」里把没核的部分藏掉。
+  for (const e of agg.endpoints) if (e.state !== "ok") intentUnreconciled.add(e.endpointId);
 
   // ── 逐 endpoint：受验读取 → validateLedger → doctor 专属判据（计数 / 到期卫生 / intent 对账）──
   const schemaByEndpoint = new Map();
@@ -151,6 +156,7 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
       } else {
         const entries = Object.values(ir.doc.entries);
         let expired = 0;
+        let stale = 0;
         // handle 全局唯一（含 intent）的比对面：账本记录四类 handle 字段（selection/rebind + 两 proof 内的）
         const ledgerHandles = new Set();
         for (const rec of Object.values(doc.records)) {
@@ -172,6 +178,14 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
             if (!REAFFIRM_TARGET_FAMILIES.includes(fam) || fam !== e.target_family) {
               entry.problems.push("intent 族不一致：目标 " + tid + "（intent " + e.target_family + " / 账本 " + fam + "）");
             }
+            // R62 返修一 P1：chat 绑定（消费侧 entry.chat_id === live.chat_id，不符即 chat_mismatch）
+            if (rec.chat_id !== e.chat_id) entry.problems.push("intent chat 不一致：目标 " + tid);
+            // R62 返修一 P2-1：复算闭包摘要（与签发/消费 CAS 同一函数）。不符 → 失效（stale）只计数不 block
+            //（与过期同口径：到期/下次签发锁内自愈的合法中间态）；live 却算不出 → block（doctor 不猜）。
+            let dg = null;
+            try { dg = ownerSelectReaffirmClosureDigest(doc, e.target_id); } catch { dg = null; }
+            if (dg === null) entry.problems.push("intent 闭包摘要复算不过：目标 " + tid);
+            else if (dg !== e.expected_old_proof_closure_digest) stale += 1;
           }
           if (!isCanonicalIso(e.expires_at)) entry.problems.push("intent 到期字段不规范：目标 " + tid);
           else if (now >= Date.parse(e.expires_at)) expired += 1; // 过期只计数：下次签发锁内清理，合法中间态
@@ -179,9 +193,10 @@ export function ownerSelectReconcile({ maintenanceDir, env = process.env, now = 
         for (const [tid, n] of byTarget) {
           if (n >= 2) entry.problems.push("同一目标多条 intent：" + tid.slice(0, 12) + " × " + n);
         }
-        entry.intents = { count: entries.length, expired };
+        entry.intents = { count: entries.length, expired, stale };
         intentTotals.count += entries.length;
         intentTotals.expired += expired;
+        intentTotals.stale += stale;
       }
     }
     if (entry.status !== "unclear") entry.status = entry.problems.length > 0 ? "block" : "ok";

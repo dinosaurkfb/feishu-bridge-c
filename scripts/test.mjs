@@ -41956,7 +41956,7 @@ test("R56 ⑰ 绿：两 ep strict 无存量 + campaign complete + writer on → 
   assert.equal(c.ok, true, c.detail);
   assert.match(c.detail, /对账 2 个：绿 2/u, "桶之和 = 总数（2 = 2）：" + c.detail);
   assert.match(c.detail, /状态链：on/u, c.detail);
-  assert.match(c.detail, /intent：共 0 条（过期 0）/u, "R62：无 intent 文件 → 计数 0：" + c.detail);
+  assert.match(c.detail, /intent：已对账 0 条（过期 0、失效 0）/u, "R62：无 intent 文件 → 计数 0：" + c.detail);
 });
 
 test("R56 ⑰ block：strict 存量非零 / writer on 而 campaign 未 complete / campaign 多出未 initDone ep / handle 重复 / 有 handle 无到期", () => {
@@ -42394,15 +42394,17 @@ const r62WriteIntents = (m, ep, entries) => {
   const doc = { schema_version: RI.REAFFIRM_INTENTS_SCHEMA, entries: Object.fromEntries(entries.map((e) => [e.reaffirm_handle, e])) };
   fs.writeFileSync(path.join(m.ledgerDir, ep, "reaffirm-intents.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
 };
+/** R62：按夹具账本现态复算闭包摘要（"与签发时一致"的 intent 该填的值）。 */
+const r62Digest = (m, ep, targetId) => TAL.ownerSelectReaffirmClosureDigest(JSON.parse(fs.readFileSync(path.join(m.ledgerDir, ep, "ledger.json"), "utf-8")), targetId);
 
 test("R62 ⑰ 绿：两 ep strict + 每 ep 一条匹配 live 的 intent → 全绿、intent 汇总「共 2 条（过期 0）」、正文无 rfh_", () => {
   const m = doctorMachine();
   r62PlantB3(m);
-  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0))]);
-  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1))]);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { expected_old_proof_closure_digest: r62Digest(m, R56_EPS[0], r56Id(0)) })]);
+  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1), { expected_old_proof_closure_digest: r62Digest(m, R56_EPS[1], r56Id(1)) })]);
   const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, true, c.detail);
-  assert.match(c.detail, /intent：共 2 条（过期 0）/u, "intent 汇总文案：" + c.detail);
+  assert.match(c.detail, /intent：已对账 2 条（过期 0、失效 0）/u, "intent 汇总文案：" + c.detail);
   assert.match(c.detail, /对账 2 个：绿 2/u, "桶之和 = 总数：" + c.detail);
   assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "正文不输出 intent handle：" + c.detail);
 });
@@ -42412,7 +42414,7 @@ test("R62 ⑰ 缺席：不建 intent 文件 → intent：共 0 条，不影响�
   r62PlantB3(m);
   const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, true, c.detail);
-  assert.match(c.detail, /intent：共 0 条（过期 0）/u, "缺席 = 计数 0：" + c.detail);
+  assert.match(c.detail, /intent：已对账 0 条（过期 0、失效 0）/u, "缺席 = 计数 0：" + c.detail);
   assert.match(c.detail, /对账 2 个：绿 2/u, "缺席不影响绿：" + c.detail);
 });
 
@@ -42464,10 +42466,10 @@ test("R62 ⑰ block 五支：悬挂 / 族不一致 / endpoint 不一致 / 同目
 test("R62 ⑰ 过期只计数不 block：expires_at ≤ now → ok:true、过期 1、桶不 block", () => {
   const m = doctorMachine();
   r62PlantB3(m);
-  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { issued_at: "2020-01-01T00:00:00.000Z" })]);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { issued_at: "2020-01-01T00:00:00.000Z", expected_old_proof_closure_digest: r62Digest(m, R56_EPS[0], r56Id(0)) })]);
   const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
   assert.equal(c.ok, true, "过期是合法中间态（下次签发锁内清理），不 block：" + c.detail);
-  assert.match(c.detail, /intent：共 1 条（过期 1）/u, "过期进计数：" + c.detail);
+  assert.match(c.detail, /intent：已对账 1 条（过期 1、失效 0）/u, "过期进计数：" + c.detail);
   assert.match(c.detail, /对账 2 个：绿 2/u, "不进 block 桶：" + c.detail);
 });
 
@@ -42483,7 +42485,46 @@ test("R62 ⑰ unclear：intent 文件 0644 → 该 endpoint 查不清（intent s
   assert.match(c.detail, /查不清 1/u, "进 unclear 桶：" + c.detail);
   assert.doesNotMatch(c.detail, /block 1/u, "不进 block 桶：" + c.detail);
   assert.doesNotMatch(c.detail, /失败无回执/u, "绝不折成「无 intent/缺回执」：" + c.detail);
-  assert.match(c.detail, /intent：1 个 endpoint 读不出/u, "intent 汇总报读不出：" + c.detail);
+  assert.match(c.detail, /intent：已对账 0 条（过期 0、失效 0），另 1 个 endpoint 未对账/u, "intent 汇总报未对账：" + c.detail);
+});
+
+test("R62 返修一 T6：intent chat_id 与 live.chat_id 不一致 → block 点名（消费侧必然 chat_mismatch 的 intent 不再报绿）", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { chat_id: "oc_r62other", expected_old_proof_closure_digest: r62Digest(m, R56_EPS[0], r56Id(0)) })]);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /intent chat 不一致：目标 [0-9a-z_]+/u, "chat 不一致点名：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 1、block 1/u, "桶之和 = 总数：" + c.detail);
+  assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "正文无 rfh_：" + c.detail);
+});
+
+test("R62 返修一 T7：闭包摘要与现账不符 → 失效（stale）只计数不 block；对照相符 → 失效 0", () => {
+  const m = doctorMachine();
+  r62PlantB3(m, { reaffirmByEp: { [R56_EPS[0]]: "rfh_" + "c".repeat(32) } });
+  const dGood = TAL.ownerSelectReaffirmClosureDigest(JSON.parse(fs.readFileSync(path.join(m.ledgerDir, R56_EPS[1], "ledger.json"), "utf-8")), r56Id(1));
+  assert.match(String(dGood), /^[0-9a-f]{64}$/u, "复算出合法摘要：" + String(dGood));
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { expected_old_proof_closure_digest: "d".repeat(64) })]); // ≠ 现闭包 → 失效
+  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1), { expected_old_proof_closure_digest: dGood })]); // = 现闭包 → 失效 0
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, "失效是合法中间态（到期/下次签发锁内自愈），不 block：" + c.detail);
+  assert.match(c.detail, /intent：已对账 2 条（过期 0、失效 1）/u, "失效进汇总计数：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "不进 block 桶：" + c.detail);
+});
+
+test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「已对账 1 条（…），另 1 个 endpoint 未对账」", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  // ep0 收据 conflict：同 ep 第二份 init（token 全量替换成合法第二笔）
+  const { doc: dup, tok: dupOrigTok } = r56InitJournal(R56_EPS[0]);
+  const dupTok = r56Uuid(5);
+  const dupText = JSON.stringify(dup).split(dupOrigTok).join(dupTok);
+  fs.writeFileSync(path.join(m.maintDir, dupTok + ".json"), JSON.stringify(JSON.parse(dupText), null, 2) + "\n", { mode: 0o600 });
+  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1), { expected_old_proof_closure_digest: r62Digest(m, R56_EPS[1], r56Id(1)) })]);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "conflict 仍查不清：" + c.detail);
+  assert.match(c.detail, /intent：已对账 1 条（过期 0、失效 0），另 1 个 endpoint 未对账/u, "未对账 endpoint 不再被藏住：" + c.detail);
+  assert.match(c.detail, /收据 conflict/u, "conflict 仍点名：" + c.detail);
 });
 
 

@@ -3797,7 +3797,7 @@ test("R61 红证：瞬态 lock_residue 在 waitMs 预算内重试后必须成功
     if (!transientFired) { transientFired = true; return { ok: false, reason: "lock_residue", path: lock }; }
     return acquireLockUngated(lock, opts);
   };
-  const r1 = withInstalledSurfaceLock(surface, ({ commit }) => commit({ chains: { claude: { version: "0123456789abcdef", at: "2026-09-14T00:00:00.000Z", artifacts: [], scripts: [] } } }), { waitMs: 3000, acquire: transient });
+  const r1 = withInstalledSurfaceLock(surface, () => "ran", { waitMs: 3000, acquire: transient });
   assert.equal(r1.ok, true, "① 瞬态 residue 必须在预算内重试成功：" + JSON.stringify(r1));
   assert.equal(transientFired, true, "① 注入确实发生过");
   // ② 持续：每次 acquire 都报 lock_residue（真残骸）→ 预算耗尽仍 fail-closed，且 reason 保留 residue、点名现场

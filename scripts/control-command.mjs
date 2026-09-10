@@ -158,14 +158,26 @@ export function readControlFailedRecord({ claimsDir, key }) {
   return problem ? { status: "unreadable", why: problem } : { status: "valid", record: r.doc };
 }
 
-const UNCLEAN_DETAIL_KEYS = "action,ledger,ledger_reason,legacy,plan_ref,request_key,target_id";
+const UNCLEAN_DETAIL_KEYS = "action,ledger,ledger_evidence,ledger_reason,legacy,plan_ref,request_key,target_id";
 /** 顶层记录（recordClaimState 把 detail 铺平到顶层，结构化证据住在 doc.detail）：精确键集，多一个/少一个都拒。 */
-const UNCLEAN_RECORD_KEYS = "changed,claim_key,control,detail,error,handle,handle_kind,intent_cleanup,ledger,locks,reason,recorded_at,result,schema_version,state,status,why";
+const UNCLEAN_RECORD_KEYS = "changed,claim_key,control,detail,error,handle,handle_kind,intent_cleanup,ledger,locks,reason,recorded_at,repair_attempts,result,schema_version,state,status,why";
 const UNCLEAN_ACTIONS = Object.freeze(["activate", "anchor", "rebind", "reaffirm"]);
 /** legacy 只有这三种提交事实 + not_applicable（authoritative 模式与 rfh 支没有 legacy 提交，不许谎报 committed）。 */
 const UNCLEAN_LEGACY_VALUES = Object.freeze(["committed", "not_committed", "unknown", "not_applicable"]);
 const UNCLEAN_LEDGER_VALUES = Object.freeze(["committed", "not_committed", "unknown"]);
 const SHA64_SHAPE = /^[0-9a-f]{64}$/u;
+/** R57d 返修六 P2：ledger_evidence / repair_attempts 的封闭形状。 */
+const LEDGER_EVIDENCE_KEYS = "commit,lock_uncleared,residue";
+const EVIDENCE_COMMITS = Object.freeze(["committed_clean", "committed_with_residue", "committed_durability_uncertain", "not_committed", "unknown"]);
+const REPAIR_ATTEMPT_KEYS = "at,commit,lock_uncleared,reason,residue";
+const evidenceProblem = (ev) => {
+  if (ev === null || typeof ev !== "object" || Array.isArray(ev)) return "ledger_evidence 不是对象";
+  if (Object.keys(ev).sort().join(",") !== LEDGER_EVIDENCE_KEYS) return "ledger_evidence 键集不对（须 " + LEDGER_EVIDENCE_KEYS + "）";
+  if (!EVIDENCE_COMMITS.includes(ev.commit)) return "ledger_evidence.commit 不在 " + EVIDENCE_COMMITS.join("/");
+  if (!Array.isArray(ev.residue) || ev.residue.some((x) => typeof x !== "string" || x.length === 0)) return "ledger_evidence.residue 不是非空字符串数组";
+  if (typeof ev.lock_uncleared !== "boolean") return "ledger_evidence.lock_uncleared 不是布尔";
+  return null;
+};
 // request_key 的两支**真实**形状（不是 64hex —— 写成 64hex 会让每条真链路的 unclean 记录都读不出，
 //   repair 从此无从下手）：
 //   · osh/orh：m1a/wiring 的通式派生 `m1a_<40hex>`（dual-write.requestKeyFor，同一函数写/读共用）；
@@ -201,6 +213,29 @@ export function controlCommittedUncleanRecordProblem(doc, key) {
   if (d.request_key === null) return d.action + " 支 detail.request_key 必非 null";
   if (d.plan_ref === null) return d.action + " 支 detail.plan_ref 必非 null";
   if (d.action === "reaffirm" && d.legacy !== "not_applicable") return "reaffirm 支 detail.legacy 必须是 not_applicable（rfh 没有 legacy 提交）";
+  // R57d 返修六 P2：交叉等式 —— 只封键集会放过语义自相矛盾的记录。
+  //   · action ↔ handle_kind：activate/anchor↔osh、rebind↔orh、reaffirm↔rfh；
+  //   · 顶层 ledger（执行器分类：clean/unclean/not_committed）↔ detail.ledger（提交事实：committed/not_committed/unknown）；
+  //   · legacy 的允许组合：committed/not_committed 只属 shadow 的 activate/anchor/rebind（rfh 恒 not_applicable，上一行已核）。
+  const wantKind = d.action === "reaffirm" ? "rfh" : (d.action === "rebind" ? "orh" : "osh");
+  if (doc.handle_kind !== wantKind) return "action（" + d.action + "）与 handle_kind（" + String(doc.handle_kind) + "）不一致（须 " + wantKind + "）";
+  if (doc.ledger === "not_committed" && d.ledger !== "not_committed") return "顶层 ledger 是 not_committed 而 detail.ledger 是 " + String(d.ledger);
+  if ((doc.ledger === "clean" || doc.ledger === "unclean") && d.ledger !== "committed") return "顶层 ledger 是 " + doc.ledger + " 而 detail.ledger 是 " + String(d.ledger) + "（须 committed）";
+  if (d.legacy === "committed" || d.legacy === "not_committed") {
+    if (d.action === "reaffirm") return "reaffirm 支不许写 legacy=" + d.legacy;
+  }
+  //   · 持久化证据与修复尝试（P1-2）也必须成形。
+  const evProblem = evidenceProblem(d.ledger_evidence);
+  if (evProblem !== null) return evProblem;
+  const attempts = doc.repair_attempts;
+  if (!Array.isArray(attempts)) return "repair_attempts 不是数组";
+  for (const a of attempts) {
+    if (a === null || typeof a !== "object" || Array.isArray(a) || Object.keys(a).sort().join(",") !== REPAIR_ATTEMPT_KEYS) return "repair_attempts 条目键集不对（须 " + REPAIR_ATTEMPT_KEYS + "）";
+    if (!isCanonicalIso(a.at)) return "repair_attempts.at 不是规范时间";
+    if (typeof a.reason !== "string") return "repair_attempts.reason 不是字符串";
+    const p2 = evidenceProblem({ commit: a.commit, residue: a.residue, lock_uncleared: a.lock_uncleared });
+    if (p2 !== null) return "repair_attempts 条目：" + p2;
+  }
   return null;
 }
 
@@ -208,7 +243,7 @@ export function controlCommittedUncleanRecordProblem(doc, key) {
  * unclean 记录的**唯一写面**（P1-5a）：顶层键集与 detail 位置只在这里定，两个写入点（执行器 unclean / 终态写失败）
  * 共用同一个形状 —— 不然「顶层精确键集」这条判据会在两个写入点之间分叉。
  */
-export function uncleanRecordFields({ control, handle, handleKind, why, ledger, intentCleanup, locks, changed, result, evidence }) {
+export function uncleanRecordFields({ control, handle, handleKind, why, ledger, intentCleanup, locks, changed, result, evidence, attempts = null }) {
   return {
     control,
     handle: handle ?? null,
@@ -223,6 +258,8 @@ export function uncleanRecordFields({ control, handle, handleKind, why, ledger, 
     changed: changed === true,
     result: result ?? null,
     detail: evidence,
+    // R57d 返修六 P1-2：修复尝试历史（**追加**，不覆盖原始证据）——顶层精确键集里的一员，起始为空数组。
+    repair_attempts: Array.isArray(attempts) ? attempts : [],
   };
 }
 export function readControlCommittedUncleanRecord({ claimsDir, key }) {
@@ -626,6 +663,23 @@ export function resumeControlClaim({ claimsDir, key, execute, expect = {} }) {
         { claim: claim.claim, claimsDir, key, uncleanRecord: unclean.record }
       );
       if (!tx.ok) {
+        // R57d 返修六 P1-2：保持 unclean 时把**最新证据**写回记录（追加 repair_attempts，不覆盖原始证据）——
+        //   否则下次 repair 读到的还是旧证据，残骸清没清、清了几次都留不下痕迹。
+        if (tx.ledger_evidence) {
+          try {
+            const prev = unclean.record;
+            const attempts = Array.isArray(prev.repair_attempts) ? prev.repair_attempts : [];
+            attempts.push({
+              at: new Date().toISOString(),
+              reason: String(tx.reason ?? "control_committed_unclean"),
+              commit: tx.ledger_evidence.commit ?? "unknown",
+              residue: Array.isArray(tx.ledger_evidence.residue) ? tx.ledger_evidence.residue : [],
+              lock_uncleared: tx.ledger_evidence.lock_uncleared === true,
+            });
+            recordClaimState({ claimsDir, key, state: "control-committed-unclean",
+              detail: { ...prev, detail: { ...prev.detail, ledger_evidence: tx.ledger_evidence }, repair_attempts: attempts } });
+          } catch { /* 写不回不算失败：原始记录还在，下一次 repair 还会再撞一次 */ }
+        }
         return { ok: false, status: tx.status ?? "control-committed-unclean", reason: tx.reason, why: tx.why, quarantined };
       }
       const changed = tx.changed !== false;

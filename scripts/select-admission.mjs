@@ -244,10 +244,21 @@ const planRefDigest = (plan) => (plan && typeof plan === "object") ? createHash(
 const actionOpType = (action) => (action === "anchor" ? "anchor" : action === "rebind" ? "rebind_session_alias" : "activate");
 /** P1-5a：结构化 uncleanness 证据（legacy / ledger 枚举 + action / target_id / request_key / plan_ref / ledger_reason）。
  *  <key>.control-committed-unclean.json 持久化这份 detail，校验器按它封闭联合；repair 读到才知道走哪支。 */
-function uncleanDetail({ action, targetId, messageId, planRef, legacy, ledger, ledger_reason }) {
+const UNKNOWN_EVIDENCE = Object.freeze({ commit: "unknown", residue: [], lock_uncleared: false });
+function uncleanDetail({ action, targetId, messageId, planRef, legacy, ledger, ledger_reason, ledgerEvidence }) {
   const k = requestKeyFor({ opType: actionOpType(action), externalRequestId: messageId, entityId: targetId });
-  return { legacy, ledger, action, target_id: targetId, request_key: k.ok ? k.request_key : null, plan_ref: planRef ?? null, ledger_reason };
+  return {
+    legacy, ledger, action, target_id: targetId, request_key: k.ok ? k.request_key : null, plan_ref: planRef ?? null, ledger_reason,
+    // R57d 返修六 P1-2：持久化证据（来自执行器分类结果 / 前向补返回）——repair 靠它决定"要不要先清残骸"。
+    ledger_evidence: ledgerEvidence ?? UNKNOWN_EVIDENCE,
+  };
 }
+/** 三份结果 → ledger_evidence 的**唯一**投影（执行器 unclean 支与成功支共用一份）。 */
+const ledgerEvidenceOf = (ledger) => ({
+  commit: (typeof ledger?.commit === "string" && ledger.commit.length > 0) ? ledger.commit : "unknown",
+  residue: Array.isArray(ledger?.residue) ? ledger.residue.map((x) => String(x)) : [],
+  lock_uncleared: ledger?.lockUncleared != null,
+});
 
 /** wired 结果 → 执行器回执（R57d 返修一 P1-1：wrapper 是唯一写面；结果按 ok/legacy/shadow 首笔封闭消费）。
  * P1-7 的三份结果分类（clean/unclean/not_committed 可恢复态）归 B 段；本函数先按旧口径收敛。 */
@@ -270,7 +281,8 @@ function wiredOutcome(w, action, info = {}) {
     return {
       ok: false, status: "control-committed-unclean", reason: "control_committed_unclean",
       text: "已写入但收口不干净（legacy 映射已更新、账本未提交：" + ledgerWhy + "）——repair 按 plan 收尾",
-      detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "not_committed", ledger_reason: ledgerWhy }),
+      detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "not_committed", ledger_reason: ledgerWhy,
+        ledgerEvidence: ledgerEvidenceOf(step ? { commit: step.committed, residue: step.residue, lockUncleared: step.lockUncleared } : null) }),
       ledger: "not_committed", intent_cleanup: "unclear",
       locks: { outer: w.release && w.release.ok === true ? "released" : "unclear", intent: "released" },
       why: "legacy 已成功但账本未提交（" + ledgerWhy + "），部分提交状态",
@@ -286,7 +298,11 @@ function wiredOutcome(w, action, info = {}) {
     : (rel.ok === true && !rel.absent && !rel.reapUncleared ? "released" : (rel.reapUncleared ? "residue" : "unclear"));
   const outcome = classifySelectOutcome({ ledger, intentCleanup: "cleared", locks: { outer, intent: "released" } });
   if (outcome.status === "consumed") {
-    return { ok: true, status: "consumed", changed: step.idempotent !== true, action, detail: uncleanDetail({ action, ...info, legacy: "committed", ledger: "committed", ledger_reason: "clean" }), text: selectExecutorSuccessText(action) };
+    // R57d 返修六 P1-3：authoritative 模式是 ledger-only —— 成功支也不许把 legacy 写成 committed（与 unclean 支同口径）。
+    return { ok: true, status: "consumed", changed: step.idempotent !== true, action, locks: { outer, intent: "released" },
+      detail: uncleanDetail({ action, ...info, legacy: w.ledgerOnly === true ? "not_applicable" : "committed", ledger: "committed", ledger_reason: "clean",
+        ledgerEvidence: { commit: "committed_clean", residue: [], lock_uncleared: false } }),
+      text: selectExecutorSuccessText(action) };
   }
   if (outcome.status === "control-committed-unclean") {
     return {
@@ -294,7 +310,8 @@ function wiredOutcome(w, action, info = {}) {
       text: "已写入但收口不干净（" + String(outcome.why ?? "账本已写入但未收净") + "）",
       // P1-5a：authoritative 模式是 ledger-only（w.legacy === null / ledgerOnly）—— 事实是「没有 legacy 提交」，
       //   写 committed 是谎报；shape 之外还要按 authority_mode 分档。
-      detail: uncleanDetail({ action, ...info, legacy: w.ledgerOnly === true ? "not_applicable" : "committed", ledger: "committed", ledger_reason: String(outcome.why ?? "") }),
+      detail: uncleanDetail({ action, ...info, legacy: w.ledgerOnly === true ? "not_applicable" : "committed", ledger: "committed", ledger_reason: String(outcome.why ?? ""),
+        ledgerEvidence: ledgerEvidenceOf(ledger) }),
       ledger: outcome.ledger, intent_cleanup: outcome.intent_cleanup, locks: outcome.locks, why: outcome.why,
     };
   }
@@ -349,7 +366,9 @@ export function executeSelectControl(intent, {
         //   plan_ref 取 sidecar 受验 digest（由 mutation 层带出，它才是写 sidecar 的那一方）。
         detail: {
           legacy: "not_applicable",
-          ledger: (res.ledger === "committed" ? "committed" : (res.ledger === "unclean" ? "unknown" : "not_committed")),
+          // 顶层 ledger 是分类（clean/unclean/not_committed），detail.ledger 是提交事实（committed/…）——
+          // 两者必须自洽（校验器的交叉等式）：unclean 也**已经提交了**，只是没收拾干净。
+          ledger: (res.ledger === "clean" || res.ledger === "unclean") ? "committed" : (res.ledger === "not_committed" ? "not_committed" : "unknown"),
           action: "reaffirm",
           target_id: res.result?.target_id ?? null,
           request_key: (typeof res.result?.target_id === "string" && typeof intent.handle === "string")
@@ -357,6 +376,7 @@ export function executeSelectControl(intent, {
             : null,
           plan_ref: res.plan_ref ?? planRefVal ?? null,
           ledger_reason: (typeof res.why === "string" ? res.why : ""),
+          ledger_evidence: ledgerEvidenceOf({ commit: res.ledger === "committed" ? "committed_clean" : null, residue: null, lockUncleared: null }),
         },
         ledger: res.ledger,
         intent_cleanup: res.intent_cleanup,
@@ -368,7 +388,25 @@ export function executeSelectControl(intent, {
     if (!res.ok) {
       return { ok: false, status: "failed", reason: res.reason ?? "reaffirm_failed", text: selectRejectTextByReason(res.reason ?? "reaffirm_failed") };
     }
-    return { ok: true, status: "consumed", changed: res.idempotent === true ? false : true, action: "reaffirm", text: selectReaffirmSuccessText(res.result) };
+    // R57d 返修六 P1-3：rfh 成功返回也要带完整证据 —— 否则 consumed sidecar 写失败时走 missing_evidence，
+    //   落不下可恢复的 unclean 记录（旧形只有 ok/status/action/text）。
+    return {
+      ok: true, status: "consumed", changed: res.idempotent === true ? false : true, action: "reaffirm",
+      text: selectReaffirmSuccessText(res.result),
+      result: res.result ?? null,
+      locks: res.locks ?? null,
+      detail: {
+        legacy: "not_applicable",
+        ledger: "committed",
+        action: "reaffirm",
+        target_id: res.result?.target_id ?? null,
+        request_key: (typeof res.result?.target_id === "string" && typeof intent.handle === "string")
+          ? ownerSelectReaffirmRequestKey({ target: res.result.target_id, handle: intent.handle }) : null,
+        plan_ref: res.plan_ref ?? null,
+        ledger_reason: "clean",
+        ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false },
+      },
+    };
   }
 
   // ── R57d：osh / orh / 省略 ──

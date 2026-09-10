@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner } from "./registry.mjs";
+import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner, clearStaleReapLock } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
@@ -1862,6 +1862,48 @@ function foldRelease(result, released) {
     return { ...result, commit, lockUncleared, lock_state: "unclear" };
   }
   return { ...result, lockUncleared };
+}
+
+/* ─────────────────────────── 写残骸清理（R57d 返修六 P1-2） ─────────────────────────── */
+
+/** 账本写原语自己产生的 tmp 残骸名（封闭形状）：ledger.json[.prev].<正整数 pid>.<v4 uuid>。 */
+const LEDGER_TMP_RE = /^ledger\.json(?:\.prev)?\.[1-9]\d*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+/**
+ * **账本侧残骸清理原语**（R57d 返修六 P1-2）：只清「这笔写自己留下的东西」，不是"什么都能删"的口子。
+ *   · 账本 tmp 残骸（名字封闭 + 必须是**普通单硬链接文件** + 必须落在本 endpoint 目录里）→ unlink + 受验读回（lstat 必须 ENOENT）；
+ *   · reap 家族残骸（<lock>.reap / <lock>.reap.quarantine-<uuid>）→ 交 registry 自己的维护入口
+ *     clearStaleReapLock（它按形状判 symlink + owner，rename 到隔离路径再删，不按路径 rm）；
+ *   · **主锁（<lock>）本原语不碰**：release 失败时归属证明已经丢了，替它做决定正是锁协议禁止的事 —— 报 residue 交人；
+ *   · 其余任何路径 → 不动、报 residue。
+ * @returns { ok, cleaned: string[], residue: string[], why? }
+ */
+export function clearLedgerResidue({ dir, residue = [], _inject = null } = {}) {
+  const { lock: lockDir } = ledgerPaths(dir);
+  const cleaned = [];
+  const left = [];
+  for (const raw of Array.isArray(residue) ? residue : []) {
+    const entry = String(raw);
+    const base = path.basename(entry);
+    if (LEDGER_TMP_RE.test(base) && path.dirname(entry) === dir) {
+      let st = null;
+      try { st = fs.lstatSync(entry); }
+      catch (err) { if (err?.code === "ENOENT") { cleaned.push(entry); continue; } left.push(entry); continue; }
+      // 形态不认识的（目录 / symlink / 多硬链接）一律不动 —— 名字像不等于协议写出来的。
+      if (!st.isFile() || st.nlink !== 1) { left.push(entry); continue; }
+      try { fs.unlinkSync(entry); } catch { left.push(entry); continue; }
+      try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
+      continue;
+    }
+    if (entry.startsWith(lockDir + ".")) {
+      const r = clearStaleReapLock(lockDir, { staleMs: 0, apply: true });
+      if (r && r.removed === true && r.reason === undefined) { cleaned.push(entry); continue; }
+      left.push(entry);
+      continue;
+    }
+    left.push(entry);
+  }
+  return { ok: left.length === 0, cleaned, residue: left };
 }
 
 /* ─────────────────────────── operations 盖章 ─────────────────────────── */

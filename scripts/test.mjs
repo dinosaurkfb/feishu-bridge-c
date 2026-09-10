@@ -44046,7 +44046,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       control: "select", handle: "osh_" + "1".repeat(32), handle_kind: "osh", reason: "control_committed_unclean",
       status: "control-committed-unclean", error: "账本未提交", why: "账本未提交", ledger: "not_committed",
       intent_cleanup: "unclear", locks: null, changed: false, result: null,
-      detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "ta_" + "1".repeat(32), request_key: "m1a_" + "b".repeat(40), plan_ref: "c".repeat(64), ledger_reason: "ledger skip" },
+      repair_attempts: [],
+      detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: "ta_" + "1".repeat(32), request_key: "m1a_" + "b".repeat(40), plan_ref: "c".repeat(64), ledger_reason: "ledger skip", ledger_evidence: { commit: "not_committed", residue: [], lock_uncleared: false } },
     };
     const badRec = { ...goodRec, detail: { ledger: "not_committed" } };
     const uf = path.join(claimsDir, keyA + ".control-committed-unclean.json");
@@ -46161,7 +46162,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const acqD = acquireClaim({ claimsDir, messageId: "om_p15d", logicalTaskKey: ltk, meta: { control: { control: "select", handle: null, handle_kind: null }, policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_p15" } });
       assert.equal(acqD.ok, true, "(d) claim 取得：" + JSON.stringify(acqD));
       // 直接造 unclean + consumed 共存（不开账本：repair 的共存检查必须先于账本分支）
-      recordClaimState({ claimsDir, key: coKey, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x" } } });
+      recordClaimState({ claimsDir, key: coKey, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: [], detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x", ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } } } });
       recordClaimState({ claimsDir, key: coKey, state: "consumed", detail: { control: "select", handle: null, handle_kind: "osh", changed: false } });
       const repaired = resumeControlClaim({ claimsDir, key: coKey, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
       assert.equal(repaired.ok, false, "(d) 共存拒：" + JSON.stringify(repaired).slice(0, 300));
@@ -46170,7 +46171,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const coKey2 = claimKey("om_p15d2", ltk);
       const acqD2 = acquireClaim({ claimsDir, messageId: "om_p15d2", logicalTaskKey: ltk, meta: { control: { control: "select", handle: null, handle_kind: null }, policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_p15" } });
       assert.equal(acqD2.ok, true, "(d') claim 取得：" + JSON.stringify(acqD2));
-      recordClaimState({ claimsDir, key: coKey2, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d2", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x" } } });
+      recordClaimState({ claimsDir, key: coKey2, state: "control-committed-unclean", detail: { control: "select", handle: null, handle_kind: "osh", reason: "control_committed_unclean", status: "control-committed-unclean", error: "x", why: "x", ledger: "committed", intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: [], detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: DW.requestKeyFor({ opType: "activate", externalRequestId: "om_p15d2", entityId: ids.b1Id }).request_key, plan_ref: "d".repeat(64), ledger_reason: "x", ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } } } });
       recordClaimState({ claimsDir, key: coKey2, state: "failed", detail: { reason: "control_failed", control: "select", handle: null, handle_kind: null, error: "x" } });
       const repaired2 = resumeControlClaim({ claimsDir, key: coKey2, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
       assert.equal(repaired2.reason, "select_state_conflict", "(d') failed 共存同拒：" + repaired2.reason);
@@ -46386,8 +46387,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       control: { control: "select", handle: ids.b1Handle, handle_kind: "osh" }, selection_context: selCtx, selection_context_digest_v1: digest,
       policy_id: MAPPING_POLICY_ID, policy_version: "1.0", origin_channel_generation_id: "gen_f6c" } });
     const tx = runControlTransaction({ claimsDir, key: acq.key, intent: { control: "select", handle: ids.b1Handle, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
-      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(ids.b1Handle, "osh"), mappingUpdate: mappingStub([]), txCtx: ctx, _inject: { failDirFsync: true } })) });
-    assert.equal(tx.status, "control-committed-unclean", "前置 unclean");
+      execute: (t, ctx) => SA.executeSelectControl(t, ctxD({ capability: capD(ids.b1Handle, "osh", { message: "om_f6c" }), messageId: "om_f6c", mappingUpdate: mappingStub([]), txCtx: ctx, _inject: { failDirFsync: true } })) });
+    assert.equal(tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(tx).slice(0, 300));
     const key = acq.key;
     const repairIt = () => resumeControlClaim({ claimsDir, key, expect: {}, execute: (t, ctx) => dispatchControlRepair(t, { onMode: () => ({ ok: true }) }, ctx) });
     // ① 原始证据进记录：ledger_evidence 封闭三项 + repair_attempts 空数组
@@ -46412,7 +46413,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(fs.existsSync(path.join(claimsDir, key + ".consumed.json")), false, "② 第 " + n + " 次：不写 consumed");
       const rec = readControlCommittedUncleanRecord({ claimsDir, key });
       assert.equal(rec.status, "valid", "② 第 " + n + " 次：记录仍受验可读");
-      assert.ok(rec.record.repair_attempts.length >= n, "② 第 " + n + " 次：追加 repair_attempts（不覆盖原始证据）：" + JSON.stringify(rec.record.repair_attempts));
+      assert.ok(rec.record.repair_attempts.length >= n, "② 第 " + n + " 次：追加 repair_attempts（不覆盖原始证据）：" + JSON.stringify(rec.record.repair_attempts) + " / repair 返回：" + JSON.stringify(r).slice(0, 260));
       assert.deepEqual(rec.record.detail.ledger_evidence.residue, [residuePath], "② 原始证据不被覆盖");
     }
     // ③ 换成形状合法的账本 tmp 残骸（普通文件 0600）→ 清理原语清掉 → 这次才转 consumed
@@ -46523,7 +46524,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const key = acq.key;
     const tx = runControlTransaction({ claimsDir, key, intent: { control: "select", handle: h, handle_kind: "osh" }, replay: false, expect: {}, contextDigest: digest,
       execute: () => ({ ok: false, status: "control-committed-unclean", reason: "control_committed_unclean", why: "账本未提交",
-        detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "c".repeat(40), plan_ref: "d".repeat(64), ledger_reason: "ledger skip" } }) });
+        detail: { legacy: "committed", ledger: "not_committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "c".repeat(40), plan_ref: "d".repeat(64), ledger_reason: "ledger skip", ledger_evidence: { commit: "not_committed", residue: [], lock_uncleared: false } } }) });
     assert.equal(tx.status, "control-committed-unclean", "前置 unclean：" + JSON.stringify(tx).slice(0, 200));
     const uf = path.join(claimsDir, key + ".control-committed-unclean.json");
     const raw = JSON.parse(fs.readFileSync(uf, "utf-8"));
@@ -46542,6 +46543,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       ["target_id 形状不对", detailOf({ target_id: "b1_x" })],
       ["rfh 支 legacy 漂移（committed）", detailOf({ action: "reaffirm", legacy: "committed" })],
       ["legacy 枚举越界", detailOf({ legacy: "maybe" })],
+      ["ledger_evidence 缺失", (d) => ({ ...d, detail: (() => { const c = { ...d.detail }; delete c.ledger_evidence; return c; })() })],
       ["detail 多一个键", (d) => ({ ...d, detail: { ...d.detail, extra: 1 } })],
       ["顶层记录多一个键", (d) => ({ ...d, extra: 1 })],
       ["顶层记录少一个键", (d) => { const c = { ...d }; delete c.why; return c; }],
@@ -46549,7 +46551,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(put(mut), "unreadable", tag + " → 必须拒读：" + JSON.stringify(readControlCommittedUncleanRecord({ claimsDir, key })));
     }
     // rfh 支合法形（legacy=not_applicable + 两个 64hex）→ valid
-    assert.equal(put((d) => ({ ...d, detail: { ...d.detail, action: "reaffirm", legacy: "not_applicable", request_key: "osr:" + ids.b1Id + ":" + "rfh_" + "e".repeat(32), plan_ref: "f".repeat(64) } })), "valid", "rfh 支合法形过校验器");
+    assert.equal(put((d) => ({ ...d, handle_kind: "rfh", detail: { ...d.detail, action: "reaffirm", legacy: "not_applicable", request_key: "osr:" + ids.b1Id + ":" + "rfh_" + "e".repeat(32), plan_ref: "f".repeat(64) } })), "valid", "rfh 支合法形过校验器（handle_kind 也得跟着换成 rfh —— P2 交叉等式）");
   }));
 
   test("R57d 返修五 P1-5b：consumed 写失败先落 unclean 记录（repair 读得到）；unclean 也写不成 → unclean_unwritten 且文案不许声称可恢复", () => withLedgerD((root, dir, ids) => {
@@ -46564,7 +46566,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.equal(acq.ok, true);
       return acq.key;
     };
-    const ev = { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "a".repeat(40), plan_ref: "b".repeat(64), ledger_reason: "clean" };
+    const ev = { legacy: "committed", ledger: "committed", action: "activate", target_id: ids.b1Id, request_key: "m1a_" + "a".repeat(40), plan_ref: "b".repeat(64), ledger_reason: "clean", ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } };
     // ① consumed 写失败（<key>.consumed.json 是目录）→ 先落 unclean 记录：可读、detail 完整、repair 能读到
     const key1 = mkAcq("om_f5b1");
     fs.mkdirSync(path.join(claimsDir, key1 + ".consumed.json"), { recursive: true });

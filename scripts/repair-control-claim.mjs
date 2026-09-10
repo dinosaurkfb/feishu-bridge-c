@@ -17,7 +17,7 @@ import { expectationFromMapping, claudeControlPrecondition } from "./control-ide
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext, mintSelectCapability } from "./select-admission.mjs";
 import { senderRole } from "./sender-roles.mjs";
-import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias, fingerprintOf } from "./topic-agent-ledger.mjs";
+import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias, fingerprintOf, clearLedgerResidue } from "./topic-agent-ledger.mjs";
 import { CHAT_SHAPE, ENDPOINT_SHAPE } from "./shapes.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
@@ -297,7 +297,35 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
     if (mismatch !== null) {
       return { ok: false, reason: "ledger_commit_unverifiable", why: "账本 " + opType + " op 与 plan 逐字核不过：" + mismatch + "，保持 control-committed-unclean" };
     }
-    return { ok: true, changed: true };
+    // R57d 返修六 P1-2：**转 consumed 前必须重做持久化屏障** ——
+    //   旧码只要核得出匹配 op 就放行：前向补返回 committed_with_residue 后第一次保持 unclean，
+    //   第二次因 op 已存在直接转 consumed（残骸还在）；原始 dirty-commit 也首次 repair 即放行。
+    //   现在：先读 unclean 记录里的证据；residue 非空 / 锁未清 → 先调账本侧残骸清理原语（只删已知路径、受验读回）；
+    //   清干净后重读账本受验核 op 仍在且逐字对得上，才闭合；否则保持 unclean 并把最新证据带回去写回记录。
+    const ev = detail.ledger_evidence ?? null;
+    let nextEvidence = null;
+    if (ev !== null && ((Array.isArray(ev.residue) && ev.residue.length > 0) || ev.lock_uncleared === true)) {
+      const cr = clearLedgerResidue({ dir: d.dir, residue: ev.residue ?? [] });
+      nextEvidence = {
+        commit: cr.ok ? "committed_clean" : "committed_with_residue",
+        residue: Array.isArray(cr.residue) ? cr.residue : [],
+        lock_uncleared: cr.ok ? false : ev.lock_uncleared === true,
+      };
+      if (!cr.ok) {
+        return { ok: false, reason: "ledger_residue_uncleared", ledger_evidence: nextEvidence,
+          why: "账本侧残骸没清干净（" + nextEvidence.residue.join("、") + "），保持 control-committed-unclean" };
+      }
+    }
+    // 重做持久化屏障：受验重读账本，op 必须仍在且逐字对得上。
+    const L3 = loadLedger(d.dir, { endpointId: sc.endpoint });
+    if (!L3.ok) return { ok: false, reason: "ledger_unreadable", why: "清理后重读账本失败（" + String(L3.why ?? L3.reason ?? "?") + "）" };
+    const again = findCommitted(L3.doc);
+    if (!again) return { ok: false, reason: "ledger_commit_unverifiable", why: "清理后重读核不出本笔 op（request_key " + wantKey.request_key + "），保持 control-committed-unclean" };
+    const againMismatch = committedMismatch(again);
+    if (againMismatch !== null) {
+      return { ok: false, reason: "ledger_commit_unverifiable", why: "清理后重读的 op 与 plan 逐字核不过：" + againMismatch + "，保持 control-committed-unclean" };
+    }
+    return { ok: true, changed: true, ledger_evidence: { commit: "committed_clean", residue: [], lock_uncleared: false } };
   }
   // 分支二：legacy 已提交、账本未提交 → outer 锁内按 plan 前向补 ledger（同 request_key / 冻结 CAS，幂等）。
   if (detail.ledger === "not_committed" && detail.legacy === "committed") {
@@ -336,6 +364,11 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
       && !r.lockUncleared && r.lock_state !== "unclear";
     if (!cleanCommit) {
       return {
+        ledger_evidence: {
+          commit: (typeof r.commit === "string" && r.commit.length > 0) ? r.commit : "unknown",
+          residue: Array.isArray(r.residue) ? r.residue.map((x) => String(x)) : [],
+          lock_uncleared: r.lockUncleared != null,
+        },
         ok: false,
         reason: "ledger_forward_fill_unclean",
         why: "前向补 " + opType + " 未干净收口（commit=" + String(r.commit ?? "?") + (r.residue && r.residue.length > 0 ? "，with_residue" : "") + (r.lockUncleared ? "，lockUncleared" : "") + (String(r.commit ?? "") === "committed_durability_uncertain" ? "，durability_uncertain" : "") + "）：保持 control-committed-unclean",

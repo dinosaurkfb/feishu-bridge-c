@@ -28,7 +28,7 @@ import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
 import { canonKey, sha256, isObj, stable } from "./maintenance/canon.mjs";
 export { canonKey, sha256 };
 // R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
-import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE } from "./shapes.mjs";
+import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE } from "./shapes.mjs";
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -44,11 +44,9 @@ const OP_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const SHA_SHAPE = /^[0-9a-f]{64}$/u;
 // 生产权威形状（评审二 P1-1/P1-6）：endpoint = legacyEndpointId = stableControlId("endpoint",…) = endpoint_<24hex>；
 // 链不可从 opaque endpoint 还原，另存顶层 chain。om_/oc_/session-UUID 各按真实前缀；claim key 复用 CLAIM_KEY_SHAPE。
-const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
-export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：同一形状只住一处
+export { ENDPOINT_SHAPE }; // 只读导出（doctor ⑭ 枚举账本目录用）：形状定义住叶子 shapes.mjs，同一形状只住一处
 const CHAIN = ["claude", "codex"];
 const OM_SHAPE = /^om_[A-Za-z0-9]{1,120}$/u;                 // 根消息 / matched om
-const CHAT_SHAPE = /^oc_[A-Za-z0-9]{1,120}$/u;               // 受验群 chat_id
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u; // claude session
 const AILY_SESSION_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;    // aliases.session_id（Aily 会话 locator）
 const CODEX_ID_SHAPE = /^[A-Za-z0-9_.:@+-]{1,128}$/u;        // codex task/thread

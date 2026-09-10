@@ -18,6 +18,7 @@ import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { executeSelectControl, verifySelectionContext, mintSelectCapability } from "./select-admission.mjs";
 import { senderRole } from "./sender-roles.mjs";
 import { resolveEndpointDir, loadLedger, ownerSelectReaffirmRequestKey, ID_SHAPE, OM_SHAPE, familyOf, activate, anchor, rebindSessionAlias } from "./topic-agent-ledger.mjs";
+import { CHAT_SHAPE, ENDPOINT_SHAPE } from "./shapes.mjs";
 import { cleanReaffirmIntent, foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
 import { readSelectionPlan, recoverSelectionPlanTmp } from "./selection-plan.mjs";
@@ -117,10 +118,20 @@ export function dispatchControlRepair(target, { onMode, onSelect = null } = {}, 
     //   endpoint，任一读不出或与 claim 的 selection_context 不符 → 拒（context_missing / sender_mismatch / endpoint_mismatch），不铸 capability。
     const ownerCtx = ctx?.ownerContext ?? null;
     if (!ownerCtx) return { ok: false, reason: "select_repair_context_missing", why: "select 支 repair 拿不到完整受验角色表/chat/endpoint（链路模板读不出或缺 owner/agent_uid 字段）——不铸 capability" };
+    // R57d 返修五 P1-2：chat 与 endpoint 的**合法形状是前置**，不是可选比较项。
+    //   旧码写 `ownerCtx.chatId != null && …`：拿 `{chatId:null, endpoint:null}` 就把两道交叉核验全跳过，
+    //   直接铸 capability。形状不合（含 null / 空 / 非字符串）→ 一律 select_repair_context_missing。
+    if (typeof ownerCtx.chatId !== "string" || !CHAT_SHAPE.test(ownerCtx.chatId)) {
+      return { ok: false, reason: "select_repair_context_missing", why: "repair 拿不到合法的 chat（须 oc_ 形状）：" + JSON.stringify(ownerCtx.chatId ?? null) };
+    }
+    if (typeof ownerCtx.endpoint !== "string" || !ENDPOINT_SHAPE.test(ownerCtx.endpoint)) {
+      return { ok: false, reason: "select_repair_context_missing", why: "repair 拿不到合法的 endpoint（须 endpoint_<24hex> 形状）：" + JSON.stringify(ownerCtx.endpoint ?? null) };
+    }
     const role = senderRole({ frank_sender_id: ownerCtx.frankSenderId, senders: ownerCtx.senders ?? [] }, sc.sender);
     if (role !== "owner") return { ok: false, reason: "select_sender_mismatch", why: "repair 重核角色：claim 登记的 sender 当前不是 owner（角色=" + String(role) + "）" };
-    if (ownerCtx.chatId != null && sc.chat !== ownerCtx.chatId) return { ok: false, reason: "select_sender_mismatch", why: "repair 重核 chat：claim 的 chat（" + sc.chat + "）与当前链路登记（" + ownerCtx.chatId + "）不一致" };
-    if (ownerCtx.endpoint != null && sc.endpoint !== ownerCtx.endpoint) return { ok: false, reason: "select_endpoint_mismatch", why: "repair 重核 endpoint：claim 的 endpoint（" + sc.endpoint + "）与当前链路派生（" + ownerCtx.endpoint + "）不一致" };
+    // 形状过了就**无条件逐字比**（不再有“缺席就跳过”的分支）。
+    if (sc.chat !== ownerCtx.chatId) return { ok: false, reason: "select_sender_mismatch", why: "repair 重核 chat：claim 的 chat（" + sc.chat + "）与当前链路登记（" + ownerCtx.chatId + "）不一致" };
+    if (sc.endpoint !== ownerCtx.endpoint) return { ok: false, reason: "select_endpoint_mismatch", why: "repair 重核 endpoint：claim 的 endpoint（" + sc.endpoint + "）与当前链路派生（" + ownerCtx.endpoint + "）不一致" };
     return executeSelectControl(target, {
       endpointId: sc.endpoint,
       chatId: sc.chat,

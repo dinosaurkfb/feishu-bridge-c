@@ -1,6 +1,6 @@
 /**
  * R57b 返修六 P2：形状常量叶子模块（无上层依赖）。
- *   把 selection-plan 与账本模块共用的形状常量下沉到这里——selection-plan 不反向依赖大账本模块，
+ *   把 selection-plan / control-command / repair 与账本模块共用的形状常量下沉到这里——selection-plan 不反向依赖大账本模块，
  *   是真叶子；topic-agent-ledger 从这里 import 并 re-export（保持既有导出面不变）。
  *
  *   ID_SHAPE / SELECTION_HANDLE_SHAPE / REBIND_HANDLE_SHAPE / REAFFIRM_HANDLE_SHAPE 为账本与
@@ -18,3 +18,7 @@ export const REBIND_HANDLE_SHAPE = /^orh_[0-9a-f]{32}$/u;
 export const REAFFIRM_HANDLE_SHAPE = /^rfh_[0-9a-f]{32}$/u;
 /** control claim 主键：64hex（与 control claim 用同一形状常量，防路径型 key 越界）。 */
 export const CLAIM_KEY_SHAPE = /^[0-9a-f]{64}$/u;
+/** 端点 id：endpoint_ + 24hex（= legacyEndpointId = stableControlId("endpoint",…)）。 */
+export const ENDPOINT_SHAPE = /^endpoint_[0-9a-f]{24}$/u;
+/** 受验群 chat_id：oc_ + 1..120 字。 */
+export const CHAT_SHAPE = /^oc_[A-Za-z0-9]{1,120}$/u;

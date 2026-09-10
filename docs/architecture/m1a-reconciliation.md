@@ -21,7 +21,7 @@
 - **严格读取**：任一在场文件读不出 / JSON 坏 / `validateTopicGenerationState` 不过 →
   `{ ok:false, reason:"legacy_unreadable", source }`；
 - **双投影**（同一 binding_id 两次）→ `{ ok:false, reason:"legacy_conflict" }`；
-- **严格 target 采集**：binding_target 全字段受验：Claude 形态支持三态（UUID 字符串 = 会话级目标；`null` = 项目级目标，会话未选；字段整体缺席 / 不全 / 非受验值 → 该代际列待修 `target_incomplete`，绝不临时选目标或填默认值；由持有真实本地 Claude UUID 的显式 retarget 补；owner_select 的 Aily session 不能填这个字段）；Codex 需逐项受验 root/task/thread，缺任一 → 该代际列待修 `target_incomplete`。
+- **严格 target 采集**：binding_target 全字段受验：Claude 形态支持三态（UUID 字符串 = 会话级目标；**键缺席**（源对象没有 claude_session_id 键）= 合法项目级 `null`（complete:true）；**键在但为 null 或非 UUID** = `target_incomplete`，绝不临时选目标或填默认值；由持有真实本地 Claude UUID 的显式 retarget 补；owner_select 的 Aily session 不能填这个字段）；Codex 需逐项受验 root/task/thread，缺任一 → 该代际列待修 `target_incomplete`。
 
 **`collectCodexLegacySnapshot({ home, now })`**：只读 Codex task registry（`mappingForTask`
 物化：binding_id=`<taskId>@codex-registry`、status、session_id、inbound_state、pending_token）；

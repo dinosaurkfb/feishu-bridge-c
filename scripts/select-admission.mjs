@@ -471,7 +471,9 @@ export function executeSelectControl(intent, {
         ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.aliases?.root_om ?? null, selection_handle: actualHandle }
         : action === "anchor"
           ? { selected_session_id: eventSessionId ?? null, selected_root_om: target.anchor_candidate ?? null, expected_handle: (handle ?? target.selection_handle) ?? null, expected_expires_at: target.handle_expires_at ?? null, expected_anchor_candidate: target.anchor_candidate ?? null }
-          : { new_session_id: eventSessionId ?? null, expected_old_session_id: target.aliases?.session_id ?? null, rebind_handle: (handle ?? target.rebind_handle) ?? null, expected_expires_at: target.rebind_expires_at ?? null },
+          // R57d 返修六 P1-1：rebind 的 result 投影里**有** selected_root_om（= 现场 B3 的 aliases.root_om），
+          //   所以按 (a) 把 expected_root_om 纳入 CAS —— repair 才能核「plan 时看到的 root」与「提交时的 root」一致。
+          : { new_session_id: eventSessionId ?? null, expected_old_session_id: target.aliases?.session_id ?? null, expected_root_om: target.aliases?.root_om ?? null, rebind_handle: (handle ?? target.rebind_handle) ?? null, expected_expires_at: target.rebind_expires_at ?? null },
     };
     planRefVal = planRefDigest(plan);
     // R57d 对齐 P1-4：plan 走 writeSelectionPlan sidecar（R57b 同一写原语：硬链接发布 + 受验读回 + 复用/冲突），

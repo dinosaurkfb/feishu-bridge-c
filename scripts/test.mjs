@@ -46360,7 +46360,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const doc = TAL.loadLedger(dir, { endpointId: EP57D }).doc;
       const op = Object.values(doc.operations).find((o) => o.op_type === "rebind_session_alias" && o.result?.selection_message_id === "om_f6rb");
       assert.ok(op, "② 补上的 rebind op");
-      assert.equal(op.result.selected_session_id, SESSION_D + "-r_b", "② 换绑到事件会话");
+      assert.equal(op.result.selected_session_id, SESSION_D + "-f6rb", "② 换绑到事件会话");
     }
     // ③ root 漂移：plan 的 expected_root_om 与账本 op 的 result.selected_root_om 不一致 → 不闭合
     {
@@ -46658,7 +46658,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       assert.notEqual(SP.selectionPlanProblem({ ...base, action: "rebind" }, keyC), null, "(c) osh + rebind 动作拒");
       assert.notEqual(SP.selectionPlanProblem({ ...base, action: "reaffirm" }, keyC), null, "(c) osh + reaffirm 动作拒");
       const orh = { ...base, kind: "orh", handle: "orh_" + "1".repeat(32), action: "rebind", basis: "rebind",
-        cas: { new_session_id: SESSION_D + "-n", expected_old_session_id: SESSION_D, rebind_handle: "orh_" + "1".repeat(32), expected_expires_at: "2099-01-01T00:00:00.000Z" } };
+        cas: { new_session_id: SESSION_D + "-n", expected_old_session_id: SESSION_D, expected_root_om: "om_b1root", rebind_handle: "orh_" + "1".repeat(32), expected_expires_at: "2099-01-01T00:00:00.000Z" } };
       assert.equal(SP.selectionPlanProblem(orh, keyC), null, "(c) 合法 orh plan 过校验器");
       assert.notEqual(SP.selectionPlanProblem({ ...orh, action: "activate", basis: "explicit_handle" }, keyC), null, "(c) orh + activate 动作拒");
     }

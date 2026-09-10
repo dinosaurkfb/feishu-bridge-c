@@ -282,7 +282,8 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
     if (o.result?.new_session_id !== plan.cas.new_session_id) return "new_session_id 与 plan.cas 不一致";
     if (o.result?.old_session_id !== plan.cas.expected_old_session_id) return "old_session_id 与 plan.cas 不一致";
     if (o.result?.selected_session_id !== plan.cas.new_session_id) return "result.selected_session_id 与 plan.cas.new_session_id 不一致";
-    if (o.result?.selected_root_om !== plan.cas.selected_root_om) return "result.selected_root_om 与 plan.cas 不一致";
+    // R57d 返修六 P1-1：rebind 的 CAS 里是 expected_root_om（result 投影是 selected_root_om）。
+    if (o.result?.selected_root_om !== plan.cas.expected_root_om) return "result.selected_root_om 与 plan.cas.expected_root_om 不一致";
     // P1-C：rebind 旧码漏了「消费的 handle」。
     if (o.result?.selection_handle !== plan.cas.rebind_handle) return "result.selection_handle（消费的 handle）与 plan.cas.rebind_handle 不一致";
     const expectR = { request_key: wantKey.request_key, topic_agent_id: plan.target_id, old_session_id: plan.cas.expected_old_session_id, new_session_id: plan.cas.new_session_id, rebind_handle: plan.cas.rebind_handle, expected_expires_at: plan.cas.expected_expires_at, selection_message_id: sc.message };

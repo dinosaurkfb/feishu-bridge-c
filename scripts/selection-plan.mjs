@@ -48,7 +48,7 @@ const keysOf = (o) => Object.keys(o).sort().join(",");
 const PLAN_CAS_KEYS = Object.freeze({
   activate: "selected_root_om,selected_session_id,selection_handle",
   anchor: "expected_anchor_candidate,expected_expires_at,expected_handle,selected_root_om,selected_session_id",
-  rebind: "expected_expires_at,expected_old_session_id,new_session_id,rebind_handle",
+  rebind: "expected_expires_at,expected_old_session_id,expected_root_om,new_session_id,rebind_handle",
   reaffirm: "expected_expires_at,intent_id",
 });
 /** handle 形状按 kind 映射（形状常量住 shapes.mjs，同一形状只有一份）。 */

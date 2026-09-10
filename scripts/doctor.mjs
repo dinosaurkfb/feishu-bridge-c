@@ -997,13 +997,13 @@ function firstDanglingSymlinkInChain(root, target, realRoot = null) {
       const countText = rec.endpoints.filter((e) => e.counts !== null)
         .map((e) => e.endpointId.slice(0, 16) + "（" + e.counts.schema_version + "：legacy " + e.counts.legacy_proof_count + " / null-B1 " + e.counts.null_b1_count + "）").join("、");
       const body = (rec.summary.total === 0 && rec.chain.state === null && rec.chain.problems.length === 0 && rec.chain.unclear === null)
-        ? "没有 initDone 的 endpoint（接入账本后出现）；" + rec.intentNote
+        ? "没有 initDone 的 endpoint（接入账本后出现）" + (rec.intentNote ? "；" + rec.intentNote : "")
         : (rec.notApplicable ? rec.notApplicable + "；" : "") + "对账 " + rec.summary.total + " 个：" + (parts.join("、") || "无") +
           (epProblems.length ? "；问题：" + epProblems.slice(0, 3).join("；") : "") +
           "；状态链：" + chainText +
           (countText ? "；存量计数：" + countText : "") +
           (rec.chain.note ? "；" + rec.chain.note : "") +
-          "；" + rec.intentNote;
+          (rec.intentNote ? "；" + rec.intentNote : "");
       const hasBlock = rec.summary.block > 0 || rec.chain.problems.length > 0;
       const hasUnclear = rec.summary.unclear > 0 || rec.chain.unclear !== null;
       // P2-6：项名不硬编码 ⑰——编号在 R54 ⑯（#141）合并后核对

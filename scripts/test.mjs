@@ -41956,7 +41956,7 @@ test("R56 ⑰ 绿：两 ep strict 无存量 + campaign complete + writer on → 
   assert.equal(c.ok, true, c.detail);
   assert.match(c.detail, /对账 2 个：绿 2/u, "桶之和 = 总数（2 = 2）：" + c.detail);
   assert.match(c.detail, /状态链：on/u, c.detail);
-  assert.match(c.detail, /intent 未纳入/u, c.detail);
+  assert.match(c.detail, /intent：已对账 0 条（过期 0、失效 0）/u, "R62：无 intent 文件 → 计数 0：" + c.detail);
 });
 
 test("R56 ⑰ block：strict 存量非零 / writer on 而 campaign 未 complete / campaign 多出未 initDone ep / handle 重复 / 有 handle 无到期", () => {
@@ -42332,6 +42332,199 @@ test("R56 返修二 P2-5：doctor 真入口——账本路径是 FIFO → 不挂
   assert.ok(Date.now() - t0 < 30000, "不挂");
   assert.equal(c.ok, false, c.detail);
   assert.match(c.detail, /查不清 1/u, "FIFO → 该 endpoint 查不清：" + c.detail);
+});
+
+// ── R62：doctor ⑰ 纳入 reaffirm intent store 对账（设计稿 §9「handle 卫生」intent 部分；只读）──
+
+/** R62 夹具：strict 1.1 账本，每 ep 一条 owner_select B3 + 同笔 A1 tombstone（照 R57b 已验夹具缩小版）；
+ *  reaffirmByEp[ep] 给出 rfh_ 时，追加同笔 reaffirm op 并把 B3 的 proof/origin 换到新闭包（rfh_ 入账本 proof）。 */
+const r62PlantB3 = (m, { reaffirmByEp = {} } = {}) => {
+  for (const [i, ep] of R56_EPS.entries()) {
+    fs.mkdirSync(path.join(m.ledgerDir, ep), { recursive: true, mode: 0o700 });
+    const b3 = r56Id(i);
+    const a1t = r56Id(i + 8);
+    const actOp = "00000000-0000-4000-8000-0000000002a" + (i + 1);
+    const osh = "osh_" + "a".repeat(32);
+    const six = { authorized_by: "ou_owner62", authorized_at: R56_T0, selected_session_id: "sess-r62-" + i, selected_root_om: "om_r62a" + i };
+    const doc = { schema_version: "1.1", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: ep, chain: "claude", authority_mode: "shadow", revision: 3, operations: {
+      "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r62_init_" + i, fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      "00000000-0000-4000-8000-0000000001a2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r62_up_" + i, fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r62_up_" + i, endpoint: ep, from_schema: "1.0", to_schema: "1.1" }), result_revision: 2, result: { endpoint: ep, from_schema: "1.0", to_schema: "1.1" } },
+      [actOp]: { op_type: "activate", terminal_kind: "activate", request_key: "r62_act_" + i, fingerprint: TAL.fingerprintOf("activate", { request_key: "r62_act_" + i, b1_id: b3, a1_id: a1t, matched_om: six.selected_root_om }), result_revision: 3, result: { surviving_id: b3, tombstoned_id: a1t, demoted_historical_id: null, authorized_by: six.authorized_by, authorized_at: six.authorized_at, selected_session_id: six.selected_session_id, selected_root_om: six.selected_root_om, selection_handle: osh, selection_operation_id: actOp, selection_basis: "explicit_handle", selection_message_id: "om_r62m" + i, affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }] } },
+    }, records: {
+      [b3]: { kind: "live", topic_agent_id: b3, chat_id: "oc_r62", aliases: { session_id: six.selected_session_id, root_om: six.selected_root_om }, facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, binding_target: { runtime: "claude", project_root: "/p/r62", claude_session_id: "00000000-0000-4000-8000-" + String(i).padStart(12, "0") }, binding_proof: { kind: "owner_select_v1", ...six, selection_handle: osh, selection_operation_id: actOp }, locator_link_proof_ref: { kind: "owner_selected_route_v1", authorized_by: six.authorized_by, authorized_at: six.authorized_at, by_identity: "owner_authorization", selected_session_id: six.selected_session_id, selected_root_om: six.selected_root_om, selection_handle: osh, selection_operation_id: actOp }, generation_lineage_id: "lin_r62_" + i, anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: actOp, created_at: R56_T0, updated_at: R56_T0 },
+      [a1t]: { kind: "forwarding_tombstone", topic_agent_id: a1t, forwards_to: b3, merged_at: R56_T0, proof_ref: { kind: "owner_select_merge_v1", selection_operation_id: actOp, selected_root_om: six.selected_root_om, selection_handle: osh }, origin_operation_id: actOp },
+    } };
+    fs.writeFileSync(path.join(m.ledgerDir, ep, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    const rfh = reaffirmByEp[ep];
+    if (rfh !== undefined) {
+      const reOp = "00000000-0000-4000-8000-0000000003a" + (i + 1);
+      const nbp = { kind: "owner_select_v1", authorized_by: six.authorized_by, authorized_at: six.authorized_at, selected_session_id: six.selected_session_id, selected_root_om: six.selected_root_om, selection_handle: rfh, selection_operation_id: reOp };
+      const nlp = { kind: "owner_selected_route_v1", authorized_by: six.authorized_by, authorized_at: six.authorized_at, by_identity: "owner_authorization", selected_session_id: six.selected_session_id, selected_root_om: six.selected_root_om, selection_handle: rfh, selection_operation_id: reOp };
+      doc.revision = 4;
+      doc.operations[reOp] = { op_type: "owner_select_reaffirm", terminal_kind: "owner_select_reaffirm", request_key: "osr:" + b3 + ":" + rfh, fingerprint: TAL.fingerprintOf("owner_select_reaffirm", { request_key: "osr:" + b3 + ":" + rfh, target_id: b3, reaffirm_handle: rfh, expected_old_proof_closure_digest: "c".repeat(64), selected_session_id: six.selected_session_id, selected_root_om: six.selected_root_om, selection_message_id: "om_r62r" + i }), result_revision: 4, result: { target_id: b3, affected_live_ids_after_commit: [b3], proof_effects: [{ topic_agent_id: b3, binding_effect: "produced", link_effect: "produced" }], new_binding_proof: nbp, new_link_proof: nlp, tombstone_remap: [], selection_message_id: "om_r62r" + i } };
+      const b3rec = doc.records[b3];
+      b3rec.binding_proof = nbp;
+      b3rec.locator_link_proof_ref = nlp;
+      b3rec.origin_operation_id = reOp;
+      fs.writeFileSync(path.join(m.ledgerDir, ep, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    }
+    const v = TAL.validateLedger(doc, { endpointId: ep });
+    assert.equal(v.ok, true, "R62 夹具账本自洽（" + ep.slice(0, 16) + "）：" + JSON.stringify(v));
+    const { doc: jdoc } = r56InitJournal(ep);
+    fs.writeFileSync(path.join(m.maintDir, jdoc.token + ".json"), JSON.stringify(jdoc, null, 2) + "\n", { mode: 0o600 });
+  }
+};
+/** R62 夹具：封闭 schema 的 intent entry（默认未过期；expires_at 恒 = issued_at + TTL，过闸 reaffirmIntentsProblem）。 */
+const r62Intent = (ep, targetId, over = {}) => {
+  const issued = over.issued_at ?? "2099-01-01T10:00:00.000Z";
+  return {
+    reaffirm_handle: "rfh_" + "b".repeat(32),
+    target_id: targetId,
+    target_family: "B3",
+    authorized_owner: "ou_owner62",
+    chat_id: "oc_r62",
+    endpoint: ep,
+    issued_at: issued,
+    expires_at: new Date(Date.parse(issued) + TAL.OWNER_SELECT_REAFFIRM_TTL_MS).toISOString(),
+    expected_old_proof_closure_digest: "c".repeat(64),
+    ...over,
+  };
+};
+const r62WriteIntents = (m, ep, entries) => {
+  const doc = { schema_version: RI.REAFFIRM_INTENTS_SCHEMA, entries: Object.fromEntries(entries.map((e) => [e.reaffirm_handle, e])) };
+  fs.writeFileSync(path.join(m.ledgerDir, ep, "reaffirm-intents.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+};
+/** R62：按夹具账本现态复算闭包摘要（"与签发时一致"的 intent 该填的值）。 */
+const r62Digest = (m, ep, targetId) => TAL.ownerSelectReaffirmClosureDigest(JSON.parse(fs.readFileSync(path.join(m.ledgerDir, ep, "ledger.json"), "utf-8")), targetId);
+
+test("R62 ⑰ 绿：两 ep strict + 每 ep 一条匹配 live 的 intent → 全绿、intent 汇总「共 2 条（过期 0）」、正文无 rfh_", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { expected_old_proof_closure_digest: r62Digest(m, R56_EPS[0], r56Id(0)) })]);
+  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1), { expected_old_proof_closure_digest: r62Digest(m, R56_EPS[1], r56Id(1)) })]);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, c.detail);
+  assert.match(c.detail, /intent：已对账 2 条（过期 0、失效 0）/u, "intent 汇总文案：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "桶之和 = 总数：" + c.detail);
+  assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "正文不输出 intent handle：" + c.detail);
+});
+
+test("R62 ⑰ 缺席：不建 intent 文件 → intent：共 0 条，不影响绿", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, c.detail);
+  assert.match(c.detail, /intent：已对账 0 条（过期 0、失效 0）/u, "缺席 = 计数 0：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "缺席不影响绿：" + c.detail);
+});
+
+test("R62 ⑰ block 五支：悬挂 / 族不一致 / endpoint 不一致 / 同目标多条 / rfh 与账本 handle 撞车 → 各自 block 点名且正文无 rfh_", () => {
+  // (a) 悬挂：intent 目标不在 live
+  let m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(9))]);
+  let c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /intent 悬挂：目标 [0-9a-z_]+ 不在 live/u, "(a) 悬挂点名：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 1、block 1/u, "(a) 桶之和 = 总数：" + c.detail);
+  assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "(a) 正文无 rfh_：" + c.detail);
+  // (b) 族不一致：intent B4 vs 账本 B3
+  m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { target_family: "B4" })]);
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /intent 族不一致：目标 [0-9a-z_]+（intent B4 \/ 账本 B3）/u, "(b) 族不一致点名：" + c.detail);
+  assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "(b) 正文无 rfh_：" + c.detail);
+  // (c) endpoint 不一致：entry 写在 ep0 的 store 里、endpoint 字段却是 ep1
+  m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[1], r56Id(0))]);
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /intent 记错 endpoint：目标 [0-9a-z_]+/u, "(c) endpoint 不一致点名：" + c.detail);
+  // (d) 同目标两条 intent
+  m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [
+    r62Intent(R56_EPS[0], r56Id(0), { reaffirm_handle: "rfh_" + "b".repeat(32) }),
+    r62Intent(R56_EPS[0], r56Id(0), { reaffirm_handle: "rfh_" + "d".repeat(32) }),
+  ]);
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /同一目标多条 intent：[0-9a-z_]+ × 2/u, "(d) 同目标多条点名：" + c.detail);
+  // (e) rfh_ 与账本内 handle 字面撞车（账本 proof 里已有同一把 rfh_——由同笔 reaffirm 产出，账本自洽）
+  m = doctorMachine();
+  r62PlantB3(m, { reaffirmByEp: { [R56_EPS[0]]: "rfh_" + "c".repeat(32) } });
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { reaffirm_handle: "rfh_" + "c".repeat(32) })]);
+  c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /intent handle 与账本 handle 撞车：目标 [0-9a-z_]+/u, "(e) 撞车点名：" + c.detail);
+  assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "(e) 正文无 rfh_（脱敏后仍点名撞车）：" + c.detail);
+});
+
+test("R62 ⑰ 过期只计数不 block：expires_at ≤ now → ok:true、过期 1、桶不 block", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { issued_at: "2020-01-01T00:00:00.000Z", expected_old_proof_closure_digest: r62Digest(m, R56_EPS[0], r56Id(0)) })]);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, "过期是合法中间态（下次签发锁内清理），不 block：" + c.detail);
+  assert.match(c.detail, /intent：已对账 1 条（过期 1、失效 0）/u, "过期进计数：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "不进 block 桶：" + c.detail);
+});
+
+test("R62 ⑰ unclear：intent 文件 0644 → 该 endpoint 查不清（intent store 读不出），不进 block；intent 汇总报 k 个读不出", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0))]);
+  fs.chmodSync(path.join(m.ledgerDir, R56_EPS[0], "reaffirm-intents.json"), 0o644);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /查不清/u, "读不出 → 查不清：" + c.detail);
+  assert.match(c.detail, /intent store 读不出/u, "点名 intent store：" + c.detail);
+  assert.match(c.detail, /查不清 1/u, "进 unclear 桶：" + c.detail);
+  assert.doesNotMatch(c.detail, /block 1/u, "不进 block 桶：" + c.detail);
+  assert.doesNotMatch(c.detail, /失败无回执/u, "绝不折成「无 intent/缺回执」：" + c.detail);
+  assert.match(c.detail, /intent：已对账 0 条（过期 0、失效 0），另 1 个 endpoint 未对账/u, "intent 汇总报未对账：" + c.detail);
+});
+
+test("R62 返修一 T6：intent chat_id 与 live.chat_id 不一致 → block 点名（消费侧必然 chat_mismatch 的 intent 不再报绿）", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { chat_id: "oc_r62other", expected_old_proof_closure_digest: r62Digest(m, R56_EPS[0], r56Id(0)) })]);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, c.detail);
+  assert.match(c.detail, /intent chat 不一致：目标 [0-9a-z_]+/u, "chat 不一致点名：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 1、block 1/u, "桶之和 = 总数：" + c.detail);
+  assert.doesNotMatch(c.detail, /rfh_[0-9a-f]{4}/u, "正文无 rfh_：" + c.detail);
+});
+
+test("R62 返修一 T7：闭包摘要与现账不符 → 失效（stale）只计数不 block；对照相符 → 失效 0", () => {
+  const m = doctorMachine();
+  r62PlantB3(m, { reaffirmByEp: { [R56_EPS[0]]: "rfh_" + "c".repeat(32) } });
+  const dGood = TAL.ownerSelectReaffirmClosureDigest(JSON.parse(fs.readFileSync(path.join(m.ledgerDir, R56_EPS[1], "ledger.json"), "utf-8")), r56Id(1));
+  assert.match(String(dGood), /^[0-9a-f]{64}$/u, "复算出合法摘要：" + String(dGood));
+  r62WriteIntents(m, R56_EPS[0], [r62Intent(R56_EPS[0], r56Id(0), { expected_old_proof_closure_digest: "d".repeat(64) })]); // ≠ 现闭包 → 失效
+  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1), { expected_old_proof_closure_digest: dGood })]); // = 现闭包 → 失效 0
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, true, "失效是合法中间态（到期/下次签发锁内自愈），不 block：" + c.detail);
+  assert.match(c.detail, /intent：已对账 2 条（过期 0、失效 1）/u, "失效进汇总计数：" + c.detail);
+  assert.match(c.detail, /对账 2 个：绿 2/u, "不进 block 桶：" + c.detail);
+});
+
+test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「已对账 1 条（…），另 1 个 endpoint 未对账」", () => {
+  const m = doctorMachine();
+  r62PlantB3(m);
+  // ep0 收据 conflict：同 ep 第二份 init（token 全量替换成合法第二笔）
+  const { doc: dup, tok: dupOrigTok } = r56InitJournal(R56_EPS[0]);
+  const dupTok = r56Uuid(5);
+  const dupText = JSON.stringify(dup).split(dupOrigTok).join(dupTok);
+  fs.writeFileSync(path.join(m.maintDir, dupTok + ".json"), JSON.stringify(JSON.parse(dupText), null, 2) + "\n", { mode: 0o600 });
+  r62WriteIntents(m, R56_EPS[1], [r62Intent(R56_EPS[1], r56Id(1), { expected_old_proof_closure_digest: r62Digest(m, R56_EPS[1], r56Id(1)) })]);
+  const c = checkOf(doctorReport(m.run()), "owner_select_reconcile");
+  assert.equal(c.ok, false, "conflict 仍查不清：" + c.detail);
+  assert.match(c.detail, /intent：已对账 1 条（过期 0、失效 0），另 1 个 endpoint 未对账/u, "未对账 endpoint 不再被藏住：" + c.detail);
+  assert.match(c.detail, /收据 conflict/u, "conflict 仍点名：" + c.detail);
 });
 
 

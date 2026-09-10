@@ -41961,6 +41961,38 @@ test("Codex #154 返修二 T3 末组件自身悬空：outbox 本身指不存在�
   assert.doesNotMatch(c3b.detail, /失败无回执/u, "对照：回执在 symlink 目标里 → 正常核对：" + c3b.detail);
 });
 
+test("#154 三轮 P2-1：realpath 首次 ENOENT、随后逐级复查全在 → 并发变化归查不清，不冒充「失败无回执」（fs 注入 --require 钩子）", () => {
+  const m = doctorMachine();
+  const root = m.project("r63cc", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({ projects: [{ id: "r63cc", root, root_message_id: "om_r63cc", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs"); fs.mkdirSync(runsDir, { recursive: true });
+  const ob = path.join(root, ".runtime-data", "outbound", "outbox"); fs.mkdirSync(ob, { recursive: true });
+  const key = r54Key(99);
+  const body = r58FailedBody(key, "API Error: 400 cc", ".runtime-data/outbound/outbox");
+  fs.writeFileSync(path.join(runsDir, key + ".forward.result.json"), body, { mode: 0o600 });
+  // 回执就在场（目录实际存在）——钩子只让首次 realpathSync(…/outbox) 报 ENOENT，模拟「核对期间才出现」
+  fs.writeFileSync(path.join(ob, key + R58_RECEIPT_SUFFIX), JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
+  const hook = path.join(root, "r63cc-hook.cjs");
+  fs.writeFileSync(hook, [
+    "const fs = require('node:fs');",
+    "const orig = fs.realpathSync;",
+    "let hit = false;",
+    "fs.realpathSync = function (p, ...a) {",
+    "  const s = String(p);",
+    "  if (!hit && s.endsWith('outbox') && s.includes('r63cc')) {",
+    "    hit = true;",
+    "    const e = new Error('ENOENT simulated by r63 test hook');",
+    "    e.code = 'ENOENT'; e.path = s; throw e;",
+    "  }",
+    "  return orig.call(fs, p, ...a);",
+    "};",
+  ].join("\n"), { mode: 0o600 });
+  const c = checkOf(doctorReport(m.run({ NODE_OPTIONS: "--require " + hook })), "inbound_forward_result");
+  assert.match(c.detail, /查不清/u, "并发变化 → 查不清：" + c.detail);
+  assert.match(c.detail, /期间发生变化/u, "点名核对期间变化：" + c.detail);
+  assert.doesNotMatch(c.detail, /失败无回执/u, "不许折成「核对过且没有」：" + c.detail);
+});
+
 // ── R56：doctor ⑰ owner_select 对账（设计稿 §9；只读）──
 
 const R56_T0 = "2026-09-07T10:00:00.000Z";

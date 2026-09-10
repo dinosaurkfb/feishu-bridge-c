@@ -735,6 +735,8 @@ export function runDoctor({
  * 只在 target 的 realpath 已经 ENOENT 时用：区分「目录真不存在」（→ 缺回执）与
  * 「父链指到不存在的地方或越出根」（→ 查不清，Codex #149 四轮 P2 / #154 返修一 P1、返修二 P1-1/P1-2）。
  * 末组件与中间组件同一套判定（#154 返修二 P1-2），唯一差别：末组件 lstat ENOENT = 目录真缺席（null）。
+ * 全链逐级都在（末组件 lstat 到了、可解析、在根内）却走到这里 → 不是缺席而是「刚刚还不在」
+ * —— 并发变化，返回 { reason: "concurrent_change" }（#154 三轮 P2-1）。
  */
 function firstDanglingSymlinkInChain(root, target, realRoot = null) {
   const rel = path.relative(root, target);
@@ -772,7 +774,8 @@ function firstDanglingSymlinkInChain(root, target, realRoot = null) {
       return { path: cur, reason: "outside_root", realPath: realCur };
     }
   }
-  return null;
+  // 能走完全链说明 target 现在确实存在——与调用点的 realpath ENOENT 合看，只可能是并发变化
+  return { path: target, reason: "concurrent_change" };
 }
 
 // ── ⑯ 入站转发结果：live_session 转发是 fire-and-forget（spawn 即回执），跑完的事实由
@@ -827,6 +830,9 @@ function firstDanglingSymlinkInChain(root, target, realRoot = null) {
             }
             if (dangling.reason === "dangling") {
               return { ok: false, why: "outbox_dir 父链有悬空 symlink（" + dangling.path + "），不冒充核对过" };
+            }
+            if (dangling.reason === "concurrent_change") {
+              return { ok: false, why: "outbox_dir 在核对期间发生变化（" + dangling.path + "），不冒充核对过" };
             }
             return { ok: false, why: "outbox_dir 父链中间组件异常（" + dangling.path + "），不冒充核对过" };
           }

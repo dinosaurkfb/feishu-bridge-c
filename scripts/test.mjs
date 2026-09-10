@@ -7840,6 +7840,39 @@ test("R60 返修二 P1-2c：createTestHarness 支持显式 filter: [] 关闭过�
   }
 });
 
+test("R60 返修二 P2：treeDriftProblem 校验路径、类型、大小、mode 与 sha——改既有文件一个字节即点名", () => {
+  // ① 纯函数级别：同路径同名，但文件大小/sha/mode 变更
+  const beforeFile = [{ path: "a/file.json", type: "file", size: 10, mode: 0o644, sha: "aaaa1111" }];
+  const afterSame = [{ path: "a/file.json", type: "file", size: 10, mode: 0o644, sha: "aaaa1111" }];
+  assert.equal(treeDriftProblem(beforeFile, afterSame), null, "同路径且属性/内容一致 → 没问题");
+
+  // 改写 1 字节（size 变或 sha 变）
+  const afterModified = [{ path: "a/file.json", type: "file", size: 11, mode: 0o644, sha: "bbbb2222" }];
+  const probMod = treeDriftProblem(beforeFile, afterModified);
+  assert.match(String(probMod), /变更|修改|不一致/u, "改写 1 字节必须点名：" + probMod);
+  assert.match(String(probMod), /a\/file\.json/u, "点名具体文件路径：" + probMod);
+
+  // 相同大小但内容 sha 变（例如改写一个字节但总长度不变）
+  const afterShaOnly = [{ path: "a/file.json", type: "file", size: 10, mode: 0o644, sha: "bbbb2222" }];
+  const probSha = treeDriftProblem(beforeFile, afterShaOnly);
+  assert.match(String(probSha), /变更|修改|不一致/u, "同大小但内容修改必须点名：" + probSha);
+
+  // mode 变更
+  const afterMode = [{ path: "a/file.json", type: "file", size: 10, mode: 0o777, sha: "aaaa1111" }];
+  const probMode = treeDriftProblem(beforeFile, afterMode);
+  assert.match(String(probMode), /变更|修改|不一致/u, "权限变更必须点名：" + probMode);
+
+  // 类型变更（文件变目录）
+  const afterType = [{ path: "a/file.json", type: "dir", size: 4096, mode: 0o755, sha: null }];
+  const probType = treeDriftProblem(beforeFile, afterType);
+  assert.match(String(probType), /变更|修改|不一致/u, "类型变更必须点名：" + probType);
+
+  // 向后兼容旧用法：纯路径字符串数组
+  assert.equal(treeDriftProblem(["x", "y"], ["x", "y"]), null, "向后兼容纯路径字符串相等");
+  assert.match(String(treeDriftProblem(["x"], ["x", "y"])), /新增/u, "向后兼容纯路径字符串新增");
+});
+
+
 test("R60 返修一 P2：证据层级改正——套件 HOME ≠ passwd home；passwd 路径由双临时 home 夹具单独证一次", () => {
   assert.notEqual(process.env.HOME, SUITE_HOME.passwdHome(), "套件 HOME ≠ passwd home（旧措辞把两者混为一谈）");
   const envHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60p2-envhome-")));

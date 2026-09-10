@@ -26,6 +26,7 @@
  * 那是合同里明说的唯一「汇总绿但 rc=1」情形。**验收除了 grep 汇总行，必须看退出码。**
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,16 +46,45 @@ const isAsyncFunction = (fn) =>
 let suiteInvariants = null;
 export function setSuiteInvariants(inv) { const prev = suiteInvariants; suiteInvariants = inv; return prev; }
 
-/** 绊线目录树漂移判定（纯函数，便于直接钉）：before/after 都是排序好的相对路径清单。 */
+/** 绊线目录树漂移判定：比对路径、类型、大小、mode 与小文件内容 sha */
 export function treeDriftProblem(before, after) {
-  const b = new Set(before);
-  const a = new Set(after);
-  const added = after.filter((x) => !b.has(x));
-  const removed = before.filter((x) => !a.has(x));
-  if (added.length === 0 && removed.length === 0) return null;
+  const norm = (item) => {
+    if (typeof item === "string") return { path: item };
+    return item;
+  };
+  const bList = (before ?? []).map(norm);
+  const aList = (after ?? []).map(norm);
+  const bMap = new Map(bList.map((x) => [x.path, x]));
+  const aMap = new Map(aList.map((x) => [x.path, x]));
+
+  const added = [];
+  const removed = [];
+  const modified = [];
+
+  for (const [p, aItem] of aMap.entries()) {
+    const bItem = bMap.get(p);
+    if (!bItem) {
+      added.push(p);
+    } else {
+      // R60 返修二 P2：比对「路径 + 类型 + 大小 + mode（+ 小文件内容 sha）」
+      const typeMismatch = aItem.type !== undefined && bItem.type !== undefined && aItem.type !== bItem.type;
+      const sizeMismatch = aItem.size !== undefined && bItem.size !== undefined && aItem.size !== bItem.size;
+      const modeMismatch = aItem.mode !== undefined && bItem.mode !== undefined && aItem.mode !== bItem.mode;
+      const shaMismatch = aItem.sha !== null && bItem.sha !== null && aItem.sha !== undefined && bItem.sha !== undefined && aItem.sha !== bItem.sha;
+      if (typeMismatch || sizeMismatch || modeMismatch || shaMismatch) {
+        modified.push(p);
+      }
+    }
+  }
+  for (const p of bMap.keys()) {
+    if (!aMap.has(p)) removed.push(p);
+  }
+
+  if (added.length === 0 && removed.length === 0 && modified.length === 0) return null;
   const parts = [];
   if (added.length > 0) parts.push("新增 " + added.slice(0, 5).join("、"));
   if (removed.length > 0) parts.push("消失 " + removed.slice(0, 5).join("、"));
+  if (modified.length > 0) parts.push("变更 " + modified.slice(0, 5).join("、"));
   return "套件绊线目录树与套件开始时不一致（" + parts.join("；") + "）";
 }
 
@@ -148,6 +178,7 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
     return rawMkdir(p, opts);
   };
   // 绊线树快照（汇总前核）：只盘绊线根，不盘套件 HOME 全体（临时产物本就该在套件 HOME 下）
+  // R60 返修二 P2：快照包含路径、类型、大小、mode 与小文件 sha 内容
   const snapshotTree = () => {
     const roots = [tripwire.ledger, tripwire.maintenance, tripwire.codexHome];
     const out = [];
@@ -156,14 +187,28 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
       try { names = fs.readdirSync(d); } catch { return; }
       for (const n of names) {
         const full = path.join(d, n);
-        out.push(path.relative(suiteHome, full));
         let st = null;
         try { st = fs.lstatSync(full); } catch { continue; }
+        const item = {
+          path: path.relative(suiteHome, full),
+          type: st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other",
+          size: st.size,
+          mode: st.mode & 0o7777,
+          sha: null,
+        };
+        if (st.isFile() && st.size <= 1024 * 1024) {
+          try {
+            item.sha = crypto.createHash("sha256").update(fs.readFileSync(full)).digest("hex");
+          } catch {
+            item.sha = null;
+          }
+        }
+        out.push(item);
         if (st.isDirectory()) walk(full);
       }
     };
     for (const r of roots) walk(r);
-    return out.sort();
+    return out.sort((a, b) => a.path.localeCompare(b.path));
   };
   const before = snapshotTree();
   const rawRm = fs.rmSync;
@@ -275,10 +320,10 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
       const invariantProblem = drift ?? treeHit;
       if (invariantProblem) {
         failedEnvDrift.push(name);
-        if (typeof suiteInvariants.restore === "function") suiteInvariants.restore();
-        if (typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree(); // 先点名再清：不让它级联污染后面的用例
+        if (suiteInvariants && typeof suiteInvariants.restore === "function") suiteInvariants.restore();
+        if (suiteInvariants && typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree(); // 先点名再清：不让它级联污染后面的用例
       } else {
-        if (typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree();
+        if (suiteInvariants && typeof suiteInvariants.cleanTree === "function") suiteInvariants.cleanTree();
       }
 
       if (threw) {

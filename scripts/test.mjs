@@ -49067,6 +49067,7 @@ fs.lstatSync = function(p, ...rest) {
 
     return {
       tmp, home, ledgerRoot, maintDir, gateFile, ep, epDir, regFile, tplFile, env,
+      frank_sender_id: tplData.frank_sender_id,
       cleanup: () => {
         for (const [k, v] of Object.entries(savedEnv)) {
           if (v === undefined) delete process.env[k];
@@ -49097,7 +49098,7 @@ fs.lstatSync = function(p, ...rest) {
   test("R65 T7: seedShadowEndpoint apply 后 reconcile 一致、blockers 空、doctor ⑭ 绿", () => {
     const fx = setupR65SeedFixture();
     try {
-      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: fx.frank_sender_id, env: fx.env });
       assert.ok(res.ok, JSON.stringify(res));
       assert.equal(res.mode, "apply");
       assert.equal(res.seeded.length, 2);
@@ -49136,7 +49137,7 @@ fs.lstatSync = function(p, ...rest) {
   test("R65 T9: 维护门开着 apply 拒（maintenance）", () => {
     const fx = setupR65SeedFixture({ gateOpen: true });
     try {
-      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: fx.frank_sender_id, env: fx.env });
       assert.equal(res.ok, false);
       assert.equal(res.reason, "maintenance");
     } finally {
@@ -49147,17 +49148,407 @@ fs.lstatSync = function(p, ...rest) {
   test("R65 T10: 重跑幂等（第二次 seeded 为空、revision 不变）", () => {
     const fx = setupR65SeedFixture();
     try {
-      const res1 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      const res1 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: fx.frank_sender_id, env: fx.env });
       assert.ok(res1.ok, JSON.stringify(res1));
       assert.equal(res1.seeded.length, 2);
       const rev1 = res1.revision;
 
-      const res2 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      const res2 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: fx.frank_sender_id, env: fx.env });
       assert.ok(res2.ok, JSON.stringify(res2));
       assert.equal(res2.seeded.length, 0);
       assert.equal(res2.revision, rev1, "重跑幂等 revision 不变");
     } finally {
       fx.cleanup();
+    }
+  });
+
+  test("R65 T11: validateLedger 校验器拒 UUID→null retarget op 历史账本（反例）且放行 null→UUID（对照）", () => {
+    const ep = "endpoint_" + "1".repeat(24);
+    const op1Id = "00000000-0000-0000-0000-000000000001";
+    const op2Id = "00000000-0000-0000-0000-000000000002";
+    const tid = "ta_" + "a".repeat(32);
+    const uuidTarget = { runtime: "claude", project_root: "/Users/test/proj", claude_session_id: "11111111-2222-4333-8444-555555555555" };
+    const nullTarget = { runtime: "claude", project_root: "/Users/test/proj", claude_session_id: null };
+    const iso = "2026-09-11T00:00:00.000Z";
+
+    // 1. 反例：UUID → null retarget 历史账本（全部 fingerprint/result/proof 自洽）
+    const reqKey1 = "rk_retarget_uuid_to_null";
+    const fp1 = TAL.fingerprintOf("retarget", { request_key: reqKey1, topic_agent_id: tid, old_target: uuidTarget, new_target: nullTarget });
+    const docBad = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_agent_ledger",
+      endpoint_id: ep,
+      chain: "claude",
+      authority_mode: "shadow",
+      revision: 2,
+      operations: {
+        [op1Id]: {
+          op_type: "initialize_shadow",
+          terminal_kind: "initialize_shadow",
+          request_key: "seed_init",
+          fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+          result_revision: 1,
+          result: { revision: 1 },
+        },
+        [op2Id]: {
+          op_type: "retarget",
+          terminal_kind: "retarget",
+          request_key: reqKey1,
+          fingerprint: fp1,
+          result_revision: 2,
+          result: {
+            affected_ids: [tid],
+            new_target: nullTarget,
+            old_target: uuidTarget,
+            unit: "record",
+          },
+        },
+      },
+      records: {
+        [tid]: {
+          kind: "live",
+          topic_agent_id: tid,
+          chat_id: "oc_" + "c".repeat(32),
+          aliases: { session_id: "sess_aily1", root_om: null },
+          facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+          binding_target: nullTarget,
+          binding_proof: {
+            kind: "retarget",
+            authorized_by: "ou_owner",
+            authorized_at: iso,
+            old_target: uuidTarget,
+            new_target: nullTarget,
+          },
+          locator_link_proof_ref: null,
+          anchor_candidate: null,
+          generation_lineage_id: null,
+          origin_operation_id: op2Id,
+          created_at: iso,
+          updated_at: iso,
+        },
+      },
+    };
+    const resBad = TAL.validateLedger(docBad, { endpointId: ep });
+    assert.equal(resBad.ok, false, "UUID→null 历史账本必须拒: " + JSON.stringify(resBad));
+    assert.match(resBad.why, /取消选定/u, "拒的文案必须含「取消选定」: " + resBad.why);
+
+    // 2. 对照：null → UUID 同款账本通过
+    const reqKey2 = "rk_retarget_null_to_uuid";
+    const fp2 = TAL.fingerprintOf("retarget", { request_key: reqKey2, topic_agent_id: tid, old_target: nullTarget, new_target: uuidTarget });
+    const docGood = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_agent_ledger",
+      endpoint_id: ep,
+      chain: "claude",
+      authority_mode: "shadow",
+      revision: 2,
+      operations: {
+        [op1Id]: {
+          op_type: "initialize_shadow",
+          terminal_kind: "initialize_shadow",
+          request_key: "seed_init",
+          fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+          result_revision: 1,
+          result: { revision: 1 },
+        },
+        [op2Id]: {
+          op_type: "retarget",
+          terminal_kind: "retarget",
+          request_key: reqKey2,
+          fingerprint: fp2,
+          result_revision: 2,
+          result: {
+            affected_ids: [tid],
+            new_target: uuidTarget,
+            old_target: nullTarget,
+            unit: "record",
+          },
+        },
+      },
+      records: {
+        [tid]: {
+          kind: "live",
+          topic_agent_id: tid,
+          chat_id: "oc_" + "c".repeat(32),
+          aliases: { session_id: "sess_aily1", root_om: null },
+          facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+          binding_target: uuidTarget,
+          binding_proof: {
+            kind: "retarget",
+            authorized_by: "ou_owner",
+            authorized_at: iso,
+            old_target: nullTarget,
+            new_target: uuidTarget,
+          },
+          locator_link_proof_ref: null,
+          anchor_candidate: null,
+          generation_lineage_id: null,
+          origin_operation_id: op2Id,
+          created_at: iso,
+          updated_at: iso,
+        },
+      },
+    };
+    const resGood = TAL.validateLedger(docGood, { endpointId: ep });
+    assert.equal(resGood.ok, true, "null→UUID 同款账本应通过: " + JSON.stringify(resGood));
+  });
+
+  test("R65 T12: seedShadowEndpoint 注入 committed_with_residue → 报 seeded_unclean 且非绿、账本已写入、下次预览差异为空", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const res = seedShadowEndpoint({
+        endpointId: fx.ep,
+        apply: true,
+        env: fx.env,
+        _inject: {
+          afterLedgerRename: () => {
+            fs.rmSync(path.join(fx.epDir, "ledger.lock"), { recursive: true, force: true });
+          },
+        },
+      });
+      assert.equal(res.ok, false, "committed_with_residue 必非绿: " + JSON.stringify(res));
+      assert.equal(res.status, "seeded_unclean");
+      assert.equal(res.commit, "committed_with_residue");
+      assert.match(res.why, /已写但收口不干净/u);
+
+      // 账本已写入（op 在场）
+      const loaded = TAL.loadByEndpoint(fx.ep, { env: fx.env });
+      assert.equal(loaded.ok, true);
+      const ops = Object.values(loaded.doc.operations);
+      const migOp = ops.find((o) => o.op_type === "migrate_seed");
+      assert.ok(migOp, "migrate_seed op 应在账本中");
+
+      // 下次预览候选为空（已写进账本）
+      const prev = seedShadowEndpoint({ endpointId: fx.ep, apply: false, env: fx.env });
+      assert.equal(prev.ok, true);
+      assert.equal(prev.candidateCount, 0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T13: seedShadowEndpoint 注入 outer 释放 lock_unreadable → 报 seeded_unclean、lock_state 非 released", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const res = seedShadowEndpoint({
+        endpointId: fx.ep,
+        apply: true,
+        env: fx.env,
+        _inject: {
+          outerRelease: () => ({ ok: false, reason: "lock_unreadable" }),
+        },
+      });
+      assert.equal(res.ok, false, "outer release 失败必非绿: " + JSON.stringify(res));
+      assert.equal(res.status, "seeded_unclean");
+      assert.notEqual(res.lock_state, "released");
+      assert.match(res.why, /已写但收口不干净/u);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T14: outer 锁被别的持有者占着 → apply 拒（reason 含 busy/unavailable）且零写入", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const ledgerPath = path.join(fx.epDir, "ledger.json");
+      const shaBefore = TAL.sha256(fs.readFileSync(ledgerPath));
+
+      const holder = DW.acquireOrderLock(fx.ep, fx.env);
+      assert.equal(holder.ok, true, "预先获取 outer 锁应成功");
+      try {
+        const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, env: fx.env });
+        assert.equal(res.ok, false, "outer 锁被占时 apply 必须拒: " + JSON.stringify(res));
+        assert.match(res.reason, /busy|unavailable/u, "reason 应含 busy 或 unavailable: " + res.reason);
+
+        const shaAfter = TAL.sha256(fs.readFileSync(ledgerPath));
+        assert.equal(shaBefore, shaAfter, "outer 锁被占必须零写入");
+      } finally {
+        holder.release();
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T15: authorized_by 不认 FEISHU_BRIDGE_SENDER_ID 环境变量；显式参数与模板不符时拒（bad_authorized_by）", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      // 1. env 里塞合法形状的 sender → 不被采用，审计仍归属链模板 frank_sender_id
+      const envWithSender = { ...fx.env, FEISHU_BRIDGE_SENDER_ID: "999999999" };
+      const res1 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, env: envWithSender });
+      assert.equal(res1.ok, true, "apply 应成功: " + JSON.stringify(res1));
+
+      const loaded = TAL.loadByEndpoint(fx.ep, { env: fx.env });
+      const migOp = Object.values(loaded.doc.operations).find((o) => o.op_type === "migrate_seed");
+      assert.ok(migOp);
+      assert.equal(migOp.result.authorized_by, fx.frank_sender_id, "审计归属必须取模板 frank_sender_id，不得取 env sender");
+      assert.notEqual(migOp.result.authorized_by, "999999999", "不得采用 env FEISHU_BRIDGE_SENDER_ID");
+
+      // 2. 显式 --authorized-by 与模板不等 → 拒（bad_authorized_by）
+      const fx2 = setupR65SeedFixture();
+      try {
+        const res2 = seedShadowEndpoint({ endpointId: fx2.ep, apply: true, authorizedBy: "888888888", env: fx2.env });
+        assert.equal(res2.ok, false, "与模板不等应被拒: " + JSON.stringify(res2));
+        assert.equal(res2.reason, "bad_authorized_by");
+      } finally {
+        fx2.cleanup();
+      }
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T16: 真 B4（read-only 历史代际 + active binding + Aily session + 无本地 UUID）走 seed → migrated 双证与 G13-mig 通过", () => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r65-b4-test-")));
+    const home = path.join(tmp, "home");
+    const ledgerRoot = path.join(tmp, "ledgers");
+    const maintDir = path.join(tmp, "maint");
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+
+    const ep = legacyEndpointId({ runtime: "claude", agentUid: "agent_r65_b4" });
+    const epDir = path.join(ledgerRoot, ep);
+    fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+
+    const bridgeDir = path.join(home, ".claude", "feishu-bridge");
+    fs.mkdirSync(bridgeDir, { recursive: true, mode: 0o700 });
+    const regFile = path.join(bridgeDir, "registry.json");
+    const tplFile = path.join(bridgeDir, "chain-config.json");
+    const tplData = {
+      chain: "claude",
+      transport_agent_name: "t",
+      transport_app_id: "cli_r65",
+      transport_open_id: "ou_r65_bot",
+      outbound_agent_name: "o",
+      outbound_app_id: "cli_r65_out",
+      outbound_open_id: "ou_r65_out",
+      lark_cli_profile: "p",
+      lark_cli_bin: "/bin/lark",
+      lark_cli_home: "/home/lark",
+      frank_sender_id: "123456789",
+      chat_name: "test_chat",
+      chat_id: "oc_" + "c".repeat(32),
+      default_freshness_ms: 1000,
+      agent_uid: "agent_r65_b4",
+    };
+    fs.writeFileSync(tplFile, JSON.stringify(tplData, null, 2) + "\n");
+
+    const proj = path.join(tmp, "p_b4");
+    fs.mkdirSync(path.join(proj, ".runtime-data", "inbound"), { recursive: true, mode: 0o700 });
+
+    // 真正构造一条 B4：read-only 历史代际 + active binding + Aily session + 无本地 UUID
+    const stateB4 = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_generations",
+      binding_id: "pb4@project-files",
+      binding_status: "active",
+      active_generation_id: "g_cur",
+      rotation: null,
+      generations: [
+        {
+          channel_generation_id: "g_hist_ro",
+          generation: 1,
+          status: "read-only",
+          root_message_id: "om_" + "4".repeat(10),
+          session_id: "sess_aily_hist",
+          pending_token: null,
+          claim_expires_at: null,
+          created_at: "2026-09-10T00:00:00.000Z",
+        },
+        {
+          channel_generation_id: "g_cur",
+          generation: 2,
+          status: "active",
+          root_message_id: "om_" + "5".repeat(10),
+          session_id: "sess_aily_cur",
+          pending_token: null,
+          claim_expires_at: null,
+          created_at: "2026-09-11T00:00:00.000Z",
+        },
+      ],
+    };
+    // 无 claude_session_id（项目级目标）
+    fs.writeFileSync(path.join(proj, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({
+      binding_id: "pb4@project-files",
+      status: "active",
+      root_message_id: "om_" + "5".repeat(10),
+      session_id: "sess_aily_cur",
+      channel_generation_id: "g_cur",
+      expires_at: "2099-01-01T00:00:00.000Z",
+      topic_generation_state: stateB4,
+    }));
+
+    fs.writeFileSync(regFile, JSON.stringify({
+      schema_version: "1.0",
+      projects: [{ root: proj, id: "pb4" }],
+    }));
+
+    // Seed init receipt
+    const at = "2026-08-31T12:00:00.000Z";
+    const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+    const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const enterDone = [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone()];
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    const docReceipt = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enterDone, ledgerStep], notes: [] };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(docReceipt), { mode: 0o600 });
+
+    const initOpId = "00000000-0000-0000-0000-000000000001";
+    const initOp = {
+      op_type: "initialize_shadow",
+      terminal_kind: "initialize_shadow",
+      request_key: "seed_init",
+      fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+      result_revision: 1,
+      result: { revision: 1 },
+    };
+    const shadowDoc = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_agent_ledger",
+      endpoint_id: ep,
+      chain: "claude",
+      authority_mode: "shadow",
+      revision: 1,
+      operations: { [initOpId]: initOp },
+      records: {},
+    };
+    fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(shadowDoc, null, 2) + "\n", { mode: 0o600 });
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile,
+      FEISHU_BRIDGE_REGISTRY: regFile,
+      FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot,
+      FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+    };
+
+    try {
+      const res = seedShadowEndpoint({ endpointId: ep, apply: true, env });
+      assert.equal(res.ok, true, "B4 seed 应成功: " + JSON.stringify(res));
+
+      const loaded = TAL.loadByEndpoint(ep, { env });
+      assert.equal(loaded.ok, true);
+      const b4Tid = topicAgentIdForLegacy(ep, "pb4@project-files", "g_hist_ro");
+      const b4Rec = loaded.doc.records[b4Tid];
+      assert.ok(b4Rec, "B4 记录应在账本中: " + b4Tid);
+      assert.equal(TAL.familyOf(b4Rec.facts), "B4", "facts 应判为 B4");
+      assert.equal(b4Rec.binding_target?.claude_session_id, null, "目标应为项目级（claude_session_id 为 null）");
+      assert.equal(b4Rec.binding_proof?.kind, "migrated", "binding_proof 必为 migrated");
+      assert.equal(b4Rec.locator_link_proof_ref?.kind, "migrated", "locator_link_proof_ref 必为 migrated");
+      assert.equal(b4Rec.binding_proof.migration_operation_id, b4Rec.locator_link_proof_ref.migration_operation_id, "migrated 两证同一 migration_operation_id");
+      assert.equal(b4Rec.binding_proof.legacy_source_digest, b4Rec.locator_link_proof_ref.legacy_source_digest, "migrated 两证同一 legacy_source_digest");
+
+      const v = TAL.validateLedger(loaded.doc, { endpointId: ep });
+      assert.equal(v.ok, true, "B4 记录的账本必须通过 validateLedger (G13-mig): " + JSON.stringify(v));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 }

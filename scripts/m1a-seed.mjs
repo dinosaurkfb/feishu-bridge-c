@@ -28,6 +28,7 @@ import {
 } from "./m1a/reconcile.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
+import { foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 
 /**
  * 派生 legacy 快照中各代际的 legacy_source_digest。
@@ -60,28 +61,27 @@ function collectFor(chain, env = process.env) {
   return collectCodexLegacySnapshot({ home: codexHome });
 }
 
-function resolveAuthorizedBy(authorizedBy, chain, env = process.env) {
-  if (typeof authorizedBy === "string" && AUTHORIZED_BY_SHAPE.test(authorizedBy)) {
-    return authorizedBy;
+export function resolveAuthorizedBy(authorizedBy, chain, env = process.env) {
+  const home = env.HOME ?? os.homedir();
+  const tplPath = env.FEISHU_BRIDGE_CHAIN_TEMPLATE ?? (
+    chain === "codex"
+      ? path.join(env.FEISHU_CODEX_BRIDGE_HOME ?? path.join(home, ".codex", "feishu-bridge"), "chain-config.json")
+      : path.join(home, ".claude", "feishu-bridge", "chain-config.json")
+  );
+  const tplRes = loadChainTemplate(tplPath);
+  if (!tplRes.ok || !tplRes.template?.frank_sender_id) {
+    return { ok: false, reason: "bad_authorized_by", why: "无法从链模板读取 frank_sender_id" };
   }
-  if (typeof env.FEISHU_BRIDGE_SENDER_ID === "string" && AUTHORIZED_BY_SHAPE.test(env.FEISHU_BRIDGE_SENDER_ID)) {
-    return env.FEISHU_BRIDGE_SENDER_ID;
+  const expected = tplRes.template.frank_sender_id;
+  if (!AUTHORIZED_BY_SHAPE.test(expected)) {
+    return { ok: false, reason: "bad_authorized_by", why: "链模板 frank_sender_id 形状非法" };
   }
-  try {
-    const home = env.HOME ?? os.homedir();
-    const tplPath = env.FEISHU_BRIDGE_CHAIN_TEMPLATE ?? (
-      chain === "codex"
-        ? path.join(env.FEISHU_CODEX_BRIDGE_HOME ?? path.join(home, ".codex", "feishu-bridge"), "chain-config.json")
-        : path.join(home, ".claude", "feishu-bridge", "chain-config.json")
-    );
-    if (fs.existsSync(tplPath)) {
-      const tpl = JSON.parse(fs.readFileSync(tplPath, "utf-8"));
-      if (typeof tpl?.frank_sender_id === "string" && AUTHORIZED_BY_SHAPE.test(tpl.frank_sender_id)) {
-        return tpl.frank_sender_id;
-      }
+  if (authorizedBy !== undefined && authorizedBy !== null) {
+    if (authorizedBy !== expected) {
+      return { ok: false, reason: "bad_authorized_by", why: `authorized-by (${authorizedBy}) 与链模板 frank_sender_id (${expected}) 不符` };
     }
-  } catch { /* fallback */ }
-  return null;
+  }
+  return { ok: true, authorizedBy: expected };
 }
 
 /**
@@ -97,6 +97,7 @@ export function seedShadowEndpoint({
   collectLegacy,
   loadLedgerFn,
   now = Date.now(),
+  _inject,
 } = {}) {
   if (!endpointId || typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) {
     return { ok: false, reason: "bad_endpoint_id", why: "endpointId 缺失或形状不对" };
@@ -162,6 +163,19 @@ export function seedShadowEndpoint({
     return { ok: false, reason: acq.reason ?? "outer_lock_unavailable", why: acq.why ?? acq.text };
   }
 
+  let outerReleased = false;
+  let outerReleaseRes = null;
+  const releaseOuter = () => {
+    if (outerReleased) return outerReleaseRes;
+    outerReleased = true;
+    try {
+      outerReleaseRes = _inject?.outerRelease ? _inject.outerRelease(acq) : acq.release();
+    } catch (err) {
+      outerReleaseRes = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) };
+    }
+    return outerReleaseRes;
+  };
+
   try {
     const L1 = loadLedgerFn ? loadLedgerFn() : loadByEndpoint(endpointId, { env });
     if (!L1.ok) return { ok: false, reason: "ledger_" + L1.reason, why: L1.why };
@@ -202,9 +216,31 @@ export function seedShadowEndpoint({
       if (!S.has(id)) toSeedIds.push(id);
     }
 
-    // P2-B already-consistent 短路：三类差异全空直接返回
+    // P2-B already-consistent 短路：三类差异全空直接返回，但同样要核 outer 释放
     if (toSeedIds.length === 0) {
-      return { ok: true, status: "already_consistent", mode: "apply", endpointId, seeded: [], revision: L1.doc.revision };
+      const rel = releaseOuter();
+      const lockState = foldLockReleaseState(rel);
+      if (lockState !== "released") {
+        const residue = rel?.reapUncleared?.path ?? (rel?.reason === "reap_uncleared" && rel?.path ? [rel.path] : []);
+        return {
+          ok: false,
+          status: "seeded_unclean",
+          reason: "seeded_unclean",
+          commit: "already_consistent",
+          residue: Array.isArray(residue) ? residue : [residue],
+          lock_state: lockState,
+          why: `已写但收口不干净（already_consistent/${lockState}）：不要重跑 apply，先 doctor`,
+        };
+      }
+      return {
+        ok: true,
+        status: "already_consistent",
+        mode: "apply",
+        endpointId,
+        seeded: [],
+        revision: L1.doc.revision,
+        lock_state: "released",
+      };
     }
 
     const digests = computeLegacyDigests(endpointId, S1);
@@ -235,24 +271,51 @@ export function seedShadowEndpoint({
       candidates.push(cand);
     }
 
-    const authBy = resolveAuthorizedBy(authorizedBy, chain, env);
-    if (!authBy || !AUTHORIZED_BY_SHAPE.test(authBy)) {
-      return { ok: false, reason: "bad_authorized_by", why: "authorizedBy 必须为合法 sender id" };
+    const authRes = resolveAuthorizedBy(authorizedBy, chain, env);
+    if (!authRes.ok) {
+      return { ok: false, reason: authRes.reason, why: authRes.why };
     }
+    const authBy = authRes.authorizedBy;
 
     const requestKey = crypto.randomUUID();
-    const seedRes = migrateSeed({ endpointId, requestKey, candidates, authorizedBy: authBy, env, now });
-    if (!seedRes.ok) {
+    const seedRes = migrateSeed({ endpointId, requestKey, candidates, authorizedBy: authBy, env, now, _inject });
+    if (!seedRes.ok && (!seedRes.commit || seedRes.commit === "not_committed")) {
       return { ok: false, reason: seedRes.reason, why: seedRes.why ?? "migrateSeed 写入失败" };
     }
 
     // 后置核验：必须 ok 且 cutover_blockers 空
-    const post = reconcileLegacyEndpoint({
-      endpointId,
-      chain: L1.doc.chain,
-      collectLegacy: () => S1,
-      loadLedgerFn: () => loadByEndpoint(endpointId, { env }),
-    });
+    let post = null;
+    if (seedRes.commit === "committed_clean") {
+      post = reconcileLegacyEndpoint({
+        endpointId,
+        chain: L1.doc.chain,
+        collectLegacy: () => S1,
+        loadLedgerFn: () => loadByEndpoint(endpointId, { env }),
+      });
+    }
+
+    const rel = releaseOuter();
+    const lockState = foldLockReleaseState(rel);
+
+    // 成功判据 = seedRes.ok && seedRes.commit === "committed_clean" && outer 释放结果折为 released 且 post-reconcile 通过
+    const isClean = seedRes.ok && seedRes.commit === "committed_clean" && lockState === "released";
+
+    if (!isClean) {
+      const allResidue = [
+        ...(Array.isArray(seedRes.residue) ? seedRes.residue : (seedRes.residue ? [seedRes.residue] : [])),
+        ...(rel?.reapUncleared?.path ? [rel.reapUncleared.path] : (rel?.reason === "reap_uncleared" && rel?.path ? [rel.path] : [])),
+      ];
+      return {
+        ok: false,
+        status: "seeded_unclean",
+        reason: "seeded_unclean",
+        commit: seedRes.commit ?? "not_committed",
+        residue: allResidue,
+        lock_state: lockState,
+        why: `已写但收口不干净（${seedRes.commit}/${lockState}）：不要重跑 apply，先 doctor`,
+      };
+    }
+
     if (!post.ok || (post.cutover_blockers?.length ?? 0) > 0) {
       return {
         ok: false,
@@ -260,18 +323,21 @@ export function seedShadowEndpoint({
         mismatches: post.mismatches,
         blockers: post.cutover_blockers,
         why: "后置对账未通过",
+        lock_state: lockState,
       };
     }
 
     return {
       ok: true,
+      status: "seeded_clean",
       mode: "apply",
       endpointId,
       seeded: seedRes.result.seeded,
       revision: seedRes.result?.revision ?? seedRes.revision,
+      lock_state: "released",
     };
   } finally {
-    acq.release();
+    releaseOuter();
   }
 }
 
@@ -318,6 +384,10 @@ if (isDirectRun(import.meta.url)) {
       process.exit(0);
     }
   } else {
+    if (res.status === "seeded_unclean") {
+      console.error(`[m1a-seed] 已写但收口不干净（${res.commit}/${res.lock_state}）：不要重跑 apply，先 doctor`);
+      process.exit(1);
+    }
     console.error(`[m1a-seed] 失败 (${res.reason}): ${res.why ?? ""}`);
     if (res.mismatches) {
       console.error("差异项:", JSON.stringify(res.mismatches, null, 2));

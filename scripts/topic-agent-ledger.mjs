@@ -388,6 +388,13 @@ export const targetProblem = (t) => {
   return null;
 };
 
+export const retargetDirectionProblem = (oldTarget, newTarget) => {
+  if (oldTarget?.runtime === "claude" && oldTarget.claude_session_id !== null && newTarget?.claude_session_id === null) {
+    return "会话不能被取消选定回项目级";
+  }
+  return null;
+};
+
 const matchedFieldsBad = (mf, pstate) => {
   if (pstate === "present") return !(Array.isArray(mf) && mf.length === 4 && mf.every((v, i) => v === MATCHED_FIELDS[i]));
   if (pstate === "absent") return !(Array.isArray(mf) && mf.length === 3 && mf.every((v, i) => v === F4_NO_TOKEN_FIELDS[i]));
@@ -411,6 +418,8 @@ const bindingProofProblem = (p, { schemaVersion = "1.0" } = {}) => {
   } else if (p.kind === "retarget") {
     if (keysOf(p) !== "authorized_at,authorized_by,kind,new_target,old_target") return "retarget proof 字段集不对";
     if (targetProblem(p.old_target) || targetProblem(p.new_target)) return "retarget old/new_target 形状不对";
+    const dirProblem = retargetDirectionProblem(p.old_target, p.new_target);
+    if (dirProblem !== null) return "retarget proof 方向不对：" + dirProblem;
   } else if (p.kind === "migrated") {
     if (keysOf(p) !== "authorized_at,authorized_by,kind,legacy_source_digest,migration_operation_id") return "migrated proof 字段集不对";
     if (typeof p.migration_operation_id !== "string" || !OP_ID_SHAPE.test(p.migration_operation_id)) return "migrated.migration_operation_id 形状不对";
@@ -919,6 +928,10 @@ function operationProblem(op, topRevision, { schemaVersion = "1.0", upgradeBound
   }
   if (op.op_type === "initialize_shadow" && op.result_revision !== 1) return "initialize 的 result_revision 必为 1";
   if (op.op_type === "authority_cutover" && op.result.revision_at_cutover !== op.result_revision) return "cutover 的 revision_at_cutover 必等于 result_revision";
+  if (op.op_type === "retarget") {
+    const dirProblem = retargetDirectionProblem(op.result?.old_target, op.result?.new_target);
+    if (dirProblem !== null) return "retarget 方向不对：" + dirProblem;
+  }
   return null;
 }
 
@@ -1228,6 +1241,8 @@ export function validateLedger(doc, { endpointId } = {}) {
     if (rec.binding_proof !== null && rec.binding_proof.kind === "retarget") {
       if (canonKey(rec.binding_proof.old_target) === canonKey(rec.binding_proof.new_target)) return bad("retarget proof old===new（G11）");
       if (canonKey(rec.binding_target) !== canonKey(rec.binding_proof.new_target)) return bad("当前 binding_target ≠ proof.new_target（G11）");
+      const dirProblem = retargetDirectionProblem(rec.binding_proof.old_target, rec.binding_proof.new_target);
+      if (dirProblem !== null) return bad("retarget proof 方向不对（G11）：" + dirProblem);
     }
     const bp = rec.binding_proof;
     const lp = rec.locator_link_proof_ref;
@@ -3505,8 +3520,9 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
       if (canonKey(oldTarget) !== canonKey(expectedOldTarget)) return { ok: false, reason: "cas_mismatch", why: "当前 target 与 expectedOldTarget 不符" };
       if (canonKey(oldTarget) === canonKey(newTarget)) return { ok: false, reason: "no_change" };
       if (newTarget.project_root !== oldTarget.project_root) return { ok: false, reason: "project_boundary" };
-      if (oldTarget.runtime === "claude" && oldTarget.claude_session_id !== null && newTarget.claude_session_id === null) {
-        return { ok: false, reason: "bad_target", why: "会话不能被取消选定回项目级" };
+      const dirProblem = retargetDirectionProblem(oldTarget, newTarget);
+      if (dirProblem !== null) {
+        return { ok: false, reason: "bad_target", why: dirProblem };
       }
       if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
       const lineage = rec.generation_lineage_id;

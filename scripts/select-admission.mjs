@@ -171,6 +171,8 @@ export function selectRejectTextByReason(reason) {
   if (reason === "no_a1") return "当前会话上没有待绑定的 A1 记录，无法完成绑定";
   if (reason === "cas_mismatch") return "选择与账本现场不符（记录可能已变动），请重新发起选择";
   if (reason === "handle_expired") return "这个 handle 已过期，未执行";
+  // R57d 返修七 P1-1：rebind 的 root CAS 单列 reason（结构性区分 root），文案不外泄裸 reason。
+  if (reason === "root_cas_mismatch") return "目标记录的根在本次选择期间变动过（root CAS 不符），未执行；请重新发起选择";
   if (reason === "select_endpoint_unknown") return "无法确定所属 endpoint，未执行";
   // R57d 返修一 P1-1：按 authority_mode 分派走 m1a wrapper 的新失败面
   if (reason === "select_legacy_required") return "迁移未完成（账本仍是影子），执行需要同步更新绑定登记；这一步不可用，未执行";
@@ -547,7 +549,7 @@ export function executeSelectControl(intent, {
     // P1-5：root = A2 的 anchor_candidate；session = 事件 session（不再自填目标旧 session——那会让 CAS 变得恒真）
     w = wireSelectAnchor({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, chatId, messageId, _inject, id: res.target_id, authorizedBy: senderId, selectedSessionId: eventSessionId, selectedRootOm: target.anchor_candidate, selectionHandle: handle ?? target.selection_handle, expectedExpiresAt: target.handle_expires_at, expectedAnchorCandidate: target.anchor_candidate, selectionBasis: res.selection_basis, clock });
   } else {
-    w = wireSelectRebind({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, chatId, messageId, _inject, id: res.target_id, expectedOldSessionId: target.aliases.session_id, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
+    w = wireSelectRebind({ endpointId, env, legacy, capability, requestedHandle: handle ?? null, chatId, messageId, _inject, id: res.target_id, expectedOldSessionId: target.aliases.session_id, expectedRootOm: target.aliases?.root_om ?? null, newSessionId: eventSessionId, authorizedBy: senderId, rebindHandle: handle ?? target.rebind_handle, expectedExpiresAt: target.rebind_expires_at, clock });
   }
   return wiredOutcome(w, action, { targetId: res.target_id, messageId, planRef: planRefVal });
 }

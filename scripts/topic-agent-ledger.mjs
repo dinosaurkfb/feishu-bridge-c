@@ -3083,7 +3083,9 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
 
 /** rebind_session_alias（W2 再认领 Phase 1，§5.1）：B3 已 active 换会话 → **只**改当前活记录的 aliases.session_id
  *  （Aily session locator），**不动** binding_target/proof/family/lineage（Phase 2 配对写方再 retarget binding_target）。
- *  CAS：当前 aliases.session_id 必须等于 expectedOldSessionId；新 locator 被另一条 live 记录占用 → fail-closed（alias_occupied，G3 backstop）。
+ *  CAS：当前 aliases.session_id 必须等于 expectedOldSessionId、当前 aliases.root_om 必须等于 **expectedRootOm**
+ *  （R57d 返修七 P1-1：真 CAS —— 锁内、提交前逐字比，两项都进请求指纹）；新 locator 被另一条 live 记录占用 →
+ *  fail-closed（alias_occupied，G3 backstop）。
  *  request_key 身份 = 字面参数（id + old/new session），与状态无关；结果 = {affected_id, old_session_id, new_session_id, authorized_by, authorized_at}。
  *  R57a（§6 rebind 行）owner-select 消费路径：传 rebindHandle + expectedExpiresAt + selectionMessageId 时，
  *  CAS 另核记录的 rebind_handle/rebind_expires_at 逐字相等 + **到期拒**（now ≥ expiry → rebind_handle_expired），
@@ -3091,9 +3093,11 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
  *  否则保留原 binding（preserved）；result = §6 增量键集（selection_basis:"rebind"；同笔归并新 session 上的
  *  A1 时 result.tombstoned_a1_id 点名该 tombstone，无归并则 null）；base 路径在有 pending handle 时拒（rebind_handle_pending），
  *  不许绕过 owner-select 消费。 */
-export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
+export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSessionId, expectedRootOm, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId, now = undefined, clock = () => Date.now(), env = process.env, _inject } = {}) {
   const consume = rebindHandle !== undefined;
-  const baseInputs = { request_key: requestKey, topic_agent_id: id, old_session_id: expectedOldSessionId, new_session_id: newSessionId };
+  // R57d 返修七 P1-1：expectedRootOm 进**请求身份**（指纹）—— 否则同 request_key 的重放/前向补
+  //   证不出"提交时的 root 与 plan 时看到的是同一个"。
+  const baseInputs = { request_key: requestKey, topic_agent_id: id, old_session_id: expectedOldSessionId, new_session_id: newSessionId, expected_root_om: expectedRootOm };
   const inputs = consume
     ? { ...baseInputs, rebind_handle: rebindHandle, expected_expires_at: expectedExpiresAt, selection_message_id: selectionMessageId }
     : baseInputs;
@@ -3103,6 +3107,8 @@ export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSess
       if (doc === null) return { ok: false, reason: "absent" };
       if (!isId(id)) return { ok: false, reason: "bad_id" };
       if (typeof expectedOldSessionId !== "string" || !AILY_SESSION_SHAPE.test(expectedOldSessionId)) return { ok: false, reason: "bad_input", why: "expectedOldSessionId 形状不对" };
+      // R57d 返修七 P1-1：expectedRootOm 是**必填** CAS 项 —— 缺席就等于没有 CAS，静默跳过即可绕过。
+      if (typeof expectedRootOm !== "string" || !OM_SHAPE.test(expectedRootOm)) return { ok: false, reason: "bad_input", why: "expectedRootOm 必填且须 om_ 形状（CAS 不得省略）" };
       if (typeof newSessionId !== "string" || !AILY_SESSION_SHAPE.test(newSessionId)) return { ok: false, reason: "bad_input", why: "newSessionId 形状不对" };
       if (consume && (doc.schema_version === "1.0" || typeof rebindHandle !== "string" || !REBIND_HANDLE_SHAPE.test(rebindHandle) || !isCanonicalIso(expectedExpiresAt) || typeof selectionMessageId !== "string" || !OM_SHAPE.test(selectionMessageId))) {
         return { ok: false, reason: "bad_input", why: "消费路径需 1.1+ 且 rebindHandle/expectedExpiresAt/selectionMessageId 形状合法" };
@@ -3116,6 +3122,9 @@ export function rebindSessionAlias({ endpointId, requestKey, id, expectedOldSess
       if (fam !== "B3") return { ok: false, reason: "target_not_current", why: "familyOf=" + String(fam) + "（仅 B3 current 可换会话重绑，B4 历史/其它 fail-closed）" };
       const oldSessionId = rec.aliases.session_id;
       if (oldSessionId !== expectedOldSessionId) return { ok: false, reason: "cas_mismatch", why: "当前 aliases.session_id 与 expectedOldSessionId 不符" };
+      // R57d 返修七 P1-1（真 CAS）：**锁内、提交前**逐字比现场 root。只做事后证据时，前向补会先按漂移后的
+      //   root 提交、再在 repair 里发现不符而永远 unclean。不符 → 结构化拒（点名 root）、不提交。
+      if (rec.aliases.root_om !== expectedRootOm) return { ok: false, reason: "root_cas_mismatch", why: "当前 aliases.root_om（" + String(rec.aliases.root_om) + "）与 expectedRootOm（" + String(expectedRootOm) + "）不符" };
       if (oldSessionId === newSessionId) return { ok: false, reason: "no_change" };
       // 新 locator 被另一条 live 记录占用：owner-select 消费路径下，A1 占位 → 同笔归并（R57c §7.1：
       // tombstoned_a1_id）；A1 之外的占位仍 fail-closed（G3 全局唯一 backstop）。基线路径一律拒。

@@ -293,7 +293,7 @@ export function wirePromoteBinding({
       const k = rk("rebind_session_alias", claimKey, b1Id);
       if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
       // R57a 返修二 P1-2：handle 事务不传数值 now——到期/TTL 由锁内 clock() 读取
-      return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldSessionId: target.aliases.session_id, newSessionId: sessionId, authorizedBy, env }))];
+      return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id: b1Id, expectedOldSessionId: target.aliases.session_id, expectedRootOm: target.aliases.root_om, newSessionId: sessionId, authorizedBy, env }))];
     }
     if (target.facts.binding !== "pending") return [{ op: "promote", ok: false, reason: "target_not_pending_or_active", why: "target.facts.binding=" + String(target.facts.binding) }];
     // W1 引用码认领（B1 仍 pending）→ create_a1 → activate。P1-2 收尾：**只消费**认领校验处受验的
@@ -567,7 +567,7 @@ export function wireSelectAnchor({ endpointId, env = process.env, capability, re
 }
 
 /** wireSelectRebind —— owner_select rebind_session_alias（B3 换绑事件会话）的双写分派。 */
-export function wireSelectRebind({ endpointId, env = process.env, legacy = null, capability, requestedHandle, chatId, messageId, _inject = undefined, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
+export function wireSelectRebind({ endpointId, env = process.env, legacy = null, capability, requestedHandle, chatId, messageId, _inject = undefined, id, expectedOldSessionId, expectedRootOm, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, clock = () => Date.now() }) {
   const vcap = verifySelectCapability(capability, { endpoint: endpointId, chat: chatId, session: newSessionId, message: messageId, sender: authorizedBy, handle: requestedHandle, handleKind: requestedHandle === null ? null : "orh" });
   if (!vcap.ok) return selectCapFail(vcap);
   const mode = selectAuthorityMode({ endpointId, env });
@@ -575,7 +575,7 @@ export function wireSelectRebind({ endpointId, env = process.env, legacy = null,
   const submit = () => {
     const k = rk("rebind_session_alias", messageId, id);
     if (!k.ok) return [{ op: "rebind_session_alias", ...k }];
-    return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id, expectedOldSessionId, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId: messageId, clock, env, _inject }))];
+    return [capture("rebind_session_alias", rebindSessionAlias({ endpointId, requestKey: k.request_key, id, expectedOldSessionId, expectedRootOm, newSessionId, authorizedBy, rebindHandle, expectedExpiresAt, selectionMessageId: messageId, clock, env, _inject }))];
   };
   if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
   if (typeof legacy !== "function") return selectLegacyMissing();

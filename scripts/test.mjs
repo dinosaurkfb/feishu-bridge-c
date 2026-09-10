@@ -26454,7 +26454,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     const b3 = famIds(talLoad(dir), "B3")[0];
     const before = talLoad(dir).records[b3];
     // ① W2 换会话：只改 aliases.session_id，target/proof/族全不动（证据：validateLedger 收口 + 记录级断言）。
-    talOk(TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: b3, expectedOldSessionId: "sess_rb_old", newSessionId: "sess_rb_new", authorizedBy: "ou_o" }), "rebind 换会话");
+    talOk(TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: b3, expectedOldSessionId: "sess_rb_old", expectedRootOm: "om_rb", newSessionId: "sess_rb_new", authorizedBy: "ou_o" }), "rebind 换会话");
     const rb = talLoad(dir).records[b3];
     assert.equal(rb.aliases.session_id, "sess_rb_new", "aliases.session_id 换新（受验 Aily 会话 locator）");
     assert.deepEqual(rb.binding_target, before.binding_target, "binding_target 不变（认领现场不铸临时 UUID、不动 target）");
@@ -26467,7 +26467,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     talOk(TAL.createA1({ endpointId: EP, requestKey: rk(), chatId: "oc_rb2", sessionId: "sess_rb_occ" }), "A1 rb2");
     const a1b = famIds(talLoad(dir), "A1")[0];
     talOk(TAL.activate({ endpointId: EP, requestKey: rk(), b1Id: b1b, a1Id: a1b, f4: F4("om_hb2"), authorizedBy: "ou_o" }), "activate rb2");
-    assert.equal(TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: b3, expectedOldSessionId: "sess_rb_new", newSessionId: "sess_rb_occ", authorizedBy: "ou_o" }).reason, "alias_occupied", "换到被占用 session → alias_occupied");
+    assert.equal(TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: b3, expectedOldSessionId: "sess_rb_new", expectedRootOm: "om_rb", newSessionId: "sess_rb_occ", authorizedBy: "ou_o" }).reason, "alias_occupied", "换到被占用 session → alias_occupied");
     assert.equal(talLoad(dir).records[b3].aliases.session_id, "sess_rb_new", "alias_occupied 不写账（仍 sess_rb_new）");
   }));
 
@@ -26499,7 +26499,7 @@ test("#R10 appendChannelSample 写侧守卫（P1-3）：字节精确写、硬链
     assert.equal(b4.aliases.session_id, "sess_h", "B4 保留 gen1 session");
 
     // ① ledger 层：rebind 一个 active 但 historical 的 B4 → 必须 fail-closed（red 先行：旧判据误放行）。
-    const rl = TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: gen1, expectedOldSessionId: "sess_h", newSessionId: "sess_h_rebind", authorizedBy: "ou_o" });
+    const rl = TAL.rebindSessionAlias({ endpointId: EP, requestKey: rk(), id: gen1, expectedOldSessionId: "sess_h", expectedRootOm: "om_h", newSessionId: "sess_h_rebind", authorizedBy: "ou_o" });
     assert.equal(rl.ok, false, "ledger rebind 拒 B4：" + JSON.stringify(rl));
     assert.equal(rl.reason, "target_not_current", "精确 reason（B4 历史）");
 
@@ -42902,14 +42902,14 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const { b1Id, sessionId } = seedB357(dir, "r57_rc", 22, "sess-r57-j");
     const rq = talOk(TAL.requestRebind({ endpointId: EP57, requestKey: "r57_rc_0", b3Id: b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: sessionId, clock: () => T0 }), "requestRebind");
     // 到期拒
-    const expired = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_e", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-r57-k", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => Date.parse(rq.result.rebind_expires_at) + 1 });
+    const expired = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_e", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb22", newSessionId: "sess-r57-k", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => Date.parse(rq.result.rebind_expires_at) + 1 });
     assert.equal(expired.ok, false, "到期拒");
     assert.equal(expired.reason, "rebind_handle_expired");
     // CAS 错 handle 拒
-    const wrong = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_w", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-r57-k", authorizedBy: "ou_r57", rebindHandle: "orh_" + "0".repeat(32), expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => T0 + 1000 });
+    const wrong = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_w", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb22", newSessionId: "sess-r57-k", authorizedBy: "ou_r57", rebindHandle: "orh_" + "0".repeat(32), expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => T0 + 1000 });
     assert.equal(wrong.reason, "cas_mismatch");
     // 消费
-    const rc = talOk(TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-r57-k", authorizedBy: "ou_owner57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => T0 + 1000 }), "消费");
+    const rc = talOk(TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_1", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb22", newSessionId: "sess-r57-k", authorizedBy: "ou_owner57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => T0 + 1000 }), "消费");
     assert.equal(rc.result.old_session_id, sessionId);
     assert.equal(rc.result.new_session_id, "sess-r57-k");
     assert.equal(rc.result.selection_handle, rq.result.rebind_handle, "selection_handle = orh_ 消费值");
@@ -42930,7 +42930,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(rec.locator_link_proof_ref.kind, "owner_selected_route_v1", "link 重签");
     assert.equal(rec.locator_link_proof_ref.selection_operation_id, Object.keys(doc.operations).find((k) => doc.operations[k].op_type === "rebind_session_alias"), "selection_operation_id = 本 op");
     // 同 key 重放返存量
-    const rc2 = talOk(TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-r57-k", authorizedBy: "ou_owner57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => T0 + 1000 }), "重放");
+    const rc2 = talOk(TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rc_1", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb22", newSessionId: "sess-r57-k", authorizedBy: "ou_owner57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_rcmsg", clock: () => T0 + 1000 }), "重放");
     assert.equal(rc2.result.selection_handle, rq.result.rebind_handle);
   }));
 
@@ -42938,7 +42938,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const { b1Id, sessionId } = seedB357(dir, "r57_rx", 23, "sess-r57-l");
     const rq = talOk(TAL.requestRebind({ endpointId: EP57, requestKey: "r57_rx_0", b3Id: b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: sessionId, clock: () => T0 }), "requestRebind");
     // base 路径（不带 rebindHandle）在有 pending handle 时拒
-    const bypass = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rx_b", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-r57-m", authorizedBy: "ou_r57", clock: () => T0 });
+    const bypass = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57_rx_b", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb23", newSessionId: "sess-r57-m", authorizedBy: "ou_r57", clock: () => T0 });
     assert.equal(bypass.ok, false, "base 路径绕过 pending handle 拒");
     assert.equal(bypass.reason, "rebind_handle_pending");
     // expire：未到期拒；到期后清两字段
@@ -43121,7 +43121,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const rq = talOk(TAL.requestRebind({ endpointId: EP57, requestKey: "r57f_ck0", b3Id: b1Id, expectedCurrentGeneration: "current", expectedOldSessionId: sessionId, clock: () => T1 }), "requestRebind@clock");
     assert.equal(rq.result.rebind_expires_at, "2099-01-30T00:00:00.000Z", "签发到期来自 clock seam（T1+TTL）");
     // 旧实现（entry 采样默认 Date.now()）会按真实时间放行 → 本断言红；新实现按锁内 T2 → 拒
-    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f_ck1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_fck", clock: () => T2 });
+    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f_ck1", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb68", newSessionId: "sess-f-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_fck", clock: () => T2 });
     assert.equal(r.ok, false, "锁内时钟已跨过到期 → 拒");
     assert.equal(r.reason, "rebind_handle_expired");
   }));
@@ -43177,11 +43177,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(Lq.ok, true, "读回账本");
     assert.equal(Lq.doc.records[b1Id].updated_at, new Date(T1).toISOString(), "事件戳写 now=T1（写 clock() 时此断言红）");
     // 消费：事件戳 now=T1+1s（远未到期）+ 锁内 clock 跨过到期 → 按锁内时间拒；反面：now 已到期、clock 未到期 → 判未到期
-    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck1", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f2-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", now: T1 + 1000, clock: () => Date.parse(rq.result.rebind_expires_at) + 1 });
+    const r = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck1", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb72", newSessionId: "sess-f2-ck2", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", now: T1 + 1000, clock: () => Date.parse(rq.result.rebind_expires_at) + 1 });
     assert.equal(r.ok, false, "到期按锁内 clock()（按事件戳 now 放行时此断言红）");
     assert.equal(r.reason, "rebind_handle_expired");
     // 反面（判未到期）：now 已到期（T1+100d）、clock 未到期（锁内 T1+1s）→ expiry 判未到期 → 重绑成功
-    const r2 = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck2", id: b1Id, expectedOldSessionId: sessionId, newSessionId: "sess-f2-ck2b", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", now: T1 + 100 * 86400e3, clock: () => T1 + 1000 });
+    const r2 = TAL.rebindSessionAlias({ endpointId: EP57, requestKey: "r57f2_ck2", id: b1Id, expectedOldSessionId: sessionId, expectedRootOm: "om_rb72", newSessionId: "sess-f2-ck2b", authorizedBy: "ou_r57", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_f2ck", now: T1 + 100 * 86400e3, clock: () => T1 + 1000 });
     assert.equal(r2.ok, true, "now 已到期但 clock 未到期 → expiry 判未到期、重绑成功（按 now 判到期时此断言红）");
     assert.notEqual(r2.reason, "rebind_handle_expired", "不是 expired（clock 未到期）");
   }));
@@ -45633,7 +45633,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     // 新 session 上的 A1（待归并）
     const a1New = a1Of(dir, "r57c_m_new", "sess-c-92-new");
     const rq = talOkC(TAL.requestRebind({ endpointId: EP57C, requestKey: "r57c_m_rq", b3Id: b1.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: "sess-c-92-old", clock: () => T0C }), "requestRebind");
-    const rc = talOkC(TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-old", newSessionId: "sess-c-92-new", authorizedBy: "ou_owner57c", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_m92rc", clock: () => T0C + 1000 }), "消费+归并");
+    const rc = talOkC(TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-old", expectedRootOm: "om_m92", newSessionId: "sess-c-92-new", authorizedBy: "ou_owner57c", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_m92rc", clock: () => T0C + 1000 }), "消费+归并");
     assert.equal(rc.result.tombstoned_a1_id, a1New.result.created_id, "tombstoned_a1_id 非空");
     const doc = loadOkC(dir);
     const tomb = doc.records[a1New.result.created_id];
@@ -45649,7 +45649,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const a1b = a1Of(dir, "r57c_m_a1b", "sess-c-93");
     talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57c_m_actb", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id, f4: F4C("om_m93"), authorizedBy: "ou_r57c", clock: () => T0C }), "B3 占位");
     const rq2 = talOkC(TAL.requestRebind({ endpointId: EP57C, requestKey: "r57c_m_rq2", b3Id: b1.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: "sess-c-92-new", clock: () => T0C }), "rq2");
-    const r2 = TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc2", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-new", newSessionId: "sess-c-93", authorizedBy: "ou_owner57c", rebindHandle: rq2.result.rebind_handle, expectedExpiresAt: rq2.result.rebind_expires_at, selectionMessageId: "om_m93rc", clock: () => T0C + 1000 });
+    const r2 = TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57c_m_rc2", id: b1.result.created_id, expectedOldSessionId: "sess-c-92-new", expectedRootOm: "om_m92", newSessionId: "sess-c-93", authorizedBy: "ou_owner57c", rebindHandle: rq2.result.rebind_handle, expectedExpiresAt: rq2.result.rebind_expires_at, selectionMessageId: "om_m93rc", clock: () => T0C + 1000 });
     assert.equal(r2.ok, false);
     assert.equal(r2.reason, "alias_occupied", "B3 占位仍拒");
   }));
@@ -45752,7 +45752,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     talOkC(TAL.activate({ endpointId: EP57C, requestKey: "r57cf_t5act", b1Id: b1.result.created_id, a1Id: a1Old.result.created_id, f4: F4C("om_t5"), authorizedBy: "ou_r57c", clock: () => T0C }), "activate 旧形");
     const a1New = a1Of(dir, "r57cf_t5n", "sess-cf-t5-new");
     const rq = talOkC(TAL.requestRebind({ endpointId: EP57C, requestKey: "r57cf_t5rq", b3Id: b1.result.created_id, expectedCurrentGeneration: "current", expectedOldSessionId: "sess-cf-t5-old", clock: () => T0C }), "requestRebind");
-    talOkC(TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57cf_t5rc", id: b1.result.created_id, expectedOldSessionId: "sess-cf-t5-old", newSessionId: "sess-cf-t5-new", authorizedBy: "ou_owner57c", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_t5m", clock: () => T0C + 1000 }), "消费+归并");
+    talOkC(TAL.rebindSessionAlias({ endpointId: EP57C, requestKey: "r57cf_t5rc", id: b1.result.created_id, expectedOldSessionId: "sess-cf-t5-old", expectedRootOm: "om_t5", newSessionId: "sess-cf-t5-new", authorizedBy: "ou_owner57c", rebindHandle: rq.result.rebind_handle, expectedExpiresAt: rq.result.rebind_expires_at, selectionMessageId: "om_t5m", clock: () => T0C + 1000 }), "消费+归并");
     const docBefore = loadOkC(dir);
     const tombId = docBefore.operations[Object.keys(docBefore.operations).find((k) => docBefore.operations[k].op_type === "rebind_session_alias")].result.tombstoned_a1_id;
     assert.ok(tombId, "tombstoned_a1_id 非空");
@@ -46427,7 +46427,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       const pf = path.join(claimsDir, s.key + ".selection-plan.json");
       const plan = JSON.parse(fs.readFileSync(pf, "utf-8"));
       assert.equal(typeof plan.cas.expected_root_om, "string", "③ rebind plan 的 CAS 必须含 expected_root_om：" + JSON.stringify(plan.cas));
-      fs.writeFileSync(pf, JSON.stringify({ ...plan, cas: { ...plan.cas, expected_root_om: "om_other_root" } }, null, 2) + "\n", { mode: 0o600 });
+      fs.writeFileSync(pf, JSON.stringify({ ...plan, cas: { ...plan.cas, expected_root_om: "om_otherRoot" } }, null, 2) + "\n", { mode: 0o600 });
       const r = repairIt(s.key);
       assert.equal(r.ok, false, "③ root 漂移不许闭合：" + JSON.stringify(r).slice(0, 300));
       assert.equal(r.reason, "ledger_commit_unverifiable", "③ reason：" + r.reason);
@@ -47218,10 +47218,10 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(noRoot.ok, false, "① 缺 expectedRootOm 必须拒（旧码直接提交）：" + JSON.stringify(noRoot));
     assert.equal(noRoot.reason, "bad_input", "① reason：" + noRoot.reason);
     // ② root 漂移 → 拒（原因点名 root）且账本零改动
-    const drift = TAL.rebindSessionAlias({ ...base, requestKey: rk("drift"), newSessionId: SESSION_D + "-f7a1-x", expectedRootOm: "om_other_root" });
+    const drift = TAL.rebindSessionAlias({ ...base, requestKey: rk("drift"), newSessionId: SESSION_D + "-f7a1-x", expectedRootOm: "om_otherRoot" });
     assert.equal(drift.ok, false, "② root 漂移必须拒：" + JSON.stringify(drift));
-    assert.equal(drift.reason, "cas_mismatch", "② reason：" + drift.reason);
-    assert.equal(drift.cas_field, "root_om", "② 结构化点名 root：" + JSON.stringify(drift));
+    assert.equal(drift.reason, "root_cas_mismatch", "② reason 区分 root：" + drift.reason);
+    assert.match(String(drift.why), /root_om/u, "② 点名 root_om：" + drift.why);
     const docAfter = TAL.loadLedger(dir, { endpointId: EP57D }).doc;
     assert.equal(docAfter.revision, rev0, "② 拒后账本 revision 零改动");
     assert.equal(docAfter.records[b3].aliases.session_id, SESSION_D + "-f7a1", "② 拒后 session 未变");
@@ -47238,7 +47238,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const planPath = path.join(claimsDir, s.key + ".selection-plan.json");
     const plan = JSON.parse(fs.readFileSync(planPath, "utf-8"));
     assert.equal(plan.cas.expected_root_om, s.rootOm, "④ plan 的 CAS 冻结了现场 root：" + JSON.stringify(plan.cas));
-    fs.writeFileSync(planPath, JSON.stringify({ ...plan, cas: { ...plan.cas, expected_root_om: "om_drifted_root" } }, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(planPath, JSON.stringify({ ...plan, cas: { ...plan.cas, expected_root_om: "om_driftedRoot" } }, null, 2) + "\n", { mode: 0o600 });
     const r = f7Repair(claimsDir, s.key);
     assert.equal(r.ok, false, "④ root 漂移下前向补必须拒：" + JSON.stringify(r).slice(0, 300));
     assert.match(String(r.why), /root/u, "④ 点名 root：" + r.why);

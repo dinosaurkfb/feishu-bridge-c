@@ -286,7 +286,7 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
     if (o.result?.selected_root_om !== plan.cas.expected_root_om) return "result.selected_root_om 与 plan.cas.expected_root_om 不一致";
     // P1-C：rebind 旧码漏了「消费的 handle」。
     if (o.result?.selection_handle !== plan.cas.rebind_handle) return "result.selection_handle（消费的 handle）与 plan.cas.rebind_handle 不一致";
-    const expectR = { request_key: wantKey.request_key, topic_agent_id: plan.target_id, old_session_id: plan.cas.expected_old_session_id, new_session_id: plan.cas.new_session_id, rebind_handle: plan.cas.rebind_handle, expected_expires_at: plan.cas.expected_expires_at, selection_message_id: sc.message };
+    const expectR = { request_key: wantKey.request_key, topic_agent_id: plan.target_id, old_session_id: plan.cas.expected_old_session_id, expected_root_om: plan.cas.expected_root_om, new_session_id: plan.cas.new_session_id, rebind_handle: plan.cas.rebind_handle, expected_expires_at: plan.cas.expected_expires_at, selection_message_id: sc.message };
     if (o.fingerprint !== fingerprintOf("rebind_session_alias", expectR)) return "fingerprint 与 plan 重算的预期输入不一致（全部 cas 逐字核）";
     return null;
   };
@@ -340,7 +340,7 @@ function repairUncleanSelectInner({ claim, claimsDir, key, uncleanRecord, env, s
     } else if (opType === "anchor") {
       r = anchor({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, authorizedBy: sc.sender, selectedSessionId: plan.cas.selected_session_id, selectedRootOm: plan.cas.selected_root_om, selectionHandle: plan.cas.expected_handle, expectedExpiresAt: plan.cas.expected_expires_at, expectedAnchorCandidate: plan.cas.expected_anchor_candidate, selectionMessageId: sc.message, selectionBasis: plan.basis, clock, env, _inject });
     } else {
-      r = rebindSessionAlias({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, expectedOldSessionId: plan.cas.expected_old_session_id, newSessionId: plan.cas.new_session_id, authorizedBy: sc.sender, rebindHandle: plan.cas.rebind_handle, expectedExpiresAt: plan.cas.expected_expires_at, selectionMessageId: sc.message, clock, env, _inject });
+      r = rebindSessionAlias({ endpointId: sc.endpoint, requestKey: wantKey.request_key, id: plan.target_id, expectedOldSessionId: plan.cas.expected_old_session_id, expectedRootOm: plan.cas.expected_root_om, newSessionId: plan.cas.new_session_id, authorizedBy: sc.sender, rebindHandle: plan.cas.rebind_handle, expectedExpiresAt: plan.cas.expected_expires_at, selectionMessageId: sc.message, clock, env, _inject });
     }
     if (!r.ok) {
       return { ok: false, reason: "ledger_forward_fill_failed", why: "前向补 " + opType + " 失败（" + (r.reason ?? "?") + (r.why ? "：" + r.why : "") + "），保持 control-committed-unclean" };

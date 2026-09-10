@@ -731,22 +731,41 @@ export function runDoctor({
   }
 
   /**
- * 从 root 到 target 逐级核父链，返回第一个**跳不过去的中间组件**（悬空 symlink / 非目录 / I/O 错）路径，否则 null。
+ * 从 root 到 target 逐级核父链，返回第一个**跳不过去或越出根的中间组件**（悬空 symlink / 指向根外 / 非目录 / I/O 错），否则 null。
  * 只在 target 的 realpath 已经 ENOENT 时用：区分「目录真不存在」（→ 缺回执）与
- * 「父链指到不存在的地方」（→ 查不清，Codex #149 四轮 P2）。最末一层缺席不算悬空。
+ * 「父链指到不存在的地方或越出根」（→ 查不清，Codex #149 四轮 P2 / #154 返修一 P1）。最末一层缺席不算悬空。
  */
-function firstDanglingSymlinkInChain(root, target) {
+function firstDanglingSymlinkInChain(root, target, realRoot = null) {
   const rel = path.relative(root, target);
   if (rel === "" || rel.startsWith("..")) return null;
+  let resolvedRealRoot = realRoot;
+  if (!resolvedRealRoot) {
+    try { resolvedRealRoot = fs.realpathSync(root); } catch { return null; }
+  }
   const parts = rel.split(path.sep).filter((x) => x.length > 0);
   let cur = root;
   for (const [i, part] of parts.entries()) {
     cur = path.join(cur, part);
     let st;
     try { st = fs.lstatSync(cur); }
-    catch (err) { return err?.code === "ENOENT" ? null : cur; }
-    if (!st.isSymbolicLink() || i === parts.length - 1) continue;
-    try { fs.statSync(cur); } catch { return cur; }
+    catch (err) { return err?.code === "ENOENT" ? null : { path: cur, reason: "lstat_error", error: err }; }
+    if (i === parts.length - 1) continue;
+    if (!st.isSymbolicLink()) {
+      if (!st.isDirectory()) return { path: cur, reason: "not_a_directory" };
+      continue;
+    }
+    let targetStat;
+    try { targetStat = fs.statSync(cur); }
+    catch { return { path: cur, reason: "dangling" }; }
+    if (!targetStat.isDirectory()) {
+      return { path: cur, reason: "not_a_directory" };
+    }
+    let realCur;
+    try { realCur = fs.realpathSync(cur); }
+    catch (err) { return { path: cur, reason: "realpath_error", error: err }; }
+    if (realCur !== resolvedRealRoot && !realCur.startsWith(resolvedRealRoot + path.sep)) {
+      return { path: cur, reason: "outside_root", realPath: realCur };
+    }
   }
   return null;
 }
@@ -789,12 +808,20 @@ function firstDanglingSymlinkInChain(root, target) {
         return { ok: false, why: "项目根 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "），无法核 outbox_dir 落点" };
       }
       try { realDir = fs.realpathSync(dir); } catch (err) {
-        // 目录不存在（ENOENT）= 还没有回执；但**父链中间组件是悬空 symlink** 时同样 ENOENT ——
-        // 那种情况连"这条路径指向哪儿"都说不清，必须归查不清，不许当成「核对过且没有」
-        // （Codex #149 四轮 P2）。其他 IO 错误照样拦。
+        // 目录不存在（ENOENT）= 还没有回执；但**父链中间组件是悬空 symlink 或越出项目根**时同样 ENOENT ——
+        // 那种情况连"这条路径指向哪儿"都说不清或越出物理根，必须归查不清，不许当成「核对过且没有」
+        // （Codex #149 四轮 P2 / #154 返修一 P1）。其他 IO 错误照样拦。
         if (err?.code === "ENOENT") {
-          const dangling = firstDanglingSymlinkInChain(rootDir, dir);
-          if (dangling !== null) return { ok: false, why: "outbox_dir 父链有悬空 symlink（" + dangling + "），不冒充核对过" };
+          const dangling = firstDanglingSymlinkInChain(rootDir, dir, realRoot);
+          if (dangling !== null) {
+            if (dangling.reason === "outside_root") {
+              return { ok: false, why: "outbox_dir 父链中间 symlink（" + dangling.path + "）的 realpath（" + dangling.realPath + "）不在项目根 realpath（" + realRoot + "）内，不冒充核对过" };
+            }
+            if (dangling.reason === "dangling") {
+              return { ok: false, why: "outbox_dir 父链有悬空 symlink（" + dangling.path + "），不冒充核对过" };
+            }
+            return { ok: false, why: "outbox_dir 父链中间组件异常（" + dangling.path + "），不冒充核对过" };
+          }
           return { ok: true, present: false };
         }
         return { ok: false, why: "outbox 目录 realpath 读不出（" + String(err?.code ?? err?.message ?? err) + "）" };

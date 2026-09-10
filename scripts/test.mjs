@@ -7754,7 +7754,7 @@ test("R60 返修一 P1-2：套件机器路径 env 是边界——无条件指向
   }
   // 注册器级不变量：用例动了 env 不恢复 → 当场红点名那个用例（用独立注册器验证，不污染本套件）
   const seen = [];
-  const h = createTestHarness({ onFail: (name, err) => seen.push([name, err.message]) });
+  const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
   const savedInv = setSuiteInvariants({
     envDrift: () => (process.env.R60_PROBE_ENV ? "R60_PROBE_ENV 被改用例没恢复" : null),
     restore: () => { delete process.env.R60_PROBE_ENV; },
@@ -7776,7 +7776,7 @@ test("R60 返修一 P1-2：套件机器路径 env 是边界——无条件指向
 
 test("R60 返修二 P1-2a：用例抛错时注册器必须在 finally 中核验与恢复不变量，且失败信息包含漂移点名", () => {
   const seen = [];
-  const h = createTestHarness({ onFail: (name, err) => seen.push([name, err.message]) });
+  const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
   let restored = 0;
   const savedInv = setSuiteInvariants({
     envDrift: () => (process.env.R60_PROBE_THROW_ENV ? "R60_PROBE_THROW_ENV 被改且没恢复" : null),
@@ -7805,7 +7805,7 @@ test("R60 返修二 P1-2a：用例抛错时注册器必须在 finally 中核验�
 
 test("R60 返修二 P1-2b：HOME 纳入每测不变量——用例改 HOME 不恢复当场点名且后续用例 HOME 恢复", () => {
   const seen = [];
-  const h = createTestHarness({ onFail: (name, err) => seen.push([name, err.message]) });
+  const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
   const fakeHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-p12b-fakehome-")));
   const savedHome = process.env.HOME;
   try {
@@ -7822,6 +7822,22 @@ test("R60 返修二 P1-2b：HOME 纳入每测不变量——用例改 HOME 不�
   assert.equal(seen[0][0], "改HOME不恢复用例");
   assert.match(String(seen[0][1]), /HOME/u, "why 点名 HOME 漂移：" + seen[0][1]);
   assert.equal(process.env.HOME, savedHome, "套件当前 HOME 已恢复");
+});
+
+test("R60 返修二 P1-2c：createTestHarness 支持显式 filter: [] 关闭过滤，保证内层用例不被外部 TEST_FILTER 误过滤", () => {
+  const origFilter = process.env.TEST_FILTER;
+  try {
+    process.env.TEST_FILTER = "SOME_FILTER_THAT_MATCHES_NOTHING";
+    // 默认行为：继承 process.env.TEST_FILTER
+    const hInherit = createTestHarness();
+    assert.deepEqual(hInherit.TEST_FILTER, ["SOME_FILTER_THAT_MATCHES_NOTHING"], "默认继承 process.env.TEST_FILTER");
+    // 显式 filter: []：关闭过滤
+    const hExplicit = createTestHarness({ filter: [] });
+    assert.deepEqual(hExplicit.TEST_FILTER, [], "显式 filter: [] 彻底关闭过滤，不受外部环境变量影响");
+  } finally {
+    if (origFilter !== undefined) process.env.TEST_FILTER = origFilter;
+    else delete process.env.TEST_FILTER;
+  }
 });
 
 test("R60 返修一 P2：证据层级改正——套件 HOME ≠ passwd home；passwd 路径由双临时 home 夹具单独证一次", () => {

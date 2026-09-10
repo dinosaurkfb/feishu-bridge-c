@@ -220,15 +220,17 @@ export function installUnhandledRejectionGuard() {
  *   Claude —— 记进 failures 清单（汇总后统一打），TEST_TRACE=1 时当场打完整断言与栈；
  *   Codex —— 当场 console.error("FAIL …")。
  */
-export function createTestHarness({ onFail = () => {} } = {}) {
+export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
   let passed = 0;
   let failed = 0;
   let registered = 0;   // 注册进来的条数（含被过滤掉的）—— 汇总里的"总 M"
   let executed = 0;     // 命中并真的跑的 —— "命中 N"
   const failures = [];
   const failedEnvDrift = [];
-  const TEST_FILTER = (process.env.TEST_FILTER ?? "").split(",")
-    .map((s) => s.trim()).filter((s) => s.length > 0);
+  // R60 返修二 P1-2c：支持显式传 filter（如 filter: [] 关闭过滤），不被外部 process.env.TEST_FILTER 污染内层用例
+  const TEST_FILTER = filter !== null
+    ? (Array.isArray(filter) ? filter : String(filter).split(",")).map((s) => s.trim()).filter((s) => s.length > 0)
+    : (process.env.TEST_FILTER ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 
   /**
    * 汇总打印之后就封条。之后任何 test() 调用立刻响亮失败。

@@ -22,7 +22,7 @@ import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 // 失败回执的 outbox 落点与 Stop 钡 / 兑底定时器同一份判据（outbox vs outbox-<sid>），不另写一份
 import { outboxDirOf } from "./drain-outbox.mjs";
-import { effectiveBindingId, pendingGeneration } from "./topic-generation.mjs";
+import { effectiveBindingId, generationForSession, pendingGeneration } from "./topic-generation.mjs";
 import { moduleRoot } from "./direct-run.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -49,6 +49,10 @@ import {
   pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction,
 } from "./live-session.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+import { maintenanceDir } from "./maintenance/journal.mjs";
+import { decideInboundDeliveryTarget, appendShadowDivergenceNote } from "./m1a/delivery-target.mjs";
 import { appendChannelSample, channelDisposition } from "./channel-samples.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
@@ -60,7 +64,6 @@ import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUncl
 import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import { wireChatA1, wirePromoteBinding, wireVoid, uncleanWired } from "./m1a/wiring.mjs";
-import { legacyEndpointId } from "./subscription.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -940,7 +943,6 @@ if (!dialogueMode &&
 // 这两条分支必须互斥。都走 --continue 的话会有两个进程写同一份 transcript ——
 // 现在没撞上纯粹是因为旧设计钉的是另一份记录，那是运气不是设计。
 // 会话级绑定要投给**它绑的那条线**；项目级绑定原来沿用「现场最近开的那个」。
-const boundSession = routed.mapping?.claude_session_id ?? null;
 // 那是猜，而它在实机上猜错过：同一个项目开着两条会话，Frank 在先开的那条工作，
 // 指令被投给了后开的那条 —— 他看着自己发出去的指令消失在另一个窗口里。
 // 现在只有一条会话时才投，多条就拒。理由跟下面那段「不回落到项目行为」一样：
@@ -954,10 +956,68 @@ if (capability !== "full" && capability !== "reply_only") {
 }
 const replyOnly = capability === "reply_only";
 
+// ── R66：投递目标从账本读（权威 / shadow 双模；M1b 前置消费路径）──
+// 权威（authoritative）：投递目标只认账本 binding_target——UUID → 会话级同款（不在场 → bound_session_gone）；
+//   null → 项目级同款（delivery pin / 唯一 live 顺手钉 / 多条拒）。账本读不出、记录缺席、多条 → 一律拒收
+//   （ledger_route_unavailable），绝不回退 legacy mapping——账本缺席时猜都不猜。
+// shadow（当前真机状态）：行为完全不变；账本可读且记录在、而 target 与 legacy sid 分歧（或账本读不出）时，
+//   往 claim notes 追加一行 divergence（best-effort，失败不影响投递），给 cutover 留证据。
+// 未接入 M1a 的 endpoint：连账本都不读，纯 legacy。reply_only 不投现场，整段跳过。
+const legacyBoundSession = routed.mapping?.claude_session_id ?? null;
+let boundSession = legacyBoundSession;
+let ledgerRouteProblem = null;   // { reason, why } —— 权威下查不到/读不出 → 拒收
+let shadowDivergence = null;     // { ledger, legacy, ledger_unavailable? } —— shadow 下记 notes
+let decidedSession = null;       // 权威会话级：{ sessionId, target }
+let decidedProject = null;       // 权威项目级：selectDeliverySession 结果
+if (!replyOnly) {
+  const maintDir66 = maintenanceDir(process.env);
+  const endpoint66 = legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid });
+  const receipt66 = (typeof maintDir66 === "string" && maintDir66.length > 0)
+    ? endpointReceipt(maintDir66, endpoint66)
+    : { ok: false };
+  const m1aOn = receipt66.ok === true && receipt66.state !== "never_initialized";
+  // 权威信号用收据层（cutover 终态收据 ⇔ 账本 authoritative，G14）——账本读不出时它仍可用。
+  const authorityMode66 = !m1aOn ? null : (receipt66.cutoverDone === true ? "authoritative" : "shadow");
+  // 本话题的根消息 id：消息落在哪个代际，就按那个代际的 root_message_id 对账本 aliases.root_om。
+  const sessionGen66 = generationForSession(mapping?.topic_generation_state ?? null, event.session_id);
+  const rootOm66 = sessionGen66?.root_message_id
+    ?? (typeof mapping?.feishu_root_message_id_reference === "string" ? mapping.feishu_root_message_id_reference : null);
+  const decision66 = decideInboundDeliveryTarget({
+    authorityMode: authorityMode66, endpointId: endpoint66, rootOm: rootOm66,
+    legacySessionId: legacyBoundSession, projectRoot: config.project_dir, env: process.env,
+  });
+  if (decision66.action === "reject") ledgerRouteProblem = decision66;
+  else if (decision66.action === "session") decidedSession = decision66;
+  else if (decision66.action === "project") decidedProject = decision66.picked;
+  else if (decision66.divergence) shadowDivergence = decision66.divergence;
+  if (shadowDivergence) {
+    appendShadowDivergenceNote({ noteFile: path.join(CLAIMS, claim.key + ".notes.log"), divergence: shadowDivergence });
+  }
+}
+
 let ambiguousDelivery = null;
 let target = null;
 if (replyOnly) {
   // 只回复不进现场：不枚举现场会话、不选、不钉 delivery pin、不判歧义 —— 这些都只属于 full 分支
+} else if (ledgerRouteProblem) {
+  // 权威模式账本说不清：拒收不投，不回退（下方统一收口）
+} else if (decidedSession !== null) {
+  boundSession = decidedSession.sessionId;
+  target = decidedSession.target; // null → 下方 bound_session_gone（与 legacy 会话级同款，不回落项目级）
+} else if (decidedProject !== null) {
+  if (decidedProject.ok) {
+    target = decidedProject.session;
+    // 现场只有一条时顺手钉下来 —— 那一刻没有歧义，钉了下次才不用碰运气。
+    // 钉住 + 留痕都是 best-effort：目标已经选定，这两步失败都不该影响这一条的交付。
+    if (decidedProject.pin) {
+      pinAndNote({
+        root: config.project_dir, sessionId: decidedProject.pin,
+        noteFile: path.join(CLAIMS, claim.key + ".notes.log"),
+      });
+    }
+  } else if (decidedProject.reason === DELIVERY_REJECT.AMBIGUOUS) {
+    ambiguousDelivery = decidedProject;
+  }
 } else if (boundSession) {
   target = findLiveSessionById({ projectRoot: config.project_dir, claudeSessionId: boundSession });
 } else {
@@ -967,13 +1027,7 @@ if (replyOnly) {
   });
   if (picked.ok) {
     target = picked.session;
-    // 现场只有一条时顺手钉下来 —— 那一刻没有歧义，钉了下次才不用碰运气。
-    // 上一版**声明了这件事却没做**：生产路径固定传 pinned:null，也从不读 picked.pin，
-    // 于是"已钉会话"那条分支只活在单测里。
     if (picked.pin) {
-      // 写不成不影响这一条的投递（目标已经选定了），但**不能假装钉住了** ——
-      // 下一条消息会因为"没钉过"重新走歧义判断，而日志里若无痕迹就查不出为什么。
-      // 钉住 + 留痕都是 best-effort：目标已经选定，这两步失败都不该影响这一条的交付。
       pinAndNote({
         root: config.project_dir, sessionId: picked.pin,
         noteFile: path.join(CLAIMS, claim.key + ".notes.log"),
@@ -982,6 +1036,20 @@ if (replyOnly) {
   } else if (picked.reason === DELIVERY_REJECT.AMBIGUOUS) {
     ambiguousDelivery = picked;
   }
+}
+
+// R66：权威模式下账本说不清 → 拒收，不冒充受理（记录失败、回执点名、不投不回退）
+if (ledgerRouteProblem) {
+  recordClaimState({ claimsDir: CLAIMS, key: claim.key, state: "failed",
+    detail: { reason: ledgerRouteProblem.reason, why: ledgerRouteProblem.why } });
+  writeReceipt("ledger-route-" + verdict.messageId, {
+    status: "rejected", reason: ledgerRouteProblem.reason,
+    message_id: verdict.messageId, claim_acquired: true, handed_off: false,
+  });
+  finish("rejected", {
+    reasonText: "账本权威但查不到/读不出这个话题的投递目标，没有投递",
+    taskName: config.task_display_name,
+  }, { reason: ledgerRouteProblem.reason });
 }
 
 if (ambiguousDelivery) {

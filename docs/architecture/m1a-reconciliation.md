@@ -22,6 +22,10 @@
   `{ ok:false, reason:"legacy_unreadable", source }`；
 - **双投影**（同一 binding_id 两次）→ `{ ok:false, reason:"legacy_conflict" }`；
 - **严格 target 采集**：binding_target 全字段受验：Claude 形态支持三态（UUID 字符串 = 会话级目标；**键缺席**（源对象没有 claude_session_id 键）= 合法项目级 `null`（complete:true）；**键在但为 null 或非 UUID** = `target_incomplete`，绝不临时选目标或填默认值；由持有真实本地 Claude UUID 的显式 retarget 补；owner_select 的 Aily session 不能填这个字段）；Codex 需逐项受验 root/task/thread，缺任一 → 该代际列待修 `target_incomplete`。
+- 入站投递目标在 authoritative 下只认账本 `binding_target`（UUID→该会话；null→项目级：pin /
+  唯一 live / 多条拒）；判源四态：init-only + 账本不可读 → 继续 legacy 并记 divergence，cutover +
+  账本不可读 → 拒；账本缺席不可读或记录缺席一律拒收不回退；shadow 期只记分歧不改行为
+  （R66，`scripts/m1a/delivery-target.mjs`；权威信号用 cutover 终态收据）。
 
 **`collectCodexLegacySnapshot({ home, now })`**：只读 Codex task registry（`mappingForTask`
 物化：binding_id=`<taskId>@codex-registry`、status、session_id、inbound_state、pending_token）；

@@ -21,6 +21,7 @@ import { isCanonicalIso } from "./canonical-time.mjs";
 import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { canonKey } from "./maintenance/canon.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
+import { createVerifiedSidecar } from "./verified-sidecar.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -185,18 +186,48 @@ export function forwardFailureReceiptProblem(record, { expectedKey = null } = {}
   return null;
 }
 
-/** 受验读回（P1-3/doctor 共用）：读 <key>.forward-failed.outbox.json 并过 forwardFailureReceiptProblem。 */
-export function readForwardFailureReceipt({ outboxDir, forwardKey }) {
+/**
+ * 回执的受验 sidecar 原语（R58 返修二 P1-1）：**机制与 selection-plan 同一份**
+ *（叶子 scripts/verified-sidecar.mjs 的 createVerifiedSidecar），这里只给参数：
+ * 文件名 `<key>.forward-failed.outbox.json`、64 KiB 上限、封闭校验器 forwardFailureReceiptProblem、
+ * key 形状 64hex。旧版裸 readFileSync 会把外指 symlink 当成合法回执、也看不见 link 后的 tmp 残骸。
+ */
+const RECEIPT_SIDECAR = createVerifiedSidecar({
+  label: "forward_failed 回执",
+  fileNameOf: (key) => key + FORWARD_FAILURE_RECEIPT_SUFFIX,
+  maxBytes: 64 * 1024,
+  problemOf: (rec, key) => forwardFailureReceiptProblem(rec, { expectedKey: key }),
+  keyShape: /^[0-9a-f]{64}$/u,
+  dirMissingReason: "outbox_dir_missing",
+});
+
+/**
+ * 受验恢复（P1-1）：只在写入口（appendForwardFailureReceipt）显式调用。
+ * 充要条件与 selection-plan 逐字一致（见 verified-sidecar.mjs 模块头 ③）：唯一候选 && final 存在 &&
+ * 同 dev+ino && final nlink===2 && 候选 nlink===2 && open 后 inode 复核 && 候选内容过封闭校验
+ * → unlink → fsync 目录。其余一律 residue fail-closed、不动任何文件。
+ */
+export function recoverForwardReceiptTmp({ outboxDir, forwardKey, _inject = null } = {}) {
+  return RECEIPT_SIDECAR.recoverTmp({ dir: outboxDir, key: forwardKey, _inject });
+}
+
+/**
+ * 受验读回（P1-1/P1-3/doctor 共用）：fd 绑定（O_NOFOLLOW|O_NONBLOCK）、普通文件、单硬链接、0600、
+ * 大小上限、JSON、封闭校验器。**不删任何文件**；遇任何精确 tmp 候选 → residue fail-closed。
+ * 返回：
+ *   { absent:true }                                    —— 规范文件名不存在（ENOENT）
+ *   { ok:true, record, file, sha256 }                  —— 受验读 + 校验全过
+ *   { ok:false, kind:"invalid", why, badPath }         —— 坏 JSON / 封闭校验不过（“有文件但不是回执”）
+ *   { ok:false, kind:"unreadable", why, badPath }      —— 读不了（symlink/权限/ENOTDIR/EIO/nlink≠1…）
+ *   { ok:false, kind:"residue", why, residue, badPath }—— 目录里有精确 tmp 候选，等人处置
+ */
+export function readForwardFailureReceipt({ outboxDir, forwardKey, _inject = null }) {
   const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
-  let raw;
-  try { raw = fs.readFileSync(file); }
-  catch (err) { if (err?.code === "ENOENT") return { absent: true }; return { ok: false, why: "读不出: " + String(err?.code ?? err?.message ?? err), badPath: file }; }
-  let rec;
-  try { rec = JSON.parse(raw.toString("utf-8")); }
-  catch { return { ok: false, why: "半截/坏 JSON", badPath: file }; }
-  const p = forwardFailureReceiptProblem(rec, { expectedKey: forwardKey });
-  if (p !== null) return { ok: false, why: "不合法: " + p, badPath: file };
-  return { ok: true, record: rec, file };
+  const r = RECEIPT_SIDECAR.read({ dir: outboxDir, key: forwardKey, _inject });
+  if (r.ok === true && r.absent === true) return { absent: true };
+  if (r.ok === true) return { ok: true, record: r.value, file, sha256: r.sha256 };
+  if (r.kind === "residue") return { ok: false, kind: "residue", why: r.problem, residue: r.residue, badPath: r.residue[0] ?? file };
+  return { ok: false, kind: r.kind ?? "unreadable", why: r.problem, badPath: file };
 }
 
 /** 回执文件名后缀：带转发 key，doctor ⑯ 靠它核「失败但回执缺失」（唯一判据）。 */
@@ -254,10 +285,14 @@ export function appendForwardFailureReceipt({
   if (ip !== null) return { ok: false, reason: "receipt_invalid", why: ip };
   fs.mkdirSync(outboxDir, { recursive: true, mode: 0o700 });
   const file = path.join(outboxDir, forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX);
-  // P1-3 原子 no-replace 发布（与 selection-plan.mjs 同纪律）：写 tmp → fsync → linkSync(tmp, final) → unlink tmp →
+  // P1-1：持锁入口先做受验恢复（全量盘点 → 唯一候选 + 同 dev/ino + nlink==2 + open 后复核 → unlink →
+  // fsync 目录）；恢复不了（无候选之外的任何 residue）→ fail-closed，不继续写。
+  const rc = recoverForwardReceiptTmp({ outboxDir, forwardKey });
+  if (rc.ok === false) return { ok: false, reason: "residue", why: rc.why, residue: rc.residue };
+  // P1-3 原子 no-replace 发布（与 selection-plan.mjs 同一套机制）：写 tmp → fsync → linkSync(tmp, final) → unlink tmp →
   // fsync 目录 → 受验读回。EEXIST：既存完整合法且 canonKey 逐字等 → duplicate；内容不等 → conflict；不合法/半截 → residue（不覆盖）。
   const bytes = Buffer.from(JSON.stringify(record, null, 2) + "\n", "utf-8");
-  const tmp = path.join(outboxDir, "." + forwardKey + FORWARD_FAILURE_RECEIPT_SUFFIX + ".tmp." + process.pid + "." + randomUUID());
+  const tmp = RECEIPT_SIDECAR.tmpPathFor(outboxDir, forwardKey);
   const errCode = (e) => String(e?.code ?? e?.message ?? e);
   let fd = null;
   let linked = false;

@@ -67,24 +67,24 @@ export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, 
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (err) {
       if (err?.code === "ENOENT") return { ok: true, absent: true };
-      return { ok: false, problem: "open 失败: " + errCode(err) };
+      return { ok: false, kind: "unreadable", problem: "open 失败: " + errCode(err) };
     }
     try {
       const st = fs.fstatSync(fd);
-      if (!st.isFile()) return { ok: false, problem: "不是普通文件" };
-      if ((st.mode & 0o777) !== 0o600) return { ok: false, problem: "mode 不是 0600: " + (st.mode & 0o777).toString(8) };
-      if (st.size > maxBytes) return { ok: false, problem: "超过大小上限（" + st.size + " > " + maxBytes + "）" };
-      if (expectedStat && !statSame(st, expectedStat)) return { ok: false, problem: "open 后 inode 与盘点快照不一致（可能被替换）" };
+      if (!st.isFile()) return { ok: false, kind: "unreadable", problem: "不是普通文件" };
+      if ((st.mode & 0o777) !== 0o600) return { ok: false, kind: "unreadable", problem: "mode 不是 0600: " + (st.mode & 0o777).toString(8) };
+      if (st.size > maxBytes) return { ok: false, kind: "unreadable", problem: "超过大小上限（" + st.size + " > " + maxBytes + "）" };
+      if (expectedStat && !statSame(st, expectedStat)) return { ok: false, kind: "unreadable", problem: "open 后 inode 与盘点快照不一致（可能被替换）" };
       const buf = Buffer.alloc(st.size);
       let off = 0;
       while (off < st.size) {
         const n = fs.readSync(fd, buf, off, st.size - off, off);
-        if (n <= 0) return { ok: false, problem: "读不满文件（" + off + "/" + st.size + "）" };
+        if (n <= 0) return { ok: false, kind: "unreadable", problem: "读不满文件（" + off + "/" + st.size + "）" };
         off += n;
       }
       return { ok: true, buf, st };
     } catch (err) {
-      return { ok: false, problem: errCode(err) };
+      return { ok: false, kind: "unreadable", problem: errCode(err) };
     } finally {
       try { fs.closeSync(fd); } catch { /* 已关 */ }
     }
@@ -172,13 +172,16 @@ export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, 
    * 规则 ④：**不删任何文件**；遇任何精确 tmp 候选 → residue fail-closed。
    */
   function read({ dir, key, _inject = null }) {
-    if (typeof dir !== "string" || dir.length === 0) return { ok: false, problem: "目录缺失" };
+    if (typeof dir !== "string" || dir.length === 0) return { ok: false, kind: "unreadable", problem: "目录缺失" };
     const kv = validateKey(key);
-    if (kv !== null) return { ok: false, problem: kv };
+    if (kv !== null) return { ok: false, kind: "unreadable", problem: kv };
     const scan = scanTmpCandidates({ dir, key, _inject });
-    if (!scan.ok) return { ok: false, reason: "residue", problem: scan.why, residue: scan.residue };
+    // 盘点本身失败（readdir EIO / ENOTDIR / lstat 异常）与「盘出了残骸」是两回事：前者是读不了
+    //（kind:unreadable），后者才是 kind:residue。判据在结构上分，不靠文案正则。
+    // reason 仍保留 "residue"：那是 selection-plan 既有的对外契约（R57b 返修九的断言逐字卡着它）。
+    if (!scan.ok) return { ok: false, kind: "unreadable", reason: "residue", problem: scan.why, residue: scan.residue };
     if (scan.entries.length > 0) {
-      return { ok: false, reason: "residue", problem: label + " tmp 残骸待人工（受验读不自动清）", residue: scan.entries.map((e) => e.path) };
+      return { ok: false, kind: "residue", reason: "residue", problem: label + " tmp 残骸待人工（受验读不自动清）", residue: scan.entries.map((e) => e.path) };
     }
     const file = filePath(dir, key);
     let fd = null;
@@ -186,28 +189,31 @@ export function createVerifiedSidecar({ label, fileNameOf, maxBytes, problemOf, 
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (err) {
       if (err?.code === "ENOENT") return { ok: true, absent: true };
-      return { ok: false, problem: "open 失败: " + errCode(err) };
+      return { ok: false, kind: "unreadable", problem: "open 失败: " + errCode(err) };
     }
     try {
       const st = fs.fstatSync(fd);
-      if (!st.isFile()) return { ok: false, problem: "不是普通文件" };
-      if (st.nlink !== 1) return { ok: false, problem: "硬链接数不为 1" };
-      if ((st.mode & 0o777) !== 0o600) return { ok: false, problem: "mode 不是 0600: " + (st.mode & 0o777).toString(8) };
-      if (st.size > maxBytes) return { ok: false, problem: "超过大小上限（" + st.size + " > " + maxBytes + "）" };
+      if (!st.isFile()) return { ok: false, kind: "unreadable", problem: "不是普通文件" };
+      if (st.nlink !== 1) return { ok: false, kind: "unreadable", problem: "硬链接数不为 1" };
+      if ((st.mode & 0o777) !== 0o600) return { ok: false, kind: "unreadable", problem: "mode 不是 0600: " + (st.mode & 0o777).toString(8) };
+      if (st.size > maxBytes) return { ok: false, kind: "unreadable", problem: "超过大小上限（" + st.size + " > " + maxBytes + "）" };
       const buf = Buffer.alloc(st.size);
       let off = 0;
       while (off < st.size) {
         const n = fs.readSync(fd, buf, off, st.size - off, off);
-        if (n <= 0) return { ok: false, problem: "读不满文件（" + off + "/" + st.size + "）" };
+        if (n <= 0) return { ok: false, kind: "unreadable", problem: "读不满文件（" + off + "/" + st.size + "）" };
         off += n;
       }
       let value = null;
-      try { value = JSON.parse(buf.toString("utf-8")); } catch (err) { return { ok: false, problem: "JSON 解析失败: " + errCode(err) }; }
+      try { value = JSON.parse(buf.toString("utf-8")); } catch (err) { return { ok: false, kind: "invalid", problem: "JSON 解析失败: " + errCode(err) }; }
       const p = problemOf(value, key);
-      if (p !== null) return problemReason === null ? { ok: false, problem: p } : { ok: false, problem: p, reason: problemReason };
+      if (p !== null) {
+        // reason 保留（selection-plan 的 selection_plan_key_mismatch 是既有对外契约），kind 是新加的通用分档。
+        return problemReason === null ? { ok: false, kind: "invalid", problem: p } : { ok: false, kind: "invalid", problem: p, reason: problemReason };
+      }
       return { ok: true, value, sha256: sha256(buf), bytes: buf.length };
     } catch (err) {
-      return { ok: false, problem: errCode(err) };
+      return { ok: false, kind: "unreadable", problem: errCode(err) };
     } finally {
       try { fs.closeSync(fd); } catch { /* 已关 */ }
     }

@@ -9,7 +9,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
 // 两套件共用一份注册器（R59）：async 用例拒绝、汇总/退出码一致都在那里
-import { createTestHarness, installUnhandledRejectionGuard } from "../test-harness.mjs";
+import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsolation } from "../test-harness.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -177,6 +177,8 @@ const { test, sealSummary, printSummary, TEST_FILTER } = createTestHarness({
   onFail: (name, err) => { console.error("FAIL " + name + "\n" + (err.stack ?? err)); },
 });
 installUnhandledRejectionGuard();
+// R60：套件级 HOME 隔离（注册器之后、第一条 test 之前）
+const SUITE_HOME = installTestHomeIsolation();
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
 
 /**
@@ -3657,7 +3659,7 @@ test("锁内重读要重判损坏：文件名一个没变，目标字段变坏�
     "**零抑制** —— 说不清该发去哪，就不能替它决定不发");
 });
 
-test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都不许碰", () => {
+test("安装器只许写进 CODEX_HOME —— 套件 HOME 派生的 ~/.codex 一个字节都不许碰（passwd 路径另由双临时 home 夹具单证）", () => {
   // **这条守的是一次实测事故。**新代码用 os.homedir() 算运行时根，而这套测试
   // 只隔离了 CODEX_HOME —— 于是跑一次测试就往真机装了 3.7M 的运行时。
   // 这个仓库为"测试污染真机"付过三次代价，那是第四次。
@@ -3671,10 +3673,11 @@ test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都
   fs.mkdirSync(home, { recursive: true });
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
 
-  // 真机上那个位置现在是什么样，记下来。
-  const realCodexRuntime = path.join(os.homedir(), ".codex", "feishu-bridge", "runtime");
-  const before = fs.existsSync(realCodexRuntime)
-    ? fs.readdirSync(realCodexRuntime).sort().join(",") : "<不存在>";
+  // R60 返修一 P2：`os.homedir()` 随套件 HOME 走 —— 这里证明的是「**HOME 派生路径**未被写」，
+  //   不是「真机 passwd home 未被写」（那是另一条证据：claude 侧的双临时 home 夹具，注入 _inject.realUserHome 调产品原语）。
+  const suiteDerivedCodexRuntime = path.join(os.homedir(), ".codex", "feishu-bridge", "runtime");
+  const before = fs.existsSync(suiteDerivedCodexRuntime)
+    ? fs.readdirSync(suiteDerivedCodexRuntime).sort().join(",") : "<不存在>";
 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
@@ -3688,10 +3691,10 @@ test("安装器只许写进 CODEX_HOME —— 真机的 ~/.codex 一个字节都
     "运行时必须落在 CODEX_HOME 下");
 
   // **不该动的地方一个字节没动。**
-  const after = fs.existsSync(realCodexRuntime)
-    ? fs.readdirSync(realCodexRuntime).sort().join(",") : "<不存在>";
+  const after = fs.existsSync(suiteDerivedCodexRuntime)
+    ? fs.readdirSync(suiteDerivedCodexRuntime).sort().join(",") : "<不存在>";
   assert.equal(after, before,
-    "给了 CODEX_HOME 还往真机写 —— 这正是那次污染的形状");
+    "给了 CODEX_HOME 还往 HOME 派生路径写 —— 这正是那次污染的形状");
 });
 
 test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () => {

@@ -165,9 +165,12 @@ export function withInstalledSurfaceLock(file, fn, { waitMs = 5000, staleMs = SU
     if (got?.ok) break;
     if (got?.reason === "reaped_uncleared") return withResidues({ ok: false, reason: "surface_lock_residue", why: "陈旧锁隔离后删不掉：" + String(got.error) + "（" + String(got.path) + "，只人工删）", path: String(got.path) });
     if (got?.reason === "reap_uncleared") return withResidues({ ok: false, reason: "surface_lock_residue", why: "归属转换锁交不还：" + String(got.error) + "（" + String(got.path) + "，node scripts/repair-publish-lock.mjs --lock " + lock + " --apply 能清）", path: String(got.path) });
-    // R61：lock_residue / reap_residue 与 busy 同预算重试 —— 重载下 readLockOwner 可能对活锁的释放窗口
-    //   做出一次性的未知形状误判（验收实测：两进程并发首笔 surface_lock_residue、单跑不复现）；
-    //   真残骸重试也不会变好，预算耗尽后仍 fail-closed，且 why 带上「预算内持续为残骸」的证据，不放松判据。
+    // R61：lock_residue / reap_residue 与 busy 同预算重试。
+    //   **这是抗抖加固，不是对某个已查明根因的修**：合法 symlink 释放窗口的 ENOENT 早已折成 busy，
+    //   非 ENOENT 的形状抖动不是当前锁协议能稳定产生的竞态 —— 所以下面这条只是**假设**：
+    //   重载下 readLockOwner 可能对活锁的释放窗口做出一次性的未知形状误判（验收实测：两进程并发首笔
+    //   surface_lock_residue、单跑不复现）。真残骸重试也不会变好，预算耗尽后仍 fail-closed，
+    //   且 why 带上「预算内持续为残骸」的证据，不放松判据。
     if (got?.reason === "lock_residue" || got?.reason === "reap_residue") {
       if (Date.now() >= deadline) return withResidues({ ok: false, reason: "surface_lock_residue", why: got.reason + "（在 " + waitMs + "ms 预算内持续为残骸，保留现场，交人工）", path: lock });
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);

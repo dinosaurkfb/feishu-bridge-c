@@ -378,8 +378,17 @@ function withReapLock(lockDir, fn, { waitMs = 0, duringReap = null } = {}) {
       // 收成 reapUncleared 挂在结果上 —— 段内做的事算数，残骸交显式维护入口。
       let residue = null;
       try {
-        const cur = readLockOwner(reapDir);
-        if (cur.present && cur.owner && cur.owner.token === token) fs.rmSync(reapDir, { recursive: true, force: true });
+        const cur = readLockOwner(reapDir, { strict: true });
+        if (cur.unreadable) {
+          residue = { path: reapDir, error: cur.errorCode ?? cur.error };
+        } else if (cur.present) {
+          if (cur.owner === null) {
+            residue = { path: reapDir, error: "owner_unreadable" };
+          } else if (cur.owner.token === token) {
+            fs.rmSync(reapDir, { recursive: true, force: true });
+          }
+          // cur.owner.token !== token（已被接管）维持静默
+        }
       } catch (err) { residue = { path: reapDir, error: String(err?.code ?? err?.message ?? err) }; }
       if (residue !== null && out !== undefined) out = { ...out, reapUncleared: residue };
     }
@@ -468,10 +477,16 @@ export function isPublishLockStale(lockDir, { staleMs = 5 * 60 * 1000, now = Dat
 export function releasePublishLock(lockDir, { waitMs = 500, expectedToken = null } = {}) {
   const mine = HELD.get(lockDir) ?? null;
   if (expectedToken !== null && mine !== expectedToken) return { ok: false, reason: "not_owner", pid: null };
-  const pre = readLockOwner(lockDir);
+  const pre = readLockOwner(lockDir, { strict: true });
+  if (pre.unreadable) {
+    return { ok: false, reason: "lock_unreadable", path: lockDir, error: pre.error, errorCode: pre.errorCode };
+  }
   if (!pre.present) { HELD.delete(lockDir); return { ok: true, absent: true }; }
   const done = withReapLock(lockDir, () => {
-    const r = readLockOwner(lockDir);
+    const r = readLockOwner(lockDir, { strict: true });
+    if (r.unreadable) {
+      return { ok: false, reason: "lock_unreadable", path: lockDir, error: r.error, errorCode: r.errorCode };
+    }
     if (!r.present) return { ok: true, absent: true };
     if (!r.owner) return { ok: false, reason: "owner_unreadable" };
     if (!r.legacy) {

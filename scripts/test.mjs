@@ -76,7 +76,7 @@ import { describeReminderSweep, describeWaited, remindClaudePendingClaims, remin
 import { acquireSessionLock, releaseSessionLock, stampSessionLock, readRunOutcome, REPLY_ONLY_ARGS, releaseSessionLockIfOwnedBy } from "./handoff.mjs";
 import {
   acquirePublishLock, attributeSession, clearStaleReapLock, exactProjectsForRoot, fileContainsAny, isUnder,
-  loadRegistry, loadRegistryStrict, normalizeRoot, readLockOwner, releasePublishLock,
+  loadRegistry, loadRegistryStrict, normalizeRoot, readLockOwner, releasePublishLock, commitWhileHeld,
   routableProjectsForRoot,
 } from "./registry.mjs";
 import * as outboxModule from "./outbox.mjs";
@@ -47582,6 +47582,150 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       fs.openSync = origOpen;
       fs.fsyncSync = origFsync;
       try { fs.unlinkSync(planTmp); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-1 T1：releasePublishLock pre 阶段注入 lstat EIO → lock_unreadable、保留 HELD、锁仍在、还原后成功释放", () => withLedgerD((root, dir) => {
+    const lockDir = path.join(dir, "ledger.lock");
+    const acq = acquirePublishLock(lockDir);
+    assert.equal(acq.ok, true, "成功取锁");
+    assert.equal(fs.lstatSync(lockDir).isSymbolicLink(), true, "锁 symlink 在盘上");
+
+    let injectEio = true;
+    const origLstat = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, opts) => {
+        if (injectEio && String(p) === lockDir) {
+          const err = new Error("EIO: i/o error, lstat");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat(p, opts);
+      };
+      const r = releasePublishLock(lockDir);
+      assert.equal(r.ok, false, "pre 阶段注入 EIO 必须 ok:false");
+      assert.equal(r.reason, "lock_unreadable", "reason 必须为 lock_unreadable");
+      assert.equal(r.errorCode, "EIO", "errorCode 必须为 EIO");
+      assert.equal(origLstat(lockDir).isSymbolicLink(), true, "盘上 symlink 仍在");
+
+      // 还原 fs 后再释放：HELD 没丢，正常释放
+      injectEio = false;
+      const r2 = releasePublishLock(lockDir);
+      assert.equal(r2.ok, true, "还原后释放成功");
+      assert.equal(r2.absent, undefined, "无 absent 字段（证明 HELD 没丢，非缺席返回）");
+      assert.throws(() => fs.lstatSync(lockDir), /ENOENT/, "锁已删除");
+    } finally {
+      injectEio = false;
+      fs.lstatSync = origLstat;
+      try { releasePublishLock(lockDir); } catch {}
+      try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-1 T2：releasePublishLock 段内注入 lstat EIO → lock_unreadable、保留 HELD、锁仍在、还原后成功释放", () => withLedgerD((root, dir) => {
+    const lockDir = path.join(dir, "ledger.lock");
+    const acq = acquirePublishLock(lockDir);
+    assert.equal(acq.ok, true, "成功取锁");
+
+    let lstatCount = 0;
+    let injectEio = true;
+    const origLstat = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, opts) => {
+        if (injectEio && String(p) === lockDir) {
+          lstatCount += 1;
+          // 第一次（pre 阶段）放行，第二次（段内 r）抛出 EIO
+          if (lstatCount === 2) {
+            const err = new Error("EIO: i/o error, lstat");
+            err.code = "EIO";
+            throw err;
+          }
+        }
+        return origLstat(p, opts);
+      };
+      const r = releasePublishLock(lockDir);
+      assert.equal(r.ok, false, "段内注入 EIO 必须 ok:false");
+      assert.equal(r.reason, "lock_unreadable", "reason 必须为 lock_unreadable");
+      assert.equal(origLstat(lockDir).isSymbolicLink(), true, "盘上 symlink 仍在");
+
+      // 还原后正常释放
+      injectEio = false;
+      const r2 = releasePublishLock(lockDir);
+      assert.equal(r2.ok, true, "还原后释放成功");
+      assert.throws(() => fs.lstatSync(lockDir), /ENOENT/, "锁已删除");
+    } finally {
+      injectEio = false;
+      fs.lstatSync = origLstat;
+      try { releasePublishLock(lockDir); } catch {}
+      try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-1 T3：withReapLock finally 中 lstat(.reap) 抛 EIO → 返回带 reapUncleared 且 .reap 留在盘上", () => withLedgerD((root, dir) => {
+    const lockDir = path.join(dir, "ledger.lock");
+    const reapDir = lockDir + ".reap";
+    const acq = acquirePublishLock(lockDir);
+    assert.equal(acq.ok, true, "成功取锁");
+
+    let insideFn = false;
+    const origLstat = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, opts) => {
+        if (insideFn && String(p) === reapDir) {
+          const err = new Error("EIO: i/o error, lstat reap");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat(p, opts);
+      };
+      const ret = commitWhileHeld(lockDir, () => {
+        insideFn = true;
+        return { ok: true, payload: 123 };
+      });
+      assert.equal(ret.ok, true, "commitWhileHeld 执行成功");
+      assert.equal(ret.run.ok, true, "fn 成功");
+      assert.ok(ret.reapUncleared, "返回值带 reapUncleared");
+      assert.equal(ret.reapUncleared.path, reapDir, "reapUncleared.path 为 reapDir");
+      assert.equal(ret.reapUncleared.error, "EIO", "reapUncleared.error 为 EIO");
+      assert.equal(origLstat(reapDir).isSymbolicLink(), true, ".reap symlink 仍在盘上");
+    } finally {
+      insideFn = false;
+      fs.lstatSync = origLstat;
+      try { releasePublishLock(lockDir); } catch {}
+      try { fs.rmSync(reapDir, { force: true, recursive: true }); } catch {}
+      try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
+    }
+  }));
+
+  test("R57d 返修十 P1-1 T4：clearLedgerResidue 释放段内注入 lockDir lstat EIO → ok:false、residue 含 lockDir、lock_held:true、why 含 lock_unreadable", () => withLedgerD((root, dir) => {
+    const lockDir = path.join(dir, "ledger.lock");
+    let lstatCount = 0;
+    let injectEio = false;
+    const origLstat = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, opts) => {
+        if (injectEio && String(p) === lockDir) {
+          lstatCount += 1;
+          // 首检放行，pre 阶段放行，段内 r 抛出 EIO
+          if (lstatCount === 3) {
+            const err = new Error("EIO: i/o error, lstat");
+            err.code = "EIO";
+            throw err;
+          }
+        }
+        return origLstat(p, opts);
+      };
+      injectEio = true;
+      const res = TAL.clearLedgerResidue({ dir, residue: [] });
+      assert.equal(res.ok, false, "释放段内注入 EIO 必须 ok:false");
+      assert.ok(Array.isArray(res.residue) && res.residue.includes(lockDir), "residue 必须包含 lockDir");
+      assert.equal(res.lock_held, true, "lock_held 必须为 true");
+      assert.match(String(res.why), /lock_unreadable/u, "why 必须包含 lock_unreadable");
+    } finally {
+      injectEio = false;
+      fs.lstatSync = origLstat;
+      try { releasePublishLock(lockDir); } catch {}
+      try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
     }
   }));
 

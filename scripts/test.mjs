@@ -42009,7 +42009,7 @@ test("#154 三轮 P2-2：helper 直调——词法越界返回 outside_root 且�
   assert.notEqual(present?.reason, "outside_root", "..foo 在场也不许判越界");
 });
 
-test("R63 outbox snapshot：受验读不过的规范命名回执（外指 symlink）不进 listPending——独立断言（R58 返修三 K1 存活钉）", () => {
+test("R63 listPending：受验读不过的规范命名回执（外指 symlink）不进待发集——独立断言（R58 返修三 K1 存活钉）", () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r63snap-"), { mode: 0o700 }));
   // 待发形状：published_at=null 且无 publish_suppressed_at——若跳过受验读，这文件会被当成待发记录收进
   // （内容与文件名的 forward_key 一致、本身是完全合法的回执——刀口下会被照常收进，红有区分度）

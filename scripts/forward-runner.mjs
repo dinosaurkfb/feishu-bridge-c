@@ -33,6 +33,7 @@ import { isDirectRun } from "./direct-run.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { appendForwardFailureReceipt } from "./outbox.mjs";
 import { ROLE_ENV } from "./live-session.mjs";
+import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 
 export const FORWARD_RESULT_SCHEMA = "forward_result_v1";
 export const FORWARD_STARTED_SCHEMA = "forward_started_v1";
@@ -45,6 +46,9 @@ const RUNNER_STARTED_AT = new Date().toISOString();
 /** result.json 键集（封闭）：写端投影与读端校验共用这一份。 */
 const RESULT_KEYS = "claude_code_version,claude_path,duration_ms,exit_code,final_text_sha256,finished_at,is_error,key,model,num_turns,outbox_dir,pid,reason_first_line,sent,subtype,target_name,schema".split(",").sort().join(",");
 const STARTED_KEYS = "claude_pid,key,runner_pid,runner_start_at,started_at,schema".split(",").sort().join(",");
+/** result 文件的封闭后缀（回执证据链按 <key> + 它取文件）。 */
+export const FORWARD_RESULT_SUFFIX = ".forward.result.json";
+const RESULT_MAX_BYTES = 64 * 1024;
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const sha256Hex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
@@ -96,9 +100,45 @@ export function forwardResultProblem(doc, { now = Date.now(), expectedKey = null
   if (!isCanonicalIso(doc.finished_at)) return "finished_at 不是规范化 ISO";
   if (Date.parse(doc.finished_at) > now + 60_000) return "finished_at 晚于写入时刻 +60s";
   if (doc.claude_path !== null && typeof doc.claude_path !== "string") return "claude_path 形状不对";
-  // P1-5：outbox_dir —— 回执所在 outbox 目录（相对 projectRoot 的相对路径，可含 ../），doc 读端据此精确核回执；null 合法。
+  // P1-5：outbox_dir —— 回执所在 outbox 目录（相对 projectRoot 的相对路径），doc 读端据此精确核回执；null 合法。
   if (doc.outbox_dir !== null && (typeof doc.outbox_dir !== "string" || doc.outbox_dir.length === 0 || doc.outbox_dir.startsWith("/"))) return "outbox_dir 形状不对（须相对路径或 null）";
   return null;
+}
+
+/**
+ * 回执↔result 的**唯一**证据链判据（P1-3）：发布器挑选时与 doctor 共用这一份。
+ * 回执里的 result_sha256 必须等于该 key 受验读到的 result 内容 sha256 —— 旧版只验 64hex 形状，
+ * 任意 64hex 都能冒充；result 重写后旧回执也照样算“有”。
+ * 返回 null（对得上 / 不是回执）或问题短句。
+ */
+export function forwardReceiptResultProblem(record, resultSha256) {
+  if (record?.kind !== "forward_failed") return null;
+  if (typeof resultSha256 !== "string" || !FORWARD_KEY_RE.test(resultSha256)) return "该 key 的 result 内容摘要不可得（受验读不通过）";
+  if (record.result_sha256 !== resultSha256) {
+    return "回执与 result 不符（result_sha256 " + String(record.result_sha256).slice(0, 12) + "… ≠ 受验 result " + resultSha256.slice(0, 12) + "…）";
+  }
+  return null;
+}
+
+/**
+ * 发布器挑选时用的证据核对器（P1-3）：对 forward_failed 记录，**受验读**该 key 的 result
+ *（fd 绑定 + 封闭校验 + 同 fd sha256）再与回执的 result_sha256 逐字比。
+ * 返回一个 (record) => null|string ；非 forward_failed 记录一律返 null（不归它管）。
+ */
+export function forwardReceiptEvidenceReader({ runsDir, maxBytes = RESULT_MAX_BYTES }) {
+  return (record) => {
+    if (record?.kind !== "forward_failed") return null;
+    const key = record.forward_key;
+    if (typeof key !== "string" || !FORWARD_KEY_RE.test(key)) return "回执的 forward_key 形状不对（无法定位 result）";
+    if (typeof runsDir !== "string" || runsDir.length === 0) return "runs 目录不可用（无法定位 result）";
+    const v = readVerifiedDoc({
+      file: path.join(runsDir, key + FORWARD_RESULT_SUFFIX),
+      docValidator: (doc) => forwardResultProblem(doc, { now: Date.now(), expectedKey: key }),
+      maxBytes,
+    });
+    if (v.ok !== true) return "该 key 的 result 读不出或不合规（" + (v.absent ? "result 缺席" : String(v.problem ?? "读不出")) + "）";
+    return forwardReceiptResultProblem(record, v.sha256);
+  };
 }
 
 /** started.json 的封闭校验器（#141 P1-4）。 */
@@ -235,7 +275,12 @@ function writeDocFile(targetPath, errPath, doc, maxBytes) {
       return { ok: false };
     }
     const dirErr = fsyncDirOf(path.dirname(targetPath));
-    if (dirErr !== null) noteErr(errPath, "目录 fsync 失败（" + dirErr + "）：" + path.dirname(targetPath));
+    // P1-3：目录 fsync 失败 = **没写成**（rename 落了但目录项不持久）。旧版只记一行日志仍返 ok:true，
+    // 于是 result 实际上可能丢、回执却已经发出去了。现在 ok:false —— 调用方不建回执（P1-5 gating）。
+    if (dirErr !== null) {
+      noteErr(errPath, "目录 fsync 失败（" + dirErr + "）：" + path.dirname(targetPath));
+      return { ok: false, sha256: null };
+    }
     return { ok: true, sha256: crypto.createHash("sha256").update(bytes).digest("hex") };
   } catch (err) {
     noteErr(errPath, String(err?.code ?? err?.message ?? err).slice(0, 200));

@@ -40778,6 +40778,11 @@ test("R58 发布器 dry-run：forward_failed 走既有出站发布器按回执�
   fs.writeFileSync(path.join(inbound, "active-mapping.json"),
     JSON.stringify({ status: "active", feishu_root_message_id_reference: "om_x", channel_generation_id: "gen-1" }));
   const createdAt = new Date().toISOString();
+  // P1-3：回执的证据链 —— result_sha256 必须等于该 key 受验读到的 result 内容 sha256，
+  // 所以夹具要真的放一份 result。
+  const resultBody = r58FailedBody(r54Key(21), "API Error: 400 dry", ".runtime-data/outbound/outbox", Date.now());
+  fs.mkdirSync(path.join(dir, ".runtime-data", "inbound", "runs"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".runtime-data", "inbound", "runs", r54Key(21) + ".forward.result.json"), resultBody, { mode: 0o600 });
   fs.writeFileSync(path.join(outbox, r54Key(21) + R58_RECEIPT_SUFFIX), JSON.stringify({
     schema_version: "1.0", artifact_type: "codex_feishu_bridge_event", zone: "work", classification: "internal",
     id: "forward-failed-" + r54Key(21), kind: "forward_failed",
@@ -40785,7 +40790,7 @@ test("R58 发布器 dry-run：forward_failed 走既有出站发布器按回执�
     event_key: "forward-failed:" + r54Key(21), source: "forward-runner",
     input_origin: null, input_text: null, target_channel_generation_id: "gen-1", run_id: null,
     forward_key: r54Key(21), message_id: "om_m1",
-    created_at: createdAt, publish_eligible_at: createdAt, published_at: null, result_sha256: R58_SHA,
+    created_at: createdAt, publish_eligible_at: createdAt, published_at: null, result_sha256: r58ShaOf(resultBody),
   }, null, 2) + "\n", { mode: 0o600 });
   const r = drainProject({ root: dir, dryRun: true });
   assert.equal(r.status, "dry_run", JSON.stringify({ status: r.status, reason: r.reason, detail: r.details ?? r.why ?? null }));
@@ -41057,7 +41062,8 @@ test("R58 返修二 P1-3：发布器挑选时核回执↔result——result_sha2
   const bad = drainProject({ root: p.root, dryRun: true });
   assert.equal(bad.status, "error", "sha 不符不许发布：" + JSON.stringify({ status: bad.status, reason: bad.reason }));
   assert.equal(bad.reason, "receipt_result_mismatch", "独立 reason receipt_result_mismatch：" + JSON.stringify(bad));
-  assert.equal(bad.count ?? 0, 0, "不符的回执不被挑选");
+  assert.equal(bad.records?.length ?? 0, 1, "不符的回执被拦下并点名：" + JSON.stringify(bad.records));
+  assert.equal(path.basename(String(bad.records?.[0]?.file ?? "")), key + R58_RECEIPT_SUFFIX, "点名是哪个文件");
   // 控制：受验读到的 result 内容 sha 写进回执 → 正常进队列
   fs.writeFileSync(file, JSON.stringify(r58ReceiptDoc(key, { result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
   const ok = drainProject({ root: p.root, dryRun: true });

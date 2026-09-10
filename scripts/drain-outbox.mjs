@@ -26,6 +26,7 @@ import {
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { readClaimState } from "./claim.mjs";
 import { publishOutboxAttempt } from "./publish-attempt.mjs";
+import { forwardReceiptEvidenceReader } from "./forward-runner.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { resolveLarkIdentity } from "./chain-template.mjs";
 import { isLockStale } from "./handoff.mjs";
@@ -264,6 +265,9 @@ export function drainProject({
     onBatchPublished: claudeRotationBatchHook({
       root, claudeSessionId: resolved.claudeSessionId ?? mapping.claude_session_id ?? claudeSessionId,
     }),
+    // P1-3：回执↔result 证据链核对器（判据只住 forward-runner.mjs 一份）——跑过 result 的落点，
+    // 由事务在挑选时现场受验读回并逐字比 result_sha256。
+    receiptEvidence: forwardReceiptEvidenceReader({ runsDir }),
   });
 
   // 入口只做入口的事：补上 root、Claude 特有的措辞素材与跨应用诊断。

@@ -1893,6 +1893,9 @@ export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process
   const left = [];
   for (const raw of Array.isArray(residue) ? residue : []) {
     const entry = String(raw);
+    // 已经不在盘上的路径不是残骸（也不删）—— 证据是**快照**：一次 repair 把主锁写进 residue、人工删掉之后，
+    //   下一次 repair 必须能凭"主锁不在了"收口（钉：主锁不在 → 才可清 lock_uncleared）。
+    try { fs.lstatSync(entry); } catch { continue; }
     const base = path.basename(entry);
     if ((LEDGER_TMP_RE.test(base) || SIDECAR_TMP_RE.test(base)) && allowedDirs.has(path.dirname(entry))) accepted.push(entry);
     else left.push(entry);

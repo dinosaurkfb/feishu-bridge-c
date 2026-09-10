@@ -47229,7 +47229,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     talD(TAL.rebindSessionAlias({ ...base, requestKey: rk("ok"), newSessionId: SESSION_D + "-f7a1-n", expectedRootOm: "om_f7a1" }), "③ root 相符提交");
     const op = Object.values(TAL.loadLedger(dir, { endpointId: EP57D }).doc.operations).find((o) => o.request_key === rk("ok"));
     assert.ok(op, "③ 本笔 rebind op");
-    assert.equal(op.result.selected_root_om, "om_f7a1", "③ result 带出 root");
+    assert.equal(TAL.loadLedger(dir, { endpointId: EP57D }).doc.records[b3].aliases.session_id, SESSION_D + "-f7a1-n", "③ 提交后 session 已换（base 路径的 result 不投影 root，root 只进请求指纹）");
     assert.equal(op.fingerprint, TAL.fingerprintOf("rebind_session_alias", { request_key: rk("ok"), topic_agent_id: b3, old_session_id: SESSION_D + "-f7a1", new_session_id: SESSION_D + "-f7a1-n", expected_root_om: "om_f7a1" }), "③ 指纹纳入 expected_root_om");
     // ④ 前向补（legacy 已提交、账本未提交）+ plan 的 root 与现场漂移 → 拒且账本零改动
     const s = f7RebindScene(dir, claimsDir, "ltk_f7p1", "om_f7p1ff", { beforeLedgerRename: () => { throw new Error("injected"); } });

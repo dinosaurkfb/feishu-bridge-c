@@ -3785,6 +3785,36 @@ test("repair-publish-lock 退出码：只有确实没有 / 已清 / 预览是 0�
   assert.ok(fs.lstatSync(badName).isSymbolicLink(), "后缀不合规的不许删");
 });
 
+// ── R61：收据锁的 residue 判据收口（两进程竞态定性后的产品加固；见该单回报）──
+
+test("R61 红证：瞬态 lock_residue 在 waitMs 预算内重试后必须成功（不得一次 residue 即永久放弃）；持续 residue 预算耗尽仍 fail-closed", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r61-residue-"));
+  const surface = path.join(local, "installed-surface.json");
+  // ① 瞬态：第一次 acquire 报 lock_residue（模拟重载下 readLockOwner 对活锁的瞬时误判），之后放行真锁 ——
+  //    预算内重试应当拿到锁并成功写收据；旧实现一次 residue 立即放弃 → 此用例红。
+  let transientFired = false;
+  const transient = (lock, opts) => {
+    if (!transientFired) { transientFired = true; return { ok: false, reason: "lock_residue", path: lock }; }
+    return acquireLockUngated(lock, opts);
+  };
+  const r1 = withInstalledSurfaceLock(surface, ({ commit }) => commit({ chains: { claude: { version: "0123456789abcdef", at: "2026-09-14T00:00:00.000Z", artifacts: [], scripts: [] } } }), { waitMs: 3000, acquire: transient });
+  assert.equal(r1.ok, true, "① 瞬态 residue 必须在预算内重试成功：" + JSON.stringify(r1));
+  assert.equal(transientFired, true, "① 注入确实发生过");
+  // ② 持续：每次 acquire 都报 lock_residue（真残骸）→ 预算耗尽仍 fail-closed，且 reason 保留 residue、点名现场
+  const always = (lock) => ({ ok: false, reason: "lock_residue", path: lock });
+  const t0 = Date.now();
+  const r2 = withInstalledSurfaceLock(surface, () => { throw new Error("不该跑到 fn"); }, { waitMs: 200, acquire: always });
+  assert.equal(r2.ok, false, "② 持续 residue 仍 fail-closed：" + JSON.stringify(r2));
+  assert.equal(r2.reason, "surface_lock_residue", "② reason：" + r2.reason);
+  assert.ok(Date.now() - t0 >= 200, "② 预算耗尽才放弃（重试了，不是秒拒）");
+  assert.match(String(r2.why ?? ""), /lock_residue/u, "② why 保留底层判据：" + r2.why);
+  // ③ 真残骸不吞：锁位置是普通文件（非协议 symlink）→ 原样 residue 交人工（不重试到误删）
+  fs.writeFileSync(surface + ".lock", "not a symlink");
+  const r3 = withInstalledSurfaceLock(surface, () => { throw new Error("不该跑到 fn"); }, { waitMs: 150 });
+  assert.equal(r3.ok, false, "③ 非协议锁位置仍拒：" + JSON.stringify(r3));
+  assert.match(String(r3.why ?? ""), /不是本协议的 symlink/u, "③ why：" + r3.why);
+  assert.ok(fs.existsSync(surface + ".lock"), "③ 现场保留（不删）");
+});
 test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 removed，之后出现的新实例不许被删", () => {
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-race-"));
   const worker = path.join(local, "worker.mjs");

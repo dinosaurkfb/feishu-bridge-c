@@ -48278,6 +48278,117 @@ fs.lstatSync = function(p, ...rest) {
     }
   });
 
+  test("R57d 返修十三 P1-1 T1：bind 失败且释放时 lockDir unreadable 时，不吞锁状态，lock_held 为 true 且 why 含 lock_unreadable；对照只 bind 失败则 lock_held 为 false", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const lockDir = path.join(dir, "ledger.lock");
+    const tmpName = "." + "a".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID();
+    const planTmp = path.join(claimsDir, tmpName);
+    fs.writeFileSync(planTmp, "data", { mode: 0o600 });
+
+    let armLockDirEio = false;
+    let armLockDirEioOnBind = true;
+    let injectClaimsDirBindEio = true;
+    const origOpen = fs.openSync;
+    const origLstat = fs.lstatSync;
+    try {
+      fs.openSync = function (p, flags, mode) {
+        if (injectClaimsDirBindEio && String(p) === claimsDir) {
+          if (armLockDirEioOnBind) armLockDirEio = true;
+          const err = new Error("injected bind EIO");
+          err.code = "EIO";
+          throw err;
+        }
+        return origOpen.apply(fs, [p, flags, mode]);
+      };
+      fs.lstatSync = function (p, ...rest) {
+        if (armLockDirEio && String(p) === lockDir) {
+          const err = new Error("injected lockDir EIO");
+          err.code = "EIO";
+          throw err;
+        }
+        return origLstat.apply(fs, [p, ...rest]);
+      };
+
+      // 测试分支：bind 失败 + 释放时 lockDir EIO
+      const res = TAL.clearLedgerResidue({ dir, claimsDir, residue: [planTmp] });
+      assert.equal(res.ok, false, "必须 ok:false");
+      assert.deepEqual(res.cleaned, [], "cleaned 必须为空");
+      assert.equal(res.lock_held, true, "释放遇 lock_unreadable 必须 lock_held: true");
+      assert.ok(res.residue.includes(lockDir), "residue 必须包含 lockDir");
+      assert.match(String(res.why), /身份受验不过/u, "why 必须包含「身份受验不过」");
+      assert.match(String(res.why), /lock_unreadable/u, "why 必须包含「lock_unreadable」");
+
+      // 对照组：只注入 bind EIO，释放正常
+      armLockDirEioOnBind = false;
+      armLockDirEio = false;
+      try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
+      const resCtrl = TAL.clearLedgerResidue({ dir, claimsDir, residue: [planTmp] });
+      assert.equal(resCtrl.ok, false, "对照组必须 ok:false");
+      assert.equal(resCtrl.lock_held, false, "对照组释放正常必须 lock_held: false");
+      assert.ok(!resCtrl.residue.includes(lockDir), "对照组 residue 不得包含 lockDir");
+      assert.match(String(resCtrl.why), /身份受验不过/u, "对照组 why 包含「身份受验不过」");
+      assert.doesNotMatch(String(resCtrl.why), /lock_unreadable/u, "对照组 why 不包含「lock_unreadable」");
+    } finally {
+      fs.openSync = origOpen;
+      fs.lstatSync = origLstat;
+      try { fs.rmSync(lockDir, { force: true, recursive: true }); } catch {}
+      try { fs.unlinkSync(planTmp); } catch {}
+    }
+  }));
+
+  test("R57d 返修十三 P1-2 T2（Codex 探针）：beforeUnlink 里替换 claimsDir 为根外 symlink 时，事后 nlink 检测捕获并记录 foreign_unlink，ok:false，原目录文件仍在", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const tmpName = "." + "b".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID();
+    const targetFile = path.join(claimsDir, tmpName);
+    fs.writeFileSync(targetFile, "original data", { mode: 0o600 });
+
+    const outsideDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "outside-t2-")));
+    const outsideFile = path.join(outsideDir, tmpName);
+    fs.writeFileSync(outsideFile, "foreign data", { mode: 0o600 });
+
+    const realClaimsDir = claimsDir + ".orig";
+
+    try {
+      const res = TAL.clearLedgerResidue({
+        dir,
+        claimsDir,
+        residue: [targetFile],
+        _inject: {
+          beforeUnlink: () => {
+            // 在 unlink 前把 claimsDir 换成指向根外目录的 symlink
+            fs.renameSync(claimsDir, realClaimsDir);
+            fs.symlinkSync(outsideDir, claimsDir);
+          },
+        },
+      });
+
+      assert.equal(res.ok, false, "发生 foreign_unlink 必须 ok:false");
+      assert.ok(Array.isArray(res.foreign_unlink) && res.foreign_unlink.includes(targetFile), "foreign_unlink 必须包含 targetFile");
+      assert.match(String(res.why), /别的 inode/u, "why 必须包含「别的 inode」");
+      const origFile = path.join(realClaimsDir, tmpName);
+      assert.equal(fs.existsSync(origFile), true, "原目录里的文件仍在");
+      // 注：根外同名文件 outsideFile 在路径式 unlink 下被删除，此为合同边界（Node 缺少相对 fd unlinkat），不断言 outsideFile 没被删
+    } finally {
+      try { fs.unlinkSync(outsideFile); } catch {}
+      try { fs.rmdirSync(outsideDir); } catch {}
+      try { fs.unlinkSync(claimsDir); } catch {}
+      try { fs.renameSync(realClaimsDir, claimsDir); } catch {}
+      try { fs.unlinkSync(targetFile); } catch {}
+    }
+  }));
+
+  test("R57d 返修十三 P1-2 T3：正向对照——无钩子时正常删除且 ok:true，无 foreign_unlink", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const tmpName = "." + "c".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID();
+    const planTmp = path.join(claimsDir, tmpName);
+    fs.writeFileSync(planTmp, "data", { mode: 0o600 });
+
+    const res = TAL.clearLedgerResidue({ dir, claimsDir, residue: [planTmp] });
+    assert.equal(res.ok, true, "正常删除必须 ok:true：" + JSON.stringify(res));
+    assert.ok(!res.foreign_unlink || res.foreign_unlink.length === 0, "正向用例无 foreign_unlink 或为空数组");
+    assert.equal(fs.existsSync(planTmp), false, "文件已被正常删除");
+  }));
+
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }
 

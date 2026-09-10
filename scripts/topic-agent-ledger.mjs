@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner, clearStaleReapLock } from "./registry.mjs";
+import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
 import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
@@ -1868,24 +1868,59 @@ function foldRelease(result, released) {
 
 /** 账本写原语自己产生的 tmp 残骸名（封闭形状）：ledger.json[.prev].<正整数 pid>.<v4 uuid>。 */
 const LEDGER_TMP_RE = /^ledger\.json(?:\.prev)?\.[1-9]\d*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+/** 同侧 sidecar 的 tmp 残骸名（封闭形状：verified-sidecar 的 `.` + 文件名 + `.<正整数 pid>.<v4 uuid>`）。 */
+const SIDECAR_TMP_RE = /^\.[0-9a-f]{64}\.selection-plan\.json\.tmp\.[1-9]\d*\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 /**
- * **账本侧残骸清理原语**（R57d 返修六 P1-2）：只清「这笔写自己留下的东西」，不是"什么都能删"的口子。
- *   · 账本 tmp 残骸（名字封闭 + 必须是**普通单硬链接文件** + 必须落在本 endpoint 目录里）→ unlink + 受验读回（lstat 必须 ENOENT）；
- *   · reap 家族残骸（<lock>.reap / <lock>.reap.quarantine-<uuid>）→ 交 registry 自己的维护入口
- *     clearStaleReapLock（它按形状判 symlink + owner，rename 到隔离路径再删，不按路径 rm）；
- *   · **主锁（<lock>）本原语不碰**：release 失败时归属证明已经丢了，替它做决定正是锁协议禁止的事 —— 报 residue 交人；
- *   · 其余任何路径 → 不动、报 residue。
- * @returns { ok, cleaned: string[], residue: string[], why? }
+ * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口）。
+ *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（LEDGER_TMP_RE / SIDECAR_TMP_RE）且落在获准目录
+ *     （endpoint 目录 + 调用方点名的 sidecar 目录）里的那些；其余一律不动、进 residue。
+ *   · **锁家族一律拒**：`<lock>` / `<lock>.reap` / `<lock>.reap.quarantine-<uuid>` 是锁协议自己的资源。在这里删
+ *     等于失去锁的归属证明 —— 旧码拿 `startsWith(lockDir + ".")` 收族、并以 `staleMs: 0` 调维护清理器，把**活**的
+ *     reap 实例（当前进程正持有）删掉还报 ok:true（探针现场）。它们只走 registry 的显式维护入口
+ *     repair-publish-lock.mjs；本原语只报 residue。
+ *   · 删除段在**真正的账本锁栅栏**（acquirePublishLock）内跑：与写方互斥，且只在拿到锁之后才动文件；
+ *     栅栏取不到 / 释放不干净 / 主锁仍在 → 一律不报 ok。
+ *   · 主锁仍在（symlink + 受验持有者）→ 本原语**不报 ok**（residue=[] 也一样）：它没有资格替锁协议做决定，交人。
+ *   · tmp 清掉之后补一次目录 fsync（"清掉了"必须落到介质上）。
+ * @returns { ok, cleaned: string[], residue: string[], lock_held?, why? }
  */
-export function clearLedgerResidue({ dir, residue = [], _inject = null } = {}) {
+export function clearLedgerResidue({ dir, residue = [], dirs = [], env = process.env } = {}) {
   const { lock: lockDir } = ledgerPaths(dir);
-  const cleaned = [];
+  const allowedDirs = new Set([dir]);
+  for (const d of Array.isArray(dirs) ? dirs : []) if (typeof d === "string" && d.length > 0) allowedDirs.add(d);
+  const accepted = [];
   const left = [];
   for (const raw of Array.isArray(residue) ? residue : []) {
     const entry = String(raw);
     const base = path.basename(entry);
-    if (LEDGER_TMP_RE.test(base) && path.dirname(entry) === dir) {
+    if ((LEDGER_TMP_RE.test(base) || SIDECAR_TMP_RE.test(base)) && allowedDirs.has(path.dirname(entry))) accepted.push(entry);
+    else left.push(entry);
+  }
+  // 锁家族先看：在场的主锁 / reap 家族一律不由本原语处置 —— 一个交人，一个交显式维护入口。
+  //   （也不去"先取锁再释放"：reap 家族在的时候释放段拿不到 reap 锁，反而会把主锁留在盘上。）
+  const held = readLockOwner(lockDir);
+  if (held.present) {
+    return { ok: false, cleaned: [], residue: [...left, lockDir], lock_held: true,
+      why: "主锁 " + path.basename(lockDir) + " 仍在（" + (held.owner ? "持有者 pid=" + String(held.owner.pid) : "owner 不可读") + "）：本原语不替锁协议清理，交人" };
+  }
+  let reapPresent = false;
+  try { fs.lstatSync(lockDir + ".reap"); reapPresent = true; } catch { /* ENOENT = 没有 */ }
+  if (reapPresent) {
+    return { ok: false, cleaned: [], residue: [...left, lockDir + ".reap"], lock_held: false,
+      why: "reap 家族残骸在场（" + path.basename(lockDir) + ".reap）：交 registry 的显式维护入口 repair-publish-lock.mjs，本原语不动" };
+  }
+  // 真账本锁栅栏：删除段与写方互斥；取不到锁（忙 / 维护门 / reap 残骸）→ 什么都不删。
+  const fence = acquirePublishLock(lockDir, { env, reapUnrecognized: false });
+  if (!fence.ok) {
+    return { ok: false, cleaned: [], residue: [...left, ...accepted], lock_held: false, fence: fence.reason ?? "unavailable",
+      why: "账本锁栅栏取不到（" + String(fence.reason ?? "?") + "）：残骸一律不清" };
+  }
+  const cleaned = [];
+  let released = null;
+  let dirFsyncErr = null;
+  try {
+    for (const entry of accepted) {
       let st = null;
       try { st = fs.lstatSync(entry); }
       catch (err) { if (err?.code === "ENOENT") { cleaned.push(entry); continue; } left.push(entry); continue; }
@@ -1893,17 +1928,24 @@ export function clearLedgerResidue({ dir, residue = [], _inject = null } = {}) {
       if (!st.isFile() || st.nlink !== 1) { left.push(entry); continue; }
       try { fs.unlinkSync(entry); } catch { left.push(entry); continue; }
       try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
-      continue;
     }
-    if (entry.startsWith(lockDir + ".")) {
-      const r = clearStaleReapLock(lockDir, { staleMs: 0, apply: true });
-      if (r && r.removed === true && r.reason === undefined) { cleaned.push(entry); continue; }
-      left.push(entry);
-      continue;
-    }
-    left.push(entry);
+    if (cleaned.length > 0) dirFsyncErr = fsyncDir(dir);
+  } finally {
+    try { released = releasePublishLock(lockDir); } catch (err) { released = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }
-  return { ok: left.length === 0, cleaned, residue: left };
+  const releaseClean = released !== null && released.ok === true && released.absent !== true && released.reapUncleared == null;
+  const after = readLockOwner(lockDir);
+  if (dirFsyncErr !== null) return { ok: false, cleaned, residue: left, lock_held: false, why: "清理后目录 fsync 失败（" + dirFsyncErr + "）：保持 unclean" };
+  if (!releaseClean) {
+    return { ok: false, cleaned, lock_held: after.present,
+      residue: [...left, ...(released?.reapUncleared?.path ? [String(released.reapUncleared.path)] : []), ...(after.present ? [lockDir] : [])],
+      why: "账本锁释放不干净（" + String(released?.reason ?? released?.why ?? "?") + "）：保持 unclean" };
+  }
+  if (after.present && after.owner !== null) {
+    return { ok: false, cleaned, residue: [...left, lockDir], lock_held: true, why: "清理后主锁仍在（持有者 pid=" + String(after.owner.pid) + "）：交人" };
+  }
+  if (left.length > 0) return { ok: false, cleaned, residue: left, lock_held: false, why: "残骸没清干净（" + left.join("、") + "）：保持 unclean" };
+  return { ok: true, cleaned, residue: [], lock_held: false };
 }
 
 /* ─────────────────────────── operations 盖章 ─────────────────────────── */

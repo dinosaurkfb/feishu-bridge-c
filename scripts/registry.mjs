@@ -624,7 +624,7 @@ export function clearStaleReapLock(lockDir, {
     };
     result = run();
   } catch (err) {
-    result = { ...base, reason: "io_error", error: String(err?.message ?? err) };
+    result = { ...base, reason: "io_error", phase: "run", error: String(err?.message ?? err), errorCode: err?.code ?? null };
   } finally {
     let maintUncleared = null;
     const cur = readLockOwner(maintDir, { strict: true });

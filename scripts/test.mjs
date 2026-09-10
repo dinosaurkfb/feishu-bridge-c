@@ -48209,6 +48209,75 @@ fs.lstatSync = function(p, ...rest) {
     }
   }));
 
+  test("R57d 返修十二 P2-1：clearStaleReapLock 注入 rmSync 静默不删 maintDir → reason:maintenance_unreleased 且 maintUncleared.error 为 still_present", () => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-reap-maint-p21-"));
+    const lockDir = path.join(local, "registry.lock");
+    const reapDir = lockDir + ".reap";
+    const maintDir = lockDir + ".maint";
+    const old = (Date.now() - 120_000) / 1000;
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old);
+
+    const origRm = fs.rmSync;
+    let armed = false;
+    try {
+      fs.rmSync = function (p, ...args) {
+        if (armed && String(p) === maintDir) {
+          return;
+        }
+        return origRm.call(fs, p, ...args);
+      };
+
+      const res = clearStaleReapLock(lockDir, {
+        apply: true,
+        afterQuarantine: () => { armed = true; },
+      });
+
+      assert.equal(res.removed, true, "reap 残骸确实清了");
+      assert.equal(res.reason, "maintenance_unreleased", "reason 为 maintenance_unreleased");
+      assert.ok(res.maintUncleared !== null, "maintUncleared 必非 null");
+      assert.equal(res.maintUncleared.error, "still_present", "error 为 still_present");
+      assert.equal(res.maintUncleared.path, maintDir, "path 为 maintDir");
+      assert.equal(fs.lstatSync(maintDir).isSymbolicLink(), true, ".maint 锁仍在盘上");
+
+      armed = false;
+      fs.rmSync = origRm;
+      fs.rmSync(maintDir, { force: true, recursive: true });
+    } finally {
+      fs.rmSync = origRm;
+      try { fs.rmSync(local, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  test("R57d 返修十二 P2-2：clearStaleReapLock run() 抛异常保留 phase:run 与 errorCode，且 maint 正常释放", () => {
+    const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-reap-maint-p22-"));
+    const lockDir = path.join(local, "registry.lock");
+    const reapDir = lockDir + ".reap";
+    const maintDir = lockDir + ".maint";
+    const old = (Date.now() - 120_000) / 1000;
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), reapDir);
+    fs.lutimesSync(reapDir, old, old);
+
+    try {
+      const res = clearStaleReapLock(lockDir, {
+        apply: true,
+        duringMaintenance: () => {
+          const err = new Error("permission denied");
+          err.code = "EACCES";
+          throw err;
+        },
+      });
+
+      assert.equal(res.reason, "io_error", "reason 必须为 io_error");
+      assert.equal(res.phase, "run", "phase 必须为 run");
+      assert.equal(res.errorCode, "EACCES", "errorCode 必须为 EACCES");
+      assert.equal(res.maintUncleared, null, "维护锁必须已被干净释放");
+      assert.throws(() => fs.lstatSync(maintDir), ".maint 锁必须已被删除");
+    } finally {
+      try { fs.rmSync(local, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }
 

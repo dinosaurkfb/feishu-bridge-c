@@ -1941,43 +1941,78 @@ function validateDirsPendingFsync(dirsPendingFsync, allowedSet) {
   return { ok: true };
 }
 
-function fsyncDirBound(d) {
+function bindAllowedDir(d) {
   let fd = null;
   try {
     const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_DIRECTORY ?? 0);
     try {
       fd = fs.openSync(d, flags);
     } catch (err) {
-      if (err?.code === "ELOOP") return "ELOOP";
+      if (err?.code === "ELOOP") return { error: "ELOOP" };
       try {
-        if (fs.lstatSync(d).isSymbolicLink()) return "ELOOP";
+        if (fs.lstatSync(d).isSymbolicLink()) return { error: "ELOOP" };
       } catch {}
-      return String(err?.code ?? err?.message ?? err);
+      return { error: String(err?.code ?? err?.message ?? err) };
     }
     const fst = fs.fstatSync(fd);
-    if (!fst.isDirectory()) return "ENOTDIR";
+    if (!fst.isDirectory()) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "ENOTDIR" };
+    }
     let lst;
     try {
       lst = fs.lstatSync(d);
     } catch (err) {
-      return String(err?.code ?? err?.message ?? err);
+      try { fs.closeSync(fd); } catch {}
+      return { error: String(err?.code ?? err?.message ?? err) };
     }
-    if (lst.isSymbolicLink()) return "ELOOP";
-    if (!lst.isDirectory()) return "ENOTDIR";
-    if (fst.dev !== lst.dev || fst.ino !== lst.ino) return "identity_mismatch";
-    fs.fsyncSync(fd);
+    if (lst.isSymbolicLink()) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "ELOOP" };
+    }
+    if (!lst.isDirectory()) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "ENOTDIR" };
+    }
+    if (fst.dev !== lst.dev || fst.ino !== lst.ino) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "identity_mismatch" };
+    }
+    let real = null;
+    try {
+      real = fs.realpathSync(d);
+    } catch (err) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: String(err?.code ?? err?.message ?? err) };
+    }
+    if (real !== d) {
+      try { fs.closeSync(fd); } catch {}
+      return { error: "not_canonical", real };
+    }
+    return { fd, dev: fst.dev, ino: fst.ino };
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    return { error: String(err?.code ?? err?.message ?? err) };
+  }
+}
+
+function fsyncDirBound(d) {
+  const bound = bindAllowedDir(d);
+  if (bound.error) return bound.error;
+  try {
+    fs.fsyncSync(bound.fd);
     return null;
   } catch (err) {
     return String(err?.code ?? err?.message ?? err);
   } finally {
-    if (fd !== null) {
-      try { fs.closeSync(fd); } catch {}
-    }
+    try { fs.closeSync(bound.fd); } catch {}
   }
 }
 
 /**
- * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口；返修八 P2 共享判别器；返修十一 P2-1/P2-2）：
+ * **账本侧残骸清理原语**（R57d 返修六 P1-2；返修七 P1-2 收口；返修八 P2 共享判别器；返修十一 P2-1/P2-2；返修十二 P1）：
  *   · 候选集是**精确路径联合**：只认传进来的路径里、形状封闭（isLedgerTmpName / isSidecarTmpName）且落在获准目录
  *     （endpoint 目录 + claimsDir 目录）里的那些；其余一律不动、进 residue（先清允许项、再因 left 非空报 ok:false）。
  *   · **锁家族一律拒**：`<lock>` / `<lock>.reap` / `<lock>.reap.quarantine-<uuid>` 是锁协议自己的资源。在这里删
@@ -1986,6 +2021,8 @@ function fsyncDirBound(d) {
  *     repair-publish-lock.mjs；本原语只报 residue。
  *   · 删除段在**真正的账本锁栅栏**（acquirePublishLock）内跑：与写方互斥，且只在拿到锁之后才动文件；
  *     栅栏取不到 / 释放不干净 / 主锁仍在 → 一律不报 ok。
+ *   · 删除前受验绑定允许目录（bindAllowedDir）：必须 realpath 规范、无 symlink、dev/ino 一致；
+ *     任一不过 → 零删除退出，不许先删再报。
  *   · 主锁仍在（symlink + 受验持有者）→ 本原语**不报 ok**（residue=[] 也一样）：它没有资格替锁协议做决定，交人。
  *   · tmp 清掉之后补一次目录 fsync（"清掉了"必须落到介质上）。
  * @returns { ok, cleaned: string[], residue: string[], lock_held?, why? }
@@ -2057,11 +2094,57 @@ export function clearLedgerResidue({ dir, residue = [], claimsDir = null, dirsPe
     return { ok: false, cleaned: [], residue: [...left, ...accepted], dirs_pending_fsync: Array.from(pendingDirs), lock_held: false, fence: fence.reason ?? "unavailable",
       why: "账本锁栅栏取不到（" + String(fence.reason ?? "?") + "）：残骸一律不清" };
   }
+
+  // R57d 返修十二 P1：栅栏内、删除循环之前对允许集里的每个目录做 bindAllowedDir
+  const boundDirs = new Map();
+  for (const d of allowedDirs) {
+    const b = bindAllowedDir(d);
+    if (b.error) {
+      for (const item of new Set(boundDirs.values())) {
+        try { fs.closeSync(item.fd); } catch {}
+      }
+      try { releasePublishLock(lockDir); } catch {}
+      return {
+        ok: false,
+        cleaned: [],
+        residue: [...accepted, ...left],
+        dirs_pending_fsync: dirsPendingFsync,
+        lock_held: false,
+        why: "允许目录身份受验不过（" + d + ": " + b.error + "）：零删除",
+      };
+    }
+    boundDirs.set(d, b);
+    boundDirs.set(path.resolve(d), b);
+  }
+  if (typeof dir === "string" && dir.length > 0 && boundDirs.has(path.resolve(dir))) {
+    boundDirs.set(dir, boundDirs.get(path.resolve(dir)));
+  }
+  if (typeof claimsDir === "string" && claimsDir.length > 0 && boundDirs.has(path.resolve(claimsDir))) {
+    boundDirs.set(claimsDir, boundDirs.get(path.resolve(claimsDir)));
+  }
+
   const cleaned = [];
   let released = null;
   let dirFsyncErr = null;
   try {
     for (const entry of accepted) {
+      const parent = path.dirname(entry);
+      const bound = boundDirs.get(parent) ?? boundDirs.get(path.resolve(parent));
+      if (!bound) {
+        left.push(entry);
+        continue;
+      }
+      let parentSt = null;
+      try {
+        parentSt = fs.lstatSync(parent);
+      } catch {
+        left.push(entry);
+        continue;
+      }
+      if (parentSt.isSymbolicLink() || !parentSt.isDirectory() || parentSt.dev !== bound.dev || parentSt.ino !== bound.ino) {
+        left.push(entry);
+        continue;
+      }
       let st = null;
       try { st = fs.lstatSync(entry); }
       catch (err) { if (err?.code === "ENOENT") { cleaned.push(entry); continue; } left.push(entry); continue; }
@@ -2070,7 +2153,8 @@ export function clearLedgerResidue({ dir, residue = [], claimsDir = null, dirsPe
       try { fs.unlinkSync(entry); } catch { left.push(entry); continue; }
       try { fs.lstatSync(entry); left.push(entry); } catch (err) { if (err?.code === "ENOENT") cleaned.push(entry); else left.push(entry); }
     }
-    // R57d 返修八 P1-2b / 返修九 P1-2 / 返修十 P1-2：按实际删除项的所有父目录规范化 + 待补耐久目录逐一 bound fsync，失败者记入 dirs_pending_fsync
+
+    // 目录 fsync 改用已绑定的 fd（fsyncSync(fd)）：待补目录逐条映射到绑定 fd；映射不到 → 进 dirs_pending_fsync 保留
     for (const p of cleaned) pendingDirs.add(path.resolve(path.dirname(p)));
     const dirsToFsync = Array.from(pendingDirs);
     if (cleaned.length > 0 && !dirsToFsync.includes(path.resolve(dir))) {
@@ -2078,14 +2162,23 @@ export function clearLedgerResidue({ dir, residue = [], claimsDir = null, dirsPe
       pendingDirs.add(path.resolve(dir));
     }
     for (const d of dirsToFsync) {
-      const err = fsyncDirBound(d);
-      if (err !== null) {
-        dirFsyncErr = "目录 " + d + " fsync 失败：" + err;
+      const bound = boundDirs.get(d) ?? boundDirs.get(path.resolve(d));
+      if (!bound) {
+        // 映射不到 → 进 dirs_pending_fsync 保留（不 fsync 别的路径）
+        continue;
+      }
+      try {
+        fs.fsyncSync(bound.fd);
+        pendingDirs.delete(d);
+      } catch (err) {
+        dirFsyncErr = "目录 " + d + " fsync 失败：" + String(err?.code ?? err?.message ?? err);
         break;
       }
-      pendingDirs.delete(d);
     }
   } finally {
+    for (const item of new Set(boundDirs.values())) {
+      try { fs.closeSync(item.fd); } catch {}
+    }
     try { released = releasePublishLock(lockDir); } catch (err) { released = { ok: false, reason: "release_exception", why: String(err?.code ?? err?.message ?? err) }; }
   }
   const releaseClean = released !== null && released.ok === true && released.absent !== true && released.reapUncleared == null;

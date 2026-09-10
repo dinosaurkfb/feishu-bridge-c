@@ -47331,17 +47331,25 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const planTmp = path.join(claimsDir, "." + "b".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID());
     fs.writeFileSync(planTmp, "content", { mode: 0o600 });
     let claimsDirFsynced = false;
+    let claimsDirFd = null;
     const origFsync = fs.fsyncSync;
     const origOpen = fs.openSync;
     try {
       fs.openSync = (p, flags, mode) => {
+        const fd = origOpen(p, flags, mode);
         if (String(p) === claimsDir) {
+          claimsDirFd = fd;
+        }
+        return fd;
+      };
+      fs.fsyncSync = (fd) => {
+        if (claimsDirFd !== null && fd === claimsDirFd) {
           claimsDirFsynced = true;
           const err = new Error("EIO: i/o error, fsyncDir");
           err.code = "EIO";
           throw err;
         }
-        return origOpen(p, flags, mode);
+        return origFsync(fd);
       };
       const r = TAL.clearLedgerResidue({ dir, claimsDir, residue: [planTmp] });
       assert.equal(claimsDirFsynced, true, "必须对发生删除的 claimsDir 调用 fsyncDir（旧实现只 fsync endpoint dir）");
@@ -47546,16 +47554,24 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     f7RewriteEvidence(claimsDir, s.key, { commit: "committed_with_residue", dirs_pending_fsync: [], residue: [planTmp], lock_uncleared: false });
 
     let injectClaimsDirFail = true;
+    let claimsDirFd = null;
     const origFsync = fs.fsyncSync;
     const origOpen = fs.openSync;
     try {
       fs.openSync = (p, flags, mode) => {
-        if (injectClaimsDirFail && String(p) === claimsDir) {
+        const fd = origOpen(p, flags, mode);
+        if (String(p) === claimsDir) {
+          claimsDirFd = fd;
+        }
+        return fd;
+      };
+      fs.fsyncSync = (fd) => {
+        if (injectClaimsDirFail && claimsDirFd !== null && fd === claimsDirFd) {
           const err = new Error("EIO: i/o error, fsyncDir");
           err.code = "EIO";
           throw err;
         }
-        return origOpen(p, flags, mode);
+        return origFsync(fd);
       };
 
       const r1 = f7Repair(claimsDir, s.key);
@@ -48052,6 +48068,146 @@ fs.lstatSync = function(p, ...rest) {
       try { fs.rmSync(local, { recursive: true, force: true }); } catch {}
     }
   });
+
+  test("R57d 返修十二 P1 T1（Codex 探针）：claimsDir 为指向根外目录的 symlink 时，clearLedgerResidue 拒绝且 unlink 零调用、根外文件仍在", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const outsideDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "outside-t1-")));
+    const tmpName = "." + "c".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID();
+    const outsideTmp = path.join(outsideDir, tmpName);
+    fs.writeFileSync(outsideTmp, "sensitive data", { mode: 0o600 });
+
+    // 把真 claimsDir rename 走，创建同名 symlink 指向 outsideDir
+    const realClaimsDir = claimsDir + ".orig";
+    fs.renameSync(claimsDir, realClaimsDir);
+    fs.symlinkSync(outsideDir, claimsDir);
+
+    const residuePath = path.join(claimsDir, tmpName);
+
+    let unlinkCalled = false;
+    const origUnlink = fs.unlinkSync;
+    try {
+      fs.unlinkSync = function (...args) {
+        unlinkCalled = true;
+        return origUnlink.apply(fs, args);
+      };
+
+      const res = TAL.clearLedgerResidue({ dir, claimsDir, residue: [residuePath] });
+      assert.equal(res.ok, false, "claimsDir 为 symlink 必须 ok:false");
+      assert.deepEqual(res.cleaned, [], "cleaned 必须为空");
+      assert.equal(unlinkCalled, false, "fs.unlinkSync 绝不得被调用（零删除）");
+      assert.equal(fs.existsSync(outsideTmp), true, "根外文件必须完好保存在盘上");
+      assert.match(String(res.why), /身份受验不过/u, "why 必须包含「身份受验不过」");
+    } finally {
+      fs.unlinkSync = origUnlink;
+      try { fs.unlinkSync(outsideTmp); } catch {}
+      try { fs.rmdirSync(outsideDir); } catch {}
+      try { fs.unlinkSync(claimsDir); } catch {}
+      try { fs.renameSync(realClaimsDir, claimsDir); } catch {}
+    }
+  }));
+
+  test("R57d 返修十二 P1 T2：claimsDir 父链含 symlink 时，clearLedgerResidue 因 not_canonical 拒绝且零删除、文件仍在", () => withLedgerD((root, dir) => {
+    const realTarget = path.join(root, "real_target");
+    fs.mkdirSync(realTarget, { recursive: true });
+    const linkParent = path.join(root, "link_parent");
+    fs.symlinkSync(realTarget, linkParent);
+    const claimsDir = path.join(linkParent, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true });
+
+    const tmpName = "." + "d".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID();
+    const targetFile = path.join(claimsDir, tmpName);
+    fs.writeFileSync(targetFile, "content", { mode: 0o600 });
+
+    let unlinkCalled = false;
+    const origUnlink = fs.unlinkSync;
+    try {
+      fs.unlinkSync = function (...args) {
+        unlinkCalled = true;
+        return origUnlink.apply(fs, args);
+      };
+
+      const res = TAL.clearLedgerResidue({ dir, claimsDir, residue: [targetFile] });
+      assert.equal(res.ok, false, "父链含 symlink 必须 ok:false");
+      assert.deepEqual(res.cleaned, [], "cleaned 必须为空");
+      assert.equal(unlinkCalled, false, "fs.unlinkSync 绝不得被调用（零删除）");
+      assert.equal(fs.existsSync(targetFile), true, "目标文件必须完好保存在盘上");
+      assert.match(String(res.why), /not_canonical/u, "why 必须包含 not_canonical");
+    } finally {
+      fs.unlinkSync = origUnlink;
+      try { fs.unlinkSync(targetFile); } catch {}
+      try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch {}
+      try { fs.unlinkSync(linkParent); } catch {}
+      try { fs.rmSync(realTarget, { recursive: true, force: true }); } catch {}
+    }
+  }));
+
+  test("R57d 返修十二 P1 T3：endpoint dir 自身为 symlink 时，clearLedgerResidue 拒绝且零删除、文件仍在", () => withLedgerD((root, dir) => {
+    const outsideDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "outside-t3-")));
+    const tmpName = "ledger.json." + process.pid + "." + crypto.randomUUID();
+    const outsideTmp = path.join(outsideDir, tmpName);
+    fs.writeFileSync(outsideTmp, "data", { mode: 0o600 });
+
+    const realDir = dir + ".real";
+    fs.renameSync(dir, realDir);
+    fs.symlinkSync(outsideDir, dir);
+
+    const residuePath = path.join(dir, tmpName);
+
+    let unlinkCalled = false;
+    const origUnlink = fs.unlinkSync;
+    try {
+      fs.unlinkSync = function (...args) {
+        unlinkCalled = true;
+        return origUnlink.apply(fs, args);
+      };
+
+      const res = TAL.clearLedgerResidue({ dir, residue: [residuePath] });
+      assert.equal(res.ok, false, "endpoint dir 为 symlink 必须 ok:false");
+      assert.deepEqual(res.cleaned, [], "cleaned 必须为空");
+      assert.equal(unlinkCalled, false, "fs.unlinkSync 绝不得被调用（零删除）");
+      assert.equal(fs.existsSync(outsideTmp), true, "根外文件必须完好");
+      assert.match(String(res.why), /身份受验不过/u, "why 必须包含「身份受验不过」");
+    } finally {
+      fs.unlinkSync = origUnlink;
+      try { fs.unlinkSync(outsideTmp); } catch {}
+      try { fs.rmdirSync(outsideDir); } catch {}
+      try { fs.unlinkSync(dir); } catch {}
+      try { fs.renameSync(realDir, dir); } catch {}
+    }
+  }));
+
+  test("R57d 返修十二 P1 T4：正向对照——规范 claimsDir 与 endpoint dir 下合法 tmp 照常被删且 ok:true", () => withLedgerD((root, dir) => {
+    const claimsDir = txDirD(root);
+    const planTmp = path.join(claimsDir, "." + "e".repeat(64) + ".selection-plan.json.tmp." + process.pid + "." + crypto.randomUUID());
+    const ledgerTmp = path.join(dir, "ledger.json." + process.pid + "." + crypto.randomUUID());
+    fs.writeFileSync(planTmp, "plan tmp", { mode: 0o600 });
+    fs.writeFileSync(ledgerTmp, "ledger tmp", { mode: 0o600 });
+
+    const res = TAL.clearLedgerResidue({ dir, claimsDir, residue: [planTmp, ledgerTmp] });
+    assert.equal(res.ok, true, "规范目录下的合法 tmp 清理必须 ok:true：" + JSON.stringify(res));
+    assert.equal(res.cleaned.length, 2, "cleaned 必须包含两项");
+    assert.equal(fs.existsSync(planTmp), false, "planTmp 必须已被删除");
+    assert.equal(fs.existsSync(ledgerTmp), false, "ledgerTmp 必须已被删除");
+  }));
+
+  test("R57d 返修十二 P1 T5：barrierLedgerDurability 对父链含 symlink 的 claimsDir 返回 ok:false 且说明 not_canonical", () => withLedgerD((root, dir) => {
+    const realTarget = path.join(root, "real_target_t5");
+    fs.mkdirSync(realTarget, { recursive: true });
+    const linkParent = path.join(root, "link_parent_t5");
+    fs.symlinkSync(realTarget, linkParent);
+    const claimsDir = path.join(linkParent, "claims");
+    fs.mkdirSync(claimsDir, { recursive: true });
+
+    try {
+      const res = TAL.barrierLedgerDurability({ dir, claimsDir, dirsPendingFsync: [claimsDir] });
+      assert.equal(res.ok, false, "父链含 symlink 的 claimsDir 必须 ok:false");
+      assert.match(String(res.why), /not_canonical/u, "why 必须包含 not_canonical");
+    } finally {
+      try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch {}
+      try { fs.unlinkSync(linkParent); } catch {}
+      try { fs.rmSync(realTarget, { recursive: true, force: true }); } catch {}
+    }
+  }));
 
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
 }

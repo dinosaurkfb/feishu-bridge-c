@@ -375,12 +375,12 @@ export function migrationInventory(doc) {
   return { legacy_proof_count: legacy, null_b1_count: nullB1.length, null_b1_ids: nullB1.sort() };
 }
 
-const targetProblem = (t) => {
+export const targetProblem = (t) => {
   if (!isObj(t)) return "binding_target 不是对象";
   if (typeof t.project_root !== "string" || !path.isAbsolute(t.project_root)) return "project_root 不是绝对路径";
   if (t.runtime === "claude") {
     if (keysOf(t) !== "claude_session_id,project_root,runtime") return "claude target 字段集不对";
-    if (typeof t.claude_session_id !== "string" || !UUID_SHAPE.test(t.claude_session_id)) return "claude_session_id 形状不对";
+    if (t.claude_session_id !== null && (typeof t.claude_session_id !== "string" || !UUID_SHAPE.test(t.claude_session_id))) return "claude_session_id 形状不对";
   } else if (t.runtime === "codex") {
     if (keysOf(t) !== "codex_task_id,codex_thread_id,project_root,runtime") return "codex target 字段集不对";
     if (typeof t.codex_task_id !== "string" || !CODEX_ID_SHAPE.test(t.codex_task_id) || typeof t.codex_thread_id !== "string" || !CODEX_ID_SHAPE.test(t.codex_thread_id)) return "codex target id 形状不对";
@@ -3505,6 +3505,9 @@ export function retarget({ endpointId, requestKey, id, expectedOldTarget, newTar
       if (canonKey(oldTarget) !== canonKey(expectedOldTarget)) return { ok: false, reason: "cas_mismatch", why: "当前 target 与 expectedOldTarget 不符" };
       if (canonKey(oldTarget) === canonKey(newTarget)) return { ok: false, reason: "no_change" };
       if (newTarget.project_root !== oldTarget.project_root) return { ok: false, reason: "project_boundary" };
+      if (oldTarget.runtime === "claude" && oldTarget.claude_session_id !== null && newTarget.claude_session_id === null) {
+        return { ok: false, reason: "bad_target", why: "会话不能被取消选定回项目级" };
+      }
       if (typeof authorizedBy !== "string" || !AUTHORIZED_BY_SHAPE.test(authorizedBy)) return { ok: false, reason: "bad_input" };
       const lineage = rec.generation_lineage_id;
       const affected = lineage === null ? [id] : Object.keys(doc.records).filter((k) => doc.records[k].kind === "live" && doc.records[k].generation_lineage_id === lineage);

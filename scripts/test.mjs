@@ -29642,14 +29642,19 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
         { root: other, id: "p1", status: "active", root_message_id: OM1, session_id: "sess_u1", created_at: "2026-08-01T00:00:00.000Z" }]);
       r = collect(s);
       assert.deepEqual([r.ok, r.reason], [false, "legacy_conflict"], "双投影 binding_id → conflict：" + JSON.stringify(r));
-      // target 缺：绝不临时选值 —— complete=false 交给判别层待修。
-      // 走 fallback（删 mapping）：registry 条目给 legacy 字段但不给 claude_session_id。
+      // R65：target 缺（无 sid）现为项目级目标（complete=true + null）；真坏数据（非 UUID）仍 complete=false
       fs.rmSync(path.join(s.proj, ".runtime-data"), { recursive: true, force: true });
       writeRegistry(s.home, [{ root: s.proj, id: "p1", status: "active", root_message_id: OM1, session_id: "sess_u1", created_at: "2026-08-01T00:00:00.000Z" }]);
       r = collect(s);
       assert.ok(r.ok, "无 session 快照仍成立");
       assert.deepEqual([r.bindings[0].binding_target.complete, r.bindings[0].binding_target.claude_session_id],
-        [false, null], "缺 claude_session_id → complete:false + null（不选值）");
+        [true, null], "缺 claude_session_id → complete:true + null（项目级目标）");
+      // 真坏数据（非 UUID 字符串）→ complete:false + 原值
+      writeRegistry(s.home, [{ root: s.proj, id: "p1", status: "active", root_message_id: OM1, session_id: "sess_u1", claude_session_id: "bad-uuid", created_at: "2026-08-01T00:00:00.000Z" }]);
+      r = collect(s);
+      assert.ok(r.ok, "坏 session 快照仍成立");
+      assert.deepEqual([r.bindings[0].binding_target.complete, r.bindings[0].binding_target.claude_session_id],
+        [false, "bad-uuid"], "坏 claude_session_id → complete:false + 原值（不选值）");
       const p = projectLegacySnapshot({ endpointId: EP1, chain: "claude", snapshot: r });
       assert.ok(p.ok && p.blockers.some((b) => b.code === "target_incomplete"), "判别层落 target_incomplete 待修");
       // 模板缺席 = chat_id 无权威 → unreadable。
@@ -48582,6 +48587,268 @@ fs.lstatSync = function(p, ...rest) {
   }));
 
   function talTmp(r) { assert.ok(r.ok, "夹具 op：" + JSON.stringify(r)); return r; }
+}
+
+{
+  // ── R65：项目级 binding_target（会话未选）+ 影子补种 ──
+  test("R65 T1: targetProblem null 通过、非 UUID 字符串拒、缺字段拒", () => {
+    // null 通过（项目级目标）
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "/path/to/project", claude_session_id: null }), null);
+    // UUID 通过（会话级目标）
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "/path/to/project", claude_session_id: "00000000-0000-4000-8000-000000000001" }), null);
+    // 非 UUID 字符串拒
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "/path/to/project", claude_session_id: "not-a-uuid" }), "claude_session_id 形状不对");
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "/path/to/project", claude_session_id: 12345 }), "claude_session_id 形状不对");
+    // 缺字段拒
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "/path/to/project" }), "claude target 字段集不对");
+    // 字段过多拒
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "/path/to/project", claude_session_id: null, extra: true }), "claude target 字段集不对");
+    // project_root 不是绝对路径拒
+    assert.equal(TAL.targetProblem({ runtime: "claude", project_root: "relative/path", claude_session_id: null }), "project_root 不是绝对路径");
+  });
+
+  const R65_TPL = {
+    chain: "claude", transport_agent_name: "t", transport_app_id: "cli_a", transport_open_id: "ou_a",
+    outbound_agent_name: "o", outbound_app_id: "cli_b", outbound_open_id: "ou_b", lark_cli_profile: "p",
+    lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "1", chat_name: "n",
+    chat_id: "oc_" + "a".repeat(32), default_freshness_ms: 1000, agent_uid: "agent_r19",
+  };
+
+  test("R65 T2: legacy 采集 sid 缺席 → complete:true + null，sid 坏 → complete:false", () => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r65-t2-")));
+    try {
+      const regFile = path.join(tmp, "registry.json");
+      const tplFile = path.join(tmp, "chain-config.json");
+      const projDir = path.join(tmp, "proj");
+      fs.mkdirSync(path.join(projDir, ".runtime-data", "inbound"), { recursive: true });
+      fs.writeFileSync(tplFile, JSON.stringify(R65_TPL));
+
+      // 1. 项目 mapping 文件中 sid 缺席（undefined/null）
+      fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [{ root: projDir, id: "p1" }] }));
+      const stateNoSid = { schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: "p1@project-files", binding_status: "active", active_generation_id: "g1", rotation: null, generations: [{ channel_generation_id: "g1", generation: 1, status: "active", root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", pending_token: null, claim_expires_at: null, created_at: "2026-09-11T00:00:00.000Z" }] };
+      fs.writeFileSync(path.join(projDir, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "p1@project-files", status: "active", root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", channel_generation_id: "g1", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: stateNoSid }));
+      const snap1 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap1.ok, JSON.stringify(snap1));
+      assert.equal(snap1.bindings.length, 1);
+      assert.equal(snap1.bindings[0].binding_target.complete, true, "mapping 无 sid 时 complete 应为 true");
+      assert.equal(snap1.bindings[0].binding_target.claude_session_id, null, "mapping 无 sid 时 claude_session_id 应为 null");
+
+      // 2. 项目 mapping 缺席，registry 内联 sid 缺席
+      fs.rmSync(path.join(projDir, ".runtime-data", "inbound", "active-mapping.json"));
+      fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [{ root: projDir, id: "p1", root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", inbound_state: "bound", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] }));
+      const snap2 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap2.ok, JSON.stringify(snap2));
+      assert.equal(snap2.bindings[0].binding_target.complete, true, "registry 内联无 sid 时 complete 应为 true");
+      assert.equal(snap2.bindings[0].binding_target.claude_session_id, null, "registry 内联无 sid 时 claude_session_id 应为 null");
+
+      // 3. sid 坏（非 UUID 字符串）→ complete: false
+      fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [{ root: projDir, id: "p1", claude_session_id: "not-a-uuid", root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", inbound_state: "bound", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] }));
+      const snap3 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap3.ok);
+      assert.equal(snap3.bindings[0].binding_target.complete, false, "坏 sid 时 complete 应为 false");
+
+      // 4. mapping 文件中有坏 sid → complete: false
+      fs.writeFileSync(path.join(projDir, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "p1@project-files", status: "active", root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", channel_generation_id: "g1", claude_session_id: "invalid-uuid-format", expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: stateNoSid }));
+      const snap4 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap4.ok);
+      assert.equal(snap4.bindings[0].binding_target.complete, false, "mapping 坏 sid 时 complete 应为 false");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("R65 T3: reconcile 对无 sid 的项目级 binding 产出 expected 记录（B3/B4）且 blockers 空", () => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r65-t3-")));
+    try {
+      const regFile = path.join(tmp, "registry.json");
+      const tplFile = path.join(tmp, "chain-config.json");
+      const projDir = path.join(tmp, "proj");
+      fs.mkdirSync(projDir, { recursive: true });
+      fs.writeFileSync(tplFile, JSON.stringify(R65_TPL));
+      fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [
+        { root: projDir, id: "p1", root_message_id: "om_" + "b".repeat(10), session_id: "sess_aily_b3", inbound_state: "bound", status: "active", expires_at: "2099-01-01T00:00:00.000Z" },
+      ] }));
+      const snap = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap.ok);
+      const proj = projectLegacySnapshot({ endpointId: "endpoint_" + "1".repeat(24), chain: "claude", snapshot: snap });
+      assert.ok(proj.ok, JSON.stringify(proj));
+      assert.equal(proj.blockers.length, 0, "blockers 必须为空：" + JSON.stringify(proj.blockers));
+      assert.equal(proj.records.size, 1);
+      const [rec] = [...proj.records.values()];
+      assert.deepEqual(rec.binding_target, { runtime: "claude", project_root: projDir, claude_session_id: null });
+      assert.equal(rec.facts.binding, "active");
+      assert.equal(rec.facts.generation, "current"); // B3
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("R65 T4: validateLedger 接受 binding_target.claude_session_id=null 的 live 记录，且 binding_target=null ⇔ binding=none 判据不受影响", () => {
+    const ep = "endpoint_" + "1".repeat(24);
+    const tid = "ta_" + "1".repeat(32);
+    const opInit = "00000000-0000-4000-8000-000000000001";
+    const opSeed = "00000000-0000-4000-8000-000000000002";
+    const candidate = {
+      kind: "live",
+      topic_agent_id: tid,
+      chat_id: "oc_" + "a".repeat(32),
+      aliases: { session_id: null, root_om: "om_" + "a".repeat(10) },
+      facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, // B1
+      generation_lineage_id: "lin_1",
+      binding_target: { runtime: "claude", project_root: "/path/to/project", claude_session_id: null },
+      anchor_candidate: null,
+      binding_proof: null,
+      locator_link_proof_ref: null,
+      origin_operation_id: opSeed,
+      created_at: "2026-09-11T00:00:00.000Z",
+      updated_at: "2026-09-11T00:00:00.000Z",
+    };
+    const reqInputs = { request_key: "seed_1", candidates: [TAL.canonKey(candidate)].sort() };
+    const doc = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_agent_ledger",
+      endpoint_id: ep,
+      chain: "claude",
+      authority_mode: "shadow",
+      revision: 2,
+      operations: {
+        [opInit]: {
+          op_type: "initialize_shadow",
+          terminal_kind: "initialize_shadow",
+          request_key: "init_1",
+          fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+          result_revision: 1,
+          result: { revision: 1 },
+        },
+        [opSeed]: {
+          op_type: "seed",
+          terminal_kind: "seed",
+          request_key: "seed_1",
+          fingerprint: TAL.fingerprintOf("seed", reqInputs),
+          result_revision: 2,
+          result: { seeded_ids: [tid] },
+        },
+      },
+      records: {
+        [tid]: candidate,
+      },
+    };
+
+    // 1. 合法 doc 带 claude_session_id: null → validateLedger 必须通过
+    const v1 = TAL.validateLedger(doc);
+    assert.equal(v1.ok, true, "binding_target.claude_session_id=null 必须通过校验：" + JSON.stringify(v1));
+
+    // 2. G4 判据：live 记录 binding≠none 但 binding_target 为 null → 拒
+    const docBadTarget = JSON.parse(JSON.stringify(doc));
+    docBadTarget.records[tid].binding_target = null;
+    const v2 = TAL.validateLedger(docBadTarget);
+    assert.equal(v2.ok, false);
+    assert.match(v2.why, /binding_target=null ⇔ binding=none 不成立/u);
+
+    // 3. G4 判据：live 记录 binding=none 但 binding_target 非 null → 拒
+    const docBadNone = JSON.parse(JSON.stringify(doc));
+    docBadNone.records[tid].facts = { binding: "none", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" };
+    docBadNone.records[tid].generation_lineage_id = null;
+    docBadNone.records[tid].aliases = { session_id: "sess_aily1", root_om: null };
+    docBadNone.records[tid].binding_target = { runtime: "claude", project_root: "/path/to/project", claude_session_id: null };
+    const v3 = TAL.validateLedger(docBadNone);
+    assert.equal(v3.ok, false);
+    assert.match(v3.why, /binding_target=null ⇔ binding=none 不成立/u);
+  });
+
+  test("R65 T5: retarget null→UUID 通过、UUID→null 拒（会话不能被「取消选定」回项目级）", () => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r65-t5-")));
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = tmp;
+    try {
+      const ep = "endpoint_" + "1".repeat(24);
+      const dir = path.join(tmp, ep);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const opInit = "00000000-0000-4000-8000-000000000001";
+      const opSeed = "00000000-0000-4000-8000-000000000002";
+      const tid = "ta_" + "1".repeat(32);
+      const rootProj = "/path/to/project";
+      const nullTarget = { runtime: "claude", project_root: rootProj, claude_session_id: null };
+      const uuidTarget = { runtime: "claude", project_root: rootProj, claude_session_id: "00000000-0000-4000-8000-000000000001" };
+
+      const rec = {
+        kind: "live",
+        topic_agent_id: tid,
+        chat_id: "oc_" + "a".repeat(32),
+        aliases: { session_id: "sess_aily1", root_om: "om_" + "a".repeat(10) },
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" }, // B3
+        generation_lineage_id: "lin_1",
+        binding_target: nullTarget,
+        anchor_candidate: null,
+        binding_proof: { kind: "pairing", authorized_by: "ou_owner", authorized_at: "2026-09-11T00:00:00.000Z", matched_om: "om_" + "a".repeat(10), matched_fields: ["chat_id", "sender", "thread_root"], pending_token_state: "absent" },
+        locator_link_proof_ref: { by_identity: "user", kind: "pairing_merge", matched_at: "2026-09-11T00:00:00.000Z", matched_fields: ["chat_id", "sender", "thread_root"], matched_om: "om_" + "a".repeat(10), pending_token_state: "absent" },
+        origin_operation_id: opSeed,
+        created_at: "2026-09-11T00:00:00.000Z",
+        updated_at: "2026-09-11T00:00:00.000Z",
+      };
+      const reqInputs = { request_key: "seed_1", candidates: [TAL.canonKey(rec)].sort() };
+      const doc = {
+        schema_version: "1.0",
+        artifact_type: "feishu_bridge_topic_agent_ledger",
+        endpoint_id: ep,
+        chain: "claude",
+        authority_mode: "shadow",
+        revision: 2,
+        operations: {
+          [opInit]: {
+            op_type: "initialize_shadow",
+            terminal_kind: "initialize_shadow",
+            request_key: "init_1",
+            fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+            result_revision: 1,
+            result: { revision: 1 },
+          },
+          [opSeed]: {
+            op_type: "seed",
+            terminal_kind: "seed",
+            request_key: "seed_1",
+            fingerprint: TAL.fingerprintOf("seed", reqInputs),
+            result_revision: 2,
+            result: { seeded_ids: [tid] },
+          },
+        },
+        records: {
+          [tid]: rec,
+        },
+      };
+      fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+
+      // 1. retarget null → UUID：必须通过
+      const r1 = TAL.retarget({
+        endpointId: ep,
+        requestKey: "rk_rt_1",
+        id: tid,
+        expectedOldTarget: nullTarget,
+        newTarget: uuidTarget,
+        authorizedBy: "ou_owner",
+        env: process.env,
+      });
+      assert.equal(r1.ok, true, "null → UUID 必须通过：" + JSON.stringify(r1));
+
+      // 2. retarget UUID → null：必须拒绝
+      const r2 = TAL.retarget({
+        endpointId: ep,
+        requestKey: "rk_rt_2",
+        id: tid,
+        expectedOldTarget: uuidTarget,
+        newTarget: nullTarget,
+        authorizedBy: "ou_owner",
+        env: process.env,
+      });
+      assert.equal(r2.ok, false, "UUID → null 必须被拒绝");
+      assert.equal(r2.reason, "bad_target", "原因必须为 bad_target");
+      assert.match(String(r2.why), /取消选定/u, "why 必须说明不能取消选定回项目级");
+    } finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR;
+      else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 }
 
 sealSummary();

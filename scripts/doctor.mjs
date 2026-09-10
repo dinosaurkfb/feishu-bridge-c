@@ -663,18 +663,27 @@ export function runDoctor({
                 })
               : () => collectCodexLegacySnapshot({ home: ctx.codexEnv.FEISHU_CODEX_BRIDGE_HOME });
             const r = reconcileLegacyEndpoint({ endpointId: ep, chain, collectLegacy, loadLedgerFn: () => loadByEndpoint(ep) });
+            let projectLevelCount = 0;
+            if (L.doc?.records) {
+              for (const rec of Object.values(L.doc.records)) {
+                if (rec?.kind === "live" && rec.binding_target?.runtime === "claude" && rec.binding_target?.claude_session_id === null) {
+                  projectLevelCount++;
+                }
+              }
+            }
+            const projNote = projectLevelCount > 0 ? "（项目级目标（会话未选）" + projectLevelCount + " 条）" : "";
             if (r.ok === true) {
               // 对账一致但 cutover 受阻是**确定的红**，不是"一致（待修）"（评审 P1-4）。
               if (r.cutover_blockers.length > 0) {
                 findings.push({ endpoint: ep, ok: false, code: "cutover_blocked",
                   detail: "cutover_blocked：对账一致但 cutover_blockers=" + r.cutover_blockers.length
-                    + "（" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、") + "）—— 任一 blocker 则 cutover 拒" });
+                    + "（" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、") + "）" + projNote + "—— 任一 blocker 则 cutover 拒" });
               } else {
-                parts.push(ep + "=一致");
+                parts.push(ep + "=一致" + projNote);
               }
             } else if (r.ok === null) {
               findings.push({ endpoint: ep, ok: null, code: r.reason,
-                detail: "对账不可判（snapshot_moved）—— 下轮体检再看" });
+                detail: "对账不可判（snapshot_moved）" + projNote + "—— 下轮体检再看" });
             } else {
               const bits = [];
               if (r.reason === "bijection_mismatch") {
@@ -692,6 +701,9 @@ export function runDoctor({
               // 判别联合（复评 P2-1）：bijection 支才有 cutover_blockers；其它失败支不带。
               if ((r.cutover_blockers?.length ?? 0) > 0) {
                 bits.push("待修 " + r.cutover_blockers.length + "：" + r.cutover_blockers.slice(0, 3).map((b) => b.code).join("、"));
+              }
+              if (projectLevelCount > 0) {
+                bits.push("项目级目标（会话未选）" + projectLevelCount + " 条");
               }
               findings.push({ endpoint: ep, ok: false, code: r.reason, detail: bits.join("；") });
             }

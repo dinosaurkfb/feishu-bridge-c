@@ -401,7 +401,7 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 - 仅作用于影子账本（`authority_mode==="shadow"`），受维护门管控；
 - 默认预览模式列出待补种的 B 族候选，严格核验双射与 blocker，零写入副作用；
 - `--apply` 需终端授权身份，调用 `migrateSeed` 幂等写入，并后置对账核验；
-- 对带有 `claude_session_id: null` 的项目级绑定记录，允许进账本（不报 `target_incomplete`），切权威后由 owner 通过 `/feishu-select`（`owner_select` 机制）逐话题选定具体会话。
+- 对带有 `claude_session_id: null` 的项目级绑定记录，允许进账本（不报 `target_incomplete`），null→UUID 的 retarget 只留给将来持有真实本地 UUID 的显式 owner retarget；UUID→null 继续拒。权威投递消费路径（从账本 binding_target 读、项目级走 legacy 同款规则：有 delivery pin 用 pin，否则唯一 live 会话才投、多条拒）尚未接通，cutover 前由后续单 R66 补——本单只宣称 shadow 补种。
 
 ## 9. 排期影响
 

@@ -160,10 +160,11 @@ const bindingEvidence = ({ bindingId, enabled, root, sessionId, chatId, target, 
 
 /* ─────────────────────────── Claude 侧 ─────────────────────────── */
 
-function claudeTarget(root, sid) {
-  if (sid === undefined || sid === null) {
+function claudeTarget(root, src) {
+  if (!src || typeof src !== "object" || !Object.hasOwn(src, "claude_session_id")) {
     return { runtime: "claude", project_root: root, claude_session_id: null, complete: true };
   }
+  const sid = src.claude_session_id;
   if (typeof sid === "string" && UUID_SHAPE.test(sid)) {
     return { runtime: "claude", project_root: root, claude_session_id: sid, complete: true };
   }
@@ -264,7 +265,7 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
         chatId,
         state: evolved.state,
         generationSource: evolved.projection,
-        target: claudeTarget(root, sid),
+        target: claudeTarget(root, mapping),
         sourceFiles: [registryFile, templateFile, mapPath],
         sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile, mapPath]),
         expiresAt: evolved.mapping.expires_at,
@@ -286,7 +287,7 @@ export function collectClaudeLegacySnapshot({ registryFile, templateFile, now = 
         chatId,
         state: evolved.state,
         generationSource: evolved.projection,
-        target: claudeTarget(root, sid),
+        target: claudeTarget(root, entry),
         sourceFiles: [registryFile, templateFile],
         sourceIdentity: frozenSourceIdentity(io, [registryFile, templateFile]),
         expiresAt: evolved.mapping.expires_at,

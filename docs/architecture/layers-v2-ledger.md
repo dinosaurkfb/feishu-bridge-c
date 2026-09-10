@@ -134,11 +134,11 @@ operation lease + `current` 桩状态核验通过后，**才**允许 `acquireLoc
 
 ```
 binding_target =
-  | { runtime:"claude", project_root:"<abs>", claude_session_id:"<uuid>" }
+  | { runtime:"claude", project_root:"<abs>", claude_session_id:"<uuid>" | null }
   | { runtime:"codex",  project_root:"<abs>", codex_task_id:"<id>", codex_thread_id:"<id>" }
 ```
 
-`binding=none` ⇔ null；`∈{pending,active,dormant}` ⇔ 非 null。
+`binding=none` ⇔ null；`∈{pending,active,dormant}` ⇔ 非 null。（Claude 侧允许 `claude_session_id: null` 表示项目级目标/会话未选。注意：权威投递消费路径（从账本 binding_target 读、项目级走 legacy 同款规则：有 delivery pin 用 pin，否则唯一 live 会话才投、多条拒）尚未接通，cutover 前由后续单 R66 补——本单只宣称 shadow 补种。）
 
 **`binding_proof`（四支各自封闭；retarget 支为 A′ 而增，评审四 P1-3；migrated 支为 M1a 迁移
 而增，`m1a-reconciliation.md` §3.1）**。其中 pairing 支是**判别联合**：token 认领 →

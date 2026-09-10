@@ -255,6 +255,7 @@ import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, r
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
+import { seedShadowEndpoint } from "./m1a-seed.mjs";
 import * as RECON45 from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
@@ -48652,6 +48653,19 @@ fs.lstatSync = function(p, ...rest) {
       const snap4 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
       assert.ok(snap4.ok);
       assert.equal(snap4.bindings[0].binding_target.complete, false, "mapping 坏 sid 时 complete 应为 false");
+
+      // 5. mapping 文件中显式 claude_session_id: null → complete: false（显式 null 不得当合法缺席，P2-A）
+      fs.writeFileSync(path.join(projDir, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({ binding_id: "p1@project-files", status: "active", root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", channel_generation_id: "g1", claude_session_id: null, expires_at: "2099-01-01T00:00:00.000Z", topic_generation_state: stateNoSid }));
+      const snap5 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap5.ok);
+      assert.equal(snap5.bindings[0].binding_target.complete, false, "mapping 显式 null sid 时 complete 应为 false");
+
+      // 6. registry 内联显式 claude_session_id: null → complete: false（显式 null 不得当合法缺席，P2-A）
+      fs.rmSync(path.join(projDir, ".runtime-data", "inbound", "active-mapping.json"));
+      fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [{ root: projDir, id: "p1", claude_session_id: null, root_message_id: "om_" + "a".repeat(10), session_id: "sess_aily1", inbound_state: "bound", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] }));
+      const snap6 = collectClaudeLegacySnapshot({ registryFile: regFile, templateFile: tplFile });
+      assert.ok(snap6.ok);
+      assert.equal(snap6.bindings[0].binding_target.complete, false, "registry 显式 null sid 时 complete 应为 false");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -48847,6 +48861,303 @@ fs.lstatSync = function(p, ...rest) {
       if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR;
       else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  const setupR65SeedFixture = ({ withShadowExtra = false, gateOpen = false } = {}) => {
+    const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r65-seed-")));
+    const home = path.join(tmp, "home");
+    const ledgerRoot = path.join(tmp, "ledgers");
+    const maintDir = path.join(tmp, "maint");
+    const gateFile = path.join(tmp, "maintenance.gate");
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+
+    const ep = legacyEndpointId({ runtime: "claude", agentUid: "agent_r65" });
+    const epDir = path.join(ledgerRoot, ep);
+    fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+
+    const bridgeDir = path.join(home, ".claude", "feishu-bridge");
+    fs.mkdirSync(bridgeDir, { recursive: true, mode: 0o700 });
+    const regFile = path.join(bridgeDir, "registry.json");
+    const tplFile = path.join(bridgeDir, "chain-config.json");
+    const tplData = {
+      chain: "claude",
+      transport_agent_name: "t",
+      transport_app_id: "cli_r65",
+      transport_open_id: "ou_r65_bot",
+      outbound_agent_name: "o",
+      outbound_app_id: "cli_r65_out",
+      outbound_open_id: "ou_r65_out",
+      lark_cli_profile: "p",
+      lark_cli_bin: "/bin/lark",
+      lark_cli_home: "/home/lark",
+      frank_sender_id: "123456789",
+      chat_name: "test_chat",
+      chat_id: "oc_" + "c".repeat(32),
+      default_freshness_ms: 1000,
+      agent_uid: "agent_r65",
+    };
+    fs.writeFileSync(tplFile, JSON.stringify(tplData, null, 2) + "\n");
+
+    const proj1 = path.join(tmp, "p1_project_level");
+    const proj2 = path.join(tmp, "p2_session_level");
+    fs.mkdirSync(path.join(proj1, ".runtime-data", "inbound"), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(proj2, ".runtime-data", "inbound"), { recursive: true, mode: 0o700 });
+
+    const sessUuid = "11111111-2222-4333-8444-555555555555";
+    // p1: no claude_session_id in mapping (project-level target)
+    const state1 = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_generations",
+      binding_id: "p1@project-files",
+      binding_status: "active",
+      active_generation_id: "g1",
+      rotation: null,
+      generations: [{
+        channel_generation_id: "g1",
+        generation: 1,
+        status: "active",
+        root_message_id: "om_" + "1".repeat(10),
+        session_id: "sess_aily1",
+        pending_token: null,
+        claim_expires_at: null,
+        created_at: "2026-09-11T00:00:00.000Z",
+      }],
+    };
+    fs.writeFileSync(path.join(proj1, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({
+      binding_id: "p1@project-files",
+      status: "active",
+      root_message_id: "om_" + "1".repeat(10),
+      session_id: "sess_aily1",
+      channel_generation_id: "g1",
+      expires_at: "2099-01-01T00:00:00.000Z",
+      topic_generation_state: state1,
+    }));
+
+    // p2: with claude_session_id in mapping (session-level target)
+    const state2 = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_generations",
+      binding_id: "p2@project-files",
+      binding_status: "active",
+      active_generation_id: "g2",
+      rotation: null,
+      generations: [{
+        channel_generation_id: "g2",
+        generation: 1,
+        status: "active",
+        root_message_id: "om_" + "2".repeat(10),
+        session_id: "sess_aily2",
+        pending_token: null,
+        claim_expires_at: null,
+        created_at: "2026-09-11T00:00:00.000Z",
+      }],
+    };
+    fs.writeFileSync(path.join(proj2, ".runtime-data", "inbound", "active-mapping.json"), JSON.stringify({
+      binding_id: "p2@project-files",
+      status: "active",
+      root_message_id: "om_" + "2".repeat(10),
+      session_id: "sess_aily2",
+      channel_generation_id: "g2",
+      claude_session_id: sessUuid,
+      expires_at: "2099-01-01T00:00:00.000Z",
+      topic_generation_state: state2,
+    }));
+
+    fs.writeFileSync(regFile, JSON.stringify({
+      schema_version: "1.0",
+      projects: [
+        { root: proj1, id: "p1" },
+        { root: proj2, id: "p2" },
+      ],
+    }));
+
+    // Seed init receipt so doctor 14 and dual-write recognize endpoint
+    const at = "2026-08-31T12:00:00.000Z";
+    const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+    const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const enterDone = [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone()];
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + ep + ":init", kind: "ledger", target: ep, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    const docReceipt = { schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enterDone, ledgerStep], notes: [] };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify(docReceipt), { mode: 0o600 });
+
+    // Initial shadow ledger (revision 1, 0 records)
+    const initOpId = "00000000-0000-0000-0000-000000000001";
+    const initOp = {
+      op_type: "initialize_shadow",
+      terminal_kind: "initialize_shadow",
+      request_key: "seed_init",
+      fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+      result_revision: 1,
+      result: { revision: 1 },
+    };
+    const shadowDoc = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_agent_ledger",
+      endpoint_id: ep,
+      chain: "claude",
+      authority_mode: "shadow",
+      revision: 1,
+      operations: { [initOpId]: initOp },
+      records: {},
+    };
+
+    fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(shadowDoc, null, 2) + "\n", { mode: 0o600 });
+
+    if (gateOpen) {
+      createGate({ file: gateFile, reason: "r65-gate-test" });
+    }
+
+    const savedEnv = {
+      HOME: process.env.HOME,
+      FEISHU_BRIDGE_CHAIN_TEMPLATE: process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE,
+      FEISHU_BRIDGE_REGISTRY: process.env.FEISHU_BRIDGE_REGISTRY,
+      FEISHU_BRIDGE_LEDGER_DIR: process.env.FEISHU_BRIDGE_LEDGER_DIR,
+      FEISHU_BRIDGE_MAINTENANCE_DIR: process.env.FEISHU_BRIDGE_MAINTENANCE_DIR,
+      FEISHU_BRIDGE_MAINTENANCE_GATE: process.env.FEISHU_BRIDGE_MAINTENANCE_GATE,
+    };
+
+    process.env.HOME = home;
+    process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = tplFile;
+    process.env.FEISHU_BRIDGE_REGISTRY = regFile;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = maintDir;
+    process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile,
+      FEISHU_BRIDGE_REGISTRY: regFile,
+      FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot,
+      FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+      FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
+    };
+
+    if (withShadowExtra) {
+      const extraId = "ta_" + "e".repeat(32);
+      const extraCand = {
+        topic_agent_id: extraId,
+        chat_id: tplData.chat_id,
+        aliases: { session_id: "sess_extra", root_om: "om_extra" },
+        anchor_candidate: null,
+        binding_target: { runtime: "claude", project_root: proj1, claude_session_id: sessUuid },
+        facts: { anchor: "present", binding: "active", generation: "current", locator_link_proof: "present", session: "present" },
+        generation_lineage_id: "lin_extra",
+        legacy_source_digest: "a".repeat(64),
+        kind: "live",
+      };
+      const extraRes = TAL.migrateSeed({
+        endpointId: ep,
+        requestKey: "req_seed_extra",
+        candidates: [extraCand],
+        authorizedBy: "ou_owner",
+        env,
+      });
+      assert.ok(extraRes.ok, "migrateSeed extra 应成功: " + JSON.stringify(extraRes));
+    }
+
+    return {
+      tmp, home, ledgerRoot, maintDir, gateFile, ep, epDir, regFile, tplFile, env,
+      cleanup: () => {
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+        fs.rmSync(tmp, { recursive: true, force: true });
+      },
+    };
+  };
+
+  test("R65 T6: seedShadowEndpoint 预览模式：零副作用（shaBefore === shaAfter），candidateCount 为 2", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const ledgerPath = path.join(fx.epDir, "ledger.json");
+      const shaBefore = TAL.sha256(fs.readFileSync(ledgerPath));
+      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: false, env: fx.env });
+      assert.ok(res.ok, JSON.stringify(res));
+      assert.equal(res.mode, "preview");
+      assert.equal(res.candidateCount, 2);
+      assert.equal(res.candidates.length, 2);
+      const shaAfter = TAL.sha256(fs.readFileSync(ledgerPath));
+      assert.equal(shaBefore, shaAfter, "预览模式不得修改账本");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T7: seedShadowEndpoint apply 后 reconcile 一致、blockers 空、doctor ⑭ 绿", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      assert.ok(res.ok, JSON.stringify(res));
+      assert.equal(res.mode, "apply");
+      assert.equal(res.seeded.length, 2);
+
+      const rec = reconcileLegacyEndpoint({
+        endpointId: fx.ep,
+        chain: "claude",
+        collectLegacy: () => collectClaudeLegacySnapshot({ registryFile: fx.regFile, templateFile: fx.tplFile }),
+        loadLedgerFn: () => TAL.loadByEndpoint(fx.ep, { env: fx.env }),
+      });
+      assert.equal(rec.ok, true, "reconcile 应通过: " + JSON.stringify(rec));
+      assert.equal(rec.cutover_blockers.length, 0, "cutover_blockers 应为空");
+
+      const rep = runDoctor({ home: fx.home });
+      const c14 = rep.checks.find((x) => x.id === "m1a_shadow_reconcile");
+      assert.ok(c14, "⑭ 在场");
+      assert.equal(c14.ok, true, "⑭ 应绿: " + JSON.stringify(c14));
+      assert.match(c14.detail, /一致/u, "detail 应含「一致」");
+      assert.match(c14.detail, /项目级目标（会话未选）1 条/u, "detail 应含「项目级目标（会话未选）1 条」");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T8: shadow 多出记录时预览拒（extra_in_shadow）", () => {
+    const fx = setupR65SeedFixture({ withShadowExtra: true });
+    try {
+      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: false, env: fx.env });
+      assert.equal(res.ok, false, JSON.stringify(res));
+      assert.equal(res.reason, "extra_in_shadow", JSON.stringify(res));
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T9: 维护门开着 apply 拒（maintenance）", () => {
+    const fx = setupR65SeedFixture({ gateOpen: true });
+    try {
+      const res = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "maintenance");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R65 T10: 重跑幂等（第二次 seeded 为空、revision 不变）", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const res1 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      assert.ok(res1.ok, JSON.stringify(res1));
+      assert.equal(res1.seeded.length, 2);
+      const rev1 = res1.revision;
+
+      const res2 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: "ou_owner", env: fx.env });
+      assert.ok(res2.ok, JSON.stringify(res2));
+      assert.equal(res2.seeded.length, 0);
+      assert.equal(res2.revision, rev1, "重跑幂等 revision 不变");
+    } finally {
+      fx.cleanup();
     }
   });
 }

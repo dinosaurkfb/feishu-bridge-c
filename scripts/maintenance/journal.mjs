@@ -20,7 +20,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { realUserHome } from "../maintenance-gate-core.mjs";
+import { realUserHome } from "../real-home.mjs";
 import { readRegularFile } from "../installed-surface.mjs";
 import { acquireLockUngated, commitWhileHeld, releasePublishLock } from "../registry.mjs";
 import { canonKey } from "./canon.mjs";
@@ -106,10 +106,10 @@ const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");
 const errCode = (err) => String(err?.code ?? err?.message ?? err);
 
-export function maintenanceDir(env = process.env) {
+export function maintenanceDir(env = process.env, { _inject } = {}) {
   const override = env[MAINTENANCE_DIR_ENV];
   if (typeof override === "string" && override.length > 0) return override;
-  const home = realUserHome();
+  const home = realUserHome({ _inject });
   return home === null ? null : path.join(home, ".claude", "feishu-bridge", "maintenance");
 }
 export const journalPath = (dir, token) => path.join(dir, token + ".json");

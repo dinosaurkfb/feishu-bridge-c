@@ -108,20 +108,19 @@ const BAD_TIME = { ok: false, commit: "not_committed", reason: "bad_time" };
 
 /* ─────────────────────────── 路径（受验派生，评审 P1-7） ─────────────────────────── */
 
-function realUserHome() {
-  try { const h = os.userInfo().homedir; if (typeof h === "string" && path.isAbsolute(h)) return h; } catch { /* 说不清 */ }
-  return null;
-}
+// R60 返修一 P1-1：passwd 家目录的读取收在叶子 scripts/real-home.mjs（只此一份，可注入）。
+import { realUserHome as realUserHomeLeaf } from "./real-home.mjs";
+const realUserHome = ({ _inject } = {}) => realUserHomeLeaf({ _inject });
 
 /** 账本根：测试注入 FEISHU_BRIDGE_LEDGER_DIR（只覆盖 root），否则 <真实 home>/.claude/feishu-bridge/ledger。 */
-function ledgerRoot(env = process.env) {
+function ledgerRoot(env = process.env, { _inject } = {}) {
   const inj = env?.[LEDGER_DIR_ENV];
   if (typeof inj === "string" && inj.length > 0 && path.isAbsolute(inj)) return inj;
-  const home = realUserHome();
+  const home = realUserHome({ _inject });
   return home ? path.join(home, ".claude", "feishu-bridge", "ledger") : null;
 }
 /** 只读派生同源导出（doctor ⑭ 枚举账本目录用）：同一概念只住一处，不许第二份路径派生。 */
-export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
+export const ledgerRootFor = (env = process.env, opts = {}) => ledgerRoot(env, opts);
 
 /**
  * 账本根受验核验（唯一校验器，#R19 四轮 P1：doctor ⑭ 根协议复用它，不再手写第二份）：
@@ -132,8 +131,8 @@ export const ledgerRootFor = (env = process.env) => ledgerRoot(env);
  * （mustExistRoot:false 同样拒父层 symlink，只是允许末级本身不存在）。
  * 返回 { ok:true, root: realRoot } 或 { ok:false, reason, why? }。
  */
-export function validateLedgerRoot({ env = process.env, mustExistRoot = true } = {}) {
-  const root = ledgerRoot(env);
+export function validateLedgerRoot({ env = process.env, mustExistRoot = true, _inject = null } = {}) {
+  const root = ledgerRoot(env, { _inject });
   if (!root || !path.isAbsolute(root)) return { ok: false, reason: "no_root" };
   let firstSeen = false; // 首次 lstat 是否看到 root 在场（#R27 P1）
   try {
@@ -224,7 +223,7 @@ export function ensureLedgerRoot({ env = process.env, _inject = null, _fence = n
   const inj = _inject ?? {};
   // ① 以"必须在场"核验：根已在场且 0700 真目录 → 也要重做父目录持久化屏障（P1-3），只读、不改目录，然后返回。
   //    root_not_canonical / root_unresolvable / root_perms / root_symlink → 原样拒（不创建）。
-  const rv = validateLedgerRoot({ env, mustExistRoot: true });
+  const rv = validateLedgerRoot({ env, mustExistRoot: true, _inject });
   if (rv.ok) {
     const parent = path.dirname(rv.root);
     let pfd = null;
@@ -237,7 +236,7 @@ export function ensureLedgerRoot({ env = process.env, _inject = null, _fence = n
   }
   // 只有"父链受验且末级确实缺席"（root_absent）才允许自建；no_root 无路径可建，也拒。
   if (rv.reason !== "root_absent") return rv;
-  const root = ledgerRootFor(env); // 合法缺席：root_absent 返回不带 root，路径从 ledgerRootFor 取（父链已受验净）
+  const root = ledgerRootFor(env, { _inject }); // 合法缺席：root_absent 返回不带 root，路径从 ledgerRootFor 取（父链已受验净）
   const parent = path.dirname(root);
   // P1-2：先受验父目录 realpath 并 open 钉住 inode，再在受验父上创建 —— 防"受验后父目录被并发换成
   // 外指 symlink"的越界写。路径式 mkdir 后即时复核父 realpath，被换 → 回滚并拒（best-effort 清理，不承诺净零）。
@@ -301,7 +300,7 @@ export function ensureLedgerRoot({ env = process.env, _inject = null, _fence = n
   fs.closeSync(pfd);
   if (!f.ok) return f;
   // ⑤ 复核：根必须已是 0700 真目录；否则 fail-closed。
-  const rc = validateLedgerRoot({ env, mustExistRoot: true });
+  const rc = validateLedgerRoot({ env, mustExistRoot: true, _inject });
   if (!rc.ok) return rc;
   return { ok: true, root: rc.root };
 }

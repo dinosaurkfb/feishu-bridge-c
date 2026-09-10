@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 // 两套件共用一份注册器（R59）：async 用例拒绝、汇总/退出码一致都在那里
-import { createTestHarness, installUnhandledRejectionGuard } from "./test-harness.mjs";
+import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsolation, setSuiteInvariants, treeDriftProblem } from "./test-harness.mjs";
 import { RISK, classifyRisk } from "./risk-class.mjs";
 import { CHAT_POLICY_ID, CHAT_REPLY_ARGS, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatReplyPathStatus, diagnosticSnippet, chatFailText, CHAT_FAIL_REASONS } from "./chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, chatLoad, recordChatOutcome, chatRecordProblem, isAdmissionLockEntry, classifyAdmissionLockEntry, inspectAdmissionLocks, inspectScratch, sweepScratch, classifyTmpEntry, lockUnclearedText, CHAT_MAX_CONCURRENT, CHAT_MAX_PER_SENDER, TMP_NAME_SHAPE } from "./chat-ledger.mjs";
@@ -621,10 +621,18 @@ function suppressAll(dir, { reason = "t", generation = "gen-1", digest } = {}) {
 const { test, sealSummary, printSummary, TEST_FILTER, failures } = createTestHarness({
   onFail: (name, err, failures) => {
     failures.push(`${name}\n    ${err.message.split("\n")[0]}`);
-    if (process.env.TEST_TRACE) console.error("\n✗ " + name + "\n" + (err.stack ?? err.message));
+    if (process.env.TEST_TRACE) {
+      const causeTrace = err.cause?.stack && !err.stack?.includes(err.cause.stack) ? "\nCaused by: " + err.cause.stack : "";
+      console.error("\n✗ " + name + "\n" + (err.stack ?? err.message) + causeTrace);
+    }
   },
 });
 installUnhandledRejectionGuard();
+// R60：套件级 HOME 隔离（注册器之后、第一条 test 之前）——真家目录的桥配置树不许被测试写
+const SUITE_HOME = installTestHomeIsolation();
+/** R60 返修一 P1-2：用例里临时改过机器路径 env 之后，恢复成套件绊线默认值（注册器每测后也会核）。
+ *  旧写法是裸 delete —— 等于把绊线默认值删到套件结束，后面几百条用例都跑在「没设」的语义上。 */
+const restoreMachineEnv = (...names) => { const d = SUITE_HOME.machineEnv(); for (const n of names) process.env[n] = d[n]; };
 
 // ---------- 固定装置（取自 2026-08-19 真实信封） ----------
 
@@ -7695,6 +7703,385 @@ test("R59 两套件都接共用注册器：源码 import test-harness，且 TEST
       JSON.stringify({ status: p.status, stdout: p.stdout?.slice(-300), stderr: p.stderr?.slice(0, 400) }));
     assert.match(p.stdout, /TEST_FILTER 命中 0/u, tag + " 套件报过滤器命中数：" + p.stdout);
   }
+});
+
+// ── R60 返修一：环境隔离是边界（Codex #152 一轮 2 P1 + 1 P2）──
+
+test("R60 返修一 P1-1：passwd home 也进守卫——双临时 home 下删 env → 账本根解析被拒、passwd home 桥树零目录", () => {
+  const envHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-envhome-")));
+  const passwdHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-passwdhome-")));
+  // 假 passwd 的桥树目录要在**装守卫之前**建（装完守卫，mkdirSync 到那棵树就被拦了 —— 这正是它的活）。
+  fs.mkdirSync(path.join(passwdHome, ".claude", "feishu-bridge"), { recursive: true, mode: 0o700 });
+  const env = { HOME: envHome };
+  const g = installTestHomeIsolation({ env, passwdHome, registerInvariants: false });
+  assert.equal(env.HOME, g.suiteHome(), "套件 HOME 移到私有 mkdtemp");
+  assert.equal(g.passwdHome(), passwdHome, "passwd home 可注入（测试不拿真 passwd home 做实验）");
+  // ① 正常路径：账本根解析落在绊线，不落 passwd home
+  const lr = TAL.ledgerRootFor(env);
+  assert.ok(!lr.startsWith(passwdHome + path.sep), "账本根解析不得落 passwd home：" + lr);
+  // ② 删掉 env（模拟"没设"）→ 回落到 passwd home 的桥树 → ensureLedgerRoot 的 mkdir 被守卫拒。
+  //    passwd home 走**产品侧的 _inject.realUserHome 缝**注入（不用 env 覆盖 passwd home：env 谁都能设）。
+  delete env.FEISHU_BRIDGE_LEDGER_DIR;
+  const inj = { realUserHome: () => passwdHome };
+  assert.equal(TAL.ledgerRootFor(env, { _inject: inj }), path.join(passwdHome, ".claude", "feishu-bridge", "ledger"), "注入缝生效：解析落在注入的 passwd home");
+  const r = TAL.ensureLedgerRoot({ env, _inject: inj });
+  assert.equal(r.ok, false, "删 env 后 ensureLedgerRoot 必须被拒（旧码在模拟 passwd home 下建出了 ledger）：" + JSON.stringify(r));
+  assert.match(String(r.why ?? ""), /test-home-isolation/u, "结构化拒因点名守卫：" + JSON.stringify(r));
+  assert.equal(fs.existsSync(path.join(passwdHome, ".claude", "feishu-bridge", "ledger")), false, "passwd home 桥树下零制品（ledger 没被建出来）");
+  // ③ .codex 桥树同样守（另一条泄漏面）
+  const probe = path.join(passwdHome, ".codex", "feishu-bridge", "runtime", "x");
+  // 注意：gate 那类制品是 symlink 到不存在目标的（payload 就是 target），existsSync 会回 false —— 判定一律用 lstat。
+  assert.throws(() => fs.mkdirSync(probe, { recursive: true }), /test-home-isolation/u, "passwd home 的 .codex 桥树同样拦");
+  assert.equal(fs.existsSync(probe), false, "零目录");
+});
+
+test("R60 返修一 P1-2：套件机器路径 env 是边界——无条件指向绊线；createGate 默认落绊线；注册器每测后核 env、汇总前核树", () => {
+  const machineEnv = SUITE_HOME.machineEnv();
+  for (const [name, value] of Object.entries(machineEnv)) {
+    assert.equal(process.env[name], value, name + " 必须指向套件绊线：" + String(process.env[name]));
+    assert.ok(String(value).startsWith(SUITE_HOME.suiteHome() + path.sep), name + " 绊线在套件 HOME 下：" + value);
+  }
+  // 维护门默认参数（不传 file）→ 落绊线，不落套件 HOME 桥树 / passwd home 桥树
+  const made = createGate({ reason: "r60 p1-2 gate tripwire" });
+  try {
+    assert.equal(made.ok, true, JSON.stringify(made));
+    // gate 是 symlink（target 就是 payload 字符串）→ 判定必须用 lstat，existsSync 永远 false。
+    const lstatIs = (p2) => { try { return fs.lstatSync(p2).isSymbolicLink(); } catch { return false; } };
+    assert.equal(lstatIs(machineEnv.FEISHU_BRIDGE_MAINTENANCE_GATE), true, "gate 落在绊线：" + machineEnv.FEISHU_BRIDGE_MAINTENANCE_GATE);
+    assert.equal(lstatIs(path.join(process.env.HOME, ".claude", "feishu-bridge", "maintenance.gate")), false, "套件 HOME 桥树下没有 gate");
+    assert.equal(lstatIs(path.join(SUITE_HOME.passwdHome(), ".claude", "feishu-bridge", "maintenance.gate")), false, "passwd home 桥树下没有 gate");
+  } finally {
+    // 门是全局阻塞：这条用例自己断言失败也必须撤门，否则后面几百条全被 maintenance 挡住
+    //（上一次跑就实测到这条级联：一个漏掉的门让 400+ 条用例转红）。
+    removeGate({ file: machineEnv.FEISHU_BRIDGE_MAINTENANCE_GATE, token: made.token });
+  }
+  // 注册器级不变量：用例动了 env 不恢复 → 当场红点名那个用例（用独立注册器验证，不污染本套件）
+  const seen = [];
+  const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
+  const savedInv = setSuiteInvariants({
+    envDrift: () => (process.env.R60_PROBE_ENV ? "R60_PROBE_ENV 被改用例没恢复" : null),
+    restore: () => { delete process.env.R60_PROBE_ENV; },
+  });
+  try {
+    h.test("漂移用例", () => { process.env.R60_PROBE_ENV = "drifted"; });
+    h.test("干净用例", () => { delete process.env.R60_PROBE_ENV; });
+  } finally {
+    setSuiteInvariants(savedInv);
+    delete process.env.R60_PROBE_ENV;
+  }
+  assert.equal(seen.length, 1, "只有一个用例被点名：" + JSON.stringify(seen));
+  assert.equal(seen[0][0], "漂移用例", "点名的是漂移的那个用例：" + JSON.stringify(seen));
+  assert.match(String(seen[0][1]), /env|环境/u, "why 说清是 env 漂移：" + seen[0][1]);
+  // 汇总前的绊线树核对是纯函数：树变了 → 点名
+  assert.equal(treeDriftProblem(["a"], ["a"]), null, "树没变 → 没问题");
+  assert.match(String(treeDriftProblem(["a"], ["a", "b/x"])), /新增|漂移|不一致/u, "树多了东西 → 点名：" + treeDriftProblem(["a"], ["a", "b/x"]));
+});
+
+test("R60 返修二 P1-2a：用例抛错时注册器必须在 finally 中核验与恢复不变量，且失败信息包含漂移点名", () => {
+  const seen = [];
+  const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
+  let restored = 0;
+  const savedInv = setSuiteInvariants({
+    envDrift: () => (process.env.R60_PROBE_THROW_ENV ? "R60_PROBE_THROW_ENV 被改且没恢复" : null),
+    restore: () => {
+      restored += 1;
+      delete process.env.R60_PROBE_THROW_ENV;
+    },
+  });
+  try {
+    h.test("抛错且漂移用例", () => {
+      process.env.R60_PROBE_THROW_ENV = "drifted";
+      throw new Error("用例内部断言失败");
+    });
+    h.test("后续正常用例", () => {
+      assert.equal(process.env.R60_PROBE_THROW_ENV, undefined, "后续用例开始前 env 已被恢复");
+    });
+  } finally {
+    setSuiteInvariants(savedInv);
+    delete process.env.R60_PROBE_THROW_ENV;
+  }
+  assert.equal(restored, 1, "用例抛错后仍然调用 restore() 恢复了不变量（旧实现 catch 直接 return 导致 restored=0）");
+  assert.equal(seen.length, 1, "只报告了抛错的用例：" + JSON.stringify(seen));
+  assert.match(String(seen[0][1]), /用例内部断言失败/u, "原错误信息保留");
+  assert.match(String(seen[0][1]), /R60_PROBE_THROW_ENV/u, "失败信息附带了漂移点名");
+});
+
+test("R60 返修二 P1-2b：HOME 纳入每测不变量——用例改 HOME 不恢复当场点名且后续用例 HOME 恢复", () => {
+  const seen = [];
+  const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
+  const fakeHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-p12b-fakehome-")));
+  const savedHome = process.env.HOME;
+  try {
+    h.test("改HOME不恢复用例", () => {
+      process.env.HOME = fakeHome;
+    });
+    h.test("后续正常用例", () => {
+      assert.equal(process.env.HOME, savedHome, "后续用例开始前 HOME 已被恢复");
+    });
+  } finally {
+    process.env.HOME = savedHome;
+  }
+  assert.equal(seen.length, 1, "改 HOME 的用例被点名：" + JSON.stringify(seen));
+  assert.equal(seen[0][0], "改HOME不恢复用例");
+  assert.match(String(seen[0][1]), /HOME/u, "why 点名 HOME 漂移：" + seen[0][1]);
+  assert.equal(process.env.HOME, savedHome, "套件当前 HOME 已恢复");
+});
+
+test("R60 返修二 P1-2c：createTestHarness 支持显式 filter: [] 关闭过滤，保证内层用例不被外部 TEST_FILTER 误过滤", () => {
+  const origFilter = process.env.TEST_FILTER;
+  try {
+    process.env.TEST_FILTER = "SOME_FILTER_THAT_MATCHES_NOTHING";
+    // 默认行为：继承 process.env.TEST_FILTER
+    const hInherit = createTestHarness();
+    assert.deepEqual(hInherit.TEST_FILTER, ["SOME_FILTER_THAT_MATCHES_NOTHING"], "默认继承 process.env.TEST_FILTER");
+    // 显式 filter: []：关闭过滤
+    const hExplicit = createTestHarness({ filter: [] });
+    assert.deepEqual(hExplicit.TEST_FILTER, [], "显式 filter: [] 彻底关闭过滤，不受外部环境变量影响");
+  } finally {
+    if (origFilter !== undefined) process.env.TEST_FILTER = origFilter;
+    else delete process.env.TEST_FILTER;
+  }
+});
+
+test("R60 返修二 P2：treeDriftProblem 校验路径、类型、大小、mode 与 sha——改既有文件一个字节即点名", () => {
+  // ① 纯函数级别：同路径同名，但文件大小/sha/mode 变更
+  const beforeFile = [{ path: "a/file.json", type: "file", size: 10, mode: 0o644, sha: "aaaa1111" }];
+  const afterSame = [{ path: "a/file.json", type: "file", size: 10, mode: 0o644, sha: "aaaa1111" }];
+  assert.equal(treeDriftProblem(beforeFile, afterSame), null, "同路径且属性/内容一致 → 没问题");
+
+  // 改写 1 字节（size 变或 sha 变）
+  const afterModified = [{ path: "a/file.json", type: "file", size: 11, mode: 0o644, sha: "bbbb2222" }];
+  const probMod = treeDriftProblem(beforeFile, afterModified);
+  assert.match(String(probMod), /变更|修改|不一致/u, "改写 1 字节必须点名：" + probMod);
+  assert.match(String(probMod), /a\/file\.json/u, "点名具体文件路径：" + probMod);
+
+  // 相同大小但内容 sha 变（例如改写一个字节但总长度不变）
+  const afterShaOnly = [{ path: "a/file.json", type: "file", size: 10, mode: 0o644, sha: "bbbb2222" }];
+  const probSha = treeDriftProblem(beforeFile, afterShaOnly);
+  assert.match(String(probSha), /变更|修改|不一致/u, "同大小但内容修改必须点名：" + probSha);
+
+  // mode 变更
+  const afterMode = [{ path: "a/file.json", type: "file", size: 10, mode: 0o777, sha: "aaaa1111" }];
+  const probMode = treeDriftProblem(beforeFile, afterMode);
+  assert.match(String(probMode), /变更|修改|不一致/u, "权限变更必须点名：" + probMode);
+
+  // 类型变更（文件变目录）
+  const afterType = [{ path: "a/file.json", type: "dir", size: 4096, mode: 0o755, sha: null }];
+  const probType = treeDriftProblem(beforeFile, afterType);
+  assert.match(String(probType), /变更|修改|不一致/u, "类型变更必须点名：" + probType);
+
+  // 向后兼容旧用法：纯路径字符串数组
+  assert.equal(treeDriftProblem(["x", "y"], ["x", "y"]), null, "向后兼容纯路径字符串相等");
+  assert.match(String(treeDriftProblem(["x"], ["x", "y"])), /新增/u, "向后兼容纯路径字符串新增");
+});
+
+test("R60 返修三 P1：绊线根纳入不可变基线——根被删/根换外指symlink/根被chmod各自点名且零删除", () => {
+  const tmpBase = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-p1-roots-")));
+  try {
+    // 反例 1：根被删 → 点名且零删除
+    {
+      const env1 = { HOME: path.join(tmpBase, "home1") };
+      const iso1 = installTestHomeIsolation({ env: env1, registerInvariants: false });
+      const ledgerRoot = iso1.tripwire().ledger;
+      assert.equal(iso1.checkRoots(), null, "初始根身份完整");
+
+      fs.rmSync(ledgerRoot, { recursive: true });
+      const prob = iso1.checkRoots();
+      assert.match(String(prob), /绊线根缺席（被删）/u, "根被删必须点名缺席：" + prob);
+      assert.match(String(prob), new RegExp(ledgerRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体被删的根");
+      assert.doesNotThrow(() => iso1.cleanTree(), "根被删时 cleanTree 零删除不报错");
+    }
+
+    // 反例 2：根换成外指 symlink（目标带哨兵文件 → 哨兵必须仍在）→ 点名且零删除
+    {
+      const env2 = { HOME: path.join(tmpBase, "home2") };
+      const iso2 = installTestHomeIsolation({ env: env2, registerInvariants: false });
+      const ledgerRoot = iso2.tripwire().ledger;
+
+      const externalDir = path.join(tmpBase, "external-target");
+      fs.mkdirSync(externalDir, { recursive: true });
+      const sentinelFile = path.join(externalDir, "sentinel.txt");
+      fs.writeFileSync(sentinelFile, "precious-external-data", { mode: 0o600 });
+
+      fs.rmSync(ledgerRoot, { recursive: true });
+      fs.symlinkSync(externalDir, ledgerRoot);
+
+      const prob = iso2.checkRoots();
+      assert.match(String(prob), /绊线根被换成 symlink/u, "根换成 symlink 必须点名：" + prob);
+      assert.match(String(prob), new RegExp(ledgerRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体根");
+
+      iso2.cleanTree();
+
+      assert.equal(fs.existsSync(sentinelFile), true, "外指 symlink 目标下的哨兵文件绝不可被 cleanTree 误删（零删除）！");
+      assert.equal(fs.readFileSync(sentinelFile, "utf-8"), "precious-external-data", "哨兵文件内容完整");
+
+      const emptyExtDir = path.join(tmpBase, "empty-external");
+      fs.mkdirSync(emptyExtDir, { recursive: true });
+      const maintenanceRoot = iso2.tripwire().maintenance;
+      fs.rmSync(maintenanceRoot, { recursive: true });
+      fs.symlinkSync(emptyExtDir, maintenanceRoot);
+      const probEmpty = iso2.checkRoots();
+      assert.match(String(probEmpty), /绊线根被换成 symlink/u, "外指空目录同样必须点名：" + probEmpty);
+    }
+
+    // 反例 3：根被 chmod → 点名且零删除
+    {
+      const env3 = { HOME: path.join(tmpBase, "home3") };
+      const iso3 = installTestHomeIsolation({ env: env3, registerInvariants: false });
+      const codexRoot = iso3.tripwire().codexHome;
+
+      fs.chmodSync(codexRoot, 0o755);
+      const prob = iso3.checkRoots();
+      assert.match(String(prob), /绊线根 mode 发生变化/u, "根被 chmod 必须点名 mode 变化：" + prob);
+      assert.match(String(prob), /0700.*0755/u, "明确指出原 mode 和现 mode：" + prob);
+      assert.match(String(prob), new RegExp(codexRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体根");
+      assert.doesNotThrow(() => iso3.cleanTree(), "mode 异常时 cleanTree 跳过该根");
+    }
+
+    // 注册器级端到端验证：用例内部把根换成外指 symlink → 注册器捕获并在 onFail 中点名，且外部哨兵仍在
+    {
+      const externalDir4 = path.join(tmpBase, "external-target4");
+      fs.mkdirSync(externalDir4, { recursive: true });
+      const sentinelFile4 = path.join(externalDir4, "sentinel4.txt");
+      fs.writeFileSync(sentinelFile4, "keep-me-safe", { mode: 0o600 });
+
+      const env4 = { HOME: path.join(tmpBase, "home4") };
+      const savedInv = setSuiteInvariants(null);
+      try {
+        const iso4 = installTestHomeIsolation({ env: env4, registerInvariants: true });
+        const seen = [];
+        const h = createTestHarness({ filter: [], onFail: (name, err) => seen.push([name, err.message]) });
+
+        h.test("用例偷换根为外指symlink", () => {
+          fs.rmSync(iso4.tripwire().ledger, { recursive: true });
+          fs.symlinkSync(externalDir4, iso4.tripwire().ledger);
+        });
+
+        assert.equal(seen.length, 1, "注册器点名违规用例：" + JSON.stringify(seen));
+        assert.equal(seen[0][0], "用例偷换根为外指symlink");
+        assert.match(String(seen[0][1]), /绊线根被换成 symlink/u, "错误信息明确点名根被换成 symlink：" + seen[0][1]);
+        assert.equal(fs.existsSync(sentinelFile4), true, "用例结束后的 cleanTree 绝不能删除外部哨兵文件！");
+        assert.equal(fs.readFileSync(sentinelFile4, "utf-8"), "keep-me-safe", "哨兵内容完整无损");
+      } finally {
+        setSuiteInvariants(savedInv);
+      }
+    }
+  } finally {
+    try { fs.rmSync(tmpBase, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test("R60 返修三 P2：并发时 new Error 保留 cause 与原始 stack——失败信息含原断言位置", () => {
+  const seen = [];
+  const h = createTestHarness({
+    filter: [],
+    onFail: (name, err) => {
+      seen.push({
+        name,
+        err,
+        message: err.message,
+        stack: err.stack,
+        cause: err.cause,
+        causeStack: err.cause?.stack,
+      });
+    },
+  });
+
+  const savedInv = setSuiteInvariants({
+    envDrift: () => "R60_CONCURRENT_DRIFT 环境变量漂移",
+    restore: () => {},
+  });
+
+  try {
+    h.test("并发断言失败与漂移用例", () => {
+      assert.equal(1 + 1, 3, "故意失败的原断言");
+    });
+  } finally {
+    setSuiteInvariants(savedInv);
+  }
+
+  assert.equal(seen.length, 1, "只记录了一条失败：" + JSON.stringify(seen));
+  const failure = seen[0];
+  assert.equal(failure.name, "并发断言失败与漂移用例");
+  assert.match(failure.message, /故意失败的原断言/u, "message 含原断言文案");
+  assert.match(failure.message, /R60_CONCURRENT_DRIFT/u, "message 含漂移文案");
+
+  // P2 核心断言：原异常作为 cause 保留，且失败信息（cause/stack）含原断言位置
+  assert.ok(failure.cause, "原异常必须作为 cause 保留（旧实现未传 cause，丢失原异常）");
+  assert.match(String(failure.cause.message), /故意失败的原断言/u, "cause.message 是原断言错误");
+  assert.ok(failure.cause.stack, "cause 必须包含原始 stack");
+  assert.match(failure.cause.stack, /test\.mjs/u, "cause.stack 必须包含原断言所在文件位置（test.mjs）");
+  assert.match(failure.stack, /test\.mjs/u, "err.stack 必须包含原断言所在位置（test.mjs）");
+});
+
+
+test("R60 返修一 P2：证据层级改正——套件 HOME ≠ passwd home；passwd 路径由双临时 home 夹具单独证一次", () => {
+  assert.notEqual(process.env.HOME, SUITE_HOME.passwdHome(), "套件 HOME ≠ passwd home（旧措辞把两者混为一谈）");
+  const envHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60p2-envhome-")));
+  const passwdHome = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60p2-passwd-")));
+  const env = { HOME: envHome, CODEX_HOME: path.join(envHome, ".codex") };
+  installTestHomeIsolation({ env, passwdHome, registerInvariants: false });
+  const treeOf = (root) => { const out = []; const walk = (d) => { let ns = []; try { ns = fs.readdirSync(d); } catch { return; } for (const n of ns) { const p = path.join(d, n); out.push(path.relative(root, p)); walk(p); } }; walk(root); return out.sort(); };
+  assert.deepEqual(treeOf(passwdHome), [], "passwd home 整棵树零制品（不是靠 $HOME 顺带证明）：" + JSON.stringify(treeOf(passwdHome)));
+  assert.notEqual(env.Home = env.HOME, passwdHome, "夹具自证两个家不是同一个");
+});
+
+test("R60 返修一 顺手：持续 residue 的失败 why 必须带「预算内持续为残骸」证据", () => {
+  const src = fs.readFileSync(path.resolve("scripts", "installed-surface.mjs"), "utf-8");
+  assert.match(src, /预算内持续为残骸/u, "诊断文案在（删掉这段文案这条用例转红）");
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r60-residue-")));
+  const surface = path.join(dir, "installed-surface.json");
+  const always = (lock) => ({ ok: false, reason: "lock_residue", path: lock });
+  const r = withInstalledSurfaceLock(surface, () => { throw new Error("不该跑到 fn"); }, { waitMs: 120, acquire: always });
+  assert.equal(r.ok, false, "持续 residue → fail-closed：" + JSON.stringify(r));
+  assert.equal(r.reason, "surface_lock_residue", "reason：" + r.reason);
+  assert.match(String(r.why ?? ""), /在 120ms 预算内持续为残骸/u, "why 带预算证据：" + r.why);
+});
+// ── R60：套件级 HOME 隔离 + 真家目录桥配置树写守卫（事实：真机 ledger 下出现测试夹具形状的 endpoint 空目录）──
+
+test("R60 红证：套件环境下账本根解析不得指向真实家目录（realUserHome 绕过 $HOME——R60 泄漏根因）", () => {
+  const passwdHome = os.userInfo().homedir; // 与 ledgerRoot 同一信息源
+  const lr = TAL.ledgerRootFor(process.env);
+  assert.ok(lr && path.isAbsolute(lr), "解析出绝对路径：" + lr);
+  assert.ok(!lr.startsWith(passwdHome + path.sep + ".claude" + path.sep + "feishu-bridge"),
+    "账本根解析落在真实家目录的桥树里（R60 泄漏）：" + lr);
+});
+
+// ── R60：套件级 HOME 隔离 + 真家目录桥配置树写守卫（事实：真机 ledger 下出现测试夹具形状的 endpoint 空目录）──
+
+test("R60 守卫行为钉：HOME 移到套件私有 mkdtemp；真家目录桥配置树建目录当场拒（结构化、零目录）；经产品原语同款；非桥路径不误伤", () => {
+  const realHome = SUITE_HOME.realHome();
+  assert.ok(realHome && path.isAbsolute(realHome), "记录到原 HOME：" + realHome);
+  assert.notEqual(process.env.HOME, realHome, "套件已把 HOME 移到私有 mkdtemp");
+  assert.ok(process.env.HOME.startsWith(fs.realpathSync(os.tmpdir())), "套件 HOME 在临时目录下：" + process.env.HOME);
+  const saved = process.env.HOME;
+  process.env.HOME = realHome;
+  try {
+    // ① 直拦：真家目录桥配置树下建目录 → 当场拒，零目录（真 HOME 只读未动）
+    const probe = path.join(realHome, ".claude", "feishu-bridge", "ledger", "endpoint_r60guard00000000");
+    assert.throws(() => fs.mkdirSync(probe, { recursive: true }), /test-home-isolation/u,
+      "真家目录桥树建目录被守卫拒");
+    assert.equal(fs.existsSync(probe), false, "守卫拒后零目录");
+    // ② 经产品原语同款：FEISHU_BRIDGE_LEDGER_DIR 指进真家桥树 → ensureLedgerRoot 的 mkdir 被拒 → 结构化拒因
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(realHome, ".claude", "feishu-bridge", "ledger", "endpoint_r60probe000000");
+    try {
+      const r = TAL.ensureLedgerRoot({ env: process.env });
+      assert.equal(r.ok, false, "ensureLedgerRoot 被拒：" + JSON.stringify(r));
+      assert.match(String(r.why ?? ""), /test-home-isolation/u, "结构化拒因点名守卫：" + JSON.stringify(r));
+      assert.equal(fs.existsSync(process.env.FEISHU_BRIDGE_LEDGER_DIR), false, "零目录");
+    } finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+    }
+    // ③ 泄漏面双保险：真家目录的 .codex 桥树同样拦
+    assert.throws(() => fs.mkdirSync(path.join(realHome, ".codex", "feishu-bridge", "ledger", "x"), { recursive: true }), /test-home-isolation/u);
+    // ④ 套件 HOME 的桥树同样拦（那是无隔离用例会写进去的地方 —— 拦住才能让泄漏当场红）
+    assert.throws(() => fs.mkdirSync(path.join(process.env.HOME, ".claude", "feishu-bridge", "ledger", "x"), { recursive: true }), /test-home-isolation/u);
+  } finally { process.env.HOME = saved; }
+  // ⑤ 不误伤：非桥路径照常建
+  const okDir = path.join(process.env.HOME, "not-bridge", "d");
+  fs.mkdirSync(okDir, { recursive: true });
+  assert.ok(fs.existsSync(okDir), "非桥路径不受守卫影响");
 });
 
 test("入站崩溃回执只出脱敏引用码，不把堆栈写进模型可见通道", () => {
@@ -23548,7 +23935,7 @@ test("P1-5②：W2 换会话再认领 → rebind_session_alias（只改 aliases.
     fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p15b_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + '\n\n**[引用]**\n绑定码    cccccc' } }) }] });
     const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_claim", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir } });
-    delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+    restoreMachineEnv("FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR"); // R60 P1-2：恢复绊线默认值，不再裸删
     const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
     return { local, r, ledger, root };
   };
@@ -23638,7 +24025,7 @@ test("P2-① 真入口：cutover/账本缺席门（P1-1）——已启用点账�
     fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21g_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
     const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_gate", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir } });
-    delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+    restoreMachineEnv("FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR"); // R60 P1-2：恢复绊线默认值，不再裸删
     const ledger = fs.existsSync(ledgerFile) ? JSON.parse(fs.readFileSync(ledgerFile, "utf-8")) : null;
     const regAfter = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
     return { local, r, ledger, regAfter, seedProject, rec: endpointReceipt(maintDir, ep) };
@@ -23719,7 +24106,7 @@ test("P2-① 真入口：release 残骸门（外层锁）——活 pid 持锁→
     fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_p21r_1", sessionID: "aily_dm", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content: at + "绑定该话题" } }) }] });
     const r = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_res", FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000", FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir } });
-    delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+    restoreMachineEnv("FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR"); // R60 P1-2：恢复绊线默认值，不再裸删
     const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
     const regAfter = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
     return { local, r, ledger, regAfter, seedProject };
@@ -23780,7 +24167,7 @@ test("P2-① 真入口：崩溃重进（幂等重放）——同一条认领消�
   const run1 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
   const reg1 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
   const led1 = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
-  delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  restoreMachineEnv("FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR"); // R60 P1-2：恢复绊线默认值，不再裸删
   try {
     assert.equal(reg1.projects[0].inbound_state, "bound", "第 1 次应完成绑定（inbound_state→bound，提交后崩溃）：" + reg1.projects[0].inbound_state);
     const ops1 = Object.values(led1.operations).map((op) => op.op_type);
@@ -23842,7 +24229,7 @@ test("守卫① 真入口：已启用端点无码认领 → 整笔拒（需绑�
   const run = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
   const reg = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
   const led = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
-  delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  restoreMachineEnv("FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR"); // R60 P1-2：恢复绊线默认值，不再裸删
   try {
     assert.equal(reg.projects[0].inbound_state, "pending", "无码认领在已启用端点上不得绑定（仍 pending）：" + reg.projects[0].inbound_state);
     const ops = Object.values(led.operations).map((op) => op.op_type);
@@ -23895,7 +24282,7 @@ test("P1-1③ 真入口：配对复合消息 bind-only——受验 owner @ 配�
   const run1 = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: spawnEnv });
   const reg1 = JSON.parse(fs.readFileSync(registryFile, "utf-8"));
   const led1 = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
-  delete process.env.FEISHU_BRIDGE_LEDGER_DIR; delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+  restoreMachineEnv("FEISHU_BRIDGE_LEDGER_DIR", "FEISHU_BRIDGE_MAINTENANCE_DIR"); // R60 P1-2：恢复绊线默认值，不再裸删
   try {
     assert.equal(reg1.projects[0].inbound_state, "bound", "配对应完成绑定（inbound_state→bound）：" + reg1.projects[0].inbound_state);
     const ops1 = Object.values(led1.operations).map((op) => op.op_type);

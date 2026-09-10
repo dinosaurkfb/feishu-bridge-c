@@ -46603,6 +46603,39 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(un.record.repair_attempts.at(-1).commit, "committed_with_residue", "attempts 尾条 commit：" + JSON.stringify(un.record.repair_attempts.at(-1)));
   }));
 
+  test("R64 钉三：ledger_evidence 键集封闭——多键 / 缺 lock_uncleared → 拒且点名「键集」；repair_attempts 条目多键 → 拒；精确键集 → valid", () => {
+    const claimsDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r64ev-"), { mode: 0o700 }));
+    const key = "c" + "d".repeat(63);
+    const rec = (ev, attempts = []) => ({
+      schema_version: "1.0", claim_key: key, state: "control-committed-unclean", recorded_at: "2026-09-13T09:00:00.000Z",
+      control: "select", handle: "osh_" + "2".repeat(32), handle_kind: "osh", reason: "control_committed_unclean",
+      status: "control-committed-unclean", error: "账本收口不净", why: "账本收口不净", ledger: "unclean",
+      intent_cleanup: "unclear", locks: null, changed: false, result: null, repair_attempts: attempts,
+      detail: { legacy: "committed", ledger: "committed", action: "activate", target_id: "ta_" + "2".repeat(32), request_key: "m1a_" + "e".repeat(40), plan_ref: "f".repeat(64), ledger_reason: "activate 已提交但收口不净", ledger_evidence: ev },
+    });
+    const goodEv = { commit: "committed_with_residue", dirs_pending_fsync: [], residue: ["/x/r64/residue-b"], lock_uncleared: true };
+    // 对照：精确四键 → 校验过、读回 valid
+    assert.equal(controlCommittedUncleanRecordProblem(rec(goodEv), key), null, "精确键集对照应过");
+    fs.writeFileSync(path.join(claimsDir, key + ".control-committed-unclean.json"), JSON.stringify(rec(goodEv)), { mode: 0o600 });
+    assert.equal(readControlCommittedUncleanRecord({ claimsDir, key }).status, "valid", "对照读回 valid");
+    const assertRejected = (ev, why) => {
+      const problem = controlCommittedUncleanRecordProblem(rec(ev), key);
+      assert.ok(problem !== null, why + "必须拒");
+      assert.match(problem, /键集/u, why + "点名键集：" + problem);
+      fs.writeFileSync(path.join(claimsDir, key + ".control-committed-unclean.json"), JSON.stringify(rec(ev)), { mode: 0o600 });
+      assert.equal(readControlCommittedUncleanRecord({ claimsDir, key }).status, "unreadable", why + "读回 unreadable");
+    };
+    // 反例①：多一个键
+    assertRejected({ ...goodEv, extra: 1 }, "多键 ");
+    // 反例②：缺 lock_uncleared
+    assertRejected({ commit: goodEv.commit, dirs_pending_fsync: goodEv.dirs_pending_fsync, residue: goodEv.residue }, "缺 lock_uncleared ");
+    // 反例③：repair_attempts 条目多键（键集检查独立于 evidenceProblem，同样拒）
+    const badAttempts = [{ at: "2026-09-13T09:01:00.000Z", reason: "r", commit: "committed_clean", dirs_pending_fsync: [], residue: [], lock_uncleared: false, extra: 1 }];
+    const problem = controlCommittedUncleanRecordProblem(rec(goodEv, badAttempts), key);
+    assert.ok(problem !== null, "attempts 多键必须拒");
+    assert.match(problem, /repair_attempts 条目键集/u, "attempts 点名键集：" + problem);
+  });
+
   test("R57d 返修六 P1-3：consumed 写失败的证据联合闭合——authoritative osh 落 not_applicable 合法 unclean；rfh 成功返回自带完整 detail", () => withLedgerD((root, dir, ids) => {
     const claimsDir = txDirD(root);
     // ① authoritative（ledger-only）osh：consumed 写失败 → 落**合法** unclean（legacy=not_applicable），repair 读得到

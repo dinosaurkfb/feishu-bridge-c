@@ -312,6 +312,7 @@ import {
 import {
   businessActivitiesForPublishedBatch, launchAutomaticTopicRotation,
 } from "./automatic-topic-rotation.mjs";
+import { mutateSidecarDoc } from "./m1b/sidecar-store.mjs";
 
 /**
  * **整个套件用一个本轮自己新建的私有临时登记表。**
@@ -50699,6 +50700,78 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
     assert.equal(ledgerStepState(), "done", "② ledger step done");
   } finally { f.cleanup(); }
 });
+
+// ─────────── PK2-W1：切权威后的会话级绑定 + 认领写方（M1b-W1） ───────────
+{
+  // T7 sidecar-store 原语：pending-claims/expiry 锁内读-改-校验-原子写（裁定 ④）。
+  test("PK2-W1 T7 sidecar-store：合法 upsert/删除幂等零写；tmp fsync 失败→拒且盘上不变；目录 fsync 失败→拒 committed:true；0644→读拒；锁被占→拒；非法条目整文档校验拒", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2w1-t7-")));
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    const ledgerRoot = path.join(base, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 });
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    try {
+      const EP = legacyEndpointId({ runtime: "claude", agentUid: "pk2w1_t7" });
+      const epDir = path.join(ledgerRoot, EP); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+      const pcFile = path.join(epDir, "pending-claims.json");
+      const TA = "ta_" + "a".repeat(32);
+      // ① upsert（缺席起步 → 规范空文档）+ 0600 + 读回一致
+      const w = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => ({ ok: true, entries: { ...entries, [TA]: { token: "abcdef", claim_expires_at: null } } }) });
+      assert.equal(w.ok, true, "upsert 成立：" + JSON.stringify(w).slice(0, 200));
+      assert.equal(w.changed, true, "首写 changed=true");
+      assert.equal((fs.lstatSync(pcFile).mode & 0o777), 0o600, "0600（与 renderer/policy 同款）");
+      assert.deepEqual(JSON.parse(fs.readFileSync(pcFile, "utf-8")).entries[TA], { token: "abcdef", claim_expires_at: null }, "读回一致");
+      // ② 删除幂等：第一笔删（changed true），第二笔删（changed false → 零写，字节不变）
+      const del1 = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => { const n = { ...entries }; const had = TA in n; delete n[TA]; return { ok: true, entries: n, changed: had }; } });
+      assert.ok(del1.ok && del1.changed === true, "第一笔删除成立：" + JSON.stringify(del1));
+      const bytesAt = fs.readFileSync(pcFile);
+      const del2 = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => { const n = { ...entries }; const had = TA in n; delete n[TA]; return { ok: true, entries: n, changed: had }; } });
+      assert.ok(del2.ok && del2.changed === false, "重复删除幂等（零写）：" + JSON.stringify(del2));
+      assert.deepEqual(fs.readFileSync(pcFile), bytesAt, "零写字节不变");
+      // ③ tmp fsync 失败 → 拒且盘上不变、无 tmp 残骸
+      mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => ({ ok: true, entries: { ...entries, [TA]: { token: "abcdef", claim_expires_at: null } } }) });
+      const bytesBefore = fs.readFileSync(pcFile);
+      const fail = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env, _inject: { failTmpFsync: true },
+        mutate: (entries) => ({ ok: true, entries: { ...entries, [TA]: { token: "ffffff", claim_expires_at: null } } }) });
+      assert.equal(fail.ok, false, "tmp fsync 失败拒：" + JSON.stringify(fail));
+      assert.equal(fail.reason, "sidecar_write_failed", "点名写失败：" + JSON.stringify(fail));
+      assert.deepEqual(fs.readFileSync(pcFile), bytesBefore, "盘上字节不变");
+      assert.equal(fs.readdirSync(epDir).some((n) => n.includes(".tmp.")), false, "无 tmp 残骸");
+      // ④ 目录 fsync 失败（rename 已发生）→ 拒且 committed:true（如实外显持久性不确定）
+      const dirFail = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env, _inject: { failDirFsync: true },
+        mutate: (entries) => ({ ok: true, entries: { ...entries, [TA]: { token: "ffffff", claim_expires_at: null } } }) });
+      assert.equal(dirFail.ok, false, "目录 fsync 失败拒：" + JSON.stringify(dirFail));
+      assert.equal(dirFail.reason, "sidecar_dir_fsync_failed", "点名：" + JSON.stringify(dirFail));
+      assert.equal(dirFail.committed, true, "如实点名已提交");
+      // ⑤ 0644 → 读拒（fail-closed 不折空）
+      fs.chmodSync(pcFile, 0o644);
+      const loose = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => ({ ok: true, entries }) });
+      assert.equal(loose.ok, false, "0644 拒：" + JSON.stringify(loose));
+      assert.match(String(loose.reason), /sidecar_unreadable|sidecar_lock_busy/u, "读拒族：" + JSON.stringify(loose));
+      fs.chmodSync(pcFile, 0o600);
+      // ⑥ 锁被占 → 拒
+      const held = acquireLedgerLock(pcFile + ".lock");
+      assert.ok(held.ok, "测试自持锁：" + JSON.stringify(held));
+      const busy = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => ({ ok: true, entries }) });
+      assert.equal(busy.ok, false, "锁被占拒：" + JSON.stringify(busy));
+      assert.equal(busy.reason, "sidecar_lock_busy", "点名 busy：" + JSON.stringify(busy));
+      releaseLedgerLock(pcFile + ".lock");
+      // ⑦ 非法条目 → 整文档校验拒（写前不落盘）
+      const bad = mutateSidecarDoc({ endpointId: EP, name: "pending-claims", env: process.env,
+        mutate: (entries) => ({ ok: true, entries: { ...entries, [TA]: { token: "zzzzzz", claim_expires_at: null } } }) });
+      assert.equal(bad.ok, false, "非法 token 拒：" + JSON.stringify(bad));
+      assert.equal(bad.reason, "sidecar_invalid", "点名校验：" + JSON.stringify(bad));
+    } finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+}
 
 sealSummary();
 

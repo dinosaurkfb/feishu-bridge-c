@@ -25,7 +25,6 @@
  * 本命令不碰 `.runtime-data/`，不写 registry / active-mapping（那是 inbound 与 bind-* 的事）。
  */
 
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -33,16 +32,30 @@ import path from "node:path";
 import { displaySafe } from "./display-safe.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
-import { acquireOrderLock } from "./m1a/dual-write.mjs";
+import { acquireOrderLock, requestKeyFor } from "./m1a/dual-write.mjs";
+import { classifyLedgerAuthority } from "./m1a/delivery-target.mjs"; // PK2-I4-fix1 P1-1：权威判源（与 W1/R66 同一矩阵，不另写）
 import { foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+import { maintenanceDir } from "./maintenance/journal.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
+import { transcriptSlug } from "./live-session.mjs"; // PK2-I4-fix1 P2：slug 单一来源
 import { ID_SHAPE, ENDPOINT_SHAPE } from "./shapes.mjs";
 import { resolveAuthorizedBy } from "./m1a-seed.mjs"; // owner 身份的**同一份**判据（seed 与这里共用，不另写一份）
 import { canonKey, loadByEndpoint, retarget, retargetDirectionProblem } from "./topic-agent-ledger.mjs";
 
 /** Claude 会话 uuid 形状（与账本 claude_session_id 同一形状；那一份没导出，这里显式定义一次）。 */
 export const SESSION_UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/**
+ * PK2-I4-fix1 P1-2：retarget op 的**确定性**请求身份 —— 由 `requestKeyFor` 同源派生
+ * （ext = `retarget:<id>:<uuid>`，entity = 目标 id）。同一条命令重跑 = 同一笔 op：
+ * 账本 replay 命中 → 幂等确认「已生效」，不新增 operations；不再用每次随机的 uuid。 */
+export function retargetRequestKey({ id, sessionId } = {}) {
+  const rk = requestKeyFor({ opType: "retarget", externalRequestId: "retarget:" + String(id) + ":" + String(sessionId), entityId: String(id) });
+  if (!rk.ok) throw new Error("retargetRequestKey 派生失败：" + String(rk.why ?? rk.reason));
+  return rk.request_key;
+}
 
 export const RETARGET_USAGE = Object.freeze([
   "用法：node scripts/m1a-retarget.mjs --endpoint <endpoint_id> --id <topic_agent_id> --session <uuid> [--apply]",
@@ -100,7 +113,7 @@ export function parseRetargetArgs(argv = []) {
  */
 export function sessionTranscriptPath({ projectRoot, sessionId, env = process.env } = {}) {
   const home = env.HOME ?? os.homedir();
-  return path.join(home, ".claude", "projects", String(projectRoot).replace(/\//gu, "-"), sessionId + ".jsonl");
+  return path.join(home, ".claude", "projects", transcriptSlug(projectRoot), sessionId + ".jsonl");
 }
 
 export function sessionPresent({ projectRoot, sessionId, env = process.env, probe = null } = {}) {
@@ -124,11 +137,18 @@ export function formatRetargetResult(res) {
       "  拟改后      " + targetLine(res.newTarget),
       "  同 lineage  " + res.affectedIds.length + " 条会一起改"
         + (res.lineage === null ? "（无 lineage：只改这一条）" : "（lineage " + short(res.lineage, 12) + "）"),
-      "  会话在场    " + (res.sessionPresent
-        ? "是（" + res.sessionFile + "）"
-        : "**否**（" + res.sessionFile + "）—— --apply 会拒 session_absent"),
+      "  会话记录    " + (res.sessionPresent
+        ? "存在（" + res.sessionFile + "）"
+        : "不存在（" + res.sessionFile + "）—— --apply 会拒 session_absent"),
       "  执行：node scripts/m1a-retarget.mjs --endpoint " + res.endpointId + " --id " + res.id
         + " --session " + String(res.newTarget?.claude_session_id ?? "") + " --apply",
+    ];
+  }
+  if (res.ok === true && res.status === "already_effective") {
+    return [
+      "[m1a-retarget] 已生效（端点 " + res.endpointId + "，记录 " + short(res.id, 12) + "，"
+        + res.affectedIds.length + " 条同 lineage，revision " + String(res.revision) + "）"
+        + "—— 同一请求身份的 retarget op 之前已提交，本次重放确认，未新增 operations",
     ];
   }
   if (res.ok === true) {
@@ -176,12 +196,19 @@ export function retargetEndpoint({
     return { ok: false, reason: "no_target", why: "这条记录没有 binding_target（facts.binding=" + String(rec.facts?.binding) + "）—— 没有可 retarget 的对象" };
   }
   if (oldTarget.runtime !== "claude") {
-    return { ok: false, reason: "not_claude", why: "本命令的会话在场探测只认 Claude 链（runtime=" + String(oldTarget.runtime) + "）" };
+    return { ok: false, reason: "not_claude", why: "本命令的会话记录探测只认 Claude 链（runtime=" + String(oldTarget.runtime) + "）" };
   }
-  if (oldTarget.claude_session_id !== null) {
+  // PK2-I4-fix1 P1-2：already_session_level 放在 replay 判定**之后** —— 同一条命令重跑时，记录已是
+  // 本命令要改的那个会话级（claude_session_id === sessionId），这不是错误：用确定性请求身份去账本
+  // 重放命中原 op → 幂等确认「已生效」。只有“已是**别的**会话级 / 无历史 op 可重放”才拒。
+  const replayConfirm = apply === true && oldTarget.claude_session_id === sessionId;
+  if (oldTarget.claude_session_id !== null && !replayConfirm) {
     return { ok: false, reason: "already_session_level", why: "这条记录已经是会话级（claude_session_id=" + short(oldTarget.claude_session_id) + "）—— 本命令只做 项目级 → 会话级" };
   }
-  const newTarget = { ...oldTarget, claude_session_id: sessionId };
+  const newTarget = replayConfirm ? oldTarget : { ...oldTarget, claude_session_id: sessionId };
+  // 重放确认时 expectedOldTarget 取 **null → UUID 那一笔**的字面输入（与首跑同指纹才在账本里命中原 op）；
+  // 正常路径 = 本次运行开头受验读到的 target（CAS：读到→写到 之间被人旁路改过 → cas_mismatch）。
+  const expectedOldTarget = replayConfirm ? { ...oldTarget, claude_session_id: null } : oldTarget;
   // 方向拒的判据只有账本那一份（retargetDirectionProblem）——这里早拒一次只为说人话，不另立判据。
   const dirProblem = retargetDirectionProblem(oldTarget, newTarget);
   if (dirProblem !== null) return { ok: false, reason: "bad_direction", why: dirProblem };
@@ -200,7 +227,7 @@ export function retargetEndpoint({
 
   if (!apply) return { ok: true, mode: "preview", ...base };
   if (!probe.present) {
-    return { ok: false, reason: "session_absent", why: "目标会话在本机不在场（" + probe.file + "）—— 先在那条会话里跑起来再 retarget", ...base };
+    return { ok: false, reason: "session_absent", why: "本机没有这条会话的记录（" + probe.file + "）—— 先在那条会话里跑起来再 retarget", ...base };
   }
   const gate = gateBlocks({ env });
   if (gate.blocked) return { ok: false, reason: "maintenance", gate: gate.state, why: "维护门开着（" + String(gate.text ?? gate.state) + "）：窗口内不写账本", ...base };
@@ -213,10 +240,23 @@ export function retargetEndpoint({
   let released = null;
   const releaseOuter = () => { if (released === null) released = acq.release(); return released; };
   try {
+    // PK2-I4-fix1 P1-1：outer 锁内**重读**收据 × 账本，只放行 authoritative（与 W1/R66 同一判源，不另写）。
+    // retarget 是 ledger-only 写方：影子期写它会造成双写分歧；未接入 / 收据说不清 / 交叉不符一律 fail-closed。
+    const recDir = maintenanceDir(env);
+    const receipt = (typeof recDir === "string" && recDir.length > 0)
+      ? endpointReceipt(recDir, endpointId)
+      : { ok: false, state: "unreadable", why: "维护目录不可派生（maintenanceDir 空）→ 无法读收据，fail-closed" };
+    const Li = loadByEndpoint(endpointId, { env });
+    const cls = classifyLedgerAuthority({ receipt, ledgerMode: Li.ok ? Li.doc.authority_mode : null });
+    if (cls.mode !== "authoritative") {
+      return { ok: false, reason: "m1a_mode_not_shadow",
+        why: "retarget 是 ledger-only 写方，只在账本 authoritative 放行（判源 " + cls.mode + "：" + cls.why + "）", ...base };
+    }
     if (typeof _inject?.beforeRetarget === "function") _inject.beforeRetarget();
-    const requestKey = typeof _inject?.requestKey === "string" ? _inject.requestKey : crypto.randomUUID();
-    // expectedOldTarget = 本次运行开头受验读到的 target（CAS：读到→写到 之间被人旁路改过 → cas_mismatch）。
-    const res = retarget({ endpointId, requestKey, id, expectedOldTarget: oldTarget, newTarget, authorizedBy: authRes.authorizedBy, now, env });
+    // PK2-I4-fix1 P1-2：请求身份确定性派生（同一条命令重跑 = 同一笔 op）；_inject.requestKey 仅测试用。
+    const requestKey = typeof _inject?.requestKey === "string" ? _inject.requestKey : retargetRequestKey({ id, sessionId });
+    // CAS：expectedOldTarget = 本次运行开头受验读到的 target（重放确认时 = 那笔 null → UUID 的字面输入）。
+    const res = retarget({ endpointId, requestKey, id, expectedOldTarget, newTarget, authorizedBy: authRes.authorizedBy, now, env });
     let post = null;
     if (res.ok === true) {
       const L2 = loadByEndpoint(endpointId, { env });
@@ -230,8 +270,10 @@ export function retargetEndpoint({
     }
     const rel = releaseOuter();
     const lockState = foldLockReleaseState(rel);
+    // PK2-I4-fix1 P1-2：账本 replay 命中（同请求身份幂等）与首次 committed_clean 都是合法收口。
+    const replayed = res.ok === true && (res.idempotent === true || res.commit === "replayed");
     const wrote = res.ok === true;
-    const clean = wrote && res.commit === "committed_clean" && post?.ok === true && lockState === "released";
+    const clean = wrote && (res.commit === "committed_clean" || replayed) && post?.ok === true && lockState === "released";
     if (!clean) {
       const residue = [
         ...(Array.isArray(res.residue) ? res.residue : (res.residue ? [res.residue] : [])),
@@ -244,7 +286,8 @@ export function retargetEndpoint({
       return { ok: false, status: wrote ? "retarget_unclean" : (res.reason ?? "retarget_failed"), reason: wrote ? "retarget_unclean" : (res.reason ?? "retarget_failed"),
         commit: res.commit ?? "not_committed", lock_state: lockState, residue, why, ...base };
     }
-    return { ok: true, mode: "apply", status: "retargeted", commit: res.commit, lock_state: lockState,
+    return { ok: true, mode: "apply", status: replayConfirm || replayed ? "already_effective" : "retargeted",
+      commit: res.commit, lock_state: lockState,
       revision: post.revision, op_count: post.ops, ...base };
   } finally {
     releaseOuter(); // 幂等：成功路径已经折过它，这里只兜异常出口

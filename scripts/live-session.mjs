@@ -210,9 +210,12 @@ export function findLiveSessions({ projectRoot, sessionsDir = SESSIONS_DIR, isAl
 /**
  * `~/.claude/projects/` 下的目录名：把 cwd 里的 `/` 换成 `-`。
  * 用来回答「--continue 有东西可续吗」，而不是等 spawn 之后才发现没有。
+ * PK2-I4-fix1 P2：slug 规则抽成单一来源（m1a-retarget 的会话记录探测复用同一助手）。
  */
+export const transcriptSlug = (projectRoot) => String(projectRoot).replace(/\//gu, "-");
+
 export function transcriptDirFor(projectRoot) {
-  return path.join(PROJECTS_DIR, projectRoot.replace(/\//g, "-"));
+  return path.join(PROJECTS_DIR, transcriptSlug(projectRoot));
 }
 
 export function hasPriorSession({ projectRoot, projectsDir }) {

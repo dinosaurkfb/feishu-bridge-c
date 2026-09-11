@@ -501,22 +501,25 @@ export function promoteBinding({
     : path.join(path.dirname(registryFile), "registry.lock");
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "binding_busy" };
+  // 释放折叠（P1-5③）只在 result 非 null 时才折得上 —— 所以**每一条返回路径都先赋 result**。
+  let result = null;
   try {
     if (useProjectFile) {
       let mapping;
       try { mapping = JSON.parse(fs.readFileSync(projectFile, "utf-8")); }
       catch (err) {
-        return { ok: false, reason: "mapping_unreadable", error: String(err.message).slice(0, 200) };
+        result = { ok: false, reason: "mapping_unreadable", error: String(err.message).slice(0, 200) };
+        return result;
       }
       const bindingId = effectiveBindingId(mapping, { root });
       const loaded = topicGenerationStateForLegacy(mapping, { runtime: "claude", bindingId, now });
-      if (!loaded.ok) return loaded;
+      if (!loaded.ok) { result = loaded; return result; }
       const activated = activatePendingTopicGeneration(loaded.state, {
         generationId, operationId, sessionId, now,
       });
-      if (!activated.ok) return activated;
+      if (!activated.ok) { result = activated; return result; }
       const materialized = materializeLegacyTopicFields(mapping, activated.state);
-      if (!materialized.ok) return materialized;
+      if (!materialized.ok) { result = materialized; return result; }
       const { root_message_id: selectedRootMessageId, ...legacyCompatible } = materialized.record;
       const next = {
         ...legacyCompatible,
@@ -526,23 +529,25 @@ export function promoteBinding({
       const tmp = projectFile + ".tmp." + process.pid;
       fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
       fs.renameSync(tmp, projectFile);
-      return { ok: true, root, sessionId, generation: activated.active };
+      result = { ok: true, root, sessionId, generation: activated.active };
+      return result;
     }
 
     let reg;
     try { reg = JSON.parse(fs.readFileSync(registryFile, "utf-8")); }
     catch (err) {
-      return { ok: false, reason: "registry_unreadable", error: String(err.message).slice(0, 200) };
+      result = { ok: false, reason: "registry_unreadable", error: String(err.message).slice(0, 200) };
+      return result;
     }
     const entry = (reg.projects ?? []).find((project) =>
       id ? project?.id === id : project?.root === root);
-    if (!entry) return { ok: false, reason: "entry_gone" };
+    if (!entry) { result = { ok: false, reason: "entry_gone" }; return result; }
     const loaded = topicGenerationStateForLegacy(entry, {
       runtime: "claude",
       bindingId: (entry.id ?? path.basename(root)) + "@registry",
       now,
     });
-    if (!loaded.ok) return loaded;
+    if (!loaded.ok) { result = loaded; return result; }
     const sessionUsed = (reg.projects ?? []).some((project) => {
       if (project === entry) return false;
       const state = topicGenerationStateForLegacy(project, {
@@ -553,13 +558,13 @@ export function promoteBinding({
       return state.ok && state.state.generations.some((generation) =>
         generation.session_id === sessionId && generation.status !== "retired");
     });
-    if (sessionUsed) return { ok: false, reason: "session_already_bound" };
+    if (sessionUsed) { result = { ok: false, reason: "session_already_bound" }; return result; }
     const activated = activatePendingTopicGeneration(loaded.state, {
       generationId, operationId, sessionId, now,
     });
-    if (!activated.ok) return activated;
+    if (!activated.ok) { result = activated; return result; }
     const materialized = materializeLegacyTopicFields(entry, activated.state);
-    if (!materialized.ok) return materialized;
+    if (!materialized.ok) { result = materialized; return result; }
     Object.assign(entry, materialized.record, {
       inbound_bound_at: new Date(now).toISOString(),
     });
@@ -567,11 +572,30 @@ export function promoteBinding({
     const tmp = registryFile + ".tmp." + process.pid;
     fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
     fs.renameSync(tmp, registryFile);
-    return { ok: true, root, sessionId, generation: activated.active };
+    result = { ok: true, root, sessionId, generation: activated.active };
+    return result;
   } catch (err) {
-    return { ok: false, reason: "registry_unwritable", error: String(err.message).slice(0, 200) };
+    result = { ok: false, reason: "registry_unwritable", error: String(err.message).slice(0, 200) };
+    return result;
   } finally {
-    releasePublishLock(lockDir);
+    // PK2-W1-fix2 P1-5③：释放结果**不得丢** —— 索引写成而登记表锁未交还时，旧版照样报 clean，
+    //   认领的下游（authoritative 复合的 index 步 → unclean 投影）也就看不到它。按 R57d 折叠：
+    //   `lockUncleared` 上折 + ok 降级（写已落盘的话 root/generation 照旧带出，供人工判断）。
+    let rel;
+    try { rel = releasePublishLock(lockDir); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const unclean = rel.reapUncleared
+      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap", detail: rel.reapUncleared.error != null ? String(rel.reapUncleared.error) : null }
+      : rel.absent === true ? { reason: "lock_absent", path: lockDir, detail: null }
+        : rel.ok !== true
+          ? { reason: String(rel.reason ?? "release_failed"), path: lockDir, detail: rel.error != null ? String(rel.error) : (rel.why != null ? String(rel.why) : null) }
+          : null;
+    if (unclean !== null && result !== null && typeof result === "object" && result.lockUncleared === undefined) {
+      result.ok = false;
+      result.reason = "registry_lock_release_failed";
+      result.why = unclean.reason;
+      result.lockUncleared = unclean;
+    }
   }
 }
 

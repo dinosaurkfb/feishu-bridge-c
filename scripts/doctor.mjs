@@ -64,7 +64,8 @@ import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
 import { forwardResultProblem, forwardStartedProblem, forwardReceiptResultProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
-import { readPolicyStore } from "./m1b/policy-store.mjs"; // PK2-I1 ⑱：authoritative 期策略 store 体检
+import { livePolicySubjects, readPolicyStoreForAudit } from "./m1b/policy-store.mjs"; // PK2-I1 ⑱：策略 store 逐条目体检 + 与账本对账
+import { policySubjectId } from "./policy-store/validator.mjs"; // ⑱ 逐条目派生自洽核验（与 store 同一函数）
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -1036,9 +1037,12 @@ export function runDoctor({
   }
 
   // ── ⑱ policy store（PK2-I1；只读）：authoritative 的 endpoint，策略已在
-  // `ledger/<ep>/policy.json`（v2 store，legacy 字段冻结）。逐 endpoint 核：能受验读（0600 /
-  // 普通文件 / 单硬链接 / ≤**1MiB）+ `validateSidecarDoc("policy")` 过 → 报**条目计数**；
-  // 读不出 / 不合法 → 红（fail-closed）。正文只出计数与 subject 前缀（不输出 binding 原文）。
+  // `ledger/<ep>/policy.json`（v2 store，legacy 字段冻结）。逐 endpoint 核三件：
+  //   ① 能受验读（0600 / 普通文件 / 单硬链接 / ≤**1MiB**）+ `validateSidecarDoc("policy")` 过；
+  //   ② **键集 ⊆ 当前 live 记录派生的 subject 集合**（P1-5：账本里没有哪条 live 记录派生出这个键
+  //      → 这条就是错挂/孤儿，点名）；
+  //   ③ 逐条目派生自洽：`entry.binding_id` 在该键的 kind 下重新派生必须等于该键。
+  // 读不出 / 不合法 / 错挂 → 红（fail-closed）。正文只出计数与 subject 前缀（不输出 binding 原文）。
   // 未 authoritative（legacy / shadow）不算病 —— 那些 endpoint 的策略仍在 legacy 面。
   {
     const dir18 = maintenanceDir();
@@ -1053,12 +1057,30 @@ export function runDoctor({
         const problems18 = [];
         const parts18 = [];
         for (const ep18 of authoritative18) {
-          const store18 = readPolicyStore({ endpointId: ep18 });
-          if (!store18.ok) { problems18.push(ep18.slice(0, 20) + "：" + String(store18.why ?? store18.reason ?? "读不出")); continue; }
-          if (store18.absent) { problems18.push(ep18.slice(0, 20) + "：policy.json 缺席（cutover 之后不应缺席）"); continue; }
+          const short18 = ep18.slice(0, 16);
+          // 逐条目视图（不做整档 kinds 门）：错挂的那一条要能点名，而不是淹成「整档读不出」。
+          const store18 = readPolicyStoreForAudit({ endpointId: ep18 });
+          if (!store18.ok) { problems18.push(short18 + "：" + String(store18.why ?? store18.reason ?? "读不出")); continue; }
+          if (store18.absent) { problems18.push(short18 + "：policy.json 缺席（cutover 之后不应缺席）"); continue; }
+          const live18 = livePolicySubjects({ endpointId: ep18 });
+          if (!live18.ok) { problems18.push(short18 + "：" + String(live18.why ?? live18.reason ?? "账本读不出")); continue; }
           const subjects18 = Object.keys(store18.entries);
-          // subject 是 hash（ps_<32hex>），本来就不带 binding 明文；只出条数 + 每个的前 11 位。
-          parts18.push(ep18.slice(0, 16) + "（" + subjects18.length + " 条" +
+          for (const key18 of subjects18) {
+            const s18 = live18.subjects.get(key18);
+            if (s18 === undefined) {
+              problems18.push(short18 + "：错挂条目 " + key18.slice(0, 11) + "…（账本里没有任何 live 记录派生出这个 subject）");
+              continue;
+            }
+            const entry18 = store18.entries[key18];
+            const bid18 = entry18 !== null && typeof entry18 === "object" ? entry18.binding_id : null;
+            let derived18 = null;
+            try { derived18 = typeof bid18 === "string" ? policySubjectId({ kind: s18.kind, endpointId: ep18, id: bid18 }) : null; } catch { derived18 = null; }
+            if (bid18 !== s18.id || derived18 !== key18) {
+              problems18.push(short18 + "：错挂条目 " + key18.slice(0, 11) + "…（entry.binding_id 在该 kind 下派生不出这个键）");
+            }
+          }
+          // subject 是 hash（ps_<32hex>），与 binding 明文无关；只出条数 + 前几个的前 11 位。
+          parts18.push(short18 + "（" + subjects18.length + " 条" +
             (subjects18.length > 0 ? "：" + subjects18.slice(0, 3).map((s) => s.slice(0, 11) + "…").join("、") + (subjects18.length > 3 ? " 等" : "") : "") + "）");
         }
         const body18 = problems18.length > 0

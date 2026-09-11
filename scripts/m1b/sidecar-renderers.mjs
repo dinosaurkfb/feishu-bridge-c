@@ -26,7 +26,6 @@ import { interactionPolicyStateProblem, policySubjectId } from "../policy-store/
 export const SIDECAR_SCHEMAS = Object.freeze({ expiry: "expiry-1", "pending-claims": "pending-claims-1", policy: "policy-1" });
 const TA_SHAPE = /^ta_[0-9a-f]{32}$/u;
 const PSID_SHAPE = /^ps_[0-9a-f]{32}$/u;
-export { PSID_SHAPE };
 const TOKEN_SHAPE = /^[0-9a-f]{6}$/u;
 const MAX_ENTRIES = 512;
 export const MAX_BYTES = 1024 * 1024; // 导出：staged-plan 的 blob 上限同一出处，防漂移

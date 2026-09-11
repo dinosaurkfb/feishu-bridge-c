@@ -14,27 +14,26 @@ import {
   reserveDialogueTurn, setInteractionPolicyMode,
 } from "./interaction-policy.mjs";
 import { projectMappingPath, resolveProject, selectBindingEntry } from "./project-resolve.mjs";
-import { effectiveBindingId } from "./topic-generation.mjs";
-import { releasePublishLock, registryPath } from "./registry.mjs";
+import { activeGeneration, effectiveBindingId, pendingGeneration } from "./topic-generation.mjs";
+import { acquirePublishLock, releasePublishLock, registryPath } from "./registry.mjs";
 import { loadChainTemplate } from "./chain-template.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { decideLedgerRoute } from "./m1a/delivery-target.mjs";
-import { policySubjectId } from "./policy-store/validator.mjs";
-import { acquireStateLock, mutatePolicyEntry, policyEntryFor, readPolicyStore } from "./m1b/policy-store.mjs";
+import { mutatePolicyEntry, policyEntryFor, readPolicyStore, resolvePolicySubject } from "./m1b/policy-store.mjs";
 
 /**
  * 本机 Claude 链的 ledger endpoint：与入站 / 投递目标**同一派生**（链模板的 agent_uid）。
- * 读不出模板（老装法：只有项目级 chain-config，没有机器模板）→ **按 legacy 处理**：
- * endpoint 派不出来就无从谈起 M1a 权威（账本文件路径就是 endpoint 的哈希），而入站自己的端点派生
- * 同样拿不到值 —— 这与 main 的行为一致，不因此把老装法的 /feishu-mode 也拒了。
+ * **读不出模板 = 派不出 endpoint = 拒**（`mode:"reject"`，P1-3 裁定 3）：
+ * 「未接入 M1a」的正判据是**收据**（`never_initialized`），不是"我读不到模板"。把后者当 legacy
+ * 会让一个坏模板静默把写面引回**冻结的 legacy**（真相已经切到 v2 store 了）。
  */
 export function claudePolicyRoute({ env = process.env } = {}) {
   const tpl = loadChainTemplate();
   const uid = tpl?.ok === true ? tpl.template?.agent_uid : null;
   if (typeof uid !== "string" || uid.length === 0) {
-    return { mode: "legacy", why: "读不出链模板的 agent_uid（派不出 ledger endpoint）—— 按未接入 M1a 处理", endpointId: null };
+    return { mode: "reject", reason: "policy_endpoint_unresolved", why: "读不出链模板的 agent_uid（派不出 ledger endpoint）：" + String(tpl?.reason ?? "template_unusable"), endpointId: null };
   }
   const endpointId = legacyEndpointId({ runtime: "claude", agentUid: uid });
   const dir = maintenanceDir(env);
@@ -42,10 +41,40 @@ export function claudePolicyRoute({ env = process.env } = {}) {
   return { ...decideLedgerRoute({ receipt, endpointId, env }), endpointId };
 }
 
-/** 本 binding 的 lineage id（与 M1a 快照 renderer 同一算法）：policy subject 的派生输入。 */
-const lineageOf = (resolved, root) => {
-  const bindingId = effectiveBindingId(resolved.mapping, { root });
-  return typeof bindingId === "string" && bindingId.length > 0 ? bindingId : null;
+/** 这个 binding 当前代际的根话题 om（legacy 索引行只用来**定位话题**；subject 由账本记录解析）。 */
+const currentRootOm = (mapping) => {
+  const state = mapping?.topic_generation_state ?? null;
+  const gen = activeGeneration(state) ?? pendingGeneration(state);
+  if (typeof gen?.root_message_id === "string" && gen.root_message_id.length > 0) return gen.root_message_id;
+  if (typeof mapping?.root_message_id === "string" && mapping.root_message_id.length > 0) return mapping.root_message_id;
+  return typeof mapping?.feishu_root_message_id_reference === "string" && mapping.feishu_root_message_id_reference.length > 0
+    ? mapping.feishu_root_message_id_reference : null;
+};
+
+/**
+ * authoritative 写面的**锁内身份**（P1-4）：给定 legacy 索引行（root/claudeSessionId）→
+ * 重读索引行拿当前代际的 root_om → 在账本里按 root_om 定位 live 记录 → 解析 subject。
+ * 只在 policy 锁内调用（身份与写之间不留漂移窗口）。
+ */
+const authoritativeIdentity = ({ root, claudeSessionId, registryFile, endpointId, env }) => () => {
+  const resolved = resolveProject({ root, claudeSessionId, registryFile });
+  if (!resolved.ok) return resolved;
+  const rootOm = currentRootOm(resolved.mapping);
+  const subj = resolvePolicySubject({ endpointId, rootOm, env });
+  if (!subj.ok) return subj;
+  return { ok: true, subjectId: subj.subjectId, kind: subj.kind, id: subj.id, bindingId: subj.id, rootOm, mapping: resolved.mapping, record: subj.record ?? null, bindingLevel: resolved.bindingLevel };
+};
+
+const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
+/** 取锁重试（与 registry 同一锁原语；维护门在 acquirePublishLock 里兜底）。legacy 读写路径用。 */
+const acquireStateLock = (lockDir, retries = 0) => {
+  let result;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    result = acquirePublishLock(lockDir);
+    if (result.ok || result.reason !== "publisher_busy") return result;
+    if (attempt < retries) Atomics.wait(LOCK_WAIT, 0, 0, 25);
+  }
+  return result;
 };
 
 const writeJsonAtomic = (file, value) => {
@@ -94,19 +123,28 @@ export function loadClaudeInteractionPolicyRouted({
   registryFile = registryPath(),
   env = process.env,
   now = Date.now(),
+  rejectBehavior = "fail_closed",
 } = {}) {
   const route = claudePolicyRoute({ env });
+  if (route.mode === "reject") {
+    // 裁定 3：**只有入站那个读点延后拒**（`rejectBehavior:"defer"`）—— 判源不明时读面照旧给一份现场，
+    // 让流程走到 claim 之后由 R66 投递层统一拒收（.failed.json + ledger-route 回执）。其余读方
+    // （status / mode / stop-hook）与写面一律 fail-closed，不回退冻结 legacy。
+    if (rejectBehavior === "defer") return loadClaudeInteractionPolicy({ root, claudeSessionId, registryFile, now });
+    return { ok: false, reason: "ledger_route_unavailable", why: route.why, endpointId: route.endpointId ?? null };
+  }
   if (route.mode !== "authoritative") return loadClaudeInteractionPolicy({ root, claudeSessionId, registryFile, now });
   const resolved = resolveProject({ root, claudeSessionId, registryFile });
   if (!resolved.ok) return resolved;
-  const bindingId = lineageOf(resolved, root);
-  if (bindingId === null) return { ok: false, reason: "binding_id_missing", why: "读不出该 binding 的 lineage id" };
-  const subjectId = policySubjectId({ kind: "lineage", endpointId: route.endpointId, id: bindingId });
-  const store = readPolicyStore({ endpointId: route.endpointId, env });
-  if (!store.ok) return { ok: false, reason: "ledger_route_unavailable", why: "policy store：" + String(store.why ?? "读不出"), endpointId: route.endpointId, subjectId };
-  if (store.absent) return { ok: false, reason: "ledger_route_unavailable", why: "policy store 缺席（cutover 之后不应缺席）", endpointId: route.endpointId, subjectId };
-  const picked = policyEntryFor({ entries: store.entries, subjectId, bindingId });
-  if (!picked.ok) return { ok: false, reason: "ledger_route_unavailable", why: picked.why ?? "policy store 里没有该 subject 且合成不出默认条目", endpointId: route.endpointId, subjectId };
+  // P1-4：subject 由**受验账本记录**解析（legacy 索引行只提供当前代际的 root_om，用来定位 live 记录）。
+  const rootOm = currentRootOm(resolved.mapping);
+  const subj = resolvePolicySubject({ endpointId: route.endpointId, rootOm, env });
+  if (!subj.ok) return { ok: false, reason: "ledger_route_unavailable", why: subj.reason + "：" + String(subj.why ?? ""), endpointId: route.endpointId, rootOm };
+  const store = readPolicyStore({ endpointId: route.endpointId, kinds: subj.kinds, env });
+  if (!store.ok) return { ok: false, reason: "ledger_route_unavailable", why: "policy store：" + String(store.why ?? "读不出"), endpointId: route.endpointId, subjectId: subj.subjectId };
+  if (store.absent) return { ok: false, reason: "ledger_route_unavailable", why: "policy store 缺席（cutover 之后不应缺席）", endpointId: route.endpointId, subjectId: subj.subjectId };
+  const picked = policyEntryFor({ entries: store.entries, subjectId: subj.subjectId, kind: subj.kind, id: subj.id, endpointId: route.endpointId });
+  if (!picked.ok) return { ok: false, reason: "ledger_route_unavailable", why: picked.why ?? "policy store 里没有该 subject 且合成不出默认条目", endpointId: route.endpointId, subjectId: subj.subjectId };
   return {
     ok: true,
     root,
@@ -118,8 +156,10 @@ export function loadClaudeInteractionPolicyRouted({
     state: picked.entry,
     migrated: false,
     synthesized: picked.synthesized,
-    bindingId,
-    subjectId,
+    bindingId: subj.id,
+    subjectId: subj.subjectId,
+    kind: subj.kind,
+    rootOm,
     endpointId: route.endpointId,
   };
 }
@@ -133,22 +173,18 @@ function mutateClaudeInteractionPolicy({
   mutate,
   env = process.env,
 } = {}) {
-  // 判源（PK2-I1）：authoritative → 只写 policy store（legacy 一字不碰）；判源不明 → 同 R66 拒。
+  // 判源（PK2-I1）：authoritative → 只写 policy store（legacy 一字不碰）；判源不明 → 同 R66 拒（**写面永不延后**）。
   const route = claudePolicyRoute({ env });
   if (route.mode === "reject") return { ok: false, reason: "ledger_route_unavailable", why: route.why };
   if (route.mode === "authoritative") {
-    // 只**读** legacy mapping（拿 lineage id 与 meta），不写：legacy 冻结。
-    const resolved = resolveProject({ root, claudeSessionId, registryFile });
-    if (!resolved.ok) return resolved;
-    const bindingId = lineageOf(resolved, root);
-    if (bindingId === null) return { ok: false, reason: "binding_id_missing", why: "读不出该 binding 的 lineage id" };
-    const subjectId = policySubjectId({ kind: "lineage", endpointId: route.endpointId, id: bindingId });
+    // P1-4：身份（subject）在 **policy 锁内**重读 —— legacy 索引行与账本都在锁内重读一遍，
+    //   锁外那份不作数（检查与写入之间不留漂移窗口）。传进 mutate 的 record 也就是**锁内那份 mapping**，
+    //   precondition（claudeControlPrecondition 重推 claim 身份）拿的是同一个现场。
     return mutatePolicyEntry({
-      endpointId: route.endpointId, bindingId, subjectId, env, lockRetries,
-      // precondition 仍拿到**锁内/现场那份 mapping**（claudeControlPrecondition 要重推 claim 身份）；
-      // 只多给 endpointId/route，不给第二套身份来源。
-      mutate: (state, meta) => mutate(state, resolved.mapping, {
-        ...meta, source: "policy-store", bindingId, root, endpointId: route.endpointId, route: "authoritative",
+      endpointId: route.endpointId, env, lockRetries,
+      identity: authoritativeIdentity({ root, claudeSessionId, registryFile, endpointId: route.endpointId, env }),
+      mutate: (state, meta) => mutate(state, meta.mapping, {
+        ...meta, source: "policy-store", root, endpointId: route.endpointId, route: "authoritative",
       }),
     });
   }

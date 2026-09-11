@@ -149,7 +149,10 @@ result，G13-mig ② 逐字核对）。
 | activity / 提醒 / 轮转计数 | 退役 | 消费者禁用，随 legacy 冻结 |
 | `interaction_policy_state` | 抽独立 v2 policy store（**M1b 前置块**） | `ledger/<ep>/policy.json`：封闭 schema、锁、0700/0600、fd 读；**主键 = `policy_subject_id`** = `"ps_" + sha256(canonKey({ domain:"policy_subject_v1", kind:"lineage"|"topic_agent", endpoint_id, id })).slice(0,32)`——B 谱系记录 kind=lineage、id=generation_lineage_id（=legacy effectiveBindingId 同键，轮转天然共享）；非谱系 A 记录 kind=topic_agent、id=自身。**保留/脱离规则（五轮 P1-4）**：activate 归并→subject=lineage（A1 tombstone 的自身 subject 随归并终结）；B4→A4（unbind 清 lineage）→subject 切自身 id、**初始化为空**（不继承谱系状态）；A4 reattach→保持自身。/feishu-mode 与 reserve/finalize 先解析 subject 再改。**权威切换三段（六轮 P1-3）**：
 ① **shadow 段**：runtime 读写 **legacy（权威）**，v2 policy store 旁路双写（同 §5 外层锁纪律：
-policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=policy mismatch（非业务失败）；
+policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=policy mismatch（非业务失败）。
+   **现状（PK2-I1-fix1 如实标注）：本段旁路双写与 doctor policy 对账*未实现、未具备*** ——
+   已落地的只有 ③（authoritative 读写面）；shadow 期依旧只写 legacy，policy.json 到 cutover 那一刻
+   才由 renderer 第一次生成。不要把本行读成"已经具备"；
 ② **cutover**：policy intended 状态作为 journal sidecar step 固定（§4.1）；
 ③ **authoritative**：只读写 v2 policy store，legacy policy 字段冻结。切换点=cutover 提交 |
 | `status` ≠ active（非 paused 语义） | cutover 前规范化或退役 | selector 拒非 active，不得投影后放行 |

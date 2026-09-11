@@ -1,7 +1,7 @@
 /**
  * policy.json 存储原语（#R31 第一交付物，#R33 按仓内 store 纪律重写）。
  *
- * 布局：`<FEISHU_BRIDGE_LEDGER_DIR>/<endpoint_id>/policy.json`，同目录 `policy.lock` 走
+ * 布局：`<FEISHU_BRIDGE_LEDGER_DIR>/<endpoint_id>/policy.json`，同目录 `policy.json.lock` 走
  * registry 的 symlink 锁原语。根 schema 封闭三键，读写**全经 ipsp-1**
  * （policy-store/validator.mjs）：读到非法 fail-closed，写前非法不落盘。
  *
@@ -36,7 +36,10 @@ export const MAX_BYTES = 1024 * 1024;
 const ROOT_KEYS = "endpoint_id,entries,schema_version";
 const POLICY_SCHEMA_VERSION = "policy-1";
 const SUBJECT_ID_SHAPE = /^ps_[0-9a-f]{32}$/u;
-const LOCK_NAME = "policy.lock";
+// PK2-I1：锁名从 `policy.lock` 改为 `policy.json.lock` —— 写这份文件的**另一个**写方（cutover 的
+//   sidecar-writer）用的是 `<file>.lock` 统一约定；同一个文件两把锁就是一个并发口子（先到的那把
+//   以为自己独占，另一把照写）。统一到 `<file>.lock`：谁是写方，谁就取同一把。
+const LOCK_NAME = "policy.json.lock";
 const FILE_NAME = "policy.json";
 
 /* ───────────────── 条目校验（值全经 ipsp-1；kind 显式裁定 + 派生自洽，#R41 P1-2） ───────────────── */
@@ -295,7 +298,7 @@ export function mutatePolicyStore({ endpointId, kinds, mutate, env = process.env
     catch (err) { return { ok: false, reason: "policy_store_lock_unavailable", why: String(err?.code ?? err?.message ?? err) }; }
     if (lock.ok) break;
     if (lock.reason !== "publisher_busy") return { ok: false, reason: lock.reason === "lock_residue" ? "policy_store_lock_residue" : "policy_store_lock_unavailable", why: String(lock.reason) + (lock.error ? "：" + lock.error : "") };
-    return { ok: false, reason: "policy_store_busy", why: "policy.lock 被持有" };
+    return { ok: false, reason: "policy_store_busy", why: "policy.json.lock 被持有" };
   }
   let result;
   try {

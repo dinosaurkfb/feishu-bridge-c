@@ -1,185 +1,256 @@
 /**
- * authoritative 期 interaction policy 的唯一读写面：`ledger/<endpoint_id>/policy.json`
- * —— cutover 时由 m1b sidecar renderer 固定的那一份（M1a §4 ③），cutover 之后由这里读写，
- * legacy 的 registry / active-mapping 策略字段**冻结**（不再读写）。
+ * PK2-I1：authoritative 侧 interaction policy 的 v2 store（`ledger/<endpoint_id>/policy.json`）—— 领域薄壳。
  *
- * 为什么不用 `policy-store/store.mjs`（#R31~#R41 的前置块，同一路径）—— 三条都是硬理由：
- *   · 盘上这份文件的 schema 判据是 **m1b 的 `validateSidecarDoc("policy")`**（renderer 写它时用的同
- *     一份判据）。阅读判据不另立第二套：读同源、写同源。
- *   · 它的锁是 sidecar-writer 用的 `<policy.json>.lock`（写这份文件的那把锁）。store.mjs 用
- *     `policy.lock` —— 同一个文件两把锁就是留了并发口子。
- *   · store.mjs 的 kinds 显式声明 / 跨 kind 查重属于"cutover 前的正面 store"设计；authoritative 期
- *     subject 只有一种 kind（lineage），由调用方按 binding_id 用**同一个** `policySubjectId` 派生。
- *   回调形状也不同：这里按**单条目** mutate（与 interaction-policy 的三条写路径同形）。
+ * 设计 `m1a-reconciliation.md` §4 ③：authoritative → 只读写 v2 policy store，legacy 的 registry /
+ * active-mapping 策略字段冻结。**存储原语、symlink 锁、fenced 提交、写后受验读回、目录 fsync 的诚实
+ * 折叠、大小上限、tmp 残骸外显、逐条目 ipsp-1 与「派生自洽」**全在 `policy-store/store.mjs`
+ * （#R31–#R41；锁 = 同目录 `policy.json.lock`，与写这份文件的 sidecar-writer 同一把）——
+ * 本模块**不写第二套 schema / 锁 / 序列化**，只钉三件领域事实：
  *
- * 读：`readSidecarFile`（父目录 0700 / O_NOFOLLOW / 普通文件 / 单硬链接 / 精确 0600 / ≤1MiB）
- *   + `validateSidecarDoc`。读不出/不合法一律 fail-closed（`policy_store_unreadable`），**不折成空**；
- *   文件缺席如实报 `absent:true`，由调用方按"cutover 之后不应缺席"处理。
- * 写：同一把锁 → 锁内 fd 重读 → 取条目（缺 → renderer 同款默认条目）→ 单条目 mutate →
- *   ipsp-1 → 整文档 `validateSidecarDoc` → tmp + fsync + rename + 目录 fsync（0600）→ 释放。
- *   释放不干净按 R57d 折叠外显（`lockUncleared`，不谎报 clean）。
+ *   ① **subject 由受验账本记录解析**（§4③）：live 记录里 `generation_lineage_id` 非空 → kind:"lineage"、
+ *      id = 该 lineage；没有（非谱系 A 记录、unbind 之后的记录）→ kind:"topic_agent"、id = 自身
+ *      topic_agent_id。调用方给的「哪个 binding」只用来**按 root_om 定位 live 记录**，不作 subject 来源。
+ *   ② 整域 kinds 声明 = 该 endpoint 当前 live 记录派生的 subject 集合（store 层仍逐条目核
+ *      「声明 kind 与 entry.binding_id 派生出的挂载键一致」；集合外的条目 = 错挂 → 整档读不出）。
+ *   ③ 缺条目 → renderer 同款默认条目（`mappingDefaultEntry`，sidecar-renderers 同一出处）。
+ *
+ * 读纪律（fail-closed）：读不出 / 权限不对 / 坏 JSON / 超限 / 错挂一律拒，绝不折成空；缺席如实带出
+ * —— cutover 后 policy.json 不应缺席，接线层按 unreadable 同等处置。
+ * 写纪律：**锁内**重读身份（P1-4：legacy 索引行只在锁外用来定位话题，身份在锁内重解析）+ 重读 store，
+ * 缺席不新建；写成立而目录 fsync 未证实（`persistence:"uncertain"`）= **不干净**（不是 ok）；释放不干净
+ * 一律折 `lockUncleared` 并把 ok 降级（不谎报 clean）。
  */
 import fs from "node:fs";
 import path from "node:path";
 
-import { acquirePublishLock, releasePublishLock } from "../registry.mjs";
-import { resolveEndpointDir } from "../topic-agent-ledger.mjs";
-import { interactionPolicyStateProblem } from "../policy-store/validator.mjs";
-import { stableStringify } from "../policy-store/canonical.mjs";
-// 复用，不写第二套 schema / 不写第二份默认条目（renderer 是它的另一半）。
-import { PSID_SHAPE, mappingDefaultEntry, readSidecarFile, validateSidecarDoc } from "./sidecar-renderers.mjs";
+import { loadByEndpoint, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { loadPolicyStore, mutatePolicyStore, policySubjectId } from "../policy-store/store.mjs";
+import { mappingDefaultEntry, readSidecarFile, validateSidecarDoc } from "./sidecar-renderers.mjs";
 
 export const POLICY_STORE_FILE = "policy.json";
-export { PSID_SHAPE };
-
+export const POLICY_STORE_LOCK_NAME = POLICY_STORE_FILE + ".lock"; // 与 sidecar-writer / store.mjs 同一把
 const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
-/** 取锁重试（与 registry 同一锁原语；maintenance 门在 acquirePublishLock 里兜底）。 */
-export function acquireStateLock(lockDir, retries = 0, env = process.env) {
-  let result;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    result = acquirePublishLock(lockDir, { env });
-    if (result.ok || result.reason !== "publisher_busy") return result;
-    if (attempt < retries) Atomics.wait(LOCK_WAIT, 0, 0, 25);
-  }
-  return result;
+/** 记录 → subject 派生输入（§4③ 两分支）。返回 null = 记录连自身 id 都缺（合法账本不该出现）。 */
+export function policyKindOf(record) {
+  const lineage = record?.generation_lineage_id;
+  if (typeof lineage === "string" && lineage.length > 0) return { kind: "lineage", id: lineage };
+  const own = record?.topic_agent_id;
+  if (typeof own === "string" && own.length > 0) return { kind: "topic_agent", id: own };
+  return null;
 }
 
-/** policy.json 的路径（只解析，不建任何东西）。 */
-export function policyStorePath({ endpointId, env = process.env, mustExistRoot = false } = {}) {
-  const d = resolveEndpointDir(endpointId, { env, mustExistRoot });
-  if (!d.ok) return { ok: false, reason: d.reason, why: d.why ?? null };
-  return { ok: true, dir: d.dir, file: path.join(d.dir, POLICY_STORE_FILE) };
-}
-
-/** 单条目读取：`entries[subjectId]` 缺 → renderer 同款默认条目（binding_id 取 lineage）。 */
-export function policyEntryFor({ entries, subjectId, bindingId } = {}) {
-  const present = entries !== null && typeof entries === "object" ? entries[subjectId] : undefined;
-  if (present !== undefined) return { ok: true, entry: present, synthesized: false };
-  if (typeof bindingId !== "string" || bindingId.length === 0) {
-    return { ok: false, reason: "policy_store_invalid", why: "store 里没有该 subject 且拿不到 binding_id，合成不出默认条目" };
-  }
-  return { ok: true, entry: mappingDefaultEntry(bindingId), synthesized: true };
+/** 一条 live 记录 → 它的 subject（派生失败 → null，调用方按「不可解析」处置）。 */
+function subjectOfRecord(record, endpointId) {
+  const k = policyKindOf(record);
+  if (k === null) return null;
+  try {
+    return { subjectId: policySubjectId({ kind: k.kind, endpointId, id: k.id }), kind: k.kind, id: k.id, record };
+  } catch { return null; }
 }
 
 /**
- * 读整份 store。返回：
- *   `{ok:true, absent:true, file, entries:{}}`  —— 文件缺席（cutover 之后不应缺席）
- *   `{ok:true, file, doc, entries, bytes}`      —— 读回且整文档过 `validateSidecarDoc("policy")`
- *   `{ok:false, reason:"policy_store_unreadable", why}` —— 读不出/不合法（fail-closed，不折成空）
+ * 账本现场 → `{ kinds, subjects }`：`kinds` 是整域声明（喂 store 层的逐条目派生自洽核验），
+ * `subjects` 是 `Map<subjectId, {kind,id,rootOm,topicAgentId}>`（doctor ⑱ 的「键集 ⊆ live」判据、
+ * 以及按 root_om 定位）。账本读不出 / 有 live 记录派不出 subject → fail-closed。
  */
-export function readPolicyStore({ endpointId, env = process.env } = {}) {
-  const p = policyStorePath({ endpointId, env });
-  if (!p.ok) return { ok: false, reason: "policy_store_unreadable", why: "账本目录解析失败：" + String(p.why ?? p.reason) };
-  try { fs.lstatSync(p.file); }
-  catch (err) {
-    if (err?.code === "ENOENT") return { ok: true, absent: true, file: p.file, entries: {} };
-    return { ok: false, reason: "policy_store_unreadable", why: "lstat：" + String(err?.code ?? err?.message ?? err) };
+export function livePolicySubjects({ endpointId, env = process.env } = {}) {
+  const L = loadByEndpoint(endpointId, { env });
+  if (!L.ok) return { ok: false, reason: "policy_store_ledger_unreadable", why: L.why ?? L.reason ?? "账本读不出" };
+  const kinds = {};
+  const subjects = new Map();
+  for (const rec of Object.values(L.doc.records ?? {})) {
+    if (rec?.kind !== "live") continue;
+    const s = subjectOfRecord(rec, endpointId);
+    if (s === null) {
+      return { ok: false, reason: "policy_store_subject_unresolved", why: "live 记录 " + String(rec.topic_agent_id ?? "?") + " 派生不出 policy subject" };
+    }
+    if (kinds[s.subjectId] !== undefined) {
+      return { ok: false, reason: "policy_store_subject_conflict", why: "两条 live 记录派生出同一个 subject：" + s.subjectId };
+    }
+    kinds[s.subjectId] = s.kind;
+    subjects.set(s.subjectId, { kind: s.kind, id: s.id, rootOm: rec.aliases?.root_om ?? null, topicAgentId: rec.topic_agent_id ?? null, record: s.record });
   }
+  return { ok: true, doc: L.doc, kinds, subjects };
+}
+
+/**
+ * 按 `root_om` 在账本里定位 live 记录 → 解析出 subject（P1-4 的主入口）。零条 / 多条 / 账本读不出
+ * 一律 fail-closed（`policy_store_subject_unresolved` / `policy_store_subject_conflict`），不猜。
+ */
+export function resolvePolicySubject({ endpointId, rootOm, env = process.env } = {}) {
+  if (typeof rootOm !== "string" || rootOm.length === 0) {
+    return { ok: false, reason: "policy_store_subject_unresolved", why: "root_om 缺失，无法在账本里定位 live 记录" };
+  }
+  const live = livePolicySubjects({ endpointId, env });
+  if (!live.ok) return live;
+  const hits = [...live.subjects.entries()].filter(([, s]) => s.rootOm === rootOm);
+  if (hits.length === 0) return { ok: false, reason: "policy_store_subject_unresolved", why: "账本里没有 root_om=" + rootOm + " 的 live 记录" };
+  if (hits.length > 1) return { ok: false, reason: "policy_store_subject_conflict", why: "root_om 命中 " + hits.length + " 条 live 记录" };
+  const [subjectId, s] = hits[0];
+  return { ok: true, subjectId, kind: s.kind, id: s.id, topicAgentId: s.topicAgentId, record: s.record, kinds: live.kinds, ledger: live.doc };
+}
+
+/**
+ * 受验读整份 store。kinds 声明默认取「当前 live 记录派生的 subject 集合」（P1-4/P1-5 同一判据）；
+ * 返回值形状沿用接线层的契约：`{ok:true, absent:true, entries:{}}` / `{ok:true, entries, raw}` /
+ * `{ok:false, reason:"policy_store_unreadable", why}`（**任何**读不出都折成这一个拒因，细节进 why）。
+ */
+export function readPolicyStore({ endpointId, kinds = null, env = process.env } = {}) {
+  let k = kinds;
+  if (k === null) {
+    const live = livePolicySubjects({ endpointId, env });
+    if (!live.ok) return { ok: false, reason: "policy_store_unreadable", why: live.reason + "：" + String(live.why ?? "") };
+    k = live.kinds;
+  }
+  const r = loadPolicyStore({ endpointId, kinds: k, env });
+  if (r.ok) return r;
+  return { ok: false, reason: "policy_store_unreadable", why: r.reason + (r.why ?? r.detail ? "：" + String(r.why ?? r.detail) : "") };
+}
+
+/**
+ * doctor ⑱ 专用：**逐条目**视图 —— 不做整档 kinds 门（那会把「错挂的那一条」淹成「整档读不出」，
+ * 而 doctor 要点名的正是那一条）。只过 sidecar schema（psid 形状 / ipsp-1 / 512 上限 / binding 查重）。
+ * 接线层的读写面仍走 `readPolicyStore`（严格）。
+ */
+export function readPolicyStoreForAudit({ endpointId, env = process.env } = {}) {
+  const d = resolveEndpointDir(endpointId, { env, mustExistRoot: false });
+  if (!d.ok) return { ok: false, reason: "policy_store_unreadable", why: d.why ?? d.reason };
+  const p = { ok: true, file: path.join(d.dir, POLICY_STORE_FILE) };
+  let exists = true;
+  try { fs.lstatSync(p.file); } catch (err) {
+    if (err?.code === "ENOENT") exists = false;
+    else return { ok: false, reason: "policy_store_unreadable", why: "lstat：" + String(err?.code ?? err?.message ?? err) };
+  }
+  if (!exists) return { ok: true, absent: true, entries: {} };
   const r = readSidecarFile({ file: p.file, endpointId, name: "policy" });
   if (!r.ok) return { ok: false, reason: "policy_store_unreadable", why: r.why ?? r.reason };
-  return { ok: true, absent: false, file: p.file, doc: r.doc, entries: r.doc.entries, bytes: r.bytes };
+  const invalid = validateSidecarDoc(r.doc, "policy", { endpointId });
+  if (invalid !== null) return { ok: false, reason: "policy_store_invalid", why: invalid };
+  return { ok: true, absent: false, entries: r.doc.entries, doc: r.doc };
 }
 
-/** 同目录 tmp（O_EXCL 0600）→ 写满 → fsync → rename → 目录 fsync；失败不留半截目标文件。 */
-function writePolicyAtomic(file, content) {
-  const dir = path.dirname(file);
-  const tmp = path.join(dir, POLICY_STORE_FILE + "." + process.pid + "." + Date.now() + ".tmp");
-  let fd = null;
-  try {
-    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-    const buf = Buffer.from(content, "utf-8");
-    let off = 0;
-    while (off < buf.length) {
-      const n = fs.writeSync(fd, buf, off, buf.length - off);
-      if (!(Number.isInteger(n) && n > 0)) throw Object.assign(new Error("short write"), { code: "ESHORTWRITE" });
-      off += n;
-    }
-    fs.fsyncSync(fd);
-  } catch (err) {
-    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } fd = null; }
-    try { fs.rmSync(tmp, { force: true }); } catch { /* 留残骸总比半截目标好 */ }
-    return { ok: false, why: String(err?.code ?? err?.message ?? err) };
-  } finally {
-    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } }
+/** 单条目读取 + P1-4 交叉核验：条目必须**挂在自己的 subject 下** ——
+ * `entry.binding_id` 就是该 subject 的派生输入，用它重新派生一次必须等于这个键。
+ * 缺条目 → renderer 同款默认条目（binding_id 取派生输入）；错挂 → 拒（`policy_store_subject_mismatch`）。 */
+export function policyEntryFor({ entries, subjectId, kind, id, endpointId } = {}) {
+  const expect = typeof id === "string" && id.length > 0 ? id : null;
+  const present = entries !== null && typeof entries === "object" ? entries[subjectId] : undefined;
+  if (present === undefined) {
+    if (expect === null) return { ok: false, reason: "policy_store_subject_unresolved", why: "store 里没有该 subject 且拿不到派生输入，合成不出默认条目" };
+    return { ok: true, entry: mappingDefaultEntry(expect), synthesized: true, bindingId: expect };
   }
-  try { fs.renameSync(tmp, file); }
-  catch (err) { try { fs.rmSync(tmp, { force: true }); } catch { /* 同上 */ } return { ok: false, why: "rename：" + String(err?.code ?? err?.message ?? err) }; }
-  // 目录 fsync：失败不谎报 fsynced（提交已落，如实报 uncertain）。
-  let persistence = "fsynced";
-  try { const dfd = fs.openSync(dir, fs.constants.O_RDONLY); try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); } }
-  catch (err) { persistence = "uncertain"; }
-  return { ok: true, persistence };
+  const bid = present !== null && typeof present === "object" ? present.binding_id : null;
+  let derived = null;
+  try { derived = typeof bid === "string" ? policySubjectId({ kind, endpointId, id: bid }) : null; } catch { derived = null; }
+  if (bid === null || bid !== expect || derived !== subjectId) {
+    return {
+      ok: false, reason: "policy_store_subject_mismatch",
+      why: "条目挂错 subject（键 " + String(subjectId) + "，entry.binding_id=" + String(bid) + " 派生 " + String(derived ?? "非法") + "）",
+    };
+  }
+  return { ok: true, entry: present, synthesized: false, bindingId: bid };
 }
+
+/** R31 写侧的「写前校验」拒因 → 接线层契约的 `policy_store_invalid`（细节进 why，不丢）。 */
+const INVALID_WRITE_REASONS = new Set([
+  "policy_entry_invalid", "policy_store_bad_subject", "policy_store_root_schema",
+  "policy_store_too_many_entries", "policy_store_parse_failed", "policy_store_mutate_invalid",
+]);
 
 /**
- * 单条目事务式改写（**唯一写入口**）。返回 union 与 `mutateClaudeInteractionPolicy` 同形：
- *   `{ok:true, changed, state, subjectId, entries, ...changed}` —— `changed:false` 时零写
- *   `{ok:false, reason, why?}` —— 拒因（`policy_store_unreadable` / `policy_store_invalid` /
- *     `policy_store_busy` / `maintenance` / `policy_store_unwritable` / `policy_store_lock_release_failed`）
+ * 锁内事务式改写**单条目**（唯一写入口）。
  *
- * 写前两道：单条目 ipsp-1（`interactionPolicyStateProblem`）+ 整文档 `validateSidecarDoc`——
- * 非法状态一个字节都不落盘。`changed:false` 由 mutate 自报，照旧零写返回。
+ * `identity()` 在 **policy 锁内**调用（P1-4：「锁内 mapping」必须在取 policy 锁**之后**重读）：
+ * 返回 `{ok:true, subjectId, kind, id, …}`（id = 派生输入 = 条目 binding_id），失败原样透传。
+ * `mutate(state, meta)` 与 `mutateClaudeInteractionPolicy` 同一返回联合（`{ok, changed, state}`）。
+ * `lockRetries`：锁被占时按 25ms 退避重试（与 legacy 写路径同语义；重试会把 identity/store 整体重来）。
+ *
+ * 返回 union：`{ok:true, changed, committed, persistence, state, subjectId, kind}`；拒 →
+ * `{ok:false, reason, why?}`。**目录 fsync 未证实**（`persistence:"uncertain"`）→
+ * `policy_store_durability_uncertain`（不是 ok）；释放不干净 → `lockUncleared` 折进返回并把 ok 降级为
+ * `policy_store_lock_release_failed`。busy / maintenance / 提交与读回残骸原样透传。
  */
-export function mutatePolicyEntry({ endpointId, bindingId = null, subjectId, mutate, env = process.env, lockRetries = 0 } = {}) {
-  if (typeof subjectId !== "string" || !PSID_SHAPE.test(subjectId)) {
-    return { ok: false, reason: "policy_store_invalid", why: "subject 不是 policy_subject_id：" + String(subjectId) };
+export function mutatePolicyEntry({ endpointId, env = process.env, identity, mutate, lockRetries = 0 } = {}) {
+  if (typeof identity !== "function" || typeof mutate !== "function") {
+    return { ok: false, reason: "policy_store_invalid", why: "identity/mutate 必须是函数" };
   }
-  if (typeof mutate !== "function") return { ok: false, reason: "policy_store_invalid", why: "mutate 必须是函数" };
-  // 目录必须已在（cutover 之后 endpoint 目录必然在场；这里不建目录、不建文件 —— 缺席是故障，不是首写）。
-  const p = policyStorePath({ endpointId, env, mustExistRoot: true });
-  if (!p.ok) return { ok: false, reason: "policy_store_unreadable", why: "账本目录解析失败：" + String(p.why ?? p.reason) };
-  const lockDir = p.file + ".lock";
-  const lock = acquireStateLock(lockDir, lockRetries, env);
-  if (!lock.ok) {
-    return { ok: false, reason: lock.reason === "maintenance" ? "maintenance" : "policy_store_busy", why: String(lock.reason ?? "lock_unavailable") };
+  // kinds 必须先于取锁算出来（store 的读走它）——它只来自账本，不来自被写的那份文件。
+  const live = livePolicySubjects({ endpointId, env });
+  if (!live.ok) return { ok: false, reason: "policy_store_unreadable", why: live.reason + "：" + String(live.why ?? "") };
+  // 「读不出」由**读**来定性（权限/坏 JSON/超限/缺席都是同一件事：这份 store 现在不可用），
+  //   不给写路径留一套自己的读失败命名；锁内那次重读才是真正决定写不写的（这里的预检只是为了
+  //   把拒因说成读因，不是替代锁内重读）。
+  const pre = readPolicyStore({ endpointId, kinds: live.kinds, env });
+  if (!pre.ok) return { ok: false, reason: "policy_store_unreadable", why: pre.why };
+  const attempt = () => {
+    let ident = null;
+    let written = null;
+    const r = mutatePolicyStore({
+      endpointId, kinds: live.kinds, env,
+      mutate: (entries) => {
+        // ── 以下全在 policy 锁内 ──────────────────────────────────────────────
+        // ① 身份重读（P1-4）：legacy 索引行 + 账本都重读一遍，subject 只从账本记录解析。
+        const got = identity();
+        if (!got || got.ok !== true) return got ?? { ok: false, reason: "policy_store_subject_unresolved" };
+        ident = got;
+        if (live.kinds[got.subjectId] === undefined) {
+          return { ok: false, reason: "policy_store_subject_undeclared",
+            why: "该 subject 不属于账本 live 记录派生的集合（取锁前后账本变过？）：" + String(got.subjectId) };
+        }
+        // ② store 重读（锁内那份才是现场）：缺席 = 故障，**不新建**。
+        const cur = readPolicyStore({ endpointId, kinds: live.kinds, env });
+        if (!cur.ok) return { ok: false, reason: "policy_store_unreadable", why: cur.why };
+        if (cur.absent) return { ok: false, reason: "policy_store_unreadable", why: "policy.json 缺席（cutover 之后不应缺席，不新建）" };
+        // ③ 取条目（含 P1-4 的错挂核验；缺 → renderer 同款默认条目）+ 单条目 mutate。
+        const picked = policyEntryFor({ entries: cur.entries, subjectId: got.subjectId, kind: got.kind, id: got.id, endpointId });
+        if (!picked.ok) return picked;
+        const changed = mutate(picked.entry, {
+          source: "policy-store", subjectId: got.subjectId, kind: got.kind, bindingId: got.id,
+          endpointId, synthesized: picked.synthesized,
+          mapping: got.mapping ?? null, record: got.record ?? null,
+        });
+        if (!changed || typeof changed !== "object" || changed.ok !== true) {
+          return changed && typeof changed === "object" && changed.ok === false
+            ? changed
+            : { ok: false, reason: "policy_store_invalid", why: "mutate 必须返回 {ok:true, changed?, state} 或 {ok:false, reason}" };
+        }
+        if (changed.changed === false) return { ok: true, entries: cur.entries, changed: false };
+        if (!("state" in changed)) return { ok: false, reason: "policy_store_invalid", why: "changed:true 必须带 state" };
+        // ④ 交叉不变量（与 renderer 同一条，P1-4）：条目 binding_id 必须等于派生输入。
+        if (changed.state === null || typeof changed.state !== "object" || changed.state.binding_id !== got.id) {
+          return { ok: false, reason: "policy_store_invalid", why: "条目 binding_id 与 subject 派生输入不一致" };
+        }
+        written = changed.state;
+        return { ok: true, entries: { ...cur.entries, [got.subjectId]: changed.state }, changed: true };
+      },
+    });
+    return { r, ident, written };
+  };
+
+  let out = null;
+  for (let i = 0; i <= Math.max(0, lockRetries); i += 1) {
+    out = attempt();
+    if (out.r.ok || out.r.reason !== "policy_store_busy") break;
+    if (i < lockRetries) Atomics.wait(LOCK_WAIT, 0, 0, 25);
   }
-  let result = null;
-  try {
-    // 锁内 fd 重读（不在锁外先读：那是个漂移窗口）。
-    const cur = readPolicyStore({ endpointId, env });
-    if (!cur.ok) return { ok: false, reason: cur.reason, why: cur.why };
-    if (cur.absent) return { ok: false, reason: "policy_store_unreadable", why: "policy.json 缺席（cutover 之后不应缺席，不新建）" };
-    const picked = policyEntryFor({ entries: cur.entries, subjectId, bindingId });
-    if (!picked.ok) return picked;
-    const changed = mutate(picked.entry, { subjectId, file: p.file, entries: cur.entries, synthesized: picked.synthesized, bindingId });
-    if (!changed || typeof changed !== "object" || changed.ok !== true) {
-      return changed && typeof changed === "object" && changed.ok === false
-        ? changed
-        : { ok: false, reason: "policy_store_invalid", why: "mutate 必须返回 {ok:true, changed?, state} 或 {ok:false, reason}" };
-    }
-    if (changed.changed === false) return { ...changed, subjectId, entries: cur.entries };
-    if (!('state' in changed)) return { ok: false, reason: "policy_store_invalid", why: "changed:true 必须带 state" };
-    const problem = interactionPolicyStateProblem(changed.state);
-    if (problem !== null) return { ok: false, reason: "policy_store_invalid", why: problem };
-    // 交叉不变量（与 renderer 同一条）：lineage subject 的条目 binding_id 必须等于派生输入。
-    if (typeof bindingId === "string" && bindingId.length > 0 && changed.state.binding_id !== bindingId) {
-      return { ok: false, reason: "policy_store_invalid", why: "条目 binding_id 与 lineage 派生输入不一致" };
-    }
-    const doc = { ...cur.doc, entries: { ...cur.entries, [subjectId]: changed.state } };
-    const invalid = validateSidecarDoc(doc, "policy", { endpointId });
-    if (invalid !== null) return { ok: false, reason: "policy_store_invalid", why: invalid };
-    const w = writePolicyAtomic(p.file, stableStringify(doc, 2) + "\n");
-    if (!w.ok) return { ok: false, reason: "policy_store_unwritable", why: w.why };
-    result = { ...changed, subjectId, entries: doc.entries, doc, committed: true, persistence: w.persistence };
-    return result;
-  } finally {
-    // R57d：释放不干净不谎报 clean —— 折成 lockUncleared（带 path）并把 ok 降级；写已落盘的话
-    // committed/changed/state 照旧带出，人工据此判断"落了但没还干净"。
-    let rel;
-    try { rel = releasePublishLock(lockDir); }
-    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
-    const unclean = rel.reapUncleared
-      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap", detail: rel.reapUncleared.error != null ? String(rel.reapUncleared.error) : null }
-      : rel.absent === true ? { reason: "lock_absent", path: lockDir, detail: null }
-        : rel.ok !== true
-          ? { reason: String(rel.reason ?? "release_failed"), path: lockDir, detail: rel.error != null ? String(rel.error) : (rel.why != null ? String(rel.why) : null) }
-          : null;
-    if (unclean !== null && result !== null && typeof result === "object" && result.lockUncleared === undefined) {
-      result.ok = false;
-      result.reason = "policy_store_lock_release_failed";
-      result.why = unclean.reason;
-      result.lockUncleared = unclean;
-    }
+  const { r, ident, written } = out;
+  const base = { subjectId: ident?.subjectId ?? null, kind: ident?.kind ?? null, ...(r.lockUncleared ? { lockUncleared: r.lockUncleared } : {}) };
+  if (!r.ok) {
+    // busy / maintenance / 提交与读回残骸原样透传；写前校验类折成接线层的 `policy_store_invalid`。
+    const reason = INVALID_WRITE_REASONS.has(r.reason) ? "policy_store_invalid" : r.reason;
+    return { ok: false, reason, why: r.why ?? r.detail ?? null, ...base };
   }
+  // P1-1：**目录 fsync 未证实 = 不干净**（R31 store 如实带 persistence:"uncertain"），接线层不许当 ok。
+  if (r.persistence !== undefined && r.persistence !== "fsynced") {
+    return { ok: false, reason: "policy_store_durability_uncertain", why: r.dirFsyncError ?? "目录 fsync 未证实",
+      committed: true, persistence: "uncertain", changed: r.changed === true, state: written, ...base };
+  }
+  // P1-2：释放不干净不许 ok —— 降级 + 点名（写已落盘的话 changed/committed/state 照旧带出）。
+  if (r.lockUncleared) {
+    return { ok: false, reason: "policy_store_lock_release_failed", why: String(r.lockUncleared.reason ?? "lock_uncleared"),
+      committed: true, changed: r.changed === true, state: written, persistence: r.persistence ?? null, ...base };
+  }
+  return { ok: true, changed: r.changed === true, committed: r.committed === true,
+    persistence: r.persistence ?? null, state: written, ...base };
 }

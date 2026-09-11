@@ -33,7 +33,10 @@ import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { wireBind, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { readSidecarStore, mutateSidecarEntry } from "./m1b/sidecar-store.mjs";
+import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
+import { withRegistryTransaction } from "./topic-generation-store.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor,
@@ -137,12 +140,86 @@ try {
 } catch { /* 没有登记表就新建 */ }
 
 const already = registry.projects.find((p) => p?.claude_session_id === me.sessionId);
-if (already?.root_message_id) {
+const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+// PK2-W1：判源分派。authoritative → 复合写（账本为准，登记表降为索引行）；shadow / 未接入 → 原路径。
+const writeRoute = m1aWriteRoute({ endpointId, env: process.env });
+// authoritative 下的**完整性**判断 —— 按账本当前 pending / active 分支（P1-4）：
+//   · active（已被认领）→ 已完成、**零写**。旧版一律要求 pending-claims 条目还在，而认领成功恰恰
+//     会删掉它 —— 于是同一条会话再跑 bind 被判"不完整"，把 active 索引盖回 pending 快照、
+//     并把 pending-claims 条目复活：一条已认领的工作线被退回待认领。
+//   · pending → 按 sidecar 条目补齐（缺条目 = 上一次半途失败，走同一条幂等复合 upsert；
+//     否则 unclean 只能靠 doctor 点名，绑定永远不完整）。
+// PK2-W1-fix2 P1-4/P1-5①：完整性判断改 **sidecar 精确核对**（键存在不够，值逐字等），
+//   且**完整时也重做零写屏障**（走 mutateSidecarEntry 的 changed:false 路径让目录 fsync 重做；
+//   屏障失败 → 不算完成）。active 分支不再无脑 return true：active 后 expiry 缺失/值漂移
+//   也判不完整，由调用方做**定点修复**（不碰索引、不复活 pending-claims）。
+const normIso = (v) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null);
+const authoritativeState = (entry) => {
+  if (writeRoute.mode !== "authoritative" || !entry?.root_message_id) return null;
+  const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
+  if (!resolved.ok) return { complete: false, active: false };
+  const led = loadByEndpoint(endpointId, { env: process.env });
+  if (!led.ok) return { complete: false, active: false };
+  const rec = led.doc.records[resolved.id];
+  if (!rec || rec.kind !== "live") return { complete: false, active: false };
+  const ta = resolved.id;
+  const iso = normIso(entry.expires_at);
+  if (iso === null) return { complete: false, active: rec.facts?.binding === "active" };
+  const pending = readSidecarStore({ endpointId, name: "pending-claims" });
+  const expiry = readSidecarStore({ endpointId, name: "expiry" });
+  if (!pending.ok || !expiry.ok) return { complete: false, active: rec.facts?.binding === "active" };
+  const expiryValue = Object.prototype.hasOwnProperty.call(expiry.entries, ta) ? expiry.entries[ta] : null;
+  if (rec.facts?.binding === "active") {
+    // 认领后：pending-claims 条目必须**不在**，expiry 值逐字等；都齐 → 重做零写屏障定完成。
+    if (Object.prototype.hasOwnProperty.call(pending.entries, ta) || expiryValue !== iso) {
+      return { complete: false, active: true, drift: expiryValue !== iso ? "expiry" : "pending-claims" };
+    }
+    const bE = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    const bP = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    return { complete: bE.ok === true && bP.ok === true, active: true, barrierFailed: bE.ok !== true || bP.ok !== true };
+  }
+  if (rec.facts?.binding !== "pending") return { complete: false, active: false };
+  const pc = Object.prototype.hasOwnProperty.call(pending.entries, ta) ? pending.entries[ta] : null;
+  if (pc && pc.token === entry.pending_token && pc.claim_expires_at === null && expiryValue === iso) {
+    const bE = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    const bP = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    return { complete: bE.ok === true && bP.ok === true, active: false, barrierFailed: bE.ok !== true || bP.ok !== true };
+  }
+  return { complete: false, active: false };
+};
+const authoritativeComplete = (entry) => {
+  const st = authoritativeState(entry);
+  return st !== null && st.complete === true;
+};
+const authState = already?.root_message_id && writeRoute.mode === "authoritative"
+  ? authoritativeState(already) : null;
+if (already?.root_message_id && (writeRoute.mode !== "authoritative" || (authState && authState.complete))) {
   console.log("这条会话已经绑过了，没有重复建话题。");
   console.log("  话题  " + already.root_message_id);
   console.log("  入站  " + (already.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));
   process.exit(0);
 }
+if (authState && authState.active && !authState.complete) {
+  // PK2-W1-fix2 P1-4：已认领（active）但 sidecar 缺失/漂移 → **定点修复**：expiry upsert 回
+  //   创建时快照、pending-claims 条目删除（不该在）；索引一个字节不动、不复活 pending 语义。
+  const resolved = resolveLiveId({ endpointId, locator: already.root_message_id, env: process.env });
+  const ta = resolved.ok ? resolved.id : null;
+  if (ta === null) die("绑定状态说不清（账本里找不到该话题的记录）", "先跑 node scripts/doctor.mjs 看 --status。");
+  const iso = normIso(already.expires_at);
+  if (iso === null) die("索引行 expires_at 不可规范化：" + JSON.stringify(already.expires_at ?? null));
+  const fixE = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env: process.env,
+    mutate: (cur) => (cur === iso ? { ok: true, changed: false } : { ok: true, changed: true, value: iso }) });
+  const fixP = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env: process.env,
+    mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
+  if (!fixE.ok || !fixP.ok) {
+    die("sidecar 修复失败（" + (fixE.ok ? "expiry ok" : "expiry：" + fixE.reason) + (fixE.ok ? "" : "") + (!fixE.ok ? "" : "；") + (!fixP.ok ? "pending-claims：" + fixP.reason : "") + "）",
+      "修好权限后重跑同一条命令即可。");
+  }
+  console.log("绑定已是认领后状态（active）；sidecar 已修复到与索引一致。");
+  console.log("  话题  " + already.root_message_id);
+  process.exit(0);
+}
+if (already?.root_message_id) console.log("这条会话的绑定不完整（缺 sidecar 条目）—— 按同一幂等键再跑一次补齐。");
 
 const identity = readProjectIdentity({ root });
 const name = arg("name") ?? (identity.name + " · " + me.name);
@@ -169,45 +246,93 @@ if (!apply) {
 const ident = resolveLarkIdentity(template);
 const canonicalRoot = (() => { try { return fs.realpathSync(root); } catch { return path.resolve(root); } })();
 const bindTarget = { runtime: "claude", project_root: canonicalRoot, claude_session_id: me.sessionId };
-// P2-2 wireBind（Frank 裁定）：会话级绑定的 legacy 两步（建根话题 + 登记）收进一个闭包，已启用端点以
-//   m1a-order 锁串行并镜像 shadow create_b1；未启用端点（never_initialized）→ 合法 legacy-only。
-const wired = wireBind({
-  endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
-  env: process.env,
-  externalRequestId: idemKey,
-  lineageId: path.basename(root) + "@project-files",
-  chatId: template.chat_id,
-  bindingTarget: bindTarget,
-  legacy: () => {
-    // ① 建根话题（幂等键）。失败 → 无任何副作用，返回 ok:false（wireBind 不跑 shadow）。
-    let rootMessageId;
-    try {
-      rootMessageId = sendToChat({
-        profile: ident.profile, chatId: template.chat_id, text: rootText,
-        idempotencyKey: idemKey, larkBin: ident.bin, larkHome: ident.configDir,
-        expectedAppId: ident.expectedAppId,
-      });
-    } catch (err) {
-      return { ok: false, phase: "send", message: err.message };
-    }
-    // ② 登记（entry push + 原子写）。失败 → 话题已在群里，返回 ok:false（phase=registry，幂等键保重跑不重建）。
-    const entry = newSessionEntry({
-      root, name, purpose: identity.purpose, token, rootMessageId,
-      claudeSessionId: me.sessionId, sessionName: me.name,
-    });
-    registry.projects.push(entry);
-    try {
-      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
-      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
-      const tmp = regFile + ".tmp." + process.pid;
-      fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, regFile);
-    } catch (err) {
-      return { ok: false, phase: "registry", root_message_id: rootMessageId, message: err.message };
-    }
-    return { ok: true, root_message_id: rootMessageId, count: registry.projects.length };
-  },
+// ① 建根话题（幂等键）——两条路径共用一个闭包。失败 → 无任何副作用（不跑后续步骤）。
+const createTopic = () => {
+  try {
+    return { ok: true, root_message_id: sendToChat({
+      profile: ident.profile, chatId: template.chat_id, text: rootText,
+      idempotencyKey: idemKey, larkBin: ident.bin, larkHome: ident.configDir,
+      expectedAppId: ident.expectedAppId,
+    }) };
+  } catch (err) {
+    return { ok: false, reason: "send_failed", message: err.message };
+  }
+};
+const indexEntry = (rootMessageId) => newSessionEntry({
+  root, name, purpose: identity.purpose, token, rootMessageId,
+  claudeSessionId: me.sessionId, sessionName: me.name,
 });
+// authoritative 路径用**同一份**条目模版（同一个 now）：索引行里的 expires_at 必须与写进 expiry sidecar
+// 的那一个逐字相同 —— 两次各自 newSessionEntry 会让两边差几毫秒。
+const ROOT_PLACEHOLDER = "om_placeholder";
+const indexTemplate = indexEntry(ROOT_PLACEHOLDER);
+// 模板里那个占位根 om → 真 om。**不能只换顶层 root_message_id**：行内嵌的 topic_generation_state 是
+//   **这一行自己的**投影，代际里的 root_message_id 也是同一个话题的 om。留着占位的后果是真入口上的：
+//   `findPendingBinding` 读 generation.root_message_id → 认领现场指向一个**不存在**的话题
+//   （evaluatePromotion 的 matched_om 与 wirePromoteAuthoritative 的 locator 都跟着它），
+//   账本侧 resolveLiveId 永远 locator_absent —— 新绑定再也认领不了（真机 2026-09-11 等这单的原因）。
+const retargetRoot = (node, rootMessageId) => (node !== null && typeof node === "object"
+  ? Array.isArray(node)
+    ? node.map((v) => retargetRoot(v, rootMessageId))
+    : Object.fromEntries(Object.entries(node).map(([k, v]) => [k, k === "root_message_id" && v === ROOT_PLACEHOLDER ? rootMessageId : retargetRoot(v, rootMessageId)]))
+  : node);
+// ③ 索引行 upsert（authoritative 路径）：**锁内重读当前文件再局部更新**（不许拿锁外那份快照写回 ——
+//   两笔并发 bind 被 outer 串行后，后一笔仍会用陈旧快照盖掉前一笔）。同会话已有行 → 就地覆盖（幂等重跑）。
+const publishIndex = ({ rootMessageId }) => {
+  const entry = { ...retargetRoot(indexTemplate, rootMessageId), root_message_id: rootMessageId };
+  const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
+    const rows = reg.projects;
+    const at = rows.findIndex((p) => p?.claude_session_id === me.sessionId || (p?.root === entry.root && p?.id === entry.id));
+    if (at >= 0) rows[at] = { ...rows[at], ...entry };
+    else rows.push(entry);
+    return { ok: true, changed: true };
+  } });
+  if (!done.ok) return { ok: false, reason: done.reason ?? "registry_unwritable", why: done.error ?? null };
+  return { ok: true, count: done.count ?? null };
+};
+// PK2-W1：判源分派 —— authoritative 走复合（账本先于索引），shadow / 未接入走原路径（一字未改）。
+const wired = writeRoute.mode === "authoritative"
+  ? wireBindAuthoritative({
+      endpointId, env: process.env, externalRequestId: idemKey,
+      // lineage 取**会话级**：`basename@<完整会话 UUID>@registry`（P2-2）。
+      //   旧形 basename@<sid8>@registry 只用 UUID 前 8 位十六进制 —— 两条会话前缀撞上就是同一条
+      //   lineage，而账本一条 lineage 只许一条 live B1（第二条 create_b1 直接 lineage_pending_exists）。
+      //   选**完整 UUID**而不是摘要：不引哈希、id 直接对得上那条会话（长度仍受 LINEAGE_SHAPE 128 限）。
+      //   与 legacy 快照的 registry 分支（entry.id + "@registry"）不再是同一算法 —— 那只适用于切换前
+      //   已存在的旧行，切后新建的以账本这条 lineage 为准。
+      lineageId: path.basename(root) + "@" + me.sessionId + "@registry", chatId: template.chat_id, bindingTarget: bindTarget,
+      pendingToken: token, expiresAt: indexTemplate.expires_at,
+      createTopic, publishIndex,
+    })
+  : wireBind({
+      endpointId,
+      env: process.env,
+      externalRequestId: idemKey,
+      lineageId: path.basename(root) + "@project-files",
+      chatId: template.chat_id,
+      bindingTarget: bindTarget,
+      legacy: () => {
+        // ① 建根话题 → ② 登记（entry push + 原子写）。失败 → 话题已在群里，phase=registry（幂等键保重跑不重建）。
+        const t = createTopic();
+        if (!t.ok) return { ok: false, phase: "send", message: t.message };
+        const entry = indexEntry(t.root_message_id);
+        registry.projects.push(entry);
+        try {
+          fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+          if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+          const tmp = regFile + ".tmp." + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
+          fs.renameSync(tmp, regFile);
+        } catch (err) {
+          return { ok: false, phase: "registry", root_message_id: t.root_message_id, message: err.message };
+        }
+        return { ok: true, root_message_id: t.root_message_id, count: registry.projects.length };
+      },
+    });
+// PK2-W1：unclean 回执**先写** —— 账本已提交而后继失败时，后面那两条 die 分支会 exit；
+//   回执不能只长在成功路径上（"不能只靠 doctor 点名"）。
+const bindUnclean = uncleanWired(wired);
+if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_session", wired, { root, claudeSessionId: me.sessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
 if (!wired.ok) {
   // 已启用端点任一取锁/账本/收据异常 → 整笔拒、不写 legacy、不建话题（fail-closed）。
   die("绑定失败（M1a 一致性锁：" + (wired.reason ?? "unknown") + (wired.why ? "；" + wired.why : "") + "）",
@@ -216,15 +341,12 @@ if (!wired.ok) {
 const lr = wired.legacy;
 if (!lr.ok) {
   if (lr.phase === "send") die("建话题失败，没有写任何文件：" + lr.message);
-  die("话题建好了（" + lr.root_message_id + "）但登记没写成：" + lr.message,
-    "修好权限后重跑同一条命令即可，幂等键保证不会多建一个话题。");
+  die("话题建好了（" + lr.root_message_id + "）但绑定没落完（停在第 " + String(lr.phase) + " 步：" + lr.message + "）",
+    "按同一幂等键重跑这一条命令即可补齐：话题不会重建、账本也不会多记一条。");
 }
 const rootMessageId = lr.root_message_id;
 console.log("\n根话题已建立  " + rootMessageId);
-console.log("已登记        " + regFile + "  （现在 " + lr.count + " 条绑定）");
-// P1-4：legacy 已提交但 shadow 镜像不干净 → 持久机器回执（不谎报 clean）。
-const bindUnclean = uncleanWired(wired);
-if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_session", wired, { root, claudeSessionId: me.sessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
+console.log("已登记        " + regFile + "  （现在 " + (lr.count ?? "?") + " 条绑定）");
 
 
 try {

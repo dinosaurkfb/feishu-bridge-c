@@ -501,6 +501,9 @@ export function promoteBinding({
     : path.join(path.dirname(registryFile), "registry.lock");
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "binding_busy" };
+  // PK2-W1-fix2 P1-5③：主体收进内层闭包，外层 finally 对**每个返回路径**折 releasePublishLock 的
+  //   结果 —— 旧版直接丢弃：索引写成而 registry 锁没交还时整体仍报 clean，之后同锁写方全部 busy。
+  const run = () => {
   try {
     if (useProjectFile) {
       let mapping;
@@ -570,8 +573,28 @@ export function promoteBinding({
     return { ok: true, root, sessionId, generation: activated.active };
   } catch (err) {
     return { ok: false, reason: "registry_unwritable", error: String(err.message).slice(0, 200) };
+  }
+  };
+  let result = null;
+  try {
+    result = run();
+    return result;
   } finally {
-    releasePublishLock(lockDir);
+    let rel;
+    try { rel = releasePublishLock(lockDir); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const unclean = rel.reapUncleared
+      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap", detail: rel.reapUncleared.error != null ? String(rel.reapUncleared.error) : null }
+      : rel.absent === true ? { reason: "lock_absent", path: lockDir, detail: null }
+        : rel.ok !== true
+          ? { reason: String(rel.reason ?? "release_failed"), path: lockDir, detail: rel.error != null ? String(rel.error) : (rel.why != null ? String(rel.why) : null) }
+          : null;
+    if (unclean !== null && result !== null && typeof result === "object") {
+      result.ok = false;
+      result.reason = "registry_lock_release_failed";
+      result.why = unclean.reason;
+      result.lockUncleared = unclean;
+    }
   }
 }
 

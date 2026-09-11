@@ -24,7 +24,7 @@ import path from "node:path";
 import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
-import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
+import { loadClaudeTopicBinding, withRegistryTransaction } from "./topic-generation-store.mjs";
 import { wirePauseResume, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
@@ -81,46 +81,10 @@ const template = tpl.template;
 const regFile = registryPath();
 
 /**
- * **这个 CLI 里所有登记表写入的唯一入口。**
- *
- * 两条要求合在一处：
- *
- *   · 锁内重读、校验、更新、原子写 —— 拿锁外那份快照写回去，
- *     并发的另一个 binder 就会被整体覆盖。
- *   · **锁内一律不 exit、不 die。**`process.exit()` 会跳过 finally，锁就漏了 ——
- *     这个坑我在抑制命令上踩过一次，这里又踩了一次：上一版锁内有四条 exit 路径。
- *     所以这里只返回结果，退出码和输出全部由调用方在锁释放之后处理。
- *
- * mutate(registry) 在锁内跑，返回 { ok, ... }；ok 为 true 时才写盘。
+ * 登记表事务入口：PK2-W1 起**一个实现**（`topic-generation-store.mjs` 的 `withRegistryTransaction`）。
+ * 这里是这个 CLI 所有登记表写入的唯一入口；锁内一律不 exit/die（exit 会跳过 finally 漏锁），
+ * 退出码与输出全部由调用方在锁释放之后处理。
  */
-function withRegistryTransaction({ regFile, root, mutate }) {
-  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: regFile, root });
-  const lock = acquirePublishLock(lockDir);
-  if (!lock.ok) return { ok: false, kind: "busy", reason: lock.reason };
-  try {
-    const fresh = loadRegistryStrict(regFile);
-    if (!fresh.ok) {
-      return { ok: false, kind: "unreadable", reason: fresh.reason + "：" + fresh.error };
-    }
-    const reg = { ...fresh.raw, projects: fresh.projects };
-    const decided = mutate(reg);
-    if (!decided.ok) return decided;
-    if (decided.skipWrite) return decided;
-    try {
-      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
-      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
-      const tmp = regFile + ".tmp." + process.pid;
-      fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, regFile);
-    } catch (err) {
-      return { ok: false, kind: "write_failed", reason: err.message };
-    }
-    return { ...decided, count: reg.projects.length };
-  } finally {
-    releasePublishLock(lockDir);
-  }
-}
-
 const loaded0 = loadRegistryStrict(regFile);
 if (!loaded0.ok) {
   die("登记表" + (loaded0.reason === "bad_json" ? "不是合法 JSON"

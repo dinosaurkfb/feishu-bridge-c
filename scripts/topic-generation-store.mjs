@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { projectMappingPath, resolveProject, selectBindingEntry } from "./project-resolve.mjs";
 import {
-  acquirePublishLock, registryPath, releasePublishLock,
+  acquirePublishLock, loadRegistryStrict, registryPath, releasePublishLock,
 } from "./registry.mjs";
 import {
   ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation, materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration, recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy, markPendingClaimReminder, markPendingClaimReminderAbandoned, reserveClaimReminderAttempt, supersedeExpiredAndPrepareTopicRotation,
@@ -133,6 +133,74 @@ function mutateClaudeTopicBinding({
     return { ok: false, reason: "binding_unwritable", error: String(err.message).slice(0, 200) };
   } finally {
     releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * 登记表行的事务入口（PK2-W1）：**锁内重读 → mutate(reg) → 原子写**。
+ * 为什么必须有它：拿锁外那份快照写回去，并发的另一个写方就会被整体覆盖（两笔 bind 被 outer 串行后，
+ * 后一笔仍会用陈旧快照盖掉前一笔）。锁与 promoteBinding / topic-generation / interaction-policy 同族
+ * （`topicGenerationLockDir`），锁内一律不 exit/die，退出码与文案由调用方在锁外决定。
+ * mutant 返回 `{ok:true, …}` 才写盘；`{ok:true, skipWrite:true, …}` = 不需要写。
+ */
+export function withRegistryTransaction({ regFile = registryPath(), root = null, mutate }) {
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: regFile });
+  if (lockDir === null) return { ok: false, kind: "busy", reason: "binding_source_unknown" };
+  const lock = acquirePublishLock(lockDir);
+  // kind 是调用方（bind-project 的四条 die 分支）的措辞依据：只有"别人正拿着"才是 busy，
+  // 锁目录不可写之类的 I/O 错误原样报出去（曾被折叠成 busy 静默跳过）。
+  if (!lock.ok) return lock.reason === "publisher_busy"
+    ? { ok: false, kind: "busy", reason: lock.reason }
+    : { ok: false, kind: "lock_io_error", reason: "lock_io_error", error: lock.error ?? lock.reason };
+  let result = null;
+  try {
+    const fresh = loadRegistryStrict(regFile);
+    if (!fresh.ok) {
+      result = { ok: false, kind: "unreadable", reason: fresh.reason + "：" + fresh.error };
+      return result;
+    }
+    const reg = { ...fresh.raw, projects: fresh.projects };
+    const decided = mutate(reg, { root });
+    if (!decided?.ok) {
+      result = decided ?? { ok: false, kind: "mutate_invalid", reason: "registry_mutate_invalid" };
+      return result;
+    }
+    if (decided.skipWrite) {
+      result = decided;
+      return result;
+    }
+    try {
+      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+      const tmp = regFile + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, regFile);
+    } catch (err) {
+      result = { ok: false, kind: "write_failed", reason: String(err.message).slice(0, 200) };
+      return result;
+    }
+    result = { ...decided, count: reg.projects.length };
+    return result;
+  } finally {
+    // P1-5③（返修）：旧版把 releasePublishLock 的返回值丢了 —— 锁没交还（reap 残骸/非本人持有/
+    //   锁目录不可读）与"干净交还"在调用方看来一模一样。这里按 R57d 翻成 lockUncleared 并
+    //   降级 ok（写已落盘的话 count/内容照旧带出）；抛错也算不干净，不裸抛出去。
+    let rel;
+    try { rel = releasePublishLock(lockDir); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const unclean = rel.reapUncleared
+      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap", detail: rel.reapUncleared.error != null ? String(rel.reapUncleared.error) : null }
+      : rel.absent === true ? { reason: "lock_absent", path: lockDir, detail: null }
+        : rel.ok !== true
+          ? { reason: String(rel.reason ?? "release_failed"), path: lockDir, detail: rel.error != null ? String(rel.error) : (rel.why != null ? String(rel.why) : null) }
+          : null;
+    if (unclean !== null && result !== null && typeof result === "object" && result.lockUncleared === undefined) {
+      result.ok = false;
+      result.kind = "lock_uncleared";
+      result.reason = "registry_lock_release_failed";
+      result.why = unclean.reason;
+      result.lockUncleared = unclean;
+    }
   }
 }
 

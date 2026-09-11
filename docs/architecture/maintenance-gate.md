@@ -400,6 +400,8 @@ node scripts/maintenance-ledger.mjs --cutover --endpoint <id> [--wait-ms N] --ap
   （账本 §8 fail-closed、绝不回退 registry）。
 - L4 forward-only：进入 `ledger_initializing`/`ledger_cutting_over` 后 `--exit`
   **绝不进 rolling_back**，只向前或停门待修；cutover 后普通写改不回 shadow、重放不新增
+>   **R69 武装**：唯一 `authority_cutover` 提交点已接 forward 引擎——一次 `--apply` 覆盖
+>   进门→三 sidecar→二次重验→提交（4c 四项账本锁内复核）→重开；不再有 not_armed 停门态。
   第二笔（账本 G14）。
 - L5 operation_kind 封闭：`ledger_*` operation 不要 install 的 artifact/receipt/
   staged_plan step；enter/install 不要 ledger step；旧 1.1 journal 无 operation_kind

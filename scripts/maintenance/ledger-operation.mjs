@@ -39,7 +39,8 @@ import { TERMINAL_PHASES, acquireOperationLease, addNote, clearActive, enterLedg
 import { readGate } from "../maintenance-gate-core.mjs";
 import { commitWhileHeld } from "../registry.mjs";
 import { enterMaintenance, rollbackOperation } from "./operation.mjs";
-import { authorityCutover, cutoverPlan, ensureLedgerRoot, initPlan, initializeShadow, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { authorityCutover, cutoverPlan, ensureLedgerRoot, initPlan, initializeShadow, ledgerSettlePrecondition, loadLedger, resolveEndpointDir } from "../topic-agent-ledger.mjs";
+import { collectLegacyForCutover, reconcileForCutover } from "../m1a/cutover-reconcile.mjs";
 import { endpointReceipt } from "./ledger-receipt.mjs";
 
 const CHAINS = ["claude", "codex"];
@@ -61,28 +62,17 @@ const releaseSurface = (surface) => {
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const resolveDir = (ctx, endpointId, env) => resolveEndpointDir(endpointId, { env });
 
-/** M1a 真对账的 legacy 采集（R45：cutover 前置从「恒拒的 reconciler_absent」换成真对账；测试注入走 env）。 */
-const collectFor = (ctx, chain, env) => chain === "claude"
-  ? collectClaudeLegacySnapshot({
-      registryFile: env.FEISHU_BRIDGE_REGISTRY ?? path.join(ctx.home, ".claude", "feishu-bridge", "registry.json"),
-      templateFile: env.FEISHU_BRIDGE_CHAIN_TEMPLATE ?? path.join(ctx.home, ".claude", "feishu-bridge", "chain-config.json"),
-    })
-  : collectCodexLegacySnapshot({ home: ctx.codexBridgeHome });
-
 // R45 三轮 P1-1：面拆分。公共 reconcileFor 走 reconcileLegacyEndpoint（预览/doctor 安全面，每键恰 {sha256}，无字节明文）；
-// 私有 prepareFor 走 prepareLegacyCutoverEndpoint（T4 私有接口，plan 锚与 verifyCutoverPlan 需要受验字节）——
-// grep 守卫只查私有接口字面名，经公共包装别名转发就能绕过；现在预览面数据源不再可能携字节。
-export const reconcileFor = ({ ctx, chain, endpointId, ledgerDir, env }) => reconcileLegacyEndpoint({
+// R69 返修一 P1-2：**采集源只有一份** —— 锁内复核（authorityCutover）与门内二次重验（prepareFor）都走
+//   m1a/cutover-reconcile.mjs 的固定维护适配器；这里不再自己拼一遍 ctx.home 路径（第二套来源 = 第二个真相）。
+export const reconcileFor = ({ chain, endpointId, ledgerDir, env }) => reconcileLegacyEndpoint({
   endpointId, chain,
-  collectLegacy: () => collectFor(ctx, chain, env),
+  collectLegacy: () => collectLegacyForCutover({ chain, env }),
   loadLedgerFn: () => loadLedger(ledgerDir, { endpointId }),
 });
 
-const prepareFor = ({ ctx, chain, endpointId, ledgerDir, env }) => prepareLegacyCutoverEndpoint({
-  endpointId, chain,
-  collectLegacy: () => collectFor(ctx, chain, env),
-  loadLedgerFn: () => loadLedger(ledgerDir, { endpointId }),
-});
+// 门内二次重验用的私有面（带受验字节）：与锁内复核**同一份**适配器（含账本目录派生，不再吃调用方的 ledgerDir）。
+const prepareFor = ({ chain, endpointId, env }) => reconcileForCutover({ endpointId, chain, env });
 
 const shaHex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
@@ -167,7 +157,6 @@ function planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env }) {
   if (kind === "init") return initPlan({ endpointId, chain, requestKey, operationId: token });
   const L1 = loadLedger(ledgerDir, { endpointId });
   if (!L1.ok) return { ok: false, reason: L1.reason, why: L1.why ?? null };
-  if (L1.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow", why: "切权威前置要求 shadow（实际 " + L1.doc.authority_mode + "）" };
   const rec = prepareFor({ ctx, chain, endpointId, ledgerDir, env });
   if (!rec.ok) return { ok: false, reason: rec.reason, why: rec.why ?? (rec.mismatches ? "双射不等（" + rec.mismatches.length + " 条）" : null) };
   // 对账期间账本被旁路改写（revision / 整文件 SHA 任一变）→ 蓝图作废，fail-closed。
@@ -198,6 +187,7 @@ function doWrite(ctx, { token, kind, endpointId, chain, ledgerDir, env, _inject 
   // P2-2：planOf 接 ctx/env——env 注入（registry 路径等）在 planOf 内的 reconcileFor 同样生效。
   const plan = planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env });
   if (!plan.ok) return plan;
+  // R69 返修一 P1-2：capability 只携带身份三键 —— 对账来源由 verifier 从固定适配器构造，不经调用方转手。
   const cap = capabilityOf(ctx, token, kind === "init" ? "initialize_shadow" : "authority_cutover", endpointId);
   return kind === "init"
     ? initializeShadow({ endpointId, capability: cap, requestKey, chain, env, _inject })
@@ -391,14 +381,23 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
         addNote({ dir: ctx.dir, token, lease, note: "ledger 已翻转但 sidecar 未收全，停门待修", now: ctx.now() });
         return { ok: false, reason: "composite_order_violation", phase, why: "intended_after 场景要求三条 sidecar 已 done" };
       }
+      if (scene.scene === "intended_after") {
+        // R69 返修一 P1-3：提交已完成**不等于**可以收口 —— 首次返回 committed_with_residue /
+        //   committed_durability_uncertain 的现场，这里必须先过三关（主锁交还 / 屏障重做 / 无 tmp 残骸），
+        //   否则停在原处分人修（绝不直接 markStepDone 把残骸一起"收"掉）。
+        const pre = ledgerSettlePrecondition({ dir: d.dir, _inject });
+        if (!pre.ok) {
+          addNote({ dir: ctx.dir, token, lease, note: "账本收口前置未过（" + pre.reason + "）：" + (pre.why ?? ""), now: ctx.now() });
+          return { ok: false, reason: pre.reason, phase, why: pre.why ?? null };
+        }
+      }
       if (scene.scene === "before") {
         if (sub === "cutover") {
           // R45 复合提交：①三条 sidecar 窄写 + ②门内二次重验（都过才到提交点）。
           const cv = convergeSidecars(ctx, { token, lease, gateFile: ctx.gateFile, env, endpointId, chain, ledgerDir: d.dir, doc, ls });
           if (!cv.ok) return { ok: false, reason: cv.reason, why: cv.why ?? null, phase, lockUncleared: cv.lockUncleared ?? null };
-          // 唯一提交点 authority_cutover：本单只武装到提交前（capability 门与真翻转账本归 M1b 后续单），停在门内。
-          return { ok: false, reason: "authority_cutover_not_armed", why: "sidecar 已收敛、二次重验已过；authority_cutover 提交点未武装，停在 ledger_cutting_over", phase };
         }
+        // R69：唯一提交点已武装 —— cutover 在 sidecar 收敛 + 二次重验通过后提交（4c 在账本锁内复核），随后同 init 收口。
         const wr = doWrite(ctx, { token, kind: sub, endpointId, chain, ledgerDir: d.dir, env, _inject });
         if (!wr.ok) return { ok: false, reason: wr.reason, why: wr.why ?? null, phase, commit: wr.commit ?? "not_committed", residue: wr.residue ?? null, lockUncleared: wr.lockUncleared ?? null };
         // 评审 P1-5：只有 committed_clean 才视为可推进；committed_with_residue / committed_durability_uncertain 保留门+active，退出码 3。
@@ -560,7 +559,7 @@ export function ledgerReopening(ctx, token, lease, env = process.env) {
 }
 
 /** `ledger_init` / `ledger_cutover` 维护 operation 进门。apply=false 只出 dry-run 计划。 */
-export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, apply = false, reason = null, env = process.env } = {}) {
+export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, apply = false, reason = null, env = process.env, _inject = null } = {}) {
   if (kind !== "init" && kind !== "cutover") return { ok: false, reason: "bad_kind" };
   // 评审 P2-2：endpointId 显式类型守卫（避免 undefined/null 被 ENDPOINT_SHAPE.test 偷偷放行）
   if (typeof endpointId !== "string" || !ENDPOINT_SHAPE.test(endpointId)) return { ok: false, reason: "bad_endpoint" };
@@ -580,7 +579,7 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
   // lease / 安装面锁在正常与异常路径都释放；simulatedCrash 契约豁免：原样重抛且不释放（模拟死亡，接管者按残骸处理）。
   let out, rollbackResult = null, crashErr = null;
   try {
-    out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, env });
+    out = ledgerForward(ctx, { token: ent.token, lease: ent.lease, intent: { kind, endpointId, chain }, env, _inject });
     if (out.ok === false && out.rollbackSafe === true) {
       // 前置条件失败（如 reconciler_absent：账本步未准备、未写盘）→ 回退清场（桩/current/门/active 与进入前一致），不留下维护态
       const rb = rollbackOperation(ctx, ent.token, ent.lease);
@@ -605,7 +604,7 @@ export function ledgerEnter(ctx, { kind, endpointId, chain, waitMs = 60000, appl
 /** `ledger_init` / `ledger_cutover` 出门（含崩溃恢复；按 phase 分派：回退 / 只向前 / 只清 active）。
  *  P1-1：调用方（runMaintenanceGate --apply）已持安装面锁时传入 `surface` 复用，不重取（非重入锁同 pid 也 busy）。
  *  P1-2：所有释放统一投影 surfaceRelease——早退分支（!op.ok / !lease.ok）也吞不掉。 */
-export function ledgerExit(ctx, { apply = false, env = process.env, surface: held = null } = {}) {
+export function ledgerExit(ctx, { apply = false, env = process.env, surface: held = null, _inject = null } = {}) {
   const readOp = (dir) => {
     const active = readActive({ dir });
     if (active.state === "absent") return { ok: false, reason: "no_operation" };
@@ -646,7 +645,7 @@ export function ledgerExit(ctx, { apply = false, env = process.env, surface: hel
   let out, crashErr = null;
   try {
     out = action === "ledger_forward"
-      ? ledgerForward(ctx, { token, lease, env })
+      ? ledgerForward(ctx, { token, lease, env, _inject })
       : rollbackOperation(ctx, token, lease);
   } catch (err) {
     if (err?.simulatedCrash === true) crashErr = err;

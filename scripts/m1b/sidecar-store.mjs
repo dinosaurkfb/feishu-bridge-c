@@ -71,8 +71,9 @@ export function readSidecarStore({ endpointId, name, env = process.env } = {}) {
   return { ok: true, absent: false, file: p.file, doc: r.doc, entries: r.doc.entries, bytes: r.bytes };
 }
 
-/** 同目录 tmp（O_EXCL 0600）→ 写满 → 文件 fsync → rename → 目录 fsync。文件 fsync 失败：删 tmp、不 rename。 */
-function writeSidecarAtomic(file, content) {
+/** 同目录 tmp（O_EXCL 0600）→ 写满 → 文件 fsync → rename → 目录 fsync。文件 fsync 失败：删 tmp、不 rename。
+ *  `_inject`（只给测试）：{failTmpFsync, failDirFsync} —— PK2-W1-fix1 的两道屏障各自可注入失败。 */
+function writeSidecarAtomic(file, content, _inject = null) {
   const dir = path.dirname(file);
   const tmp = path.join(dir, path.basename(file) + "." + process.pid + "." + Date.now() + ".tmp");
   let fd = null;
@@ -85,6 +86,7 @@ function writeSidecarAtomic(file, content) {
       if (!(Number.isInteger(n) && n > 0)) throw Object.assign(new Error("short write"), { code: "ESHORTWRITE" });
       off += n;
     }
+    if (_inject?.failTmpFsync === true) { const e = new Error("input/output error"); e.code = "EIO"; throw e; }
     fs.fsyncSync(fd);
   } catch (err) {
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* 已关 */ } fd = null; }
@@ -96,6 +98,7 @@ function writeSidecarAtomic(file, content) {
   try { fs.renameSync(tmp, file); }
   catch (err) { try { fs.rmSync(tmp, { force: true }); } catch { /* 同上 */ } return { ok: false, reason: "sidecar_write_failed", why: "rename：" + String(err?.code ?? err?.message ?? err) }; }
   try {
+    if (_inject?.failDirFsync === true) { const e = new Error("input/output error"); e.code = "EIO"; throw e; }
     const dfd = fs.openSync(dir, fs.constants.O_RDONLY);
     try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
   } catch (err) {
@@ -113,7 +116,7 @@ function writeSidecarAtomic(file, content) {
  * 或 `{ok:false, reason, why?}`（原样透传）。
  * 写前**整文档**过 `validateSidecarDoc(nextDoc, name, {endpointId})`——非法条目一个字节都不落盘。
  */
-export function mutateSidecarEntry({ endpointId, name, key, mutate, env = process.env, lockRetries = 0 } = {}) {
+export function mutateSidecarEntry({ endpointId, name, key, mutate, env = process.env, lockRetries = 0, _inject = null } = {}) {
   if (typeof key !== "string" || key.length === 0) return { ok: false, reason: "sidecar_bad_key", why: "key 必须是非空字符串" };
   if (typeof mutate !== "function") return { ok: false, reason: "sidecar_bad_mutate", why: "mutate 必须是函数" };
   const p = sidecarPath({ endpointId, name, env, mustExistRoot: true });
@@ -123,8 +126,10 @@ export function mutateSidecarEntry({ endpointId, name, key, mutate, env = proces
   if (!lock.ok) {
     return { ok: false, reason: lock.reason === "maintenance" ? "maintenance" : "sidecar_busy", why: String(lock.reason ?? "lock_unavailable") };
   }
-  let result = null;
-  try {
+  // PK2-W1-fix1 P1-5②：主体收进内层闭包，**每个返回路径**都经过外层的释放折叠 ——
+  //   旧版只有最后一条成功路径给 result 赋值，changed:false / 各类早退 return 绕过 finally 的折叠
+  //  （result 恒 null），锁释放不净被吞成 ok。
+  const run = () => {
     // 锁内 fd 受验重读（不在锁外先读：那是个漂移窗口）。
     const cur = readSidecarStore({ endpointId, name, env });
     if (!cur.ok) return { ok: false, reason: cur.reason, why: cur.why };
@@ -136,6 +141,12 @@ export function mutateSidecarEntry({ endpointId, name, key, mutate, env = proces
         : { ok: false, reason: "sidecar_bad_mutate", why: "mutate 必须返回 {ok:true, changed?, value?} 或 {ok:false, reason}" };
     }
     if (changed.changed === false) {
+      // PK2-W1-fix1 P1-5①：文件在场（上次可能 durability 未证实）→ 零写返回前**重做目录屏障**。
+      //   屏障再失败 → 如实拒（committed:true）——重跑可重做，直到屏障过为止；缺席文件无事可屏障。
+      if (cur.absent !== true) {
+        const barrier = writeSidecarAtomic(p.file, stableStringify(cur.doc, 2) + "\n", _inject);
+        if (!barrier.ok) return { ok: false, reason: barrier.reason, why: "目录屏障重做失败（零写路径）：" + (barrier.why ?? ""), committed: barrier.committed === true };
+      }
       return { ok: true, changed: false, value: present, entries: cur.entries ?? {}, file: p.file, committed: false };
     }
     const nextEntries = { ...(cur.entries ?? {}) };
@@ -145,7 +156,7 @@ export function mutateSidecarEntry({ endpointId, name, key, mutate, env = proces
     const nextDoc = { schema_version: (cur.doc?.schema_version ?? SIDECAR_SCHEMAS[name]), endpoint_id: endpointId, entries: nextEntries };
     const invalid = validateSidecarDoc(nextDoc, name, { endpointId });
     if (invalid !== null) return { ok: false, reason: "sidecar_invalid", why: invalid };
-    const w = writeSidecarAtomic(p.file, stableStringify(nextDoc, 2) + "\n");
+    const w = writeSidecarAtomic(p.file, stableStringify(nextDoc, 2) + "\n", _inject);
     if (!w.ok) return { ok: false, reason: w.reason, why: w.why, committed: w.committed === true, entries: w.committed === true ? nextEntries : cur.entries };
     // 写后受验读回：整文档再过一遍，且条目逐字一致（读不回/不一致 → 已提交但不干净）。
     const back = readSidecarStore({ endpointId, name, env });
@@ -153,7 +164,11 @@ export function mutateSidecarEntry({ endpointId, name, key, mutate, env = proces
     if (stableStringify(back.entries, 2) !== stableStringify(nextEntries, 2)) {
       return { ok: false, reason: "sidecar_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, entries: nextEntries, file: p.file };
     }
-    result = { ok: true, changed: true, value, entries: nextEntries, doc: nextDoc, file: p.file, committed: true, persistence: "fsynced" };
+    return { ok: true, changed: true, value, entries: nextEntries, doc: nextDoc, file: p.file, committed: true, persistence: "fsynced" };
+  };
+  let result = null;
+  try {
+    result = run();
     return result;
   } finally {
     // R57d：释放不干净不谎报 clean —— 折成 lockUncleared（带 path）并降级 ok；写已落盘的话 entries/committed 照旧带出。

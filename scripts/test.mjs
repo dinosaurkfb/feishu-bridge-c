@@ -50788,6 +50788,35 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       });
     } finally { fs.rmSync(r.base, { recursive: true, force: true }); }
   });
+  // PK2-W1-fix1 P1-5①②：目录屏障可在重跑时重做（零写路径也重做）；每个返回路径都折锁释放。
+  test("PK2-W1-fix1 T8 sidecar-store：目录 fsync 失败 → 零写重跑重做屏障（仍失败如实拒）；changed:false 早退也折锁释放", () => {
+    const r = w1Root();
+    const file = path.join(r.epDir, "expiry.json");
+    try {
+      w1WithLedger(r.ledgerRoot, () => {
+        w1WriteDoc(file, { schema_version: "expiry-1", endpoint_id: r.EP, entries: { [W1_TA]: "2099-01-01T00:00:00.000Z" } });
+        // ① 首写撞上目录 fsync 失败（注入）→ 拒且 committed:true（数据已 rename，持久性未证实）
+        const f1 = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA2, _inject: { failDirFsync: true },
+          mutate: () => ({ ok: true, changed: true, value: "2098-01-01T00:00:00.000Z" }) });
+        assert.deepEqual([f1.ok, f1.reason, f1.committed], [false, "sidecar_durability_unconfirmed", true], "目录屏障失败如实拒：" + JSON.stringify(f1));
+        // ② 重跑（值已一致 → changed:false 路径）：屏障必须**重做** —— 仍失败 → 如实拒（旧码这里 ok:true 把屏障吞了）
+        const f2 = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA2, _inject: { failDirFsync: true },
+          mutate: (cur) => (cur === "2098-01-01T00:00:00.000Z" ? { ok: true, changed: false } : { ok: true, changed: true, value: "2098-01-01T00:00:00.000Z" }) });
+        assert.deepEqual([f2.ok, f2.reason, f2.committed], [false, "sidecar_durability_unconfirmed", true], "零写路径重做目录屏障、仍失败如实拒（P1-5①）：" + JSON.stringify(f2));
+        // ③ 屏障这次能过（不注入）→ 零写返回
+        const f3 = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA2, mutate: () => ({ ok: true, changed: false }) });
+        assert.deepEqual([f3.ok, f3.changed], [true, false], "屏障重做成功 → 零写返回：" + JSON.stringify(f3));
+        // ④ changed:false + 释放不净（mutate 里删掉锁目录 → release absent）→ 必须折 lockUncleared 并降级 ok
+        const lockDir = file + ".lock";
+        const f4 = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA,
+          mutate: () => { fs.rmSync(lockDir, { recursive: true, force: true }); return { ok: true, changed: false }; } });
+        assert.equal(f4.ok, false, "changed:false 早退也折锁释放（P1-5②）：" + JSON.stringify(f4));
+        assert.equal(f4.reason, "sidecar_lock_release_failed", "点名释放失败：" + JSON.stringify(f4));
+        assert.ok(f4.lockUncleared, "lockUncleared 在场：" + JSON.stringify(f4.lockUncleared));
+      });
+    } finally { fs.rmSync(r.base, { recursive: true, force: true }); }
+  });
+
   // ── W1 夹具：真 cutover（authoritative）的端机器 + 假 lark-cli + 会话登记 —— 全程 tmp ──
   // 链模板的 agent_uid 决定 endpoint（与入站 / 策略面同源）；lark_cli_bin 指向夹具里的假 binary。
   const w1Fixture = (tag) => {

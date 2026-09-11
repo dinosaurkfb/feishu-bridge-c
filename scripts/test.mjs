@@ -51377,6 +51377,206 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       }
     } finally { x.f.cleanup(); }
   });
+  // ── 返修二（fix2）：三条剩余 P1 的反例 ─────────────────────────────────
+  /** 刀：让第 N 次**目录 fsync** 失败（N 从 1 数；真原语 → 真的 committed_durability_uncertain）。 */
+  const w1DirFsyncKnife = (failAt = [1]) => {
+    const orig = fs.fsyncSync;
+    const want = new Set(Array.isArray(failAt) ? failAt : [failAt]);
+    let n = 0;
+    let hit = 0;
+    return {
+      on: () => {
+        fs.fsyncSync = (fd) => {
+          if (fs.fstatSync(fd).isDirectory()) {
+            n += 1;
+            if (want.has(n)) { hit += 1; const e = new Error("EIO"); e.code = "EIO"; throw e; }
+          }
+          return orig(fd);
+        };
+      },
+      off: () => { fs.fsyncSync = orig; },
+      hits: () => hit,
+      dirSeen: () => n,
+    };
+  };
+  /** 同一把刀的子进程版本（NODE_OPTIONS=--require）：CJS 预载与 ESM 共享同一个 node:fs 单例。 */
+  const w1FsyncPreload = (dir, failAt = [1]) => {
+    const file = path.join(dir, "fsync-knife-" + (Array.isArray(failAt) ? failAt.join("_") : failAt) + ".cjs");
+    fs.writeFileSync(file, [
+      "const fs = require('node:fs');",
+      "const orig = fs.fsyncSync;",
+      "const want = new Set(" + JSON.stringify(Array.isArray(failAt) ? failAt : [failAt]) + ");",
+      "let n = 0;",
+      "fs.fsyncSync = (fd) => {",
+      "  if (fs.fstatSync(fd).isDirectory()) { n += 1; if (want.has(n)) { const e = new Error('EIO'); e.code = 'EIO'; throw e; } }",
+      "  return orig(fd);",
+      "};",
+    ].join("\n") + "\n", { mode: 0o600 });
+    return file;
+  };
+  /** bind-session CLI 的 unclean 回执目录（emitUncleanReceipt 的 receiptDir）。 */
+  const w1UncleanReceipts = (x) => {
+    const dir = path.join(x.f.home, ".claude", "feishu-bridge", "receipts");
+    return fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => n.startsWith("m1a-unclean-")) : [];
+  };
+  /** 入站（inbound.mjs）的 unclean 回执目录：writeReceipt 落在机器级 inbound/receipts。 */
+  const w1InboundUncleanReceipts = (x) => {
+    const dir = path.join(x.f.home, ".claude", "feishu-bridge", "inbound", "receipts");
+    return fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => n.startsWith("m1a-unclean-")) : [];
+  };
+  /** 认领（真复合）的共用夹具：绑定 → 返回 {x, om, ta, env}。 */
+  const w1ClaimableFixture = (tag) => {
+    const x = w1Fixture(tag);
+    const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+    const r0 = w1Bind(x, env);
+    if (r0.status !== 0) { try { x.f.cleanup(); } catch { /* 尽力而为 */ } throw new Error("W1 认领夹具前置绑定失败：" + r0.stdout + r0.stderr); }
+    const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+    return { x, env, om: rec0.aliases.root_om, ta: rec0.topic_agent_id };
+  };
+
+  test("PK2-W1 T17 返修二 P1-3：create_a1 提交为 durability_uncertain（activate clean）→ 直调必须判 unclean（K3 刀）", () => {
+    const f = w1ClaimableFixture("t17");
+    const { x, om } = f;
+    try {
+      const knife = w1DirFsyncKnife([1]);
+      let wired;
+      try {
+        knife.on();
+        wired = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: om, claimKey: "f".repeat(64),
+          sessionId: "aily_t17", authorizedBy: "ou_frank", f4: w1F4Of(om),
+          publishIndex: () => ({ ok: true, root: x.proj, sessionId: "aily_t17", generation: { channel_generation_id: "g17" } }) });
+      } finally { knife.off(); }
+      assert.equal(knife.hits(), 1, "夹具：那一刀命中了（第 1 次目录 fsync = create_a1 的账本写）");
+      assert.deepEqual(wired.commits.map((c) => [c.op, c.commit]),
+        [["create_a1", "committed_durability_uncertain"], ["activate", "committed_clean"]],
+        "逐原语提交证据：" + JSON.stringify(wired.commits));
+      assert.equal(wired.commit, "committed_unclean", "联合判 unclean：" + String(wired.commit));
+      const unc = WIRE.uncleanWired(wired);
+      assert.equal(unc.clean, false, "投影必须消费 commit/commits（旧版只看 shadow 步 → 报 clean、入站照成功继续）：" + JSON.stringify(unc).slice(0, 320));
+      assert.ok(JSON.stringify(unc).includes("create_a1"), "点名是 create_a1 那一笔：" + JSON.stringify(unc).slice(0, 320));
+      assert.ok(JSON.stringify(unc).includes("committed_durability_uncertain"), "点名提交类别：" + JSON.stringify(unc).slice(0, 320));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T18 返修二 P1-3 真入口：认领时 create_a1 提交 durability_uncertain → 入站仍必须落 unclean 回执", () => {
+    const f = w1ClaimableFixture("t18");
+    const { x, om } = f;
+    try {
+      const row = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      const token = row.pending_token;
+      const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 干活\n\n**[引用]**\n🌉 话题\n\n绑定码    " + token + "\n";
+      const preload = w1FsyncPreload(x.f.base, [1]);
+      const r1 = spawnSync(process.execPath, [path.resolve("scripts", "inbound.mjs")], { encoding: "utf-8", cwd: x.proj,
+        env: { ...f.env, NODE_OPTIONS: "--require " + preload,
+          AILY_CLI_CALLER_AGENT_UID: x.uid, AILY_CLI_SESSION_ID: "aily_t18", AILY_CLI_RUN_ID: "run_t18", AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id,
+          [ENV_PASS]: JSON.stringify({ message_id: "msg_w1_t18_1", session_id: "aily_t18", sender_id: TPL.frank_sender_id, content, created_at_ms: Date.now() }) } });
+      assert.equal(r1.status, 0, "入站正常退出：" + r1.stdout + r1.stderr);
+      const recs = w1InboundUncleanReceipts(x);
+      assert.equal(recs.length, 1, "必须落 unclean 回执（旧版判 clean → 一条都没有）：" + JSON.stringify(recs));
+      const doc = JSON.parse(fs.readFileSync(path.join(x.f.home, ".claude", "feishu-bridge", "inbound", "receipts", recs[0]), "utf-8"));
+      assert.equal(doc.clean, false, "回执不谎报 clean：" + JSON.stringify(doc).slice(0, 300));
+      assert.ok(JSON.stringify(doc).includes("committed_durability_uncertain"), "回执点名那一笔提交：" + JSON.stringify(doc).slice(0, 400));
+      assert.ok(JSON.stringify(doc).includes("create_a1"), "回执点名是 create_a1：" + JSON.stringify(doc).slice(0, 400));
+      assert.ok(Object.values(x.ledger().records).some((rec) => rec.kind === "live" && rec.facts.binding === "active"), "认领本身确实成了（unclean 说的是提交不干净，不是没提交）");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T19 返修二 P1-4/P1-5①：目录屏障失败后重跑 bind-session（真子进程）必须重做零写屏障，不得直接「已接入」", () => {
+    const x = w1Fixture("t19");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      // 第 1 跑：只让**第 3 次**目录 fsync 失败（= expiry 那一份 sidecar 写；前两次是账本 create_b1
+      // 与 pending-claims）。于是两个条目都已在盘上、而 expiry 的目录屏障没做成 —— 这正是票据说的现场。
+      const r1 = w1Bind(x, { ...env, NODE_OPTIONS: "--require " + w1FsyncPreload(x.f.base, [3]) });
+      assert.notEqual(r1.status, 0, "第一跑：expiry 目录屏障失败 → 非零退出：" + r1.stdout);
+      assert.ok(w1UncleanReceipts(x).length >= 1, "第一跑落 unclean 回执：" + JSON.stringify(w1UncleanReceipts(x)));
+      const row = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[rec0.topic_agent_id].token, row.pending_token, "夹具前提①：待认领条目已在盘上");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries[rec0.topic_agent_id], row.expires_at, "夹具前提②：expiry 也已在盘上（只差目录屏障）");
+      // 第 2 跑：这次让**第 1 次**目录 fsync 失败 —— 若重跑省掉了零写屏障，就根本没有这次 fsync，
+      // 旧版于是 exit 0 报「已接入」（屏障再也没补做）。
+      const r2 = w1Bind(x, { ...env, NODE_OPTIONS: "--require " + w1FsyncPreload(x.f.base, [1]) });
+      // 关键：不许早退报「已接入」（旧版在这里 exit 0，屏障再也没补做）。这一跑要么如实报不完整后补齐
+      // （复合里那次目录 fsync 成了），要么直接非零退出 —— 两种都算诚实，只有"静默早退"是红的。
+      assert.doesNotMatch(r2.stdout, /已经绑过了/u, "不许早退（旧版在这里 exit 0 直接报已接入）：" + r2.stdout);
+      assert.match(r2.stdout, /不完整|没成|补齐/u, "必须如实报屏障没做成：" + r2.stdout);
+      // 撤刀 → 真恢复（补做成才算完整：expiry 那一份在第 1 跑就没写成，重跑得把它补上）
+      const r3 = w1Bind(x, env);
+      assert.equal(r3.status, 0, "撤刀后恢复：" + r3.stdout + " || stderr: " + String(r3.stderr).split("\n").slice(0, 6).join(" | "));
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[rec0.topic_agent_id].token, row.pending_token, "恢复后待认领条目仍在");
+      const rowNow = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries[rec0.topic_agent_id], rowNow.expires_at, "expiry 与索引行逐字一致（重跑用的是新模板的那一刻）：" + JSON.stringify(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries));
+      // 再跑一次（现场已完整、屏障这次能做成）→ 这才是「已接入」的早退
+      const r4 = w1Bind(x, env);
+      assert.equal(r4.status, 0, "完整后重跑：" + r4.stdout + r4.stderr);
+      assert.match(r4.stdout, /已经绑过了/u, "现场完整且屏障做成后才早退：" + r4.stdout);
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T19b 返修二 P1-4：认领后 expiry 值被篡改 → 重跑 bind 判不完整（拒，不重跑复合、不复活待认领）", () => {
+    const f = w1ClaimableFixture("t19b");
+    const { x, om, ta, env } = f;
+    try {
+      const claim = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: om, claimKey: "b".repeat(64),
+        sessionId: "aily_t19b", authorizedBy: "ou_frank", f4: w1F4Of(om), publishIndex: w1ClaimIndex(x, "aily_t19b") });
+      assert.deepEqual([claim.ok, claim.commit, claim.legacy.ok], [true, "committed_clean", true], "前置认领成功：" + JSON.stringify(claim).slice(0, 260));
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta], undefined, "认领后待认领条目已删");
+      const tampered = mutateSidecarEntry({ endpointId: x.EP, name: "expiry", key: ta,
+        mutate: () => ({ ok: true, changed: true, value: "2098-01-01T00:00:00.000Z" }) });
+      assert.deepEqual([tampered.ok, tampered.changed], [true, true], "夹具：篡改 expiry 值：" + JSON.stringify(tampered).slice(0, 180));
+      const r2 = w1Bind(x, env);
+      assert.notEqual(r2.status, 0, "active + expiry 漂移 → 不得 exit 0 报「已接入」（旧版 active 直接 return true）：" + r2.stdout);
+      assert.doesNotMatch(r2.stdout, /已经绑过了/u, "不许早退：" + r2.stdout);
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta], undefined, "不重跑复合 → 待认领条目不复活");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries[ta], "2098-01-01T00:00:00.000Z", "漂移值不被悄悄改回（拒而不是覆盖备份侧的事实）");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T21 返修二 P1-3（bind-session 消费点）：create_b1 提交 durability_uncertain → CLI 必须落 unclean 回执", () => {
+    const x = w1Fixture("t21");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      // 刀只咬第 1 次目录 fsync = create_b1 的账本写；索引/两条 sidecar 照常写成。
+      const r1 = w1Bind(x, { ...env, NODE_OPTIONS: "--require " + w1FsyncPreload(x.f.base, [1]) });
+      assert.equal(r1.status, 0, "绑定本身成了（unclean 说的是提交不干净，不是没绑成）：" + r1.stdout + " || stderr: " + String(r1.stderr).split("\n").slice(0, 4).join(" | "));
+      const recs = w1UncleanReceipts(x);
+      assert.equal(recs.length, 1, "CLI 必须落 unclean 回执（旧版判 clean → 一条都没有）：" + JSON.stringify(recs));
+      const doc = JSON.parse(fs.readFileSync(path.join(x.f.home, ".claude", "feishu-bridge", "receipts", recs[0]), "utf-8"));
+      assert.equal(doc.clean, false, "不谎报 clean：" + JSON.stringify(doc).slice(0, 240));
+      assert.ok(JSON.stringify(doc).includes("committed_durability_uncertain"), "回执点名那一笔提交：" + JSON.stringify(doc).slice(0, 360));
+      assert.ok(Array.isArray(doc.commits) && doc.commits.some((c) => c.op === "create_b1"), "逐原语证据带出：" + JSON.stringify(doc.commits).slice(0, 240));
+      assert.ok(Object.values(x.ledger().records).some((rec) => rec.kind === "live"), "账本确实写了（只是持久性没证实）");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T20 返修二 P1-5③：认领的索引写（promoteBinding）释放不干净 → 折 lockUncleared、不报 clean", () => {
+    const f = w1ClaimableFixture("t20");
+    const { x, om, env } = f;
+    try {
+      const lockDir = path.join(path.dirname(x.regFile), "registry.lock");
+      const origRename = fs.renameSync;
+      let armed = true;
+      fs.renameSync = (from, to) => {
+        if (armed && String(to) === x.regFile) { armed = false; fs.rmSync(lockDir, { recursive: true, force: true }); }
+        return origRename(from, to);
+      };
+      let wired;
+      try {
+        wired = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env, locator: om, claimKey: "c".repeat(64),
+          sessionId: "aily_t20", authorizedBy: "ou_frank", f4: w1F4Of(om), publishIndex: w1ClaimIndex(x, "aily_t20") });
+      } finally { fs.renameSync = origRename; }
+      assert.equal(armed, false, "夹具：那一刀确实命中了索引写的 rename");
+      const idxStep = wired.shadow.find((s) => s.op === "index");
+      assert.deepEqual([idxStep.ok, idxStep.reason, idxStep.lockUncleared?.reason],
+        [false, "registry_lock_release_failed", "lock_absent"],
+        "索引步必须带出释放残骸（旧版 promoteBinding 把 releasePublishLock 结果丢掉 → ok:true）：" + JSON.stringify(idxStep).slice(0, 300));
+      assert.equal(wired.commit, "committed_unclean", "认领 outcome 消费它（账本已提交 + 后继不干净）：" + String(wired.commit));
+      const unc = WIRE.uncleanWired(wired);
+      assert.equal(unc.clean, false, "投影不报 clean：" + JSON.stringify(unc).slice(0, 320));
+      assert.ok(JSON.stringify(unc).includes("registry_lock_release_failed"), "回执点名释放失败：" + JSON.stringify(unc).slice(0, 320));
+    } finally { x.f.cleanup(); }
+  });
 }
 
 sealSummary();

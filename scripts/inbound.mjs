@@ -63,7 +63,7 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1, wirePromoteBinding, wireVoid, uncleanWired } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wirePromoteAuthoritative, m1aWriteRoute, uncleanWired } from "./m1a/wiring.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -502,39 +502,71 @@ if (!routed.ok) {
   //   locator=被认领代际根消息 om（matched_om）；claimKey=claim.mjs 64hex；authorizedBy=event.sender_id。
   //   W2（B3 已 active 换会话再认领）只把 aliases.session_id 改到 event.session_id（受验新 Aily 会话 locator）——
   //   认领现场不铸临时 UUID/不碰 binding_target；ledger 侧 claude_session_id 的 retarget 归 Phase 2 配对写方（§5.1）。
-  const wired = wirePromoteBinding({
-    endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
-    env: process.env,
-    legacy: () => promoteBinding({
-      root: promo.root,
-      id: promo.id,
-      source: promo.source,
-      generationId: promo.generationId,
-      operationId: pending.operationId,
-      sessionId: event.session_id,
-    }),
-    locator: pending.generation?.root_message_id ?? null,
-    claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
-    sessionId: event.session_id ?? null,
-    authorizedBy: event.sender_id ?? null,
-    f4: promo.f4 ?? null,
-    // #R37 P1-1②：锁内重核六件事。调用侧 evaluatePromotion 在取锁前算（只作路由/旁路用，结论可能被竞态
-    //   作废）；取得 outer 锁、legacy 前这里重跑 findPendingBinding + evaluatePromotion（用锁内时刻的 now，
-    //   重核新鲜度/唯一可认领/来源受验等全部六条）。拒 → 整笔 fail-closed（不跑 legacy、不写 shadow、不归并）。
-    //   通过 → 其给出的 f4 全权替代调用侧 f4（锁内结论优先），配合 wirePromoteBinding 侧 f4Ok 的
-    //   matched_om===locator 复核，locator 若在锁前被改 → bad_f4 兜底。
-    verify: () => {
-      const nowVerify = Date.now();
-      const pendingVerify = findPendingBinding({ content: event.content, now: nowVerify });
-      if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
-      // #守卫①：这里已在锁内 = 端点有 init 收据（已启用）。owner_root_no_token_v1 已停产后，无码认领（only_pending）
-      //   没有可写的诚实配对证明 —— 整笔拒（legacy 不跑、shadow 不写、B1 保持 pending）。
-      if (pendingVerify.matchedBy === "only_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
-      const promoVerify = evaluatePromotion({ event, template, pending: pendingVerify, now: nowVerify });
-      if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
-      if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
-      return { ok: true, f4: promoVerify.f4 };
-    },
+  const promoteEndpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+  // PK2-W1：判源分派 —— authoritative 走认领复合（账本 create_a1→activate 在前，索引/sidecar 在后）；
+  //   shadow / 未接入走原路径（一字未改）。
+  const wired = (m1aWriteRoute({ endpointId: promoteEndpointId, env: process.env }).mode === "authoritative")
+    ? wirePromoteAuthoritative({
+        endpointId: promoteEndpointId,
+        env: process.env,
+        locator: pending.generation?.root_message_id ?? null,
+        claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
+        sessionId: event.session_id ?? null,
+        authorizedBy: event.sender_id ?? null,
+        f4: promo.f4 ?? null,
+        verify: () => {
+          const nowVerify = Date.now();
+          const pendingVerify = findPendingBinding({ content: event.content, now: nowVerify });
+          if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+          if (pendingVerify.matchedBy === "only_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
+          const promoVerify = evaluatePromotion({ event, template, pending: pendingVerify, now: nowVerify });
+          if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
+          if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+          return { ok: true, f4: promoVerify.f4 };
+        },
+        // ② 索引更新：现行 promoteBinding（自带锁内重读 + 局部更新），一字未改。
+        publishIndex: () => promoteBinding({
+          root: promo.root,
+          id: promo.id,
+          source: promo.source,
+          generationId: promo.generationId,
+          operationId: pending.operationId,
+          sessionId: event.session_id,
+        }),
+      })
+    : wirePromoteBinding({
+        endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
+        env: process.env,
+        legacy: () => promoteBinding({
+          root: promo.root,
+          id: promo.id,
+          source: promo.source,
+          generationId: promo.generationId,
+          operationId: pending.operationId,
+          sessionId: event.session_id,
+        }),
+        locator: pending.generation?.root_message_id ?? null,
+        claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
+        sessionId: event.session_id ?? null,
+        authorizedBy: event.sender_id ?? null,
+        f4: promo.f4 ?? null,
+        // #R37 P1-1②：锁内重核六件事。调用侧 evaluatePromotion 在取锁前算（只作路由/旁路用，结论可能被竞态
+        //   作废）；取得 outer 锁、legacy 前这里重跑 findPendingBinding + evaluatePromotion（用锁内时刻的 now，
+        //   重核新鲜度/唯一可认领/来源受验等全部六条）。拒 → 整笔 fail-closed（不跑 legacy、不写 shadow、不归并）。
+        //   通过 → 其给出的 f4 全权替代调用侧 f4（锁内结论优先），配合 wirePromoteBinding 侧 f4Ok 的
+        //   matched_om===locator 复核，locator 若在锁前被改 → bad_f4 兜底。
+        verify: () => {
+          const nowVerify = Date.now();
+          const pendingVerify = findPendingBinding({ content: event.content, now: nowVerify });
+          if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+          // #守卫①：这里已在锁内 = 端点有 init 收据（已启用）。owner_root_no_token_v1 已停产后，无码认领（only_pending）
+          //   没有可写的诚实配对证明 —— 整笔拒（legacy 不跑、shadow 不写、B1 保持 pending）。
+          if (pendingVerify.matchedBy === "only_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
+          const promoVerify = evaluatePromotion({ event, template, pending: pendingVerify, now: nowVerify });
+          if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
+          if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+          return { ok: true, f4: promoVerify.f4 };
+        },
   });
   if (!wired.ok) {
     // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔披、不写 legacy、没有绑定。
@@ -547,6 +579,13 @@ if (!routed.ok) {
     finish("rejected", { reasonText }, { reason: finishReason });
   }
 
+  // PK2-W1：unclean 回执**先于** wrote.ok 分支 —— authoritative 复合是「账本已提交而后继（索引/sidecar）
+  //   失败」，那条路径会走下面的 error 出口 exit，回执不能只在成功路径上写（"不能只靠 doctor 点名"）。
+  const promoteUnclean = uncleanWired(wired);
+  if (!promoteUnclean.clean) writeReceipt("m1a-unclean-" + event.message_id, {
+    status: "unclean", legacy: wrote.ok === true ? "ok" : "failed", ...promoteUnclean,
+    claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
+  });
   const wrote = wired.legacy;
   if (!wrote.ok) {
     writeReceipt("bind-failed-" + event.message_id, {
@@ -558,12 +597,7 @@ if (!routed.ok) {
   }
 
   // #R37 P1-4：legacy 已成但 shadow 不干净（镜像步失败/非干净提交/锁残骸/release 残骸）→ 写持久机器回执，不谎报 clean。
-  const promoteUnclean = uncleanWired(wired);
-  if (!promoteUnclean.clean) writeReceipt("m1a-unclean-" + event.message_id, {
-    status: "unclean", legacy: "ok", ...promoteUnclean,
-    claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
-  });
-
+  // PK2-W1：回执已在上面提前发过（同一投影）。
   justBound = true;
   pendingMatchedBy = pending.matchedBy ?? null;
   routed = findBindingForSession({ sessionId: event.session_id });

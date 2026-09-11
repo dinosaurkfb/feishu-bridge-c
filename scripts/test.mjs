@@ -62,6 +62,7 @@ import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor, firstDanglingSymlinkInChain } from "./doctor.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
+import { resolveDeliveryTargetFromLedger, decideInboundDeliveryTarget, appendShadowDivergenceNote, classifyLedgerAuthority } from "./m1a/delivery-target.mjs"; // R66：入站投递目标解析/判源/决策
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
 import {
   claimReminderDue as tgClaimReminderDue, markPendingClaimReminder as tgMarkPendingClaimReminder,
@@ -46640,6 +46641,271 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const problem = controlCommittedUncleanRecordProblem(rec(goodEv, badAttempts), key);
     assert.ok(problem !== null, "attempts 多键必须拒");
     assert.match(problem, /repair_attempts 条目键集/u, "attempts 点名键集：" + problem);
+  });
+
+  // ── R66：入站投递目标从账本读（权威 / shadow 双模）──
+
+  test("R66 解析器：root_om 恰一命中 → record（id+binding_target）；零条 → record=null；读不出 → ledger_unavailable；多条经账本校验拒 → 仍拒", () => withLedgerD((root, dir, ids) => {
+    const r1 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_b1root", env: process.env });
+    assert.equal(r1.ok, true, JSON.stringify(r1));
+    assert.equal(r1.authority_mode, "shadow", "authority_mode 随读随带");
+    assert.deepEqual(Object.keys(r1.record).sort(), ["binding_target", "topic_agent_id"], "record 封闭两键");
+    assert.equal(r1.record.topic_agent_id, ids.b1Id);
+    assert.equal(r1.record.binding_target.claude_session_id, "00000000-0000-4000-8000-0000000000d1");
+    const r2 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_nothing", env: process.env });
+    assert.deepEqual({ ok: r2.ok, authority_mode: r2.authority_mode, record: r2.record }, { ok: true, authority_mode: "shadow", record: null }, "零条 → record=null");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const r3 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_b1root", env: process.env });
+    assert.deepEqual({ ok: r3.ok, reason: r3.reason }, { ok: false, reason: "ledger_unavailable" }, "读不出 fail-closed");
+    assert.ok(String(r3.why ?? "").length > 0, "why 点名原因");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, "ledger.json"), "utf-8"));
+    const dup = JSON.parse(JSON.stringify(raw.records[ids.b1Id]));
+    dup.topic_agent_id = "ta_" + "9".repeat(32);
+    raw.records[dup.topic_agent_id] = dup;
+    fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(raw, null, 2) + "\n", { mode: 0o600 });
+    const r4 = resolveDeliveryTargetFromLedger({ endpointId: EP57D, rootOm: "om_b1root", env: process.env });
+    assert.equal(r4.ok, false, "多条 → 拒（G3 locator 全局唯一，账本校验 fail-closed，结果层面同为拒）：" + JSON.stringify(r4).slice(0, 200));
+  }));
+
+  test("R66 决策 authoritative：UUID target → 会话（不在场 → target=null，调用方走 bound_session_gone）", () => withLedgerD((root, dir, ids) => {
+    const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66del-"), { mode: 0o700 }));
+    const sidD1 = "00000000-0000-4000-8000-0000000000d1";
+    const receipt = { ok: true, state: "ok", cutoverDone: true };
+    const resolve = () => ({ ok: true, authority_mode: "authoritative", record: { topic_agent_id: ids.b1Id, binding_target: { runtime: "claude", project_root: proj, claude_session_id: sidD1 } } });
+    const d1 = decideInboundDeliveryTarget({ receipt, endpointId: EP57D, rootOm: "om_b1root", projectRoot: proj, resolve, findLiveById: () => ({ sessionId: sidD1 }) });
+    assert.equal(d1.action, "session", JSON.stringify(d1));
+    assert.equal(d1.sessionId, sidD1, "投给账本点名的会话");
+    assert.equal(d1.target.sessionId, sidD1, "会话 live");
+    const d2 = decideInboundDeliveryTarget({ receipt, endpointId: EP57D, rootOm: "om_b1root", projectRoot: proj, resolve, findLiveById: () => null });
+    assert.equal(d2.action, "session", JSON.stringify(d2));
+    assert.equal(d2.target, null, "不在场 → target=null（bound_session_gone），不回落项目级");
+  }));
+
+  test("R66 决策 authoritative 项目级：null target → 有 pin 用 pin / 无 pin 唯一 live 顺手钉 / 多条歧义拒（文案不变）", () => withLedgerD((root, dir, ids) => {
+    const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66proj-"), { mode: 0o700 }));
+    const mkResolve = () => ({ ok: true, authority_mode: "authoritative", record: { topic_agent_id: ids.a2Id, binding_target: { runtime: "claude", project_root: proj, claude_session_id: null } } });
+    const d1 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: true }, endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => mkResolve(), readPin: () => "sess-pin", findLive: () => [{ sessionId: "sess-pin" }] });
+    assert.equal(d1.action, "project", JSON.stringify(d1));
+    assert.equal(d1.picked.ok, true, "有 pin 用 pin");
+    assert.equal(d1.picked.session.sessionId, "sess-pin");
+    assert.equal(d1.picked.pin, null, "pinned 支不重复钉");
+    const d2 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: true }, endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => mkResolve(), readPin: () => null, findLive: () => [{ sessionId: "sess-only" }] });
+    assert.equal(d2.picked.ok, true, "唯一 live 投");
+    assert.equal(d2.picked.pin, "sess-only", "顺手钉");
+    const d3 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: true }, endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => mkResolve(), readPin: () => null, findLive: () => [{ sessionId: "x" }, { sessionId: "y" }] });
+    assert.equal(d3.picked.ok, false, "多条不投");
+    assert.equal(d3.picked.reason, DELIVERY_REJECT.AMBIGUOUS, "歧义拒（复用既有 reason/文案）");
+  }));
+
+  test("R66 决策 authoritative fail-closed：账本读不出 / 记录缺席 → reject ledger_route_unavailable，绝不回退 legacy mapping", () => withLedgerD((root, dir, ids) => {
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const d1 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: true }, endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid-still-there", projectRoot: root, env: process.env });
+    assert.deepEqual({ action: d1.action, reason: d1.reason }, { action: "reject", reason: "ledger_route_unavailable" }, "读不出 → 拒（legacy 有 sid 也不用）：" + JSON.stringify(d1));
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    const d2 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: true }, endpointId: EP57D, rootOm: "om_no_such_topic", legacySessionId: "legacy-sid", projectRoot: root, env: process.env });
+    assert.equal(d2.action, "reject", "记录缺席 → 拒：" + JSON.stringify(d2));
+    assert.equal(d2.reason, "ledger_route_unavailable", "同一拒收 reason");
+  }));
+
+  test("R66 决策 shadow：分歧/一致/读不出 → 行为同 legacy + divergence 标注；notes 追加 divergence 行（best-effort）", () => withLedgerD((root, dir, ids) => {
+    const d1 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: false }, endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid", env: process.env });
+    assert.equal(d1.action, "legacy", "shadow 行为不变");
+    assert.deepEqual(d1.divergence, { ledger: "00000000-0000-4000-8000-0000000000d1", legacy: "legacy-sid" }, "分歧标注");
+    const d2 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: false }, endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "00000000-0000-4000-8000-0000000000d1", env: process.env });
+    assert.equal(d2.action, "legacy");
+    assert.equal(d2.divergence, null, "一致 → 无该行");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const d3 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: false }, endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid", env: process.env });
+    assert.equal(d3.action, "legacy", "读不出也只记不改行为");
+    assert.deepEqual(d3.divergence, { ledger: null, legacy: "legacy-sid", ledger_unavailable: true }, "读不出记一行");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+    const nf = path.join(root, "notes.log");
+    assert.equal(appendShadowDivergenceNote({ noteFile: nf, divergence: d3.divergence }), true, "notes 追加成功");
+    assert.match(fs.readFileSync(nf, "utf-8"), /delivery_target_shadow_divergence ledger=null legacy=legacy-sid ledger_unavailable=true/u, "行格式");
+    assert.equal(appendShadowDivergenceNote({ noteFile: nf, divergence: null }), false, "无分歧不写");
+  }));
+
+  test("R66 返修一 P1-1 矩阵：classifyLedgerAuthority 四态——非 ok 收据一律拒、never_initialized=legacy、init-only/cutover 与账本模式交叉", () => {
+    for (const bad of [{ ok: false, state: "unreadable", why: "x" }, { ok: false, state: "duplicate_or_conflict", why: "x" }, { ok: false, state: "in_progress_foreign", why: "x" }, null]) {
+      const c = classifyLedgerAuthority({ receipt: bad, ledgerMode: null });
+      assert.equal(c.mode, "reject", JSON.stringify(bad) + " → 拒：" + JSON.stringify(c));
+      assert.match(String(c.why), /收据/u, "why 点名收据态");
+    }
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "never_initialized" }, ledgerMode: null }).mode, "legacy", "未接入 → legacy");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "never_initialized" }, ledgerMode: "authoritative" }).mode, "legacy", "未接入不读账本——ledgerMode 无意义");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "ok", cutoverDone: false }, ledgerMode: null }).mode, "shadow", "init-only + 未读 → shadow");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "ok_in_progress", cutoverDone: false }, ledgerMode: "shadow" }).mode, "shadow", "ok_in_progress 同 init-only 口径");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "ok", cutoverDone: false }, ledgerMode: "authoritative" }).mode, "reject", "init-only + 账本 authoritative → 拒");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "ok", cutoverDone: true }, ledgerMode: "authoritative" }).mode, "authoritative", "cutover + 账本 authoritative → 权威");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "ok", cutoverDone: true }, ledgerMode: null }).mode, "reject", "cutover + 账本读不出 → 拒");
+    assert.equal(classifyLedgerAuthority({ receipt: { ok: true, state: "ok", cutoverDone: true }, ledgerMode: "shadow" }).mode, "reject", "cutover + 账本 shadow → 拒");
+  });
+
+  test("R66 返修一 P1-1 决策交叉核：收据 cutover + 账本 shadow → 拒；init-only + 账本 authoritative → 拒；shadow + 账本读不出 → 只记不拒", () => withLedgerD((root, dir, ids) => {
+    const d1 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: true }, endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid", projectRoot: root, env: process.env });
+    assert.deepEqual({ action: d1.action, reason: d1.reason }, { action: "reject", reason: "ledger_route_unavailable" }, JSON.stringify(d1));
+    assert.match(d1.why, /shadow|authority_mode/u, "why 点名账本模式：" + d1.why);
+    const d2 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: false }, endpointId: EP57D, rootOm: "om_b1root", projectRoot: root, resolve: () => ({ ok: true, authority_mode: "authoritative", record: null }) });
+    assert.deepEqual({ action: d2.action, reason: d2.reason }, { action: "reject", reason: "ledger_route_unavailable" }, JSON.stringify(d2));
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o644);
+    const d3 = decideInboundDeliveryTarget({ receipt: { ok: true, state: "ok", cutoverDone: false }, endpointId: EP57D, rootOm: "om_b1root", legacySessionId: "legacy-sid", projectRoot: root, env: process.env });
+    assert.equal(d3.action, "legacy", "shadow + 账本读不出 → 只记不拒");
+    assert.equal(d3.divergence.ledger_unavailable, true, "divergence 带上不可读标注");
+    fs.chmodSync(path.join(dir, "ledger.json"), 0o600);
+  }));
+
+  test("R66 返修一 P1-2：authoritative 下核 binding_target.project_root（realpath 等式）——不符 → 拒不静默切项目；相等 → 放行", () => withLedgerD((root, dir, ids) => {
+    const proj = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66p1-"), { mode: 0o700 }));
+    const receipt = { ok: true, state: "ok", cutoverDone: true };
+    const rec = (targetRoot) => ({ ok: true, authority_mode: "authoritative", record: { topic_agent_id: ids.b1Id, binding_target: { runtime: "claude", project_root: targetRoot, claude_session_id: "00000000-0000-4000-8000-0000000000d1" } } });
+    const d1 = decideInboundDeliveryTarget({ receipt, endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => rec("/other/project"), findLiveById: () => ({ sessionId: "s" }) });
+    assert.deepEqual({ action: d1.action, reason: d1.reason }, { action: "reject", reason: "ledger_route_unavailable" }, "项目根不符 → 拒：" + JSON.stringify(d1));
+    assert.match(d1.why, /项目根/u, "why 点名项目根：" + d1.why);
+    const d2 = decideInboundDeliveryTarget({ receipt, endpointId: EP57D, rootOm: "om_x", projectRoot: proj, resolve: () => rec(proj), findLiveById: () => ({ sessionId: "s" }) });
+    assert.equal(d2.action, "session", "项目根相等 → 放行：" + JSON.stringify(d2));
+  }));
+
+  test("R66 未接入 M1a：authorityMode=null → 纯 legacy，账本连 open 都不发生（解析器零调用探针）", () => {
+    let calls = 0;
+    const d = decideInboundDeliveryTarget({ receipt: { ok: true, state: "never_initialized" }, endpointId: "endpoint_" + "6".repeat(24), rootOm: "om_any", resolve: () => { calls += 1; return { ok: false, reason: "ledger_unavailable" }; } });
+    assert.equal(calls, 0, "未接入 → 解析器一次都不调");
+    assert.deepEqual(d, { action: "legacy", divergence: null });
+  });
+
+  // ── R66 返修一 P2：真入口行为钉（aily-inbound 全流程，替换源码字符串断言）──
+
+  test("R66 返修一 P2 真入口（T7-T11）：收据四态 × 账本模式 × 项目根等式——拒收/legacy 行为从入口跑出来", () => {
+    const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66entry-")));
+    const root = path.join(local, "project"); const bin = path.join(local, "bin");
+    fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin, { recursive: true });
+    const TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t", outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "7621020633916345545", chat_name: "群", chat_id: "oc_r66", default_freshness_ms: 900000, agent_uid: "agent_r66" };
+    const ledgerDir = path.join(local, "ledger"); fs.mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+    const maintDir = path.join(local, "maint"); fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const templateFile = path.join(local, "chain-config.json");
+    fs.writeFileSync(templateFile, JSON.stringify(TPL));
+    const sid = "00000000-0000-4000-8000-0000000000d1";
+    const registryFile = path.join(local, "registry.json");
+    fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "r66", root, name: "R66 投递", root_message_id: "om_r66", session_id: "aily_r66", claude_session_id: sid, inbound_state: "bound", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] }));
+    fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+    const endpoint = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+    // 账本骨架 + B1（root_om=om_r66，binding_target 指向本项目 + UUID）
+    const epDir = path.join(ledgerDir, endpoint); fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+    const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: endpoint, chain: "claude", authority_mode: "shadow", revision: 2, operations: {
+      "00000000-0000-4000-8000-0000000006d1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r66_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: endpoint, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+      "00000000-0000-4000-8000-0000000006d2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r66_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r66_up", endpoint, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint, from_schema: "1.0", to_schema: "1.1-transition" } },
+    }, records: {} };
+    fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
+    const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => Date.parse("2026-09-20T00:00:00.000Z") });
+    if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+    assert.ok(b1.ok, "B1 夹具：" + JSON.stringify(b1));
+    // 收据夹具：init journal（终态）→ 恰好 init-only；surgeryCutoverJournal 造 cutover 终态
+    const initTok = "00000000-0000-4000-8000-0000000006e1";
+    const ats = "2026-09-20T00:00:00.000Z"; const sha = "b".repeat(64);
+    const initDoc = () => {
+      const initState = (over = {}) => ({ endpoint_id: endpoint, operation_id: initTok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+      const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
+      const sDone = (c) => ({ id: "stub:" + c, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + initTok, after: "versions/maintenance-" + initTok, state: "done", at: ats, chain: null });
+      const cDone = (c) => ({ id: "current:" + c, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + initTok, after: "versions/maintenance-" + initTok, state: "done", at: ats, chain: null });
+      const gDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: initTok }, after: { token: initTok, txnUncleared: null }, state: "done", at: ats, chain: null });
+      const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+      const lStep = { id: "ledger:" + endpoint + ":init", kind: "ledger", target: endpoint, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at: ats, chain: "claude" };
+      return { schema_version: "1.2", operation_kind: "ledger_init", token: initTok, reason: "r66", started_at: ats, updated_at: ats, phase: "done", steps: [...["claude", "codex"].flatMap((c) => [tDone(c), sDone(c), cDone(c)]), gDone(), lStep], notes: [] };
+    };
+    const writeJournal = (d) => fs.writeFileSync(path.join(maintDir, d.token + ".json"), JSON.stringify(d, null, 2) + "\n", { mode: 0o600 });
+    const rmJournals = () => { for (const f of fs.readdirSync(maintDir)) fs.rmSync(path.join(maintDir, f), { force: true }); };
+    const plantInit = () => { rmJournals(); writeJournal(initDoc()); };
+    const plantCutover = () => { plantInit(); writeJournal(surgeryCutoverJournal(maintDir, initTok, endpoint)); };
+    const plantInProgress = () => {
+      rmJournals(); plantInit();
+      const progTok = "66666666-6666-4666-8666-666666666666";
+      const d = JSON.parse(JSON.stringify(JSON.parse(fs.readFileSync(path.join(maintDir, initTok + ".json"), "utf-8"))).split(initTok).join(progTok));
+      d.operation_kind = "ledger_cutover"; d.phase = "ledger_cutting_over"; d.started_at = ats; d.updated_at = ats;
+      const ls = d.steps.find((st) => st.kind === "ledger");
+      ls.id = "ledger:" + endpoint + ":cutover"; ls.state = "done";
+      writeJournal(d);
+    };
+    const plantUnreadable = () => { rmJournals(); plantInit(); fs.writeFileSync(path.join(maintDir, "00000000-0000-4000-8000-0000000006f1.json"), "{ not json", { mode: 0o600 }); };
+    const run = (messageId) => {
+      const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 帮我核对 " + messageId;
+      const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+        id: messageId, sessionID: "aily_r66", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content,
+      } }) }] });
+      return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+        encoding: "utf-8", timeout: 20000,
+        env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir,
+          AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_r66", AILY_CLI_RUN_ID: "run_r66", FAKE_AILY_ENVELOPE: envelope },
+      });
+    };
+    const lastReceipt = (prefix) => {
+      const dir66 = path.join(root, ".runtime-data", "inbound", "receipts");
+      const f = fs.readdirSync(dir66).filter((x) => x.startsWith(prefix)).sort().at(-1);
+      return f ? JSON.parse(fs.readFileSync(path.join(dir66, f), "utf-8")) : null;
+    };
+    const expectReject = (messageId) => {
+      const r = run(messageId);
+      assert.equal(r.error, undefined, messageId + " 不允许挂起/崩溃：" + String(r.stderr ?? r.error));
+      const rec = lastReceipt("ledger-route-" + messageId);
+      assert.ok(rec, messageId + " 有 ledger-route 拒收回执：" + JSON.stringify((r.stdout ?? "").slice(-200)));
+      assert.equal(rec.status, "rejected", messageId + " status rejected");
+      assert.equal(rec.reason, "ledger_route_unavailable", messageId + " reason");
+      assert.equal(rec.handed_off, false, messageId + " 未投递");
+      assert.equal(fs.existsSync(path.join(root, ".runtime-data", "inbound", "delivery-claims", claimKey(messageId, "r66") + ".consumed.json")), false, messageId + " 不写 consumed");
+      return rec;
+    };
+    // T7 收据 unreadable：坏 journal → 拒收；legacy mapping 明明有 sid 也不投
+    plantUnreadable();
+    expectReject("om_r66t7");
+    // T8 收据 in-progress（进行中的 cutover journal）→ 拒收
+    plantInProgress();
+    expectReject("om_r66t8");
+    // T9a 收据 cutover 但账本仍 shadow → 模式不符拒
+    plantCutover();
+    expectReject("om_r66t9a");
+    // T9b 收据 init-only 但账本 authoritative（cutoverPlan 造合法权威账本）→ 模式不符拒
+    fs.rmSync(path.join(maintDir, "66666666-6666-4666-8666-666666666666.json"), { force: true }); // 只留 init → init-only
+    plantInit();
+    {
+      const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+      process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
+      try {
+        const lp = TAL.loadLedger(epDir, { endpointId: endpoint });
+        assert.equal(lp.ok, true, "T9b 读回账本：" + JSON.stringify(lp.why ?? null));
+        const plan = TAL.cutoverPlan({ endpointId: endpoint, chain: "claude", requestKey: "r66_cut", operationId: "00000000-0000-4000-8000-0000000006d3", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: "e".repeat(64), sidecarShas: { expiry: "e".repeat(64), pending_claims: "f".repeat(64), policy: "a".repeat(64) } });
+        assert.ok(plan.ok, "T9b cutoverPlan：" + JSON.stringify(plan));
+        fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(plan.doc, null, 2) + "\n", { mode: 0o600 });
+      } finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+    }
+    expectReject("om_r66t9b");
+    // T11 项目根等式：账本 target 指向别的项目 → 拒；指回本项目 → 过项目核（会话不在场 → bound_session_gone，非 ledger_route_unavailable）
+    {
+      const f = path.join(epDir, "ledger.json");
+      const rawDoc = JSON.parse(fs.readFileSync(f, "utf-8"));
+      const other = fs.mkdtempSync(path.join(os.tmpdir(), "r66other-"), { mode: 0o700 });
+      const tampered = JSON.parse(JSON.stringify(rawDoc));
+      for (const rr of Object.values(tampered.records)) if (rr.binding_target) rr.binding_target.project_root = path.join(other, "elsewhere");
+      fs.writeFileSync(f, JSON.stringify(tampered, null, 2) + "\n", { mode: 0o600 });
+      expectReject("om_r66t11a");
+      fs.writeFileSync(f, JSON.stringify(rawDoc, null, 2) + "\n", { mode: 0o600 });
+      plantCutover(); // 相等支收据与账本同为 authoritative，排除判源干扰、单测项目根等式
+      const r = run("om_r66t11b");
+      assert.equal(r.error, undefined, "T11 相等支不挂起");
+      const rec = lastReceipt("bound-session-gone-om_r66t11b");
+      assert.ok(rec, "T11 相等 → 过项目核，走 bound_session_gone（会话不在场）：" + JSON.stringify((r.stdout ?? "").slice(-200)));
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+    // T10 never_initialized：零账本读取（FIFO 探针——若入口读了账本路径会挂起到超时）且走 legacy
+    rmJournals(); // 无任何收据 → never_initialized
+    fs.rmSync(path.join(epDir, "ledger.json"), { force: true });
+    execFileSync("mkfifo", [path.join(epDir, "ledger.json")]);
+    const r10 = run("om_r66t10");
+    assert.equal(r10.error, undefined, "T10 未接入不读账本（FIFO 未被 open，不挂起）：" + String(r10.error ?? ""));
+    const rec10 = lastReceipt("bound-session-gone-om_r66t10");
+    assert.ok(rec10, "T10 走 legacy（会话级 sid 不在场 → bound_session_gone）：" + JSON.stringify((r10.stdout ?? "").slice(-200)));
+    fs.rmSync(path.join(epDir, "ledger.json"), { force: true });
+    fs.rmSync(local, { recursive: true, force: true });
   });
 
   test("R57d 返修六 P1-3：consumed 写失败的证据联合闭合——authoritative osh 落 not_applicable 合法 unclean；rfh 成功返回自带完整 detail", () => withLedgerD((root, dir, ids) => {

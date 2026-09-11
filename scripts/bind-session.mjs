@@ -35,8 +35,10 @@ import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { mutateSidecarEntry, readSidecarStore } from "./m1b/sidecar-store.mjs";
-import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
+import { canonKey, loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
+import { validateTopicGenerationState } from "./topic-generation.mjs";
 import { withRegistryTransaction } from "./topic-generation-store.mjs";
+import { foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { stableStringify } from "./policy-store/canonical.mjs"; // 值比对用键序无关的规范序列化（同一份，不另写）
 import { legacyEndpointId } from "./subscription.mjs";
 import {
@@ -167,7 +169,7 @@ const sameSidecarValue = (cur, expected) => stableStringify(normSidecarValue(cur
  *   · 不完整时的动作分两种：pending → `repair`（走同一幂等复合补齐）；active → `reject`
  *     （**绝不重跑复合** —— 那会把已认领的工作线退回待认领，也会拿索引快照覆盖 parity 侧的事实）。
  */
-const authoritativeBindingState = (entry) => {
+const authoritativeBindingState = (entry, { barrier = false } = {}) => {
   if (!entry?.root_message_id) return { ok: false, why: "这条登记行没有根话题", action: "repair" };
   if (writeRoute.mode !== "authoritative") return { ok: true, why: "非 authoritative（行为与 main 一致）", action: null };
   const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
@@ -180,21 +182,42 @@ const authoritativeBindingState = (entry) => {
   const ta = resolved.id;
   const expectedExpiry = normSidecarValue(entry.expires_at);
   const expectedClaim = active ? null : { token: entry.pending_token ?? null, claim_expires_at: null };
-  // 零写屏障 = 锁内重读 + 逐字比对 + `changed:false`（不写一个字节，只把目录 fsync 补做一次）。
-  const barrier = (name, expected) => {
+  // 只读比对（预览路径用的就是它）：不取 sidecar 锁、不 fsync、不建任何文件 —— 预览必须零写（P1-B）。
+  const compare = (name, expected) => {
+    const cur = readSidecarStore({ endpointId, name, env: process.env });
+    if (cur.ok !== true) return { ok: false, why: name + " 读不出（" + String(cur.reason ?? "unknown") + "）" };
+    const present = cur.absent === true ? null : (Object.prototype.hasOwnProperty.call(cur.entries ?? {}, ta) ? cur.entries[ta] : null);
+    if (!sameSidecarValue(present, expected)) return { ok: false, why: name + " 现场值与索引行不符" };
+    return { ok: true };
+  };
+  // 零写屏障（只在 --apply、且已在 outer 锁内）：锁内重读 + 逐字比对 + `changed:false`
+  //   —— 不写一个字节，要的就是那次目录 fsync（P1-5①：上一笔可能正是死在 rename 之后的目录 fsync 上）。
+  const doBarrier = (name, expected) => {
     const r = mutateSidecarEntry({ endpointId, name, key: ta, env: process.env,
       mutate: (cur) => (sameSidecarValue(cur, expected)
         ? { ok: true, changed: false }
         : { ok: false, reason: "sidecar_state_drift", why: name + " 现场值与索引行不符（锁内重读）" }) });
     return r.ok === true ? { ok: true } : { ok: false, why: name + " 没成（" + String(r.reason ?? "unknown") + "）" };
   };
-  const bad = [barrier("pending-claims", expectedClaim), barrier("expiry", expectedExpiry)].find((b) => b.ok !== true);
+  // 先**只读**比对两项；漂移 → 立即返回（一个字节都不碰：接下来要么拒、要么走补齐复合，
+  //   那边的 sidecar 写自带目录 fsync，不需要这里再补屏障）。
+  const bad = [compare("pending-claims", expectedClaim), compare("expiry", expectedExpiry)].find((b) => b.ok !== true);
   if (bad !== undefined) {
     return { ok: false, why: bad.why, action: active ? "reject" : "repair", active };
   }
-  return { ok: true, why: active ? "已认领、sidecar 与索引逐字一致、屏障已重做" : "待认领、sidecar 与索引逐字一致、屏障已重做", action: null, active };
+  if (!barrier) {
+    return { ok: true, action: null, active, why: (active ? "已认领" : "待认领") + "、sidecar 与索引逐字一致（只读判定）" };
+  }
+  // 完整时才补那次**零写目录屏障**（P1-5①：上一笔可能正是死在 rename 之后的目录 fsync 上）。
+  const barrierBad = [doBarrier("pending-claims", expectedClaim), doBarrier("expiry", expectedExpiry)].find((b) => b.ok !== true);
+  if (barrierBad !== undefined) {
+    return { ok: false, why: barrierBad.why, action: active ? "reject" : "repair", active };
+  }
+  return { ok: true, action: null, active, why: (active ? "已认领" : "待认领") + "、sidecar 与索引逐字一致、屏障已重做" };
 };
-if (already?.root_message_id) {
+
+if (already?.root_message_id && !apply) {
+  // PK2-W1-fix4 P1-B：预览一律**只读** —— 状态判定不取 sidecar 锁、不 fsync、不建任何文件。
   const state = authoritativeBindingState(already);
   if (state.ok) {
     console.log("这条会话已经绑过了，没有重复建话题。");
@@ -206,9 +229,10 @@ if (already?.root_message_id) {
     die("这条会话的绑定现场与索引行不一致（" + state.why + "）—— 已认领的工作线不会重跑绑定复合",
       "重跑会把它退回待认领并用索引快照覆盖 sidecar；先人工核对 ledger/<endpoint>/ 下的 sidecar，或等 I2/I3 切换后再修。");
   }
-  console.log("这条会话的绑定不完整（" + state.why + "）—— 按同一幂等键再跑一次补齐。");
+  console.log("这条会话的绑定不完整（" + state.why + "）—— 带 --apply 再跑同一条命令补齐。");
   console.log("  续用原事实：bound_at / expires_at / pending_token（含待认领代际）从既有索引行取，不重新生成。");
 }
+// --apply：既有行只当预览素材；「冻结行 + 完整性 + repair/reject」一律在 outer 锁内定（P1-A，见 decideInLock）。
 
 const identity = readProjectIdentity({ root });
 const name = arg("name") ?? (identity.name + " · " + me.name);
@@ -247,24 +271,74 @@ const createTopic = () => {
     return { ok: false, reason: "send_failed", message: err.message };
   }
 };
+// PK2-W1-fix3 P1 + fix4 P1-A：条目模板**只在 outer 锁内确定**（见 decideInLock）：
+//   ① 索引行不存在 → 新模板（`indexEntry(占位)`，首跑）；② 索引行在 → **那一行本身**（冻结
+//   `bound_at` / `expires_at` / `pending_token` 与代际那段）。锁外只打印预览，不下任何结论。
+//   冻结的意义（fix3）：补齐不许重新 `newSessionEntry()` —— 否则同一条命令的耐久重试会暗中把授权
+//   期限往后延，代际那段也会被重生成成账本里的另一条 binding。
+const ROOT_PLACEHOLDER = "om_placeholder";
+let indexTemplate = null;   // 锁内确定：既有行（冻结）或新模板（首跑）
+let frozenRow = null;       // 锁内冻结的那一行（首跑为 null）—— 写索引前的逐字 CAS 基准
+
 const indexEntry = (rootMessageId) => newSessionEntry({
   root, name, purpose: identity.purpose, token, rootMessageId,
   claudeSessionId: me.sessionId, sessionName: me.name,
 });
-// authoritative 路径用**同一份**条目模版（同一个 now）：索引行里的 expires_at 必须与写进 expiry sidecar
-// 的那一个逐字相同 —— 两次各自 newSessionEntry 会让两边差几毫秒。
-//
-// PK2-W1-fix3 P1：**repair 路径冻结既有索引行**。模板只有两个来源：
-//   ① 首跑（索引行不存在）→ `indexEntry(占位)`，也就是新模板；
-//   ② 补齐（索引行在，只是现场不完整 / 零写目录屏障没做成）→ **那一行本身**：
-//      `bound_at` / `expires_at` / `pending_token`（进而 sidecar 的 expiry / pending-claims 值）
-//      一律从既有行取，不重新生成 —— 否则同一条命令的耐久重试会**暗中把授权期限往后延**
-//      （旧实现每次 `newSessionEntry()` 都按当时的 `Date.now()` 重算一年期）。
-//   冻结粒度是**整行**而不是那三个字段：代际那段（`topic_generation_state` 的 `created_at` /
-//   `activity`）同样是 now 派生的，重生成会把同一条工作线变成账本里的另一条 binding。
-//   既有行里 `expires_at` 不成形时**不改判**：照旧往下走 → `bad_expires_at` 拒（不静默重铸一个）。
-const ROOT_PLACEHOLDER = "om_placeholder";
-const indexTemplate = already?.root_message_id ? structuredClone(already) : indexEntry(ROOT_PLACEHOLDER);
+
+/** P2：repair 依赖的冻结字段**一次性校验**（非法即拒并点名字段）。
+ *  不许「缺 pending_token 就回退到新算的 token」—— 那会让索引行仍是 null、sidecar 写的是新 token，
+ *  两边永久不一致；代际投影（`topic_generation_state`）是补齐时唯一的话题现场来源，同样要过校验器。 */
+const frozenRowProblem = (row) => {
+  if (typeof row.root_message_id !== "string" || row.root_message_id.length === 0) return "root_message_id 不是非空字符串";
+  if (typeof row.bound_at !== "string" || Number.isNaN(Date.parse(row.bound_at))) return "bound_at 不是时间";
+  if (typeof row.expires_at !== "string" || Number.isNaN(Date.parse(row.expires_at))) return "expires_at 不是时间";
+  if (typeof row.pending_token !== "string" || row.pending_token.length === 0) return "pending_token 不是非空字符串";
+  const st = validateTopicGenerationState(row.topic_generation_state);
+  if (st.ok !== true) return "topic_generation_state 不过校验器（" + (st.problems ?? []).join("、") + "）";
+  return null;
+};
+
+/** 锁内**新鲜读**登记表里这一行（不用启动时那份快照 —— P1-A 的起点）。读不出就返 null（当首跑）。 */
+const readRowNow = () => {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    return (fresh.projects ?? []).find((p) => p?.claude_session_id === me.sessionId) ?? null;
+  } catch { return null; }
+};
+
+/**
+ * PK2-W1-fix4 P1-A：**冻结行在 outer 锁内确定**。整段「读既有行 → 校验冻结字段 → 判完整性 →
+ *   决定 repair / reject / 已完成」都跑在 `m1a-order` 锁内（`wireBindAuthoritative` 的 prepare 槽位）：
+ *   锁外那份快照只够打印预览。交错场景（另一路 promote 在本进程「读」与「写」之间把这一行改成
+ *   active 并删掉待认领条目）因此落在锁之前 —— 锁内重读看得见它，判定成「已完整」→ 零写中止，
+ *   既不把 active 覆盖回 pending，也不复活待认领条目。
+ *   这里只读（判定用的屏障那次写入属于 --apply 的路径，符合 P1-B：预览零写）。
+ * @returns {{ok:true, pendingToken:string, expiresAt:string}|{ok:false, reason:string, why:string}}
+ */
+const decideInLock = () => {
+  const rowNow = readRowNow();
+  if (rowNow === null || !rowNow.root_message_id) {
+    indexTemplate = indexEntry(ROOT_PLACEHOLDER);   // 首跑：新模板（now 也在锁内取）
+    frozenRow = null;
+    return { ok: true, pendingToken: indexTemplate.pending_token, expiresAt: indexTemplate.expires_at };
+  }
+  const state = authoritativeBindingState(rowNow, { barrier: true });
+  if (state.ok === true) return { ok: false, reason: "already_bound", why: state.why };
+  if (state.action === "reject") return { ok: false, reason: "binding_state_reject", why: state.why };
+  // P2：**只有真要补齐（repair）时**才校验冻结字段 —— 已认领的行 `pending_token` 为 null 是合法的
+  //   （token 已被消费），那时既不用它也不改它。非法即拒并点名字段，绝不回退到新算的 token。
+  const bad = frozenRowProblem(rowNow);
+  if (bad !== null) {
+    return { ok: false, reason: "bad_frozen_row",
+      why: "既有索引行的冻结字段非法（" + bad + "）—— 拒：不覆盖也不重铸（先人工核对这一行）" };
+  }
+  console.log("这条会话的绑定不完整（" + state.why + "）—— 按同一幂等键再跑一次补齐。");
+  console.log("  续用原事实：bound_at / expires_at / pending_token（含待认领代际）从既有索引行取，不重新生成。");
+  frozenRow = rowNow;                               // 补齐路径：冻结这一行
+  indexTemplate = rowNow;
+  return { ok: true, pendingToken: rowNow.pending_token, expiresAt: rowNow.expires_at };
+};
+
 // 模板里那个占位根 om → 真 om。**不能只换顶层 root_message_id**：行内嵌的 topic_generation_state 是
 //   **这一行自己的**投影，代际里的 root_message_id 也是同一个话题的 om。留着占位的后果是真入口上的：
 //   `findPendingBinding` 读 generation.root_message_id → 认领现场指向一个**不存在**的话题
@@ -275,20 +349,34 @@ const retargetRoot = (node, rootMessageId) => (node !== null && typeof node === 
     ? node.map((v) => retargetRoot(v, rootMessageId))
     : Object.fromEntries(Object.entries(node).map(([k, v]) => [k, k === "root_message_id" && v === ROOT_PLACEHOLDER ? rootMessageId : retargetRoot(v, rootMessageId)]))
   : node);
-// ③ 索引行 upsert（authoritative 路径）：**锁内重读当前文件再局部更新**（不许拿锁外那份快照写回 ——
-//   两笔并发 bind 被 outer 串行后，后一笔仍会用陈旧快照盖掉前一笔）。同会话已有行 → 就地覆盖（幂等重跑）。
+// ③ 索引行 upsert（authoritative 路径）：**锁内重读 + 对冻结行逐字 CAS** 才允许覆盖。
+//   withRegistryTransaction 自己的锁内重读只保证"读的是最新一版"，不保证"这一行还是我冻结的那一行"——
+//   PK2-W1-fix4 P1-A：谁在两拍之间改了这一行（另一路写方/旁路），一律 `cas_mismatch` 拒，不覆盖别人的事实。
 const publishIndex = ({ rootMessageId }) => {
+  if (indexTemplate === null) {
+    return { ok: false, reason: "no_index_template", why: "索引模板还没在锁内确定（prepare 没跑）—— 拒，不写" };
+  }
   const entry = { ...retargetRoot(indexTemplate, rootMessageId), root_message_id: rootMessageId };
   const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
     const rows = reg.projects;
     const at = rows.findIndex((p) => p?.claude_session_id === me.sessionId || (p?.root === entry.root && p?.id === entry.id));
+    if (frozenRow === null) {
+      // 首跑：锁内读说"我没有行"，写时却看见**我自己**的行 → 有人在这两拍之间插了行，不覆盖。
+      //   （行只按 root+id 撞上、而 claude_session_id 是**别的会话**：这是既有查找面的语义，不在这里改。）
+      if (at >= 0 && rows[at]?.claude_session_id === me.sessionId) {
+        return { ok: false, reason: "cas_mismatch", why: "锁内没有该会话的索引行，写索引时却出现了 —— 不覆盖" };
+      }
+    } else if (at < 0 || canonKey(rows[at]) !== canonKey(frozenRow)) {
+      return { ok: false, reason: "cas_mismatch", why: "索引行在「锁内冻结」与「写索引」之间被改过 —— 不覆盖（先核对再重跑）" };
+    }
     if (at >= 0) rows[at] = { ...rows[at], ...entry };
     else rows.push(entry);
     return { ok: true, changed: true };
   } });
-  if (!done.ok) return { ok: false, reason: done.reason ?? "registry_unwritable", why: done.error ?? null };
+  if (!done.ok) return { ok: false, reason: done.reason ?? "registry_unwritable", why: done.why ?? done.error ?? null };
   return { ok: true, count: done.count ?? null };
 };
+
 // PK2-W1：判源分派 —— authoritative 走复合（账本先于索引），shadow / 未接入走原路径（一字未改）。
 const wired = writeRoute.mode === "authoritative"
   ? wireBindAuthoritative({
@@ -300,8 +388,9 @@ const wired = writeRoute.mode === "authoritative"
       //   与 legacy 快照的 registry 分支（entry.id + "@registry"）不再是同一算法 —— 那只适用于切换前
       //   已存在的旧行，切后新建的以账本这条 lineage 为准。
       lineageId: path.basename(root) + "@" + me.sessionId + "@registry", chatId: template.chat_id, bindingTarget: bindTarget,
-      // 待认领值取模版（首跑=新铸；补齐=既有索引行冻结值）——sidecar 两侧据此 changed:false，不重写。
-      pendingToken: indexTemplate.pending_token ?? token, expiresAt: indexTemplate.expires_at,
+      // 待认领值 / 到期值 / 冻结行都由**锁内回调**给（首跑=新铸；补齐=既有行冻结值）——
+      // sidecar 两侧据此 changed:false，不重写；锁外那份快照只用于预览（P1-A）。
+      prepare: decideInLock,
       createTopic, publishIndex,
     })
   : wireBind({
@@ -329,6 +418,27 @@ const wired = writeRoute.mode === "authoritative"
         return { ok: true, root_message_id: t.root_message_id, count: registry.projects.length };
       },
     });
+// PK2-W1-fix4 P1-A：锁内判定「已完整」→ 复合**零写**中止（reason=already_bound）——按「已绑过」收口。
+//   锁没交还干净时不许报成功（与其它路径同一纪律）；这里也**不发 unclean 回执**（它不是失败）。
+if (writeRoute.mode === "authoritative" && wired.reason === "already_bound") {
+  const lockState = foldLockReleaseState(wired.release);
+  if (lockState !== "released") {
+    emitUncleanReceipt("cli_bind_session", wired, { root, claudeSessionId: me.sessionId,
+      receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
+    die("这条会话的绑定已完整，但排序锁没交还干净（" + lockState + "）—— 先 doctor",
+      "不要重跑 apply；锁残骸要人工核对。");
+  }
+  const rowNowBound = readRowNow();
+  console.log("这条会话已经绑过了，没有重复建话题。");
+  console.log("  话题  " + String(rowNowBound?.root_message_id ?? already?.root_message_id ?? "?"));
+  console.log("  入站  " + (rowNowBound?.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));
+  process.exit(0);
+}
+// 锁内判定「已认领但现场漂移」→ 拒（与预览路径同一段措辞：绝不重跑复合把已认领的退回待认领）。
+if (writeRoute.mode === "authoritative" && wired.reason === "binding_state_reject") {
+  die("这条会话的绑定现场与索引行不一致（" + String(wired.why ?? "") + "）—— 已认领的工作线不会重跑绑定复合",
+    "重跑会把它退回待认领并用索引快照覆盖 sidecar；先人工核对 ledger/<endpoint>/ 下的 sidecar。");
+}
 // PK2-W1：unclean 回执**先写** —— 账本已提交而后继失败时，后面那两条 die 分支会 exit；
 //   回执不能只长在成功路径上（"不能只靠 doctor 点名"）。
 const bindUnclean = uncleanWired(wired);

@@ -32802,7 +32802,12 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       // PK2-F7：R69 之后一次 --apply 直达提交与重开 —— 预览不得再印「停在 authority cutover 提交点之前（等逐次授权）」。
       // 旧文案会让授权者以为还要再点一次（Codex 清单第 4 条：预览不出现「未武装」语义）。
       assert.match(prevD, /提交 authority_cutover → 重开/u, "预览点名一次 --apply 直达提交与重开：" + prevD);
-      assert.match(prevD, /不可回滚、只向前/u, "预览明说不可回滚、只向前：" + prevD);
+      // PK2-F10：「不可回滚、只向前」只对**进入前向段（cutting_over）之后**成立——停定时器/切桩/建门/
+      //   converge/二次重验失败仍可安全回退，预览不许说过头（旧句「全程不可回滚」会吓退授权者）。
+      assert.match(prevD, /进入前向段后不可回滚、只向前/u, "预览明说进入前向段后不可回滚、只向前：" + prevD);
+      assert.match(prevD, /此前失败按阶段回退/u, "预览明说进入前向段前可按阶段回退：" + prevD);
+      assert.doesNotMatch(prevD, /全程不可回滚/u, "预览不得出现不限定的「全程不可回滚」：" + prevD);
+      assert.doesNotMatch(prevD, /覆盖全程，不可回滚/u, "预览不得出现旧句「覆盖全程，不可回滚」（未限定前向段）：" + prevD);
       assert.match(prevD, /账本锁内复核/u, "预览点名提交点的锁内复核：" + prevD);
       assert.doesNotMatch(prevD, /提交点之前|等逐次授权|未武装/u, "预览不得再出现「停在提交点之前 / 等逐次授权 / 未武装」：" + prevD);
       assert.equal(readActive({ dir }).state, "absent", "预览不动状态");

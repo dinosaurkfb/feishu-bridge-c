@@ -64,6 +64,9 @@ herdr agent read <pane> --source recent-unwrapped --lines 60
   「装」无效，先重新汇报再等他回。
 - **轮转 / 接入 / 切模式**：授权对象就是他发消息的那个话题所对应的精确 binding
   （项目级或工作线级，与出站同一条选择规则）；不许据此去动别的 binding。
+- **m1a-retarget --apply**（2026-09 起，PK2-I4）：把项目级绑定改成会话级的 owner 终端动作，
+  = owner 对精确 **endpoint / id / session 三元组**的逐次授权；授权对象必须是上一条汇报里
+  写明的三元组（预览不需要授权）；只认链模板 frank_sender_id，不接受命令行传入。
 - **控制命令从飞书来的精确形状**（正文**恰为**下列之一，多一个字都不算）：
   `/feishu-bind`、`/feishu-rotate`、`/feishu-rotate cancel`、`/feishu-mode dialogue`、
   `/feishu-mode mapping`、`/feishu-select`、`/feishu-select <osh_|orh_|rfh_ + 32 位十六进制>`（2026-09-09 起，PR #136：路由侧确定性处置，

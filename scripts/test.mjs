@@ -259,7 +259,8 @@ import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
 import * as SEED_MOD from "./m1a-seed.mjs";
 import { seedShadowEndpoint } from "./m1a-seed.mjs";
-import { retargetEndpoint, parseRetargetArgs, formatRetargetResult, sessionTranscriptPath } from "./m1a-retarget.mjs"; // PK2-I4：显式 owner retarget 终端命令
+import { retargetEndpoint, parseRetargetArgs, formatRetargetResult, sessionTranscriptPath, retargetRequestKey } from "./m1a-retarget.mjs"; // PK2-I4：显式 owner retarget 终端命令
+import { transcriptSlug } from "./live-session.mjs"; // PK2-I4-fix1 P2：slug 单一来源
 import { collectLegacyForCutover } from "./m1a/cutover-reconcile.mjs"; // R69 返修二 P1-A：registry/template 路径同源断言
 import * as RECON45 from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
@@ -51693,8 +51694,10 @@ const I4_TA_B = "ta_" + "2".repeat(32);
 const I4_LIN = "lin_i4";
 
 /** PK2-I4 夹具：authoritative 账本（同 lineage 两条项目级 B3/B4 live 记录）+ 真链模板 + registry/mapping
- *  + 假 transcript。账本由真蓝图造（initPlan → migrateSeed → cutoverPlan），不是手写 JSON。 */
-const i4Fixture = () => {
+ *  + 假 transcript。账本由真蓝图造（initPlan → migrateSeed → cutoverPlan），不是手写 JSON。
+ *  PK2-I4-fix1 P1-1 参数化：ledgerShadow=true 时不切权威（停回 shadow）；receipts 控制维护收据档位
+ *  （cutover = 真 init + 手术 cutover done 收据；init-only = 只 init；none = 不写收据）。 */
+const i4Fixture = ({ ledgerShadow = false, receipts = "cutover" } = {}) => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2-i4-")));
   const home = path.join(base, "home");
   const bridge = path.join(home, ".claude", "feishu-bridge");
@@ -51739,10 +51742,28 @@ const i4Fixture = () => {
   assert.equal(seed.ok, true, JSON.stringify(seed));
   const sh = TAL.loadByEndpoint(EP, { env });
   assert.equal(sh.ok, true, JSON.stringify(sh.ok ? sh.doc.authority_mode : sh));
-  const cp = TAL.cutoverPlan({ endpointId: EP, chain: "claude", requestKey: "rk_cut", operationId: cutOpId,
-    shadowDoc: sh.doc, shadowSha: sh.sha256, digest, sidecarShas: { expiry: digest, pending_claims: digest, policy: digest } });
-  assert.equal(cp.ok, true, JSON.stringify(cp));
-  write600(ledgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
+  if (ledgerShadow) {
+    write600(ledgerFile, JSON.stringify(sh.doc, null, 2) + "\n");
+  } else {
+    const cp = TAL.cutoverPlan({ endpointId: EP, chain: "claude", requestKey: "rk_cut", operationId: cutOpId,
+      shadowDoc: sh.doc, shadowSha: sh.sha256, digest, sidecarShas: { expiry: digest, pending_claims: digest, policy: digest } });
+    assert.equal(cp.ok, true, JSON.stringify(cp));
+    write600(ledgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
+  }
+  // 真 init done 收据（与 seedLedgerInitReceipt 同一形状），按档位决定是否手术成 cutover done
+  if (receipts !== "none") {
+    const initTok = "44444444-4444-4444-8444-444444444444";
+    const mkInitState = (over = {}) => ({ endpoint_id: EP, operation_id: initTok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (ch) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + initTok, after: "versions/maintenance-" + initTok, state: "done", at, chain: null });
+    const curDone = (ch) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + initTok, after: "versions/maintenance-" + initTok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: initTok }, after: { token: initTok, txnUncleared: null }, state: "done", at, chain: null });
+    const initState = mkInitState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const initStep = { id: "ledger:" + EP + ":init", kind: "ledger", target: EP, backup: null, backup_sha256: null, backup_bytes: null, before: mkInitState(), intended_after: initState, after: initState, state: "done", at, chain: "claude" };
+    const docReceipt = { schema_version: "1.2", operation_kind: "ledger_init", token: initTok, reason: "i4 夹具收据", started_at: at, updated_at: at, phase: "done", steps: [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone(), initStep], notes: [] };
+    write600(path.join(maint, initTok + ".json"), JSON.stringify(docReceipt));
+    if (receipts === "cutover") surgeryCutoverJournal(maint, initTok, EP);
+  }
   const transcript = (uuid) => {
     const file = sessionTranscriptPath({ projectRoot: proj, sessionId: uuid, env });
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -51799,7 +51820,7 @@ test("PK2-I4 T2 preview 默认零副作用：打印当前/拟改 target 与 line
     assert.match(r.stdout, /拟改后/u, r.stdout);
     assert.ok(r.stdout.includes(I4_UUID), "拟改后要打出目标 uuid：" + r.stdout);
     assert.match(r.stdout, /同 lineage  2 条会一起改/u, "同 lineage 计数（这条 fixture 恰 2 条）：" + r.stdout);
-    assert.match(r.stdout, /会话在场    是/u, r.stdout);
+    assert.match(r.stdout, /会话记录\s+存在/u, r.stdout);
     assert.match(r.stdout, new RegExp(I4_UUID + String.raw`\.jsonl`, "u"), "在场要给到 transcript 路径：" + r.stdout);
     assert.match(r.stdout, /执行：node scripts\/m1a-retarget\.mjs/u, "给下一步命令：" + r.stdout);
     assert.deepEqual(x.bytes(), before, "**预览零写**：账本字节不变");
@@ -51807,7 +51828,7 @@ test("PK2-I4 T2 preview 默认零副作用：打印当前/拟改 target 与 line
     // 会话不在场：只标注 + 预告 --apply 会拒，仍退出码 0（预览不拦）
     const r2 = x.runCli(["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID_OTHER]);
     assert.equal(r2.status, 0, "不在场也是预览成功：" + r2.stdout + r2.stderr);
-    assert.match(r2.stdout, /会话在场    \*\*否\*\*/u, r2.stdout);
+    assert.match(r2.stdout, /会话记录\s+不存在/u, r2.stdout);
     assert.match(r2.stdout, /session_absent/u, "预告 --apply 会拒：" + r2.stdout);
     assert.deepEqual(x.bytes(), before, "预览（含不在场）零写");
   } finally { x.cleanup(); }
@@ -51918,6 +51939,77 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     assert.equal(lines[0], "[m1a-retarget] retarget_unclean：已写但收口不干净（commit=…）：不要重跑 apply，先 doctor", JSON.stringify(lines[0]));
     assert.match(lines[1], /"commit":"committed_with_residue"/u, JSON.stringify(lines));
     assert.match(lines[1], /"lock_state":"residue"/u, JSON.stringify(lines));
+  } finally { x.cleanup(); }
+});
+
+// ─────────────────── PK2-I4-fix1：P1-1 权威判源 / P1-2 确定性 operation 身份 / P2 探测口径 ───────────────────
+// 红反例（先写红再改）：① shadow 期也能 ledger-only retarget（双写分歧）；② 同一命令重跑不能幂等确认；
+// ③ 预览文案声称“可投递”而非“记录存在”。
+
+test("PK2-I4-fix1 P1-1 权威判源：--apply 只在 outer 锁内 classifyLedgerAuthority===authoritative 放行 —— shadow 账本（无收据 / init-only）与 cutover 收据 × shadow 账本交叉不符一律拒且零写", () => {
+  const cases = [
+    { label: "① shadow 账本 + 无任何收据", opts: { ledgerShadow: true, receipts: "none" } },
+    { label: "② shadow 账本 + init-only 收据", opts: { ledgerShadow: true, receipts: "init-only" } },
+    { label: "③ cutover 收据在但账本 shadow（交叉不符）", opts: { ledgerShadow: true, receipts: "cutover" } },
+  ];
+  for (const c of cases) {
+    const x = i4Fixture(c.opts);
+    try {
+      x.transcript(I4_UUID);
+      const before = x.bytes();
+      const res = retargetEndpoint({ endpointId: x.EP, id: I4_TA_A, sessionId: I4_UUID, apply: true, env: x.env, _inject: { probeSession: () => true } });
+      assert.equal(res.ok, false, c.label + " 必须拒：" + JSON.stringify(res).slice(0, 300));
+      assert.equal(res.reason, "m1a_mode_not_shadow", c.label + " 拒因与 W1 同名：" + JSON.stringify(res).slice(0, 300));
+      assert.match(res.why, /authoritative|收据|authority_mode/u, c.label + " why 说人话：" + res.why);
+      assert.equal(x.opsOf("retarget"), 0, c.label + " 零写（无 retarget op）");
+      assert.deepEqual(x.bytes(), before, c.label + " 零写（字节不变）");
+    } finally { x.cleanup(); }
+  }
+});
+
+test("PK2-I4-fix1 P1-2 确定性 operation 身份：--apply 成功后重跑同一条命令 → 退出码 0（已生效）、operations 不增；requestKey 由 requestKeyFor 派生；无历史 op 的已会话级仍拒", () => {
+  const x = i4Fixture();
+  try {
+    x.transcript(I4_UUID);
+    const args = ["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID, "--apply"];
+    const r1 = x.runCli(args);
+    assert.equal(r1.status, 0, "首跑成功：" + r1.stdout + r1.stderr);
+    assert.equal(x.opsOf("retarget"), 1, "首跑恰一笔 retarget op");
+    const after1 = x.bytes();
+    // 重跑：同一请求身份 → 账本 replay 命中 → 已生效，退出码 0，operations 不增
+    const r2 = x.runCli(args);
+    assert.equal(r2.status, 0, "重跑要幂等确认（不能 already_session_level 报错）：" + r2.stdout + r2.stderr);
+    assert.match(r2.stdout, /已生效|already_effective/u, "重跑文案：" + r2.stdout);
+    assert.equal(x.opsOf("retarget"), 1, "重跑不新增 op");
+    assert.deepEqual(x.bytes(), after1, "重跑账本字节不变");
+    // 请求身份派生口径：与 requestKeyFor 同源（ext = retarget:<id>:<uuid>，entity = id）
+    const rk = retargetRequestKey({ id: I4_TA_A, sessionId: I4_UUID });
+    const expect = DW.requestKeyFor({ opType: "retarget", externalRequestId: "retarget:" + I4_TA_A + ":" + I4_UUID, entityId: I4_TA_A });
+    assert.equal(rk, expect.request_key, "requestKey 派生与 requestKeyFor 同源");
+    const doc = x.ledger();
+    const op = Object.values(doc.operations).find((o) => o.op_type === "retarget");
+    assert.equal(op.request_key, rk, "账本里那笔 op 的 request_key 就是派生值");
+    // 已是会话级但**不是**本命令所改（无历史 op 可重放）→ 仍拒 already_session_level
+    const r3 = x.runCli(["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID_OTHER, "--apply"]);
+    assert.equal(r3.status, 1, "别的会话 → 拒：" + r3.stdout + r3.stderr);
+    assert.match(r3.stderr, /already_session_level/u, r3.stderr);
+  } finally { x.cleanup(); }
+});
+
+test("PK2-I4-fix1 P2 探测口径与文案：预览只声称「会话记录存在/不存在」（不声称可投递）；slug 与 live-session 同一助手", () => {
+  const x = i4Fixture();
+  try {
+    x.transcript(I4_UUID);
+    const r = x.runCli(["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /会话记录\s+存在/u, "在场文案 = 会话记录存在：" + r.stdout);
+    assert.doesNotMatch(r.stdout, /会话在场/u, "旧文案（声称在场/可投递）不得出现");
+    const r2 = x.runCli(["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID_OTHER]);
+    assert.match(r2.stdout, /会话记录\s+不存在/u, "缺席文案：" + r2.stdout);
+    // slug 单一来源：sessionTranscriptPath 与 live-session.transcriptSlug 同一算法
+    assert.equal(sessionTranscriptPath({ projectRoot: "/a/b-c/d", sessionId: I4_UUID, env: { HOME: "/h" } }),
+      path.join("/h", ".claude", "projects", transcriptSlug("/a/b-c/d"), I4_UUID + ".jsonl"),
+      "路径由 transcriptSlug 派生（同一助手）");
   } finally { x.cleanup(); }
 });
 

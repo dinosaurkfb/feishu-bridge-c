@@ -253,6 +253,7 @@ import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
 import { writeSidecarPrepared } from "./maintenance/sidecar-writer.mjs";
 import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, readSidecarFile, validateSidecarDoc, SIDECAR_SCHEMAS } from "./m1b/sidecar-renderers.mjs";
+import { POLICY_STORE_FILE, readPolicyStore, mutatePolicyEntry } from "./m1b/policy-store.mjs"; // PK2-I1：authoritative 期策略 store
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
@@ -50699,6 +50700,117 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
     assert.equal(ledgerStepState(), "done", "② ledger step done");
   } finally { f.cleanup(); }
 });
+
+// ── PK2-I1：authoritative 期 interaction policy 切到 v2 policy store（`ledger/<ep>/policy.json`）──
+// 设计 m1a-reconciliation.md §4 ③：authoritative → 只读写 policy store，legacy policy 字段冻结。
+// 本段全部在 tmp 夹具里跑（真机账本 / 真实 policy.json 一行不碰）。
+{
+  const i1Base = () => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2-i1-")));
+  // 一个只带 ledger 根的夹具：policy-store 只认 FEISHU_BRIDGE_LEDGER_DIR（与账本同根）。
+  const i1Store = (base, ep) => {
+    const ledgerRoot = path.join(base, "ledger");
+    fs.mkdirSync(ledgerRoot, { recursive: true, mode: 0o700 });
+    const epDir = path.join(ledgerRoot, ep);
+    fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+    return { ledgerRoot, epDir, file: path.join(epDir, POLICY_STORE_FILE) };
+  };
+  const i1Entry = (bindingId, over = {}) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping",
+    policy_version: "1.0", updated_at: "1970-01-01T00:00:00.000Z", dialogue: null, ...over });
+  const i1Doc = (ep, entries) => ({ schema_version: "policy-1", endpoint_id: ep, entries });
+  const i1WriteDoc = (file, doc) => fs.writeFileSync(file, stableStringify(doc, 2) + "\n", { mode: 0o600 });
+  const i1Subject = (ep, bindingId) => policySubjectId({ kind: "lineage", endpointId: ep, id: bindingId });
+  // 夹具自己管 FEISHU_BRIDGE_LEDGER_DIR（harness 绊线值在 finally 回写）。
+  const i1WithLedgerRoot = (root, run) => {
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    try { process.env.FEISHU_BRIDGE_LEDGER_DIR = root; run(); }
+    finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  };
+
+  test("PK2-I1 T1 store 原语：缺席/0644/坏 JSON/超限 → unreadable；合法 ↔ 原子写；非法状态零写入；锁被占拒", () => {
+    const base = i1Base();
+    const EP = "endpoint_" + "1".repeat(24);
+    try {
+      const s = i1Store(base, EP);
+      const psid = i1Subject(EP, "p1@registry");
+      i1WithLedgerRoot(s.ledgerRoot, () => {
+        // ① 缺席：如实报 absent（不折成空、不建文件）
+        const absent = readPolicyStore({ endpointId: EP });
+        assert.deepEqual([absent.ok, absent.absent, fs.existsSync(s.file)], [true, true, false], "缺席 → absent 且不建文件：" + JSON.stringify(absent));
+        // ② 合法：读回条目
+        i1WriteDoc(s.file, i1Doc(EP, { [psid]: i1Entry("p1@registry") }));
+        const ok1 = readPolicyStore({ endpointId: EP });
+        assert.equal(ok1.ok, true, "合法 → 读得出：" + JSON.stringify(ok1).slice(0, 200));
+        assert.deepEqual([ok1.absent, ok1.entries[psid].binding_id], [false, "p1@registry"], "合法 → 读回条目：" + JSON.stringify(ok1.entries).slice(0, 160));
+        // ③ 0644 → unreadable（受验读的形状要求：精确 0600）
+        fs.chmodSync(s.file, 0o644);
+        const p644 = readPolicyStore({ endpointId: EP });
+        assert.equal(p644.reason, "policy_store_unreadable", "0644 → unreadable：" + JSON.stringify(p644));
+        assert.match(String(p644.why), /0600/u, "why 点名权限：" + p644.why);
+        fs.chmodSync(s.file, 0o600);
+        // ④ 坏 JSON → unreadable
+        fs.writeFileSync(s.file, "{ not json", { mode: 0o600 });
+        assert.equal(readPolicyStore({ endpointId: EP }).reason, "policy_store_unreadable", "坏 JSON → unreadable");
+        // ⑤ 值域不合法（policy_id 越界）→ unreadable（同一读取器带的值域判据）
+        i1WriteDoc(s.file, i1Doc(EP, { [psid]: i1Entry("p1@registry", { policy_id: "nope" }) }));
+        assert.equal(readPolicyStore({ endpointId: EP }).reason, "policy_store_unreadable", "条目越界 → unreadable");
+        // ⑥ 超限（> 1MiB）→ unreadable
+        fs.writeFileSync(s.file, Buffer.alloc(1024 * 1024 + 1, 0x20), { mode: 0o600 });
+        const big = readPolicyStore({ endpointId: EP });
+        assert.equal(big.reason, "policy_store_unreadable", "超限 → unreadable：" + JSON.stringify(big));
+        assert.match(String(big.why), /1MiB|MiB/u, "why 点名超限：" + big.why);
+        // ⑦ 原子写：合法状态落盘、读回一致、无 tmp 残骸、仍是 0600
+        i1WriteDoc(s.file, i1Doc(EP, { [psid]: i1Entry("p1@registry") }));
+        const w1 = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", subjectId: psid,
+          mutate: (state) => setInteractionPolicyMode(state, { mode: DIALOGUE_POLICY_ID, now: Date.parse("2026-09-11T00:00:00.000Z") }) });
+        assert.deepEqual([w1.ok, w1.changed, w1.committed], [true, true, true], "写成立：" + JSON.stringify(w1).slice(0, 240));
+        const back1 = readPolicyStore({ endpointId: EP });
+        assert.equal(back1.entries[psid].policy_id, DIALOGUE_POLICY_ID, "读回切成了 dialogue：" + JSON.stringify(back1.entries[psid]).slice(0, 160));
+        assert.deepEqual(fs.readdirSync(s.epDir).filter((n) => n.endsWith(".tmp")), [], "不留 tmp 残骸：" + JSON.stringify(fs.readdirSync(s.epDir)));
+        assert.equal(fs.statSync(s.file).mode & 0o777, 0o600, "写后仍是 0600");
+        // ⑧ 非法状态（mutate 返回越界条目）→ 零写入
+        const before = fs.readFileSync(s.file);
+        const bad = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", subjectId: psid,
+          mutate: () => ({ ok: true, changed: true, state: i1Entry("p1@registry", { dialogue: { nope: true } }) }) });
+        assert.deepEqual([bad.ok, bad.reason], [false, "policy_store_invalid"], "非法状态拒：" + JSON.stringify(bad).slice(0, 200));
+        assert.deepEqual(fs.readFileSync(s.file), before, "非法状态零写入（字节级）");
+        // ⑨ 条目 binding_id 与 lineage 派生输入不一致 → 拒（与 renderer 同一条交叉不变量）
+        const crossed = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", subjectId: psid,
+          mutate: () => ({ ok: true, changed: true, state: i1Entry("other@registry") }) });
+        assert.equal(crossed.reason, "policy_store_invalid", "交叉不变量拒：" + JSON.stringify(crossed).slice(0, 160));
+        // ⑩ 锁被占 → 拒（与 registry 同一把公开锁原语）
+        const lockPath = s.file + ".lock";
+        const held = acquirePublishLock(lockPath);
+        assert.ok(held.ok, "夹具取锁：" + JSON.stringify(held));
+        try {
+          const busy = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", subjectId: psid, mutate: (state) => setInteractionPolicyMode(state, { mode: MAPPING_POLICY_ID }) });
+          assert.equal(busy.reason, "policy_store_busy", "锁被占 → busy：" + JSON.stringify(busy));
+        } finally { releasePublishLock(lockPath); }
+        // ⑪ 条目缺席 → 用 renderer 同款默认条目（binding_id 取 lineage），而不是拒
+        const fresh = i1Subject(EP, "p2@registry");
+        const synth = mutatePolicyEntry({ endpointId: EP, bindingId: "p2@registry", subjectId: fresh,
+          mutate: (state) => setInteractionPolicyMode(state, { mode: DIALOGUE_POLICY_ID, now: Date.parse("2026-09-11T00:00:00.000Z") }) });
+        assert.deepEqual([synth.ok, synth.changed], [true, true], "缺席条目 → 默认条目再 mutate：" + JSON.stringify(synth).slice(0, 200));
+        assert.equal(readPolicyStore({ endpointId: EP }).entries[fresh].binding_id, "p2@registry", "新条目落在自己 subject 下");
+        assert.equal(readPolicyStore({ endpointId: EP }).entries[psid].binding_id, "p1@registry", "旧条目未被顺手改（单条目 mutate）");
+        // ⑫ 文件缺席时的写：不新建（cutover 后缺席是故障）
+        fs.rmSync(s.file);
+        const gone = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", subjectId: psid, mutate: (state) => setInteractionPolicyMode(state, { mode: MAPPING_POLICY_ID }) });
+        assert.deepEqual([gone.reason, fs.existsSync(s.file)], ["policy_store_unreadable", false], "缺席不新建：" + JSON.stringify(gone));
+        // ⑬ **整文档**校验的独有效用：单条目过 ipsp-1、但 entries 要涨到 513（> 512 上限）——只有
+        //   validateSidecarDoc 拦得住（读路径的整档校验在写前已经跑过，这里钉的是写前那一道）。
+        const full = {};
+        for (let i = 0; i < 512; i += 1) full[i1Subject(EP, "b" + i + "@registry")] = i1Entry("b" + i + "@registry");
+        i1WriteDoc(s.file, i1Doc(EP, full));
+        assert.equal(readPolicyStore({ endpointId: EP }).ok, true, "夹具：512 条（上限内）读得出");
+        const over = mutatePolicyEntry({ endpointId: EP, bindingId: "p513@registry", subjectId: i1Subject(EP, "p513@registry"),
+          mutate: (state) => setInteractionPolicyMode(state, { mode: DIALOGUE_POLICY_ID, now: Date.parse("2026-09-11T00:00:00.000Z") }) });
+        assert.deepEqual([over.ok, over.reason], [false, "policy_store_invalid"], "513 条 → 整文档拒：" + JSON.stringify(over).slice(0, 200));
+        assert.match(String(over.why), /512/u, "why 点名上限：" + over.why);
+        assert.equal(readPolicyStore({ endpointId: EP }).entries[i1Subject(EP, "p513@registry")], undefined, "越限条目一个字节都没落盘");
+      });
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+}
 
 sealSummary();
 

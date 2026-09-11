@@ -26,6 +26,7 @@ import { interactionPolicyStateProblem, policySubjectId } from "../policy-store/
 export const SIDECAR_SCHEMAS = Object.freeze({ expiry: "expiry-1", "pending-claims": "pending-claims-1", policy: "policy-1" });
 const TA_SHAPE = /^ta_[0-9a-f]{32}$/u;
 const PSID_SHAPE = /^ps_[0-9a-f]{32}$/u;
+export { PSID_SHAPE };
 const TOKEN_SHAPE = /^[0-9a-f]{6}$/u;
 const MAX_ENTRIES = 512;
 export const MAX_BYTES = 1024 * 1024; // 导出：staged-plan 的 blob 上限同一出处，防漂移
@@ -122,7 +123,9 @@ export function renderPendingClaimsSidecar({ endpointId, bindings, E }) {
 }
 
 const MAPPING_DEFAULT_UPDATED_AT = "1970-01-01T00:00:00.000Z";
-const mappingDefaultEntry = (bindingId) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping", policy_version: "1.0", updated_at: MAPPING_DEFAULT_UPDATED_AT, dialogue: null });
+/** 没策略字段的 binding 在 policy-1 里的默认条目（mapping 模式、无对话）。
+ *  导出（PK2-I1）：authoritative 期的 store 读写拿它当"条目缺席"的默认 —— 同一份，不写第二套。 */
+export const mappingDefaultEntry = (bindingId) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping", policy_version: "1.0", updated_at: MAPPING_DEFAULT_UPDATED_AT, dialogue: null });
 
 export function renderPolicySidecar({ endpointId, bindings, E }) {
   return renderSidecar({ endpointId, bindings, E, name: "policy", buildEntries: (perRecord) => {

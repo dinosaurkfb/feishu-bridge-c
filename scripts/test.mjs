@@ -256,6 +256,7 @@ import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, r
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
+import * as SEED_MOD from "./m1a-seed.mjs";
 import { seedShadowEndpoint } from "./m1a-seed.mjs";
 import * as RECON45 from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
@@ -49649,6 +49650,33 @@ fs.lstatSync = function(p, ...rest) {
     assert.match(res.why, /retarget 方向不对/u, "文案必须来自 operationProblem 那层（「retarget 方向不对」）: " + res.why);
   });
 
+  // ── R68：m1a-seed CLI 格式化层直接输出 res.why 原文（Codex #160 一轮 P2）──
+  test("R68 红证：formatSeedResult 各非成功分支打印 res.why 原文（不拼旧文案）+ 结构字段 JSON 摘要；成功与 already_consistent 保留一行", () => {
+    const fmt = SEED_MOD.formatSeedResult;
+    assert.equal(typeof fmt, "function", "formatSeedResult 应从 m1a-seed.mjs 导出（CLI 格式化层抽成纯函数）：实际 " + typeof fmt);
+    const ep = "endpoint_" + "r68".padEnd(24, "0");
+    // ① already_consistent 时释放失败：why 原文逐字输出，旧拼文案不得出现
+    const res1 = { ok: false, status: "seeded_unclean", reason: "seeded_unclean", commit: "already_consistent", residue: ["x.reap"], lock_state: "residue", why: "未写入；排序锁释放不干净（residue）：先 doctor" };
+    const l1 = fmt(res1, ep);
+    assert.equal(l1[0], "[m1a-seed] seeded_unclean：未写入；排序锁释放不干净（residue）：先 doctor", "① 首行 = why 原文：" + JSON.stringify(l1[0]));
+    assert.ok(!l1.join("\n").includes("已写但收口不干净（already_consistent"), "① 旧拼文案不得出现：" + l1.join("\n"));
+    assert.ok(l1.slice(1).some((l) => l.includes("\"commit\":\"already_consistent\"") && l.includes("\"lock_state\":\"residue\"")), "① 结构字段 JSON 摘要一行：" + JSON.stringify(l1.slice(1)));
+    // ② 写后收口脏：why 原文逐字输出
+    const res2 = { ok: false, status: "seeded_unclean", reason: "seeded_unclean", commit: "committed_with_residue", residue: [], lock_state: "unclear", why: "已写但收口不干净（committed_with_residue/unclear）：不要重跑 apply，先 doctor" };
+    const l2 = fmt(res2, ep);
+    assert.equal(l2[0], "[m1a-seed] seeded_unclean：已写但收口不干净（committed_with_residue/unclear）：不要重跑 apply，先 doctor", "② 首行 = why 原文：" + JSON.stringify(l2[0]));
+    // ③ post_reconcile_failed：why 原文逐字输出（含 mismatches/blockers 诊断行保留）
+    const res3 = { ok: false, reason: "post_reconcile_failed", commit: "committed_clean", mismatches: ["m1"], blockers: ["b1"], why: "已写成但后置对账失败（commit=committed_clean）：不要重跑 apply，先 doctor", lock_state: "released" };
+    const l3 = fmt(res3, ep);
+    assert.equal(l3[0], "[m1a-seed] post_reconcile_failed：已写成但后置对账失败（commit=committed_clean）：不要重跑 apply，先 doctor", "③ 首行 = why 原文：" + JSON.stringify(l3[0]));
+    assert.ok(l3.some((l) => l.includes("差异项:")), "③ 诊断行保留");
+    assert.ok(l3.some((l) => l.includes("阻塞项:")), "③ 诊断行保留");
+    // ④ 成功与 already_consistent 保留现有一行
+    assert.deepEqual(fmt({ ok: true, status: "already_consistent", mode: "apply", seeded: [], revision: 7 }, ep),
+      ["[m1a-seed] 账本已一致，无需补种（端点: " + ep + ", revision: 7）"]);
+    assert.deepEqual(fmt({ ok: true, status: "seeded", mode: "apply", seeded: ["a"], revision: 8 }, ep),
+      ["[m1a-seed] 补种成功（端点: " + ep + ", revision: 8, 补种条数: 1）"]);
+  });
   test("R65 T12: seedShadowEndpoint 注入 committed_with_residue → 报 seeded_unclean 且非绿、账本已写入、下次预览差异为空", () => {
     const fx = setupR65SeedFixture();
     try {

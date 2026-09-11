@@ -255,6 +255,8 @@ import { writeSidecarPrepared } from "./maintenance/sidecar-writer.mjs";
 import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, readSidecarFile, validateSidecarDoc, SIDECAR_SCHEMAS, mappingDefaultEntry } from "./m1b/sidecar-renderers.mjs";
 import { POLICY_STORE_FILE, POLICY_STORE_LOCK_NAME, readPolicyStore, readPolicyStoreForAudit, livePolicySubjects, resolvePolicySubject, mutatePolicyEntry, policyEntryFor } from "./m1b/policy-store.mjs"; // PK2-I1：authoritative 期策略 store（R31 底座薄壳）
 import { readSidecarStore, mutateSidecarEntry } from "./m1b/sidecar-store.mjs"; // PK2-W1：sidecar 条目的锁内读-改-写
+import { readExpiryEntry, mutateExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）
+import { expiryGate, EXPIRY_SOURCE, evaluateInboundEvidence } from "./selector.mjs"; // PK2-I2：到期闸纯判据
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
@@ -53376,6 +53378,265 @@ test("PK2-I4-fix3 P2：失败格式化输出 lockUncleared 一行（lock_state /
   assert.equal(formatRetargetResult({ ok: false, reason: "bad_session", why: "形状不对" }).filter((l) => l.includes("lockUncleared")).length, 0,
     "没有锁残骸就不要多一行：" + formatRetargetResult({ ok: false, reason: "bad_session", why: "形状不对" }).join(" | "));
 });
+// ─────────────────── PK2-I2：绑定到期（expiry）在 authoritative 下切到 ledger/<ep>/expiry.json ───────────────
+// 读（入站到期闸）按判源换判据：authoritative → 账本记录的 topic_agent_id 取权威条目（缺条目 = 没设到期）；
+// shadow / legacy / 未接入 → 照 main 读 mapping.expires_at。写（续期）同理：authoritative → 只写 expiry.json
+// （legacy 的 registry / mapping 一个字节不碰）。器具全在 tmp；账本走真蓝图真收据。
+
+const I2_ISO_FUTURE = "2099-01-01T00:00:00.000Z";
+const I2_ISO_PAST = "2020-01-01T00:00:00.000Z";
+const I2_TA = "ta_" + "9".repeat(32);
+
+/** 极简账本夹具：真蓝图（initPlan → migrateSeed → cutoverPlan）+ 真收据 journal + 一条**项目级** live 记录。 */
+function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = true, noReceipts = false, expiryEntries = null } = {}) {
+  const m = doctorMachine();
+  const proj = m.project("good", { expiresAt: I2_ISO_FUTURE });
+  const OM = "om_I2Root";                       // registry 行的 root_message_id 必须与账本记录的 aliases.root_om 同一个
+  const tplFile = path.join(m.home, ".claude", "feishu-bridge", "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify({ ...TPL, agent_uid: agentUid }, null, 2) + "\n", { mode: 0o600 });
+  const EP = legacyEndpointId({ runtime: "claude", agentUid });
+  const epDir = path.join(m.ledgerDir, EP);
+  fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  const env = { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
+    FEISHU_BRIDGE_REGISTRY: m.files.registry, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile,
+    FEISHU_BRIDGE_LEDGER_DIR: m.ledgerDir, FEISHU_BRIDGE_MAINTENANCE_DIR: m.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: m.gateFile };
+  // registry：**项目级**行（binding.mjs 只认项目级；session_id 是入站话题）——项目 mapping 文件删掉，让 registry 行说了算
+  m.writeTables({ projects: [{ id: "good", root: proj, root_message_id: OM, status: "active",
+    inbound_state: "bound", session_id: "aily_i2", expires_at: I2_ISO_FUTURE }], routes: [], sessions: {}, providers: [] });
+  fs.rmSync(path.join(proj, ".runtime-data", "inbound", "active-mapping.json"), { force: true });
+  // 账本
+  const write600 = (f, t) => { fs.writeFileSync(f, t, { mode: 0o600 }); fs.chmodSync(f, 0o600); };
+  const at = "2026-09-01T12:00:00.000Z";
+  const sha = "b".repeat(64); const digest = "c".repeat(64);
+  const initOpId = "00000000-0000-0000-0000-000000000001";
+  const cutOpId = "00000000-0000-0000-0000-000000000002";
+  const ledgerFile = path.join(epDir, "ledger.json");
+  const ip = TAL.initPlan({ endpointId: EP, chain: "claude", requestKey: "rk_init", operationId: initOpId });
+  assert.equal(ip.ok, true, JSON.stringify(ip));
+  write600(ledgerFile, JSON.stringify(ip.doc, null, 2) + "\n");
+  const seed = TAL.migrateSeed({ endpointId: EP, requestKey: "rk_seed", authorizedBy: TPL.frank_sender_id, now: Date.parse(at), env,
+    candidates: [{ topic_agent_id: I2_TA, chat_id: TPL.chat_id, aliases: { session_id: "sess_i2", root_om: OM },
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      binding_target: { runtime: "claude", project_root: proj, claude_session_id: null },
+      generation_lineage_id: "lin_i2", legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null }] });
+  assert.equal(seed.ok, true, JSON.stringify(seed));
+  // 收据 journal（suffix 必须与 operation_kind 一致；token 必须等于账本里那笔 op id —— ⑬ 要核不可变事务祖先）
+  const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+  const stubDone = (ch, tok) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const curDone = (ch, tok) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+  const gateDone = (tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+  const enter = (tok) => [timerDone("claude"), timerDone("codex"), stubDone("claude", tok), stubDone("codex", tok), curDone("claude", tok), curDone("codex", tok)];
+  const initStep = { id: "ledger:" + EP + ":init", kind: "ledger", target: EP, backup: null, backup_sha256: null, backup_bytes: null,
+    before: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
+    intended_after: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
+    after: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }, state: "done", at, chain: "claude" };
+  if (!noReceipts) write600(path.join(m.maintDir, initOpId + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: initOpId, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(initOpId), gateDone(initOpId), initStep], notes: [] }));
+  if (cutover) {
+    const sh = TAL.loadByEndpoint(EP, { env });
+    assert.equal(sh.ok, true, JSON.stringify(sh.ok ? sh.doc.authority_mode : sh));
+    const cp = TAL.cutoverPlan({ endpointId: EP, chain: "claude", requestKey: "rk_cut", operationId: cutOpId, shadowDoc: sh.doc, shadowSha: sh.sha256, digest,
+      sidecarShas: { expiry: digest, pending_claims: digest, policy: digest } });
+    assert.equal(cp.ok, true, JSON.stringify(cp));
+    const cutStep = { id: "ledger:" + EP + ":cutover", kind: "ledger", target: EP, backup: null, backup_sha256: null, backup_bytes: null,
+      before: { endpoint_id: EP, operation_id: cutOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha, bijection_digest: null },
+      intended_after: { endpoint_id: EP, operation_id: cutOpId, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest },
+      after: { endpoint_id: EP, operation_id: cutOpId, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest }, state: "done", at, chain: "claude" };
+    write600(path.join(m.maintDir, cutOpId + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_cutover", token: cutOpId, reason: "cut 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(cutOpId), gateDone(cutOpId), cutStep], notes: [] }));
+    if (authoritative) write600(ledgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
+  }
+  // cutover 的三件 sidecar：policy.json 是 I1 读点要的（authoritative 下缺它会被判 ledger_route_unavailable）；
+  // expiry.json 按签名可选给。pending-claims 与本单无关，不必造。
+  if (cutover && authoritative) write600(path.join(epDir, "policy.json"), JSON.stringify({ schema_version: "policy-1", endpoint_id: EP, entries: {} }, null, 2) + "\n");
+  const expiryPath = path.join(epDir, "expiry.json");
+  if (expiryEntries !== null) write600(expiryPath, JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP, entries: expiryEntries }, null, 2) + "\n");
+  const projectReceipts = path.join(fs.realpathSync(proj), ".runtime-data", "inbound", "receipts");
+  return {
+    m, proj, EP, epDir, env, OM, tplFile, agentUid, expiryPath, projectReceipts,
+    registry: () => JSON.parse(fs.readFileSync(m.files.registry, "utf-8")),
+    expiryBytes: () => { try { return fs.readFileSync(expiryPath); } catch { return null; } },
+    rejectReasons: () => (fs.existsSync(projectReceipts) ? fs.readdirSync(projectReceipts).filter((n) => n.startsWith("reject-")).sort()
+      .map((n) => JSON.parse(fs.readFileSync(path.join(projectReceipts, n), "utf-8")).reason) : []),
+    rejectReasonsFor: (messageId) => (fs.existsSync(projectReceipts)
+      ? fs.readdirSync(projectReceipts).filter((n) => n.startsWith("reject-" + messageId + "-")).sort()
+        .map((n) => JSON.parse(fs.readFileSync(path.join(projectReceipts, n), "utf-8")).reason) : []),
+    receiptsOf: (prefix) => (fs.existsSync(projectReceipts) ? fs.readdirSync(projectReceipts).filter((n) => n.startsWith(prefix)).sort()
+      .map((n) => JSON.parse(fs.readFileSync(path.join(projectReceipts, n), "utf-8"))) : []),
+    runInbound: (messageId) => {
+      const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 干活\n";
+      return spawnSync(process.execPath, [path.resolve("scripts", "inbound.mjs")], { encoding: "utf-8", cwd: proj,
+        env: { ...env, AILY_CLI_CALLER_AGENT_UID: agentUid, AILY_CLI_SESSION_ID: "aily_i2", AILY_CLI_RUN_ID: "run_i2",
+          AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id,
+          [ENV_PASS]: JSON.stringify({ message_id: messageId, session_id: "aily_i2", sender_id: TPL.frank_sender_id, content, created_at_ms: Date.now() }) } });
+    },
+    runRenew: () => spawnSync(process.execPath, [path.resolve("scripts", "binding.mjs"), "--project", proj, "--renew", "1y", "--apply"],
+      { encoding: "utf-8", cwd: proj, env }),
+    cleanup: () => fs.rmSync(m.home, { recursive: true, force: true }),
+  };
+}
+
+test("PK2-I2 T1 store 薄壳：非法 iso 拒（盘上不变）；null 删条目；缺席=没设到期；0644 读不出", () => {
+  const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i2-store-"));
+  const ledgerRoot = path.join(base, "ledger");
+  const EP = "endpoint_" + "c".repeat(24);
+  const epDir = path.join(ledgerRoot, EP);
+  fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  const env = { ...process.env, FEISHU_BRIDGE_LEDGER_DIR: ledgerRoot };
+  const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+  try {
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    // ① 缺席不是故障：没设到期
+    assert.deepEqual(readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env }), { ok: true, present: false, iso: null }, "缺席 = 没设到期");
+    // ② 合法写入 + 读回
+    const w1 = mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: I2_ISO_FUTURE }) });
+    assert.deepEqual([w1.ok, w1.changed, w1.iso], [true, true, I2_ISO_FUTURE], "写入：" + JSON.stringify(w1));
+    assert.equal(readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env }).iso, I2_ISO_FUTURE, "读回同一值");
+    // ③ 非法 iso → 拒（sidecar 校验器），盘上一个字节不变
+    const file = path.join(epDir, "expiry.json");
+    const before = fs.readFileSync(file);
+    const w2 = mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: "说不清" }) });
+    assert.equal(w2.ok, false, "非法 iso 必须拒：" + JSON.stringify(w2));
+    assert.match(String(w2.why), /不是规范化 ISO/u, "拒因来自校验器：" + JSON.stringify(w2));
+    assert.deepEqual(fs.readFileSync(file), before, "被拒的写不动盘");
+    // ④ null → 删条目
+    const w3 = mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: null }) });
+    assert.deepEqual([w3.ok, w3.changed], [true, true], "删条目：" + JSON.stringify(w3));
+    assert.equal(readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env }).present, false, "删完读回是缺席");
+    // ⑤ 0644 → 读不出（fail-closed 的那一半）
+    mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: I2_ISO_FUTURE }) });
+    fs.chmodSync(file, 0o644);
+    const bad = readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env });
+    assert.deepEqual([bad.ok, bad.reason], [false, "expiry_store_unreadable"], "0644 必须读不出：" + JSON.stringify(bad));
+    // ⑥ 纯判据一瞥：sidecar 来源的四种取值
+    assert.equal(expiryGate({ mapping: { expires_at: I2_ISO_PAST }, expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: null } }).ok, true, "缺条目 = 没设到期 → 不拒");
+    assert.equal(expiryGate({ mapping: { expires_at: I2_ISO_FUTURE }, expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: I2_ISO_PAST } }).ok, false, "权威条目过期 → 拒（不看 legacy 的未来值）");
+    assert.equal(expiryGate({ mapping: { expires_at: I2_ISO_PAST }, expiry: null }).ok, false, "legacy 判据照旧（past）");
+    assert.equal(expiryGate({ mapping: { expires_at: I2_ISO_PAST }, expiry: { source: "???", iso: I2_ISO_FUTURE } }).ok, false, "来源不认识 → fail-closed");
+  } finally {
+    if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("PK2-I2 T2 authoritative：续期写 expiry.json（registry 字节不变）；入站按它判（条目过期→拒，缺条目→放行）", () => {
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const regBefore = fs.readFileSync(fx.m.files.registry);
+    // ① 续期：真入口 → 写权威 expiry.json
+    const ren = fx.runRenew();
+    assert.equal(ren.status, 0, "续期成功：" + ren.stdout + ren.stderr);
+    assert.match(ren.stdout, /ledger\/<endpoint>\/expiry\.json/u, "文案要说清写到了哪份文件：" + ren.stdout);
+    const entry = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env });
+    assert.equal(entry.ok, true, "读回权威条目：" + JSON.stringify(entry));
+    const days = (Date.parse(entry.iso) - Date.now()) / 86400000;
+    assert.ok(days > 360 && days < 370, "新到期 ≈ 一年后：" + entry.iso + "（" + days.toFixed(1) + " 天）");
+    assert.deepEqual(fs.readFileSync(fx.m.files.registry), regBefore, "registry 字节不变（权威期不碰冻结的 legacy）");
+    assert.equal(fs.existsSync(fx.m.files.registry + ".prev"), false, "也没写 legacy 的 .prev（那份备份是 legacy 的）");
+    // ② 入站：权威条目改成**过去** → 拒，拒因仍是 mapping_expired
+    const past = mutateExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env, mutate: () => ({ ok: true, changed: true, value: I2_ISO_PAST }) });
+    assert.equal(past.ok, true, "夹具：改成过去：" + JSON.stringify(past));
+    const r1 = fx.runInbound("msg_i2_a");
+    assert.deepEqual(fx.rejectReasonsFor("msg_i2_a"), ["mapping_expired"], "过期必须拒、拒因不变：" + r1.stdout.slice(0, 300));
+    // ③ 入站：**删掉条目**（= 没设到期）→ 不再因到期被拒（legacy 的 expires_at 是多少都不看）
+    const del = mutateExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env, mutate: () => ({ ok: true, changed: true, value: null }) });
+    assert.equal(del.ok, true, "夹具：删条目：" + JSON.stringify(del));
+    const r2 = fx.runInbound("msg_i2_b");
+    // 这一条的**到期闸**必须放行：不许出现 mapping_expired（它后面被投递层按别的原因拒是另一回事）
+    assert.deepEqual(fx.rejectReasonsFor("msg_i2_b").filter((x) => x === "mapping_expired"), [],
+      "缺条目 = 没设到期 → 不许按过期拒：" + JSON.stringify(fx.rejectReasonsFor("msg_i2_b")) + " || " + r2.stdout.slice(0, 300));
+    assert.doesNotMatch(String(r2.stdout) + String(r2.stderr), /绑定关系已过期/u, "回执/输出里不许出现过期措辞：" + r2.stdout.slice(0, 300));
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2 T3 shadow / never_initialized：行为与 main 完全一致（写 registry、不碰 expiry.json、入站仍按 legacy 判）", () => {
+  const fx = i2Fixture({ cutover: false, noReceipts: true, expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const expiryBefore = fx.expiryBytes();
+    // ① 续期：写 registry，不碰 expiry.json
+    const ren = fx.runRenew();
+    assert.equal(ren.status, 0, "legacy 续期成功：" + ren.stdout + ren.stderr);
+    assert.doesNotMatch(ren.stdout, /ledger\/<endpoint>\/expiry\.json/u, "legacy 期不许说写到了权威 sidecar：" + ren.stdout);
+    assert.match(ren.stdout, /已写入/u, ren.stdout);
+    const row = fx.registry().projects.find((p) => p.root === fs.realpathSync(fx.proj));
+    const days = (Date.parse(row.expires_at) - Date.now()) / 86400000;
+    assert.ok(days > 360 && days < 370, "registry 的 expires_at 被续到一年后（main 行为）：" + row.expires_at);
+    assert.deepEqual(fx.expiryBytes(), expiryBefore, "expiry.json 一个字都没动");
+    // ② 入站：把 legacy expires_at 改成过去（sidecar 仍是未来）→ 必须按 legacy 判成过期
+    const reg = fx.registry();
+    reg.projects.find((p) => p.root === fs.realpathSync(fx.proj)).expires_at = I2_ISO_PAST;
+    fs.writeFileSync(fx.m.files.registry, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+    const r = fx.runInbound("msg_i2_c");
+    assert.deepEqual(fx.rejectReasons(), ["mapping_expired"], "legacy 期按 registry 的 expires_at 判（忽略 sidecar 的未来值）：" + r.stdout.slice(0, 300));
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2 T4 authoritative + expiry.json 读不出 → 入站拒 ledger_route_unavailable；续期写拒（零写）", () => {
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    fs.chmodSync(fx.expiryPath, 0o644);              // 受验读拒 0644（父目录 0700 + mode 0600 是合同）
+    const before = fx.expiryBytes();
+    // ① 入站：store 读不出 → fail-closed 拒（不回退 —— registry 的 expires_at 其实还在有效期内）
+    const r1 = fx.runInbound("msg_i2_d");
+    const receipts = fx.receiptsOf("expiry-store-");
+    assert.equal(receipts.length, 1, "store 读不出要落一条回执：" + JSON.stringify(fx.receiptsOf("")) + " || " + r1.stdout.slice(0, 300));
+    assert.equal(receipts[0].reason, "ledger_route_unavailable", "拒因与投递层同码：" + JSON.stringify(receipts[0]).slice(0, 300));
+    assert.deepEqual(fx.rejectReasons(), [], "不是 verdict 层的过期拒（这一条根本没让对方按 legacy 判）");
+    // ② 续期：写拒（不许把 0644 改回、也不许拿 legacy 兜底）
+    const regBefore = fs.readFileSync(fx.m.files.registry);
+    const ren = fx.runRenew();
+    assert.equal(ren.status, 1, "读不出 → 续期非零退出（fixture 的权威条目读不出）：" + ren.stdout + ren.stderr);
+    assert.match(String(ren.stderr), /读不出|没写成/u, "拒因要说清：" + String(ren.stderr).slice(0, 300));
+    assert.deepEqual(fx.expiryBytes(), before, "被拒的写不碰文件");
+    assert.deepEqual(fs.readFileSync(fx.m.files.registry), regBefore, "续期也没回退去写 legacy");
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2 T5 判源不明（收据读不出）：到期闸不在这一层下结论 —— 不回退 legacy、不按 sidecar 判，交 R66 延后拒", () => {
+  // 两条路都会判过期（registry 的 expires_at 与 sidecar 条目都设成过去）——只要出现 mapping_expired
+  // 就说明我们在判源不明时**回退**了某一份冻结事实。期望：延后到 R66，回执码 ledger_route_unavailable。
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_PAST } });
+  try {
+    const reg = fx.registry();
+    reg.projects.find((p) => p.root === fs.realpathSync(fx.proj)).expires_at = I2_ISO_PAST;
+    fs.writeFileSync(fx.m.files.registry, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+    // 注入「收据读不出」：维护目录里放一份坏 journal → endpointReceipt fail-closed → m1aWriteRoute → reject
+    fs.writeFileSync(path.join(fx.m.maintDir, "11111111-1111-4111-8111-111111111111.json"),
+      '{"schema_version":"1.2","operation_kind":"ledger_init"}\n', { mode: 0o600 });
+    const r = fx.runInbound("msg_i2_e");
+    assert.deepEqual(fx.rejectReasonsFor("msg_i2_e").filter((x) => x === "mapping_expired"), [],
+      "判源不明时不许按过期拒（那等于回退某一份冻结事实）：" + JSON.stringify(fx.rejectReasonsFor("msg_i2_e")) + " || " + r.stdout.slice(0, 300));
+    const routed = fx.receiptsOf("ledger-route-").filter((d) => d.message_id === "msg_i2_e");
+    assert.equal(routed.length, 1, "必须由 R66 投递层延后拒（ledger-route 回执）：" + JSON.stringify(fx.receiptsOf("")) + " || " + r.stdout.slice(0, 300));
+    assert.equal(routed[0].reason, "ledger_route_unavailable", "拒因与投递层同码：" + JSON.stringify(routed[0]).slice(0, 300));
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2 T6 authoritative 但账本里定位不到这条记录：续期拒（零写）—— 口径是 locator_absent，不是「过期」", () => {
+  // 说明（给复核）：读侧（入站到期闸）在「记录定位不了」时的表现**端到端观察不到** ——
+  //   那条状态下更早的 policy 读点就会以 ledger_route_unavailable 终结进程（判决分支在它之后），
+  //   所以入站侧只能断言「没出现 mapping_expired」；这里改钉**写侧**这条可观察的：
+  //   续期在定位不到记录时**拒**且两处都不写（也不回退 legacy）。
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const ledgerFile = path.join(fx.m.ledgerDir, fx.EP, "ledger.json");
+    const doc = JSON.parse(fs.readFileSync(ledgerFile, "utf-8"));
+    for (const rec of Object.values(doc.records)) rec.aliases.root_om = "om_Elsewhere";
+    fs.writeFileSync(ledgerFile, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    // ① 定位器（闸与续期共用的那一处）自己说了算：旧 om 查不到、新 om 查得到
+    assert.deepEqual(resolveExpiryTarget({ endpointId: fx.EP, locator: fx.OM, env: fx.env }),
+      { ok: false, reason: "locator_absent", why: null }, "旧 om 应定位不到（这正是「记录缺席」那一支）");
+    assert.equal(resolveExpiryTarget({ endpointId: fx.EP, locator: "om_Elsewhere", env: fx.env }).ok, true,
+      "（对照）新 om 反而定位得到 —— 证明上面那条是 locator 不匹配，不是账本读不出");
+    // ② 续期：定位不到 → 拒，registry 与 expiry.json 都不写
+    const regBefore = fs.readFileSync(fx.m.files.registry);
+    const expBefore = fx.expiryBytes();
+    const ren = fx.runRenew();
+    assert.equal(ren.status, 1, "定位不到记录 → 续期必须非零退出：" + ren.stdout + ren.stderr);
+    assert.match(String(ren.stderr), /定位不到账本里的这条记录/u, "拒因点明定位不到：" + String(ren.stderr).slice(0, 300));
+    assert.deepEqual(fs.readFileSync(fx.m.files.registry), regBefore, "没回退去写 legacy（registry 字节不变）");
+    assert.deepEqual(fx.expiryBytes(), expBefore, "权威 sidecar 也没动");
+  } finally { fx.cleanup(); }
+});
+
 
 sealSummary();
 

@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { normalizeBody } from "./selector.mjs";
+import { EXPIRY_SOURCE, normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 // 失败回执的 outbox 落点与 Stop 钡 / 兑底定时器同一份判据（outbox vs outbox-<sid>），不另写一份
@@ -53,6 +53,7 @@ import { legacyEndpointId } from "./subscription.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { decideInboundDeliveryTarget, appendShadowDivergenceNote } from "./m1a/delivery-target.mjs";
+import { readExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）读侧
 import { appendChannelSample, channelDisposition } from "./channel-samples.mjs";
 import {
   appendConsumed, buildClaudeSubscriptionProjection, evaluatePromotion, findBindingForSession,
@@ -650,12 +651,46 @@ if (justBound) {
     { bound: true, root: routed.root, body_skipped: bodySkipped });
 }
 
+// PK2-I2：到期闸的判据随判源换书。本话题的根消息 id（消息落在哪个代际，就按那个代际的 root_message_id
+//   对账本 aliases.root_om）—— 这里推一次，下面 R66 投递层复用同一份。
+const sessionGenForLedger = generationForSession(mapping?.topic_generation_state ?? null, event.session_id);
+const rootOmForLedger = sessionGenForLedger?.root_message_id
+  ?? (typeof mapping?.feishu_root_message_id_reference === "string" ? mapping.feishu_root_message_id_reference : null);
+const endpointForLedger = legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid });
+// authoritative → 按投递记录的 topic_agent_id 取权威 expiry.json 条目（缺条目 = 没设到期，不拒）；
+// shadow / legacy / 未接入 → 照 main 读 mapping.expires_at；判源不明（reject）→ 不在这里下结论，
+//   让 R66 投递层统一拒收（与 policy 读点「延后拒」同一裁定）。
+// store 读不出 → **fail-closed 拒收**（reason 与投递层同码），绝不回退冻结的 legacy 值。
+let expiryInput = null;
+const expiryRouteMode = m1aWriteRoute({ endpointId: endpointForLedger, env: process.env }).mode;
+if (expiryRouteMode === "reject") {
+  // 判源不明：按上面那条裁定延后拒（不回退 legacy、也不读 sidecar）。
+  expiryInput = { source: EXPIRY_SOURCE.SIDECAR, iso: null };
+} else if (expiryRouteMode === "authoritative") {
+  const target = resolveExpiryTarget({ endpointId: endpointForLedger, locator: rootOmForLedger, env: process.env });
+  if (target.ok !== true) {
+    // 记录定位不了：不是到期问题，交给 R66 投递层按 ledger_route_unavailable 拒（那里有完整判据）。
+    expiryInput = { source: EXPIRY_SOURCE.SIDECAR, iso: null };
+  } else {
+    const entry = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: target.topicAgentId, env: process.env });
+    if (entry.ok !== true) {
+      writeReceipt("expiry-store-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
+        status: "error", reason: "ledger_route_unavailable", why: entry.why ?? null,
+        message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
+      });
+      finish("error", { detail: "权威到期账本读不出，这条消息拒收（不回退 legacy）" }, { reason: "ledger_route_unavailable" });
+    }
+    expiryInput = { source: EXPIRY_SOURCE.SIDECAR, iso: entry.iso };
+  }
+}
+
 const verdict = evaluateMappingAdmission({
   canonicalEvent: fetched.canonical_event,
   event,
   mapping,
   config,
   now: Date.now(),
+  expiry: expiryInput,
 });
 // Slice B1：只读旁路。它使用与 legacy 精确路由相同的 binding，写独立 Git 外 sidecar；
 // 任意投影/校验/I/O 失败都不得改变本轮 verdict、claim 或 dispatch。
@@ -1015,13 +1050,10 @@ if (!replyOnly) {
   const receipt66 = (typeof maintDir66 === "string" && maintDir66.length > 0)
     ? endpointReceipt(maintDir66, endpoint66)
     : { ok: false };
-  // 本话题的根消息 id：消息落在哪个代际，就按那个代际的 root_message_id 对账本 aliases.root_om。
-  const sessionGen66 = generationForSession(mapping?.topic_generation_state ?? null, event.session_id);
-  const rootOm66 = sessionGen66?.root_message_id
-    ?? (typeof mapping?.feishu_root_message_id_reference === "string" ? mapping.feishu_root_message_id_reference : null);
+  // 本话题的根消息 id：与上面到期闸用**同一份**推导（rootOmForLedger），不重复推。
   // 判源四态矩阵（含收据不可用/模式交叉核）在 decide 内共用——inbound 不再自行折叠。
   const decision66 = decideInboundDeliveryTarget({
-    receipt: receipt66, endpointId: endpoint66, rootOm: rootOm66,
+    receipt: receipt66, endpointId: endpoint66, rootOm: rootOmForLedger,
     legacySessionId: legacyBoundSession, projectRoot: config.project_dir, env: process.env,
   });
   if (decision66.action === "reject") ledgerRouteProblem = decision66;

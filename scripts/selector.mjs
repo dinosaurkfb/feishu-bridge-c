@@ -45,6 +45,32 @@ export function isValidPrefix(v) {
   return v === NO_PREFIX || (typeof v === "string" && v.trim().length > 0);
 }
 
+/** 到期闸的判据来源（PK2-I2）：legacy = 照 main 读 mapping.expires_at；sidecar = 读权威 expiry.json 条目。 */
+export const EXPIRY_SOURCE = Object.freeze({ LEGACY: "legacy", SIDECAR: "sidecar" });
+
+/**
+ * 绑定到期闸的**唯一判据**（PK2-I2）。`expiry` 由调用方按判源给：
+ *   · `null`/缺省 → legacy：读 `mapping.expires_at`；缺失或非法 = 配错 → **拒**（main 行为，一字不改）。
+ *   · `{source:"sidecar", iso}` → authoritative：iso=null = **没设到期**（不拒）；iso 非法 → 拒（fail-closed）。
+ * 纯函数、零 IO：sidecar 的读取（含「读不出 → 调用方拒收」）在 `m1b/expiry-store.mjs` + 调用点完成。
+ * @returns {{ok:boolean, source:string, at:number|null, why?:string}}
+ */
+export function expiryGate({ mapping = null, expiry = null, now } = {}) {
+  const nowMs = typeof now === "number" ? now : Date.now();
+  if (expiry !== null && expiry !== undefined) {
+    if (expiry.source !== EXPIRY_SOURCE.SIDECAR) {
+      return { ok: false, source: String(expiry.source ?? "unknown"), at: null, why: "到期判据来源不认识（fail-closed）" };
+    }
+    if (expiry.iso === null || expiry.iso === undefined) return { ok: true, source: EXPIRY_SOURCE.SIDECAR, at: null };
+    const at = Date.parse(expiry.iso);
+    if (!Number.isFinite(at)) return { ok: false, source: EXPIRY_SOURCE.SIDECAR, at: null, why: "权威到期的条目不是时间" };
+    return { ok: nowMs < at, source: EXPIRY_SOURCE.SIDECAR, at };
+  }
+  const at = Date.parse(mapping?.expires_at ?? "");
+  if (!Number.isFinite(at)) return { ok: false, source: EXPIRY_SOURCE.LEGACY, at: null, why: "expires_at 读不出日期" };
+  return { ok: nowMs < at, source: EXPIRY_SOURCE.LEGACY, at };
+}
+
 export const REJECT = {
   MAPPING_MISSING: "mapping_missing",
   MAPPING_NOT_ACTIVE: "mapping_not_active",
@@ -139,7 +165,7 @@ export function bindingTokensInQuote(content) {
  * mention_ids 必须由可信运输层构造，不能由 policy handler 再从不可信正文猜。旧入口
  * evaluateInbound() 仍会从 Aily 兼容事件生成这份证据，供尚未经过 dispatcher 的诊断路径使用。
  */
-export function evaluateInboundEvidence({ event, mapping, config, now }) {
+export function evaluateInboundEvidence({ event, mapping, config, now, expiry = null }) {
   const nowMs = typeof now === "number" ? now : Date.now();
   const reject = (reason) => ({
     decision: "reject",
@@ -160,8 +186,8 @@ export function evaluateInboundEvidence({ event, mapping, config, now }) {
   if (!mapping) return reject(REJECT.MAPPING_MISSING);
   if (mapping.status !== "active") return reject(REJECT.MAPPING_NOT_ACTIVE);
 
-  const expiresAt = Date.parse(mapping.expires_at ?? "");
-  if (!Number.isFinite(expiresAt) || nowMs >= expiresAt) {
+  // PK2-I2：到期判据（legacy expires_at / 权威 expiry.json 条目）在这一处，处置仍是 MAPPING_EXPIRED。
+  if (!expiryGate({ mapping, expiry, now: nowMs }).ok) {
     return reject(REJECT.MAPPING_EXPIRED);
   }
 
@@ -236,7 +262,7 @@ export function evaluateInboundEvidence({ event, mapping, config, now }) {
 }
 
 /** 旧 Aily 事件视图的兼容入口；新 mapping policy 在 dispatcher 路径直接消费 Canonical Event。 */
-export function evaluateInbound({ event, mapping, config, now }) {
+export function evaluateInbound({ event, mapping, config, now, expiry = null }) {
   return evaluateInboundEvidence({
     event: event && {
       event_id: event.message_id,
@@ -249,5 +275,6 @@ export function evaluateInbound({ event, mapping, config, now }) {
     mapping,
     config,
     now,
+    expiry,
   });
 }

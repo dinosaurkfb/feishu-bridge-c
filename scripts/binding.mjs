@@ -25,6 +25,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mjs";
+import { mutateExpiryEntry, readExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）
+import { m1aWriteRoute } from "./m1a/wiring.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
 import { projectMappingPath, resolveProject } from "./project-resolve.mjs";
 import { registryPath } from "./registry.mjs";
@@ -99,8 +103,29 @@ const mapping = resolved.mapping;
 const FROM_REGISTRY = resolved.source === "registry";
 const STORE = FROM_REGISTRY ? registryPath() : projectMappingPath(ROOT);
 
+// PK2-I2：**续期的落点随判源换书**。authoritative → 权威 `ledger/<ep>/expiry.json`（不再碰 registry/mapping）；
+//   其余（legacy / shadow / 未接入）→ 原逻辑（registry 那一行或项目 mapping 文件）。
+//   判源不明（收据坏 / 维护目录读不出）→ 未知态：**不写**（fail-closed），下面按错误报。
+const tplForLedger = loadChainTemplate();
+const endpointForLedger = tplForLedger.ok && tplForLedger.template?.agent_uid
+  ? legacyEndpointId({ runtime: "claude", agentUid: tplForLedger.template.agent_uid }) : null;
+const routeMode = endpointForLedger === null ? "unknown" : m1aWriteRoute({ endpointId: endpointForLedger, env: process.env }).mode;
+const AUTHORITATIVE = routeMode === "authoritative";
+// 权威落点：按这条绑定的根消息（代际优先）定位账本 live 记录 → topic_agent_id。
+const expiryTarget = (() => {
+  if (!AUTHORITATIVE) return null;
+  const locator = typeof mapping.feishu_root_message_id_reference === "string" && mapping.feishu_root_message_id_reference.length > 0
+    ? mapping.feishu_root_message_id_reference : null;
+  if (locator === null) return { ok: false, reason: "no_locator", why: "这条绑定没有根消息 locator，定位不到账本记录" };
+  return resolveExpiryTarget({ endpointId: endpointForLedger, locator, env: process.env });
+})();
+
 const now = Date.now();
 const health = checkBinding({ root: ROOT, now });
+// 权威现值（只读）：authoritative 下这条命令改的就是它，报告要显示它而不是冻结的 legacy 值。
+const authoritativeEntry = AUTHORITATIVE && expiryTarget?.ok === true
+  ? readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env })
+  : null;
 
 // ---------- 算改动 ----------
 
@@ -167,7 +192,15 @@ console.log("项目    " + ROOT);
 console.log("绑定    " + (mapping.binding_id ?? "(无 id)") + "   存放在 " + (FROM_REGISTRY ? "登记表" : "项目目录"));
 console.log("状态    " + (mapping.status ?? "?") + " / " + (STATE_TEXT[health.state] ?? health.state));
 console.log("有效期  " + (mapping.expires_at ?? "(缺)") +
-  (daysLeft === null ? "" : "   还有 " + daysLeft + " 天"));
+  (daysLeft === null ? "" : "   还有 " + daysLeft + " 天") +
+  (AUTHORITATIVE ? "   （legacy 值已冻结，仅供参考）" : ""));
+if (AUTHORITATIVE) {
+  const iso = authoritativeEntry?.ok === true ? authoritativeEntry.iso : null;
+  const days = iso === null ? null : Math.floor((Date.parse(iso) - now) / DAY_MS);
+  console.log("权威到期  " + (authoritativeEntry?.ok === true ? (iso ?? "(未设 —— 不过期)") : "读不出（" + String(authoritativeEntry?.why ?? "unknown") + "）") +
+    (days === null || iso === null ? "" : "   还有 " + days + " 天") +
+    "   存放在 ledger/<endpoint>/expiry.json");
+}
 console.log("配额    " + (quotaNow === UNLIMITED ? "不限" : quotaNow) + "   已用 " + consumed + " 条");
 console.log("话题    " + (mapping.session_id ?? "?"));
 console.log("根消息  " + (mapping.feishu_root_message_id_reference ?? "?"));
@@ -195,6 +228,36 @@ if (!apply) {
 }
 
 // ---------- 写 ----------
+
+// PK2-I2：authoritative 下**只写权威 expiry.json** —— 冻结的 legacy（登记表 / 项目 mapping）一个字节都不碰，
+//   也就不留 .prev（它是 legacy 文件的备份，这里没有可回退的那一份）。除 expires_at 之外的字段在
+//   authoritative 下**没有权威落点**（quota / prefix / note 仍是 legacy 面）：明说拒，不悄悄写冻结文件。
+if (AUTHORITATIVE) {
+  const unsupported = changes.filter(([f]) => f !== "expires_at").map(([f]) => f);
+  if (unsupported.length > 0) {
+    console.error("权威（authoritative）下这些字段没有权威落点：" + unsupported.join(", "));
+    console.error("本命令在权威期只改 expires_at（写 ledger/<endpoint>/expiry.json）；其余字段仍只在 legacy 面。");
+    process.exit(1);
+  }
+  if (expiryTarget?.ok !== true) {
+    console.error("定位不到账本里的这条记录（" + String(expiryTarget?.reason ?? "unknown") + "）：不写，先核对账本");
+    process.exit(1);
+  }
+  const iso = changes.find(([f]) => f === "expires_at")[2];
+  const w = mutateExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env,
+    mutate: (cur) => (cur === iso ? { ok: true, changed: false } : { ok: true, changed: true, value: iso }) });
+  if (w.ok !== true) {
+    console.error("权威到期没写成（" + String(w.reason ?? "unknown") + (w.why ? "：" + w.why : "") + "）" +
+      (w.committed === true ? " —— 已落盘但不干净，先 doctor" : ""));
+    process.exit(1);
+  }
+  const afterAuth = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env });
+  console.log("\n已写入 ledger/<endpoint>/expiry.json（topic_agent_id " + expiryTarget.topicAgentId.slice(0, 12) + "…，" +
+    (w.changed ? "已更新" : "本就是这个值") + "）");
+  console.log("现在权威到期：" + (afterAuth.ok === true ? (afterAuth.iso ?? "(未设 —— 不过期)") : "读回失败"));
+  console.log("legacy 的 expires_at 一个字没动（切权威后它已冻结；入站按权威这份判）。");
+  process.exit(0);
+}
 
 // 留一份上一版：改错了能立刻退回去，不用去翻别的地方。
 fs.copyFileSync(STORE, STORE + ".prev");

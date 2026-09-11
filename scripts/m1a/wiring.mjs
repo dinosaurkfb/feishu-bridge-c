@@ -66,7 +66,12 @@ function capture(op, res) {
  * 直写点消费：legacy 已成但 shadow 不干净 → 调用方写持久机器回执。
  * 语义：clean **不改变** wired.ok / legacy 成功语义 —— 它只是「影子是否镜像干净」的投影，
  * 覆盖四类：① shadow 步提交失败（ok:false）；② 非干净提交（committed_with_residue /
- * committed_durability_uncertain）；③ 内层（shadow 提交步）/外层（acq）锁残骸；④ release 残骸。 */
+ * committed_durability_uncertain）；③ 内层（shadow 提交步）/外层（acq）锁残骸；④ release 残骸。
+ *
+ * PK2-W1-fix2 P1-3：**authoritative 复合的提交进度不在 shadow 步里** —— 它在 union 的 `commit`/`commits`
+ * （一次步骤可能含两笔原语：认领 = create_a1 → activate，步级 capture 只留得下后一笔）。不消费它
+ * 就是 K3 那把刀：create_a1 提交为 `committed_durability_uncertain`、activate clean 时，投影只看
+ * shadow 步 → 报 clean、入站照成功继续。这里两类都折：`commits[]` 逐原语 + union 的 `commit` 总判。 */
 export function uncleanWired(wired) {
   const steps = Array.isArray(wired?.shadow) ? wired.shadow : [];
   const failedSteps = steps.filter((s) => s && s.ok === false).map((s) => ({
@@ -89,12 +94,27 @@ export function uncleanWired(wired) {
     reason: wired.reason ?? null, why: wired.why ?? null,
     path: wired.lockPath ?? wired.lock ?? null, error: wired.lockError ?? null,
   } : null;
-  const durabilityUncertain = uncleanSteps.some((s) => s.commit === "committed_durability_uncertain");
-  const residue = steps.filter((s) => s && s.residue).map((s) => ({ op: s.op ?? null, residue: s.residue ?? null }));
+  // 逐原语提交证据（authoritative 复合自报；shadow 路径没有这个字段 → 空数组，行为不变）
+  const commits = (Array.isArray(wired?.commits) ? wired.commits : []).filter((c) => c && typeof c === "object").map((c) => ({
+    op: c.op ?? null, commit: c.commit ?? null, idempotent: c.idempotent === true,
+    residue: c.residue ?? null, lockUncleared: c.lockUncleared ?? null, path: c.path ?? null, error: c.error ?? null,
+  }));
+  const uncleanPrimitives = commits.filter((c) =>
+    (typeof c.commit === "string" && c.commit !== "committed_clean") || c.residue || c.lockUncleared || c.path || c.error);
+  // union 的总判（runAuthoritative 按同一批证据联合算出来的）也当一道闸：少带 commits 就漏不掉。
+  //   `not_committed` 不算 unclean（那是"没提交"，与"提交不干净"是两件事）。
+  const commitUnclean = typeof wired?.commit === "string" && wired.commit !== "not_committed" && wired.commit !== "committed_clean"
+    ? wired.commit : null;
+  const durabilityUncertain = uncleanSteps.some((s) => s.commit === "committed_durability_uncertain")
+    || uncleanPrimitives.some((c) => c.commit === "committed_durability_uncertain");
+  const residue = [...steps.filter((s) => s && s.residue).map((s) => ({ op: s.op ?? null, residue: s.residue ?? null })),
+    ...uncleanPrimitives.filter((c) => c.residue).map((c) => ({ op: c.op, residue: c.residue }))];
   return {
-    clean: wired?.ok === true && failedSteps.length === 0 && uncleanSteps.length === 0 && !releaseUnclean,
+    clean: wired?.ok === true && failedSteps.length === 0 && uncleanSteps.length === 0 && !releaseUnclean
+      && uncleanPrimitives.length === 0 && commitUnclean === null,
     steps, failedSteps, uncleanSteps, residue, releaseUnclean, lockUnclean,
     durabilityUncertain,
+    commit: wired?.commit ?? null, commits, uncleanPrimitives, commitUnclean,
   };
 }
 

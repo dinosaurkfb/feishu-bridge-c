@@ -34,9 +34,10 @@ import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
-import { readSidecarStore } from "./m1b/sidecar-store.mjs";
+import { mutateSidecarEntry, readSidecarStore } from "./m1b/sidecar-store.mjs";
 import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
 import { withRegistryTransaction } from "./topic-generation-store.mjs";
+import { stableStringify } from "./policy-store/canonical.mjs"; // 值比对用键序无关的规范序列化（同一份，不另写）
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor,
@@ -143,35 +144,70 @@ const already = registry.projects.find((p) => p?.claude_session_id === me.sessio
 const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
 // PK2-W1：判源分派。authoritative → 复合写（账本为准，登记表降为索引行）；shadow / 未接入 → 原路径。
 const writeRoute = m1aWriteRoute({ endpointId, env: process.env });
-// authoritative 下的**完整性**判断 —— 按账本当前 pending / active 分支（P1-4）：
-//   · active（已被认领）→ 已完成、**零写**。旧版一律要求 pending-claims 条目还在，而认领成功恰恰
-//     会删掉它 —— 于是同一条会话再跑 bind 被判"不完整"，把 active 索引盖回 pending 快照、
-//     并把 pending-claims 条目复活：一条已认领的工作线被退回待认领。
-//   · pending → 按 sidecar 条目补齐（缺条目 = 上一次半途失败，走同一条幂等复合 upsert；
-//     否则 unclean 只能靠 doctor 点名，绑定永远不完整）。
-const authoritativeComplete = (entry) => {
-  if (writeRoute.mode !== "authoritative" || !entry?.root_message_id) return false;
-  const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
-  if (!resolved.ok) return false;
-  const led = loadByEndpoint(endpointId, { env: process.env });
-  if (!led.ok) return false;
-  const rec = led.doc.records[resolved.id];
-  if (!rec || rec.kind !== "live") return false;
-  if (rec.facts?.binding === "active") return true;
-  const ta = resolved.id;
-  const pending = readSidecarStore({ endpointId, name: "pending-claims" });
-  const expiry = readSidecarStore({ endpointId, name: "expiry" });
-  return pending.ok === true && expiry.ok === true
-    && Object.prototype.hasOwnProperty.call(pending.entries, ta)
-    && Object.prototype.hasOwnProperty.call(expiry.entries, ta);
+/** sidecar 值的**归一 + 键序无关**比对：时间串与写侧的 `isoOf` 同一判据（规范化成 ISO），
+ *  对象逐值归一（`{"claim_expires_at":null,"token":…}` 与 `{token, claim_expires_at}` 是同一份现场）。 */
+const normSidecarValue = (v) => {
+  if (typeof v === "string") return (!Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : v);
+  if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, normSidecarValue(x)]));
+  }
+  return v ?? null;
 };
-if (already?.root_message_id && (writeRoute.mode !== "authoritative" || authoritativeComplete(already))) {
-  console.log("这条会话已经绑过了，没有重复建话题。");
-  console.log("  话题  " + already.root_message_id);
-  console.log("  入站  " + (already.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));
-  process.exit(0);
+const sameSidecarValue = (cur, expected) => stableStringify(normSidecarValue(cur), 0) === stableStringify(normSidecarValue(expected), 0);
+
+/**
+ * authoritative 下的**完整性 + 零写屏障**（P1-4 / P1-5①）。返回 `{ok, why, action}`：
+ *   · 非 authoritative（shadow / 未接入）→ `{ok:true}`：行为与 main 一致（旧的那条早退）。
+ *   · 账本说 **pending** → 条目必须**逐字对**：`pending-claims[ta] = {token: 索引行的 pending_token,
+ *     claim_expires_at: null}`、`expiry[ta] = 索引行的 expires_at`（旧版只核"键在不在"）。
+ *   · 账本说 **active**（已认领）→ `pending-claims` 里 ta **不在** + `expiry[ta]` 逐字等
+ *     （旧版直接 `return true`：expiry 缺失/漂移也被误判完整）。
+ *   · **完整时也重做零写屏障**（P1-5①）：调 mutateSidecarEntry 走 `changed:false` 那条路（要的就是
+ *     那次目录 fsync —— 上一笔可能正是死在 rename 之后的目录 fsync 上）。屏障失败 = **不算完成**。
+ *   · 不完整时的动作分两种：pending → `repair`（走同一幂等复合补齐）；active → `reject`
+ *     （**绝不重跑复合** —— 那会把已认领的工作线退回待认领，也会拿索引快照覆盖 parity 侧的事实）。
+ */
+const authoritativeBindingState = (entry) => {
+  if (!entry?.root_message_id) return { ok: false, why: "这条登记行没有根话题", action: "repair" };
+  if (writeRoute.mode !== "authoritative") return { ok: true, why: "非 authoritative（行为与 main 一致）", action: null };
+  const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
+  if (!resolved.ok) return { ok: false, why: "账本里定位不到这条根话题（" + String(resolved.reason) + "）", action: "repair" };
+  const led = loadByEndpoint(endpointId, { env: process.env });
+  if (!led.ok) return { ok: false, why: "账本读不出（" + String(led.reason ?? "unknown") + "）", action: "repair" };
+  const rec = led.doc.records[resolved.id];
+  if (!rec || rec.kind !== "live") return { ok: false, why: "账本里这条记录不是 live", action: "repair" };
+  const active = rec.facts?.binding === "active";
+  const ta = resolved.id;
+  const expectedExpiry = normSidecarValue(entry.expires_at);
+  const expectedClaim = active ? null : { token: entry.pending_token ?? null, claim_expires_at: null };
+  // 零写屏障 = 锁内重读 + 逐字比对 + `changed:false`（不写一个字节，只把目录 fsync 补做一次）。
+  const barrier = (name, expected) => {
+    const r = mutateSidecarEntry({ endpointId, name, key: ta, env: process.env,
+      mutate: (cur) => (sameSidecarValue(cur, expected)
+        ? { ok: true, changed: false }
+        : { ok: false, reason: "sidecar_state_drift", why: name + " 现场值与索引行不符（锁内重读）" }) });
+    return r.ok === true ? { ok: true } : { ok: false, why: name + " 没成（" + String(r.reason ?? "unknown") + "）" };
+  };
+  const bad = [barrier("pending-claims", expectedClaim), barrier("expiry", expectedExpiry)].find((b) => b.ok !== true);
+  if (bad !== undefined) {
+    return { ok: false, why: bad.why, action: active ? "reject" : "repair", active };
+  }
+  return { ok: true, why: active ? "已认领、sidecar 与索引逐字一致、屏障已重做" : "待认领、sidecar 与索引逐字一致、屏障已重做", action: null, active };
+};
+if (already?.root_message_id) {
+  const state = authoritativeBindingState(already);
+  if (state.ok) {
+    console.log("这条会话已经绑过了，没有重复建话题。");
+    console.log("  话题  " + already.root_message_id);
+    console.log("  入站  " + (already.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));
+    process.exit(0);
+  }
+  if (state.action === "reject") {
+    die("这条会话的绑定现场与索引行不一致（" + state.why + "）—— 已认领的工作线不会重跑绑定复合",
+      "重跑会把它退回待认领并用索引快照覆盖 sidecar；先人工核对 ledger/<endpoint>/ 下的 sidecar，或等 I2/I3 切换后再修。");
+  }
+  console.log("这条会话的绑定不完整（" + state.why + "）—— 按同一幂等键再跑一次补齐。");
 }
-if (already?.root_message_id) console.log("这条会话的绑定不完整（缺 sidecar 条目）—— 按同一幂等键再跑一次补齐。");
 
 const identity = readProjectIdentity({ root });
 const name = arg("name") ?? (identity.name + " · " + me.name);

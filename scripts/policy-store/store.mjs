@@ -53,7 +53,9 @@ function entryProblem(subject, value, endpointId, kinds) {
   if (!SUBJECT_ID_SHAPE.test(subject)) return { reason: "policy_store_bad_subject", detail: null };
   const ip = interactionPolicyStateProblem(value);
   if (ip !== null) return { reason: "policy_entry_invalid", detail: ip };
-  const kind = kinds != null && typeof kinds === "object" ? kinds[subject] : undefined;
+  // PK2-I1：kinds.default —— 域级 kind 声明（如 m1b policy store 整域都是 lineage 主体）：逐条目的
+  //   显式声明优先，未声明时回退整域默认；派生自洽核验（binding_id → 挂载键）照旧逐条执行，不放松。
+  const kind = kinds != null && typeof kinds === "object" ? (kinds[subject] ?? kinds.default) : undefined;
   if (kind === undefined || kind === null || kind === "") {
     return { reason: "policy_entry_invalid", detail: "policy_subject_kind_required" };
   }

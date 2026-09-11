@@ -122,7 +122,8 @@ export function renderPendingClaimsSidecar({ endpointId, bindings, E }) {
 }
 
 const MAPPING_DEFAULT_UPDATED_AT = "1970-01-01T00:00:00.000Z";
-const mappingDefaultEntry = (bindingId) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping", policy_version: "1.0", updated_at: MAPPING_DEFAULT_UPDATED_AT, dialogue: null });
+// PK2-I1：导出 —— v2 policy store 的缺条目默认与 renderer 同一出处（不写第二套默认）。
+export const mappingDefaultEntry = (bindingId) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping", policy_version: "1.0", updated_at: MAPPING_DEFAULT_UPDATED_AT, dialogue: null });
 
 export function renderPolicySidecar({ endpointId, bindings, E }) {
   return renderSidecar({ endpointId, bindings, E, name: "policy", buildEntries: (perRecord) => {

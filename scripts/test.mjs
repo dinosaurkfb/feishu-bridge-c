@@ -309,6 +309,7 @@ import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn,
   setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
+import { mutatePolicyEntry, readPolicyStore } from "./m1b/policy-store.mjs";
 import {
   businessActivitiesForPublishedBatch, launchAutomaticTopicRotation,
 } from "./automatic-topic-rotation.mjs";
@@ -50638,6 +50639,73 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
     assert.equal(ledgerStepState(), "done", "② ledger step done");
   } finally { f.cleanup(); }
 });
+
+// ─────────── PK2-I1：authoritative 下 interaction policy 读写切到 v2 policy store（ledger/<ep>/policy.json） ───────────
+{
+  // T1 store 原语：readPolicyStore fail-closed 封闭读 + mutatePolicyEntry 锁内原子写/校验/锁互斥。
+  test("PK2-I1 T1 policy store 原语：缺席→absent；0644/坏 JSON/超限→unreadable 族；合法→读回；mutate 原子写+拒非法状态+锁被占拒", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2i1-t1-")));
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    const ledgerRoot = path.join(base, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 });
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    try {
+      const EP = legacyEndpointId({ runtime: "claude", agentUid: "pk2i1_t1" });
+      const epDir = path.join(ledgerRoot, EP);
+      const file = path.join(epDir, "policy.json");
+      // ① 缺席 → {ok:true, absent:true}（cutover 后不应缺席；接线层按 unreadable 处置）
+      const absent = readPolicyStore({ endpointId: EP });
+      assert.deepEqual([absent.ok, absent.absent === true], [true, true], "缺席 → absent:" + JSON.stringify(absent));
+      // ② 合法 mutate：缺条目 → renderer 同款默认条目 → 写回（0600 原子）→ 读回逐字一致
+      const now = Date.parse("2026-09-12T08:00:00.000Z");
+      const w = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", env: process.env,
+        mutate: (state) => setInteractionPolicyMode(state, { mode: DIALOGUE_POLICY_ID, now }) });
+      assert.equal(w.ok, true, "mutate 成立：" + JSON.stringify(w).slice(0, 300));
+      assert.equal(w.changed, true, "首写 changed=true");
+      assert.equal(w.state.policy_id, DIALOGUE_POLICY_ID, "状态已切 dialogue");
+      assert.equal(w.state.binding_id, "p1@registry", "binding_id 保留 legacy 原值");
+      const st = fs.lstatSync(file);
+      assert.equal((st.mode & 0o777), 0o600, "policy.json 精确 0600");
+      const back = readPolicyStore({ endpointId: EP });
+      assert.equal(back.ok, true, "读回成立：" + JSON.stringify(back).slice(0, 200));
+      const subject = back.ok && !back.absent ? Object.keys(back.entries)[0] : null;
+      assert.ok(subject && /^ps_[0-9a-f]{32}$/u.test(subject), "subject 是 ps_<32hex>：" + String(subject));
+      assert.equal(back.entries[subject].policy_id, DIALOGUE_POLICY_ID, "读回与写一致");
+      // ③ mutate 拒非法状态（mutate 返回坏状态 → 不落盘）
+      const bytesBefore = fs.readFileSync(file);
+      const bad = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", env: process.env,
+        mutate: () => ({ ok: true, changed: true, state: { schema_version: "1.0", binding_id: "p1@registry", policy_id: "bogus", policy_version: "9", updated_at: "nope", dialogue: null } }) });
+      assert.equal(bad.ok, false, "非法状态拒：" + JSON.stringify(bad));
+      assert.match(String(bad.reason ?? "") + String(bad.detail ?? bad.why ?? ""), /policy_entry_invalid|bogus/u, "拒因点名条目不合法：" + JSON.stringify(bad));
+      assert.deepEqual(fs.readFileSync(file), bytesBefore, "盘上字节不变（不落盘）");
+      // ④ 锁被占 → 拒（mutual exclusion）
+      const lockPath = path.join(epDir, "policy.lock");
+      const held = acquireLedgerLock(lockPath);
+      assert.ok(held.ok, "测试自持锁：" + JSON.stringify(held));
+      const busy = mutatePolicyEntry({ endpointId: EP, bindingId: "p1@registry", env: process.env,
+        mutate: (state) => setInteractionPolicyMode(state, { mode: DIALOGUE_POLICY_ID, now }) });
+      assert.equal(busy.ok, false, "锁被占 → 拒：" + JSON.stringify(busy));
+      releaseLedgerLock(lockPath);
+      // ⑤ 0644 → 读拒（fail-closed，不折空）
+      fs.chmodSync(file, 0o644);
+      const loose = readPolicyStore({ endpointId: EP });
+      assert.equal(loose.ok, false, "0644 拒：" + JSON.stringify(loose));
+      assert.match(String(loose.reason), /policy_store_file_perms|policy_store_unreadable/u, "点名权限：" + JSON.stringify(loose));
+      fs.chmodSync(file, 0o600);
+      // ⑥ 坏 JSON → 读拒
+      fs.writeFileSync(file, "{not json", { mode: 0o600 });
+      const corrupt = readPolicyStore({ endpointId: EP });
+      assert.equal(corrupt.ok, false, "坏 JSON 拒：" + JSON.stringify(corrupt));
+      // ⑦ 超限（>1MiB）→ 读拒
+      fs.writeFileSync(file, JSON.stringify({ schema_version: "policy-1", endpoint_id: EP, entries: {} }) + "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
+      const huge = readPolicyStore({ endpointId: EP });
+      assert.equal(huge.ok, false, "超限拒：" + JSON.stringify(huge));
+      assert.match(String(huge.reason), /policy_store_too_large|policy_store_unreadable/u, "点名超限：" + JSON.stringify(huge));
+    } finally {
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+}
 
 sealSummary();
 

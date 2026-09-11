@@ -21,6 +21,32 @@ import fs from "node:fs";
 import { loadByEndpoint } from "../topic-agent-ledger.mjs";
 import { findLiveSessionById, findLiveSessions, readDeliveryPin, selectDeliverySession } from "../live-session.mjs";
 
+/** 项目根等式：两边 realpath 规范化；任一 realpath 失败（含不存在）按不符。 */
+const sameRealPath = (a, b) => {
+  try { return fs.realpathSync(a) === fs.realpathSync(b); } catch { return false; }
+};
+
+/**
+ * R66 返修一 P1-1：判源四态矩阵（inbound 与决策函数共用，纯函数）。
+ * receipt = endpointReceipt 结果；ledgerMode = null（账本读不出/尚未读）或 "shadow"|"authoritative"。
+ *   · 非 ok 收据（unreadable / conflict / in-progress / 维护目录说不清）→ reject，不回退；
+ *   · never_initialized → legacy（不读账本）；
+ *   · ok 且 !cutoverDone → shadow；账本可读时其 authority_mode 必须同为 shadow，否则 reject；
+ *   · ok 且 cutoverDone → authoritative；账本必须可读且同为 authoritative，否则 reject。
+ */
+export function classifyLedgerAuthority({ receipt = null, ledgerMode = null } = {}) {
+  if (!receipt || receipt.ok !== true) {
+    return { mode: "reject", why: "收据判定不可用（" + String(receipt?.state ?? receipt?.why ?? "维护目录说不清") + "），不回退" };
+  }
+  if (receipt.state === "never_initialized") return { mode: "legacy", why: "未接入 M1a（无任何账本收据）" };
+  if (!receipt.cutoverDone) {
+    if (ledgerMode !== null && ledgerMode !== "shadow") return { mode: "reject", why: "收据是 init-only（shadow 期）但账本 authority_mode=" + String(ledgerMode) };
+    return { mode: "shadow", why: "收据 init-only" };
+  }
+  if (ledgerMode !== "authoritative") return { mode: "reject", why: "收据已 cutover 但账本" + (ledgerMode === null ? "读不出（无法交叉核验）" : " authority_mode=" + String(ledgerMode)) };
+  return { mode: "authoritative", why: "收据与账本一致（authoritative）" };
+}
+
 export function resolveDeliveryTargetFromLedger({ endpointId, rootOm, env = process.env } = {}) {
   if (typeof rootOm !== "string" || rootOm.length === 0) return { ok: false, reason: "ledger_unavailable", why: "root_om 缺失，无法在账本里定位话题" };
   const L = loadByEndpoint(endpointId, { env });
@@ -35,7 +61,7 @@ export function resolveDeliveryTargetFromLedger({ endpointId, rootOm, env = proc
 }
 
 export function decideInboundDeliveryTarget({
-  authorityMode = null,
+  receipt = null,
   endpointId,
   rootOm = null,
   legacySessionId = null,
@@ -47,20 +73,32 @@ export function decideInboundDeliveryTarget({
   readPin = readDeliveryPin,
   findLive = findLiveSessions,
 } = {}) {
-  if (authorityMode !== "authoritative" && authorityMode !== "shadow") return { action: "legacy", divergence: null };
+  // 第一刀：不读账本就能定的态（未接入 = legacy；收据本身坏 = 终态拒）
+  const pre = classifyLedgerAuthority({ receipt, ledgerMode: null });
+  if (pre.mode === "legacy") return { action: "legacy", divergence: null };
+  if (receipt?.ok !== true) return { action: "reject", reason: "ledger_route_unavailable", why: pre.why };
+  // shadow/authoritative：读账本，按矩阵交叉核账本 authority_mode（cutoverDone + 账本读不出在达里才拒）
   const resolved = resolve({ endpointId, rootOm, env });
-  if (!resolved.ok) {
-    if (authorityMode === "authoritative") return { action: "reject", reason: "ledger_route_unavailable", why: resolved.why ?? resolved.reason ?? "账本读不出" };
-    return { action: "legacy", divergence: { ledger: null, legacy: legacySessionId, ledger_unavailable: true } };
+  const cls = classifyLedgerAuthority({ receipt, ledgerMode: resolved.ok ? resolved.authority_mode : null });
+  if (cls.mode === "reject") return { action: "reject", reason: "ledger_route_unavailable", why: cls.why };
+  if (cls.mode === "shadow") {
+    // shadow + 账本不可读 = 记录（不拒）；可读才谈分歧
+    if (!resolved.ok) return { action: "legacy", divergence: { ledger: null, legacy: legacySessionId, ledger_unavailable: true } };
+    const sid = resolved.record?.binding_target?.claude_session_id ?? null;
+    return { action: "legacy", divergence: sid !== legacySessionId ? { ledger: sid, legacy: legacySessionId } : null };
   }
-  const sid = resolved.record?.binding_target?.claude_session_id ?? null;
-  // 分派只认调用方带来的 authorityMode（收据层：账本读不出时它仍可用；cutover 收据 ⇔ 账本 authoritative，G14）。
-  if (authorityMode === "authoritative") {
-    if (resolved.record === null) return { action: "reject", reason: "ledger_route_unavailable", why: "账本里没有这个话题（root_om " + rootOm + "）的 live 记录" };
-    if (sid !== null) return { action: "session", sessionId: sid, target: findLiveById({ projectRoot, claudeSessionId: sid }) };
-    return { action: "project", picked: selectSession({ pinned: readPin(projectRoot), live: findLive({ projectRoot }) }) };
+  // authoritative：只认账本
+  if (!resolved.ok) return { action: "reject", reason: "ledger_route_unavailable", why: resolved.why ?? "账本读不出" };
+  if (resolved.record === null) return { action: "reject", reason: "ledger_route_unavailable", why: "账本里没有这个话题（root_om " + rootOm + "）的 live 记录" };
+  // R66 返修一 P1-2：账本 target 的项目根必须与本次路由项目一致（两边 realpath 规范化，失败按不符）——
+  // 否则会把别的项目的 session 在当前 cwd 续起。不根据账本静默切项目。
+  const btRoot = resolved.record.binding_target?.project_root;
+  if (typeof btRoot !== "string" || !sameRealPath(btRoot, projectRoot)) {
+    return { action: "reject", reason: "ledger_route_unavailable", why: "账本 target 的项目根与本次路由项目不一致" };
   }
-  return { action: "legacy", divergence: sid !== legacySessionId ? { ledger: sid, legacy: legacySessionId } : null };
+  const sid = resolved.record.binding_target?.claude_session_id ?? null;
+  if (sid !== null) return { action: "session", sessionId: sid, target: findLiveById({ projectRoot, claudeSessionId: sid }) };
+  return { action: "project", picked: selectSession({ pinned: readPin(projectRoot), live: findLive({ projectRoot }) }) };
 }
 
 export function appendShadowDivergenceNote({ noteFile, divergence }) {

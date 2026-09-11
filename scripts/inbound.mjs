@@ -975,15 +975,13 @@ if (!replyOnly) {
   const receipt66 = (typeof maintDir66 === "string" && maintDir66.length > 0)
     ? endpointReceipt(maintDir66, endpoint66)
     : { ok: false };
-  const m1aOn = receipt66.ok === true && receipt66.state !== "never_initialized";
-  // 权威信号用收据层（cutover 终态收据 ⇔ 账本 authoritative，G14）——账本读不出时它仍可用。
-  const authorityMode66 = !m1aOn ? null : (receipt66.cutoverDone === true ? "authoritative" : "shadow");
   // 本话题的根消息 id：消息落在哪个代际，就按那个代际的 root_message_id 对账本 aliases.root_om。
   const sessionGen66 = generationForSession(mapping?.topic_generation_state ?? null, event.session_id);
   const rootOm66 = sessionGen66?.root_message_id
     ?? (typeof mapping?.feishu_root_message_id_reference === "string" ? mapping.feishu_root_message_id_reference : null);
+  // 判源四态矩阵（含收据不可用/模式交叉核）在 decide 内共用——inbound 不再自行折叠。
   const decision66 = decideInboundDeliveryTarget({
-    authorityMode: authorityMode66, endpointId: endpoint66, rootOm: rootOm66,
+    receipt: receipt66, endpointId: endpoint66, rootOm: rootOm66,
     legacySessionId: legacyBoundSession, projectRoot: config.project_dir, env: process.env,
   });
   if (decision66.action === "reject") ledgerRouteProblem = decision66;

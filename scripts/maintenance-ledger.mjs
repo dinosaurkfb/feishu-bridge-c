@@ -133,7 +133,7 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
       if (!rec.ok) { out("[cutover 预览] 对账不一致：" + String(rec.reason ?? "") + (rec.why ? "：" + rec.why : "") + " —— 加了 --apply 也会被拒（什么都不动）"); return 1; }
       out("[cutover 预览] " + parsed.endpoint + "（" + chain + "）：对账一致（双射 digest " + String(rec.digest) + "）");
       out("  sidecar 目标：ledger/" + parsed.endpoint + "/expiry.json、ledger/" + parsed.endpoint + "/pending-claims.json、ledger/" + parsed.endpoint + "/policy.json");
-      out("  停两链定时器 → 两链 current 切维护桩 → 建门 → converge 三 sidecar → 二次对账重验 → 停在 authority cutover 提交点之前（等逐次授权）。加 --apply 执行。");
+      out("  停两链定时器 → 两链 current 切维护桩 → 建门 → converge 三 sidecar → 二次对账重验 → 账本锁内复核（pre SHA / 双射 digest / 三 sidecar SHA / 蓝图）→ 提交 authority_cutover → 重开（一次 --apply 覆盖全程，不可回滚、只向前）。加 --apply 执行。");
       return 0;
     }
     out("[预览] 预检通过，账本 init→shadow revision1（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。");

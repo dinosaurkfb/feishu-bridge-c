@@ -49293,6 +49293,96 @@ fs.lstatSync = function(p, ...rest) {
     assert.equal(resGood.ok, true, "null→UUID 同款账本应通过: " + JSON.stringify(resGood));
   });
 
+  test("R67 T17: validateLedger 必拒 op 层历史 UUID→null retarget（当前记录 proof 指向后一笔合法 null→UUID，G11 绿但 operationProblem 拒）", () => {
+    const ep = "endpoint_" + "2".repeat(24);
+    const op1Id = "00000000-0000-0000-0000-000000000001";
+    const op2Id = "00000000-0000-0000-0000-000000000002";
+    const op3Id = "00000000-0000-0000-0000-000000000003";
+    const tid = "ta_" + "b".repeat(32);
+    const uuidTarget = { runtime: "claude", project_root: "/Users/test/proj", claude_session_id: "11111111-2222-4333-8444-555555555555" };
+    const nullTarget = { runtime: "claude", project_root: "/Users/test/proj", claude_session_id: null };
+    const iso = "2026-09-11T00:00:00.000Z";
+
+    // 历史一笔 UUID→null 的 retarget op（自洽），随后又一笔合法 null→UUID retarget
+    // 当前记录 binding_proof 指向后一笔 op3（G11 绿、bindingProofProblem 绿、G13 绿）
+    const reqKey2 = "rk_hist_uuid_to_null";
+    const fp2 = TAL.fingerprintOf("retarget", { request_key: reqKey2, topic_agent_id: tid, old_target: uuidTarget, new_target: nullTarget });
+    const reqKey3 = "rk_hist_null_to_uuid";
+    const fp3 = TAL.fingerprintOf("retarget", { request_key: reqKey3, topic_agent_id: tid, old_target: nullTarget, new_target: uuidTarget });
+
+    const doc = {
+      schema_version: "1.0",
+      artifact_type: "feishu_bridge_topic_agent_ledger",
+      endpoint_id: ep,
+      chain: "claude",
+      authority_mode: "shadow",
+      revision: 3,
+      operations: {
+        [op1Id]: {
+          op_type: "initialize_shadow",
+          terminal_kind: "initialize_shadow",
+          request_key: "seed_init",
+          fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: ep, chain: "claude" }),
+          result_revision: 1,
+          result: { revision: 1 },
+        },
+        [op2Id]: {
+          op_type: "retarget",
+          terminal_kind: "retarget",
+          request_key: reqKey2,
+          fingerprint: fp2,
+          result_revision: 2,
+          result: {
+            affected_ids: [tid],
+            new_target: nullTarget,
+            old_target: uuidTarget,
+            unit: "record",
+          },
+        },
+        [op3Id]: {
+          op_type: "retarget",
+          terminal_kind: "retarget",
+          request_key: reqKey3,
+          fingerprint: fp3,
+          result_revision: 3,
+          result: {
+            affected_ids: [tid],
+            new_target: uuidTarget,
+            old_target: nullTarget,
+            unit: "record",
+          },
+        },
+      },
+      records: {
+        [tid]: {
+          kind: "live",
+          topic_agent_id: tid,
+          chat_id: "oc_" + "c".repeat(32),
+          aliases: { session_id: "sess_aily1", root_om: null },
+          facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" },
+          binding_target: uuidTarget,
+          binding_proof: {
+            kind: "retarget",
+            authorized_by: "ou_owner",
+            authorized_at: iso,
+            old_target: nullTarget,
+            new_target: uuidTarget,
+          },
+          locator_link_proof_ref: null,
+          anchor_candidate: null,
+          generation_lineage_id: null,
+          origin_operation_id: op3Id,
+          created_at: iso,
+          updated_at: iso,
+        },
+      },
+    };
+
+    const res = TAL.validateLedger(doc, { endpointId: ep });
+    assert.equal(res.ok, false, "op 层历史非法 retarget 必拒: " + JSON.stringify(res));
+    assert.match(res.why, /retarget 方向不对/u, "文案必须来自 operationProblem 那层（「retarget 方向不对」）: " + res.why);
+  });
+
   test("R65 T12: seedShadowEndpoint 注入 committed_with_residue → 报 seeded_unclean 且非绿、账本已写入、下次预览差异为空", () => {
     const fx = setupR65SeedFixture();
     try {
@@ -49342,6 +49432,55 @@ fs.lstatSync = function(p, ...rest) {
       assert.equal(res.status, "seeded_unclean");
       assert.notEqual(res.lock_state, "released");
       assert.match(res.why, /已写但收口不干净/u);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R67 T18: seedShadowEndpoint already_consistent 分支 outer 释放失败 → 文案为「未写入；排序锁释放不干净（<lock_state>）：先 doctor」、commit 为 already_consistent", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      // 先跑一次 apply 补种成功，使后续对账成为 already_consistent
+      const seed1 = seedShadowEndpoint({ endpointId: fx.ep, apply: true, authorizedBy: fx.frank_sender_id, env: fx.env });
+      assert.equal(seed1.ok, true);
+
+      // 再次运行 apply，注入 outer release 失败
+      const res = seedShadowEndpoint({
+        endpointId: fx.ep,
+        apply: true,
+        authorizedBy: fx.frank_sender_id,
+        env: fx.env,
+        _inject: {
+          outerRelease: () => ({ ok: false, reason: "lock_unreadable" }),
+        },
+      });
+      assert.equal(res.ok, false, "already_consistent 释放失败必非绿");
+      assert.equal(res.status, "seeded_unclean");
+      assert.equal(res.commit, "already_consistent", "commit 状态字段必须为 already_consistent");
+      assert.equal(res.lock_state, "unclear");
+      assert.match(res.why, /^未写入；排序锁释放不干净（unclear）：先 doctor$/u, "文案必须校准为未写入及先 doctor");
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  test("R67 T19: seedShadowEndpoint post_reconcile_failed → 文案为「已写成但后置对账失败（commit=<commit>）：不要重跑 apply，先 doctor」、带出 commit 字段", () => {
+    const fx = setupR65SeedFixture();
+    try {
+      const res = seedShadowEndpoint({
+        endpointId: fx.ep,
+        apply: true,
+        authorizedBy: fx.frank_sender_id,
+        env: fx.env,
+        _inject: {
+          postReconcile: () => ({ ok: false, mismatches: [{ kind: "mock_mismatch" }], cutover_blockers: [] }),
+        },
+      });
+      assert.equal(res.ok, false, "后置对账失败必非绿");
+      assert.equal(res.reason, "post_reconcile_failed");
+      assert.equal(res.commit, "committed_clean", "必须带出 commit=committed_clean 状态字段");
+      assert.equal(res.lock_state, "released");
+      assert.match(res.why, /^已写成但后置对账失败（commit=committed_clean）：不要重跑 apply，先 doctor$/u, "文案必须校准为已写成但后置对账失败");
     } finally {
       fx.cleanup();
     }

@@ -301,7 +301,8 @@ lineage 相同，都会把合法新请求误判成旧重放）：
 
 fingerprint 只用于**同一 request_key 内判等**，不作授权；`result` 保证 create→归并后仍能按
 op_id 找回创建 ID / 存活 ID（评审四 P1-2）。
-（`initialize_shadow`/`authority_cutover` 属维护层入口，**第 1 块生产恒拒、正文已删**，只留恒拒外壳；
+（`initialize_shadow`/`authority_cutover` 属维护层入口：**裸调用恒拒**（无受验 capability 时只留恒拒外壳）；
+受验维护 capability 路径（R69）已武装，判据只在 verifyCutoverPlan 一处；
 其 request_key、virgin 盘点、§5.2 WAL、门内双射对账都由第 2 块维护层提供，且必须校验并使用调用方原
 request_key、不 fallback，评审六 P1-1。）
 

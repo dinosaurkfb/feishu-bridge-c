@@ -122,7 +122,9 @@ export function renderPendingClaimsSidecar({ endpointId, bindings, E }) {
 }
 
 const MAPPING_DEFAULT_UPDATED_AT = "1970-01-01T00:00:00.000Z";
-const mappingDefaultEntry = (bindingId) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping", policy_version: "1.0", updated_at: MAPPING_DEFAULT_UPDATED_AT, dialogue: null });
+/** 没策略字段的 binding 在 policy-1 里的默认条目（mapping 模式、无对话）。
+ *  导出（PK2-I1）：authoritative 期的 store 读写拿它当"条目缺席"的默认 —— 同一份，不写第二套。 */
+export const mappingDefaultEntry = (bindingId) => ({ schema_version: "1.0", binding_id: bindingId, policy_id: "mapping", policy_version: "1.0", updated_at: MAPPING_DEFAULT_UPDATED_AT, dialogue: null });
 
 export function renderPolicySidecar({ endpointId, bindings, E }) {
   return renderSidecar({ endpointId, bindings, E, name: "policy", buildEntries: (perRecord) => {

@@ -32,7 +32,7 @@ import {
   applyInteractionPolicyToAdmission, handleDialoguePolicy,
 } from "./interaction-policy.mjs";
 import {
-  finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn, setClaudeInteractionMode,
+  finalizeClaudeDialogueTurn, loadClaudeInteractionPolicyRouted, reserveClaudeDialogueTurn, setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
 import { controlAckText, runControlTransaction } from "./control-command.mjs";
 import { claudeControlPrecondition } from "./control-identity.mjs";
@@ -645,9 +645,13 @@ if (!dryRun && dialogueAuthorizationShadowEnabled()) {
     }
   } catch { /* shadow 永不承重 */ }
 }
-const interaction = loadClaudeInteractionPolicy({
+// PK2-I1：策略读面按账本判源分派（authoritative → v2 policy store；shadow/legacy 照旧）。
+//   判源不明（收据坏 / 模式交叉）时**只有这个读点延后拒**（裁定 3）：本读点不提前终结这条消息，
+//   让流程走到 claim 之后由 R66 投递层统一拒收（.failed.json + ledger-route 回执，R69 T7 同款）。
+const interaction = loadClaudeInteractionPolicyRouted({
   root: routed.root,
   claudeSessionId: routed.mapping?.claude_session_id ?? null,
+  rejectBehavior: "defer",
 });
 if (!interaction.ok) {
   writeReceipt("policy-state-" + (event.message_id ?? "unknown") + "-" + Date.now(), {

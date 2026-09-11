@@ -164,6 +164,18 @@ export function formatRetargetResult(res) {
     if (res[k] !== undefined) structural[k] = res[k];
   }
   if (Object.keys(structural).length > 0) lines.push("结构字段: " + JSON.stringify(structural));
+  // PK2-I4-fix3 P2：锁释放残骸单独一行点名（lock_state / path / reason / why）。
+  //   旧版这里只打 commit/lock_state/residue/gate —— `lockUncleared` 里的 EIO 原文永远上不了终端，
+  //   而 why 里只说"释放不干净"：人看不到该去查什么。
+  if (res.lockUncleared !== undefined && res.lockUncleared !== null) {
+    const u = res.lockUncleared;
+    lines.push("lockUncleared: " + [
+      "lock_state=" + String(u.lock_state ?? res.lock_state ?? "?"),
+      "path=" + String(u.path ?? "?"),
+      "reason=" + String(u.reason ?? "?"),
+      "why=" + String(u.why ?? "?"),
+    ].join("  "));
+  }
   return lines;
 }
 
@@ -303,13 +315,24 @@ export function retargetEndpoint({
           + (post && post.ok !== true ? "/post:" + post.why : "") + "）：不要重跑 apply，先 doctor"
         : String(res.why ?? "retarget 未提交") + lockNote(f);
       return { ok: false, status: wrote ? "retarget_unclean" : (res.reason ?? "retarget_failed"), reason: wrote ? "retarget_unclean" : (res.reason ?? "retarget_failed"),
-        commit: res.commit ?? "not_committed", lock_state: lockState, residue, why, ...base };
+        // PK2-I4-fix3 P1-2：失败返回与成功返回**同一形状** —— `...f` 展开（lock_state + lockUncleared），
+        //   与 reaffirm-intents 的 foldIntentsLockRelease 同款；旧版只手写 lock_state、把 lockUncleared 丢了，
+        //   于是"声明的统一形状"在普通拒绝这条路上并不成立。
+        commit: res.commit ?? "not_committed", residue, why, ...f, ...base };
     }
     return { ok: true, mode: "apply", status: replayConfirm || replayed ? "already_effective" : "retargeted",
       commit: res.commit, lock_state: lockState,
       revision: post.revision, op_count: post.ops, ...base };
+  } catch (err) {
+    // PK2-I4-fix3 P1-1：**锁内抛异常也走同一个出口**。旧版只靠 finally 释放，原异常裸穿 ——
+    //   释放不干净折不进返回值，调用方（CLI / 上层）拿到的是一个栈，没有任何锁信息。
+    //   这里 catch → finish() 分类（释放干净与否如实上折）→ 返回结构化失败，不裸抛。
+    const f = finish({});
+    return { ok: false, status: "retarget_threw", reason: "retarget_threw",
+      why: "锁内执行抛异常：" + String(err?.code !== undefined ? err.code + " " : "") + String(err?.message ?? err) + lockNote(f),
+      ...f, ...base };
   } finally {
-    releaseOuter(); // 幂等：成功路径已经折过它，这里只兜异常出口
+    releaseOuter(); // 幂等：成功/异常路径已经折过它，这里只兜最后一道
   }
 }
 

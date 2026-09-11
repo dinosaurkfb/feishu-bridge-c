@@ -53308,6 +53308,69 @@ test("PK2-I4-fix2 P2：预览提示项目根须字面一致（探测按字面 cw
   } finally { x.cleanup(); }
 });
 
+// ─────────────────── PK2-I4-fix3：锁内真正单出口（Codex #201 2 P1 + P2） ───────────────────
+test("PK2-I4-fix3 P1-1：锁内抛异常也走统一收口 —— 结构化 retarget_threw + lockUncleared（不许裸穿）", () => {
+  const x = i4Fixture();
+  try {
+    x.transcript(I4_UUID);
+    const before = x.bytes();
+    // 两条注入：账本 op 抛异常（锁内抛）+ 释放失败（残骸）——旧版只靠 finally 释放、原异常裸穿，
+    //   调用方拿到的是一个栈，没有任何锁信息。
+    const res = retargetEndpoint({ endpointId: x.EP, id: I4_TA_A, sessionId: I4_UUID, apply: true, env: x.env, _inject: {
+      probeSession: () => true,
+      retargetOp: () => { throw Object.assign(new Error("注入：账本 op 抛异常"), { code: "EINJECT" }); },
+      outerRelease: () => ({ ok: false, reason: "release_threw", path: "injected", why: "EIO: injected" }),
+    } });
+    assert.equal(res.ok, false, "不得裸抛 —— 必须返回结构化失败：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.reason, "retarget_threw", JSON.stringify(res).slice(0, 300));
+    assert.match(String(res.why), /EINJECT|注入/u, "why 带异常原文：" + res.why);
+    assert.ok(res.lockUncleared, "异常腿同样要折释放残骸：" + JSON.stringify(res).slice(0, 300));
+    assert.notEqual(res.lockUncleared.lock_state, "released", JSON.stringify(res.lockUncleared));
+    assert.match(String(res.why), /EIO|释放不干净/u, "why 要提释放失败：" + res.why);
+    assert.deepEqual(x.bytes(), before, "账本零写（异常在 op 里抛出）");
+    assert.equal(x.opsOf("retarget"), 0, "零写");
+    // CLI 出口就是这一条：失败 → 格式层 → 退出码 1（非 0）；不得把栈泼到终端
+    const lines = formatRetargetResult(res);
+    assert.match(lines[0], /retarget_threw/u, "首行点名结构化拒因：" + lines[0]);
+    assert.doesNotMatch(lines.join("\n"), /\n\s+at /u, "不许把异常栈当输出：" + lines.join(" | "));
+  } finally { x.cleanup(); }
+});
+
+test("PK2-I4-fix3 P1-2：账本 op 拒绝 + 释放失败 → 失败返回同样展开锁状态（形状与 reaffirm-intents 同款）", () => {
+  const x = i4Fixture();
+  try {
+    x.transcript(I4_UUID);
+    const before = x.bytes();
+    const res = retargetEndpoint({ endpointId: x.EP, id: I4_TA_A, sessionId: I4_UUID, apply: true, env: x.env, _inject: {
+      probeSession: () => true,
+      retargetOp: () => ({ ok: false, reason: "cas_mismatch", why: "注入：CAS 不符", commit: "not_committed" }),
+      outerRelease: () => ({ ok: false, reason: "release_threw", path: "injected", why: "EIO: injected" }),
+    } });
+    assert.equal(res.ok, false, JSON.stringify(res).slice(0, 300));
+    assert.equal(res.reason, "cas_mismatch", "仍是 op 的拒因：" + JSON.stringify(res).slice(0, 300));
+    assert.ok(res.lockUncleared, "普通拒绝也要展开锁状态（旧版只留 lock_state/residue，lockUncleared 丢了）：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.lockUncleared.lock_state, res.lock_state, "两处同源：" + JSON.stringify(res.lockUncleared));
+    assert.equal(res.lockUncleared.reason, "release_threw", JSON.stringify(res.lockUncleared));
+    assert.match(String(res.lockUncleared.why), /EIO/u, "残骸原文带出：" + JSON.stringify(res.lockUncleared));
+    assert.deepEqual(x.bytes(), before, "零写");
+    assert.equal(x.opsOf("retarget"), 0, "零写");
+  } finally { x.cleanup(); }
+});
+
+test("PK2-I4-fix3 P2：失败格式化输出 lockUncleared 一行（lock_state / path / reason / why）", () => {
+  const lines = formatRetargetResult({ ok: false, reason: "cas_mismatch", why: "CAS 不符", lock_state: "unclear",
+    lockUncleared: { lock_state: "unclear", path: "/tmp/x/m1a-order.lock", reason: "release_threw", why: "EIO: injected" } });
+  const text = lines.join("\n");
+  const picked = lines.filter((l) => l.includes("lockUncleared"));
+  assert.equal(picked.length, 1, "lockUncleared 恰一行：" + text);
+  for (const want of ["lock_state=unclear", "path=/tmp/x/m1a-order.lock", "reason=release_threw", "why=EIO: injected"]) {
+    assert.ok(picked[0].includes(want), "这一行要点名 " + want + "（旧版 EIO 根本不在终端上）：" + picked[0]);
+  }
+  // 没有 lockUncleared 时不多打一行（释放干净 / 无锁的失败）
+  assert.equal(formatRetargetResult({ ok: false, reason: "bad_session", why: "形状不对" }).filter((l) => l.includes("lockUncleared")).length, 0,
+    "没有锁残骸就不要多一行：" + formatRetargetResult({ ok: false, reason: "bad_session", why: "形状不对" }).join(" | "));
+});
+
 sealSummary();
 
 printSummary({ printFailures: true });

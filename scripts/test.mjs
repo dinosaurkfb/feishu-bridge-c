@@ -257,6 +257,7 @@ import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
 import { seedShadowEndpoint } from "./m1a-seed.mjs";
+import { collectLegacyForCutover } from "./m1a/cutover-reconcile.mjs"; // R69 返修二 P1-A：registry/template 路径同源断言
 import * as RECON45 from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
@@ -32445,6 +32446,8 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     // R69 返修一 P1-2：链模板来源同样显式钉住（固定适配器按 env 派生；CLI 面带的是本地 env 快照）。
     env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge45, "chain-config.json");
     const savedReg45 = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge45, "registry.json");
+    // R69 返修二 P1-A：链模板独立解析 —— process.env 侧也要钉住（CLI/ledgerEnter 默认 env=process.env）。
+    const savedTpl45 = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge45, "chain-config.json");
     fs.writeFileSync(path.join(bridge45, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
     fs.writeFileSync(path.join(bridge45, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 }); // M1a Claude 采集器读链模板（collectFor 默认路径）
     const node = pickClaudeNodeB();
@@ -32682,6 +32685,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.match(doc3.detail, /deadface[\s\S]*staged 残骸|staged 残骸[\s\S]*deadface/u, "残骸点名（不裸抛）：" + doc3.detail);
     } finally {
       if (savedReg45 === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg45;
+      if (savedTpl45 === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = savedTpl45;
       if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
       if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
       if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
@@ -32701,6 +32705,8 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const bridge45 = path.join(home, ".claude", "feishu-bridge");
     // 同 C+D：登记表必须钉到受控文件（ledgerEnter 默认 env=process.env，全局沙箱表会盖掉本测试的 retired 场景）。
     const savedReg45 = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge45, "registry.json");
+    // R69 返修二 P1-A：链模板独立解析 —— process.env 侧也要钉住（CLI/ledgerEnter 默认 env=process.env）。
+    const savedTpl45 = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge45, "chain-config.json");
     const writeRegistry45 = (projects) => fs.writeFileSync(path.join(bridge45, "registry.json"), JSON.stringify({ projects }, null, 2) + "\n", { mode: 0o600 });
     writeRegistry45([]);
     fs.writeFileSync(path.join(bridge45, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
@@ -32760,6 +32766,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.equal(cut4.phase, "done", "③ 清掉待修项 → 武装提交点续跑收口 done：" + JSON.stringify({ phase: cut4.phase, reason: cut4.reason }));
     } finally {
       if (savedReg45 === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg45;
+      if (savedTpl45 === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = savedTpl45;
       if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
       if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
       if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
@@ -49970,6 +49977,8 @@ const r69Fixture = (tag) => {
   //   只剩全局登记表目录那条回落路径，链模板在别处缺席）。
   env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
   const savedReg = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
+  // R69 返修二 P1-A：registry 与 template **各自独立**解析 —— 两处都要显式钉（钉一个不等于钉另一个）。
+  const savedTpl69 = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
   fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
   const node = pickClaudeNodeB();
@@ -50005,6 +50014,7 @@ const r69Fixture = (tag) => {
   };
   const cleanup = () => {
     if (savedReg === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg;
+    if (savedTpl69 === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = savedTpl69;
     if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
     if (savedGateEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGateEnv;
     if (savedMaintDirEnv === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDirEnv;
@@ -50409,6 +50419,77 @@ test("R69 返修一 P1-3 T5b 恢复腿：committed_with_residue 之后不得直�
     const exit5 = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
     assert.equal(exit5.phase, "done", "④ 收口：" + JSON.stringify({ phase: exit5.phase, reason: exit5.reason, why: exit5.why }));
     assert.equal(ledgerStepState(), "done", "④ ledger step done");
+  } finally { f.cleanup(); }
+});
+
+test("R69 返修二 P1-A T14 registry 与 template **各自独立**解析：只覆盖 registry 时 template 仍走 <HOME>/.claude/feishu-bridge/chain-config.json（fs 探针），且与 doctor 的派生逐字同源", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r69-t14-")));
+  const home = path.join(base, "home");
+  const bridge = path.join(home, ".claude", "feishu-bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  // 只覆盖 registry：template 不设 —— 旧码把 template 隐式挪到 registry 同目录，这里恰好没有那个文件。
+  const altReg = path.join(base, "x", "registry.json");
+  fs.mkdirSync(path.dirname(altReg), { recursive: true });
+  fs.writeFileSync(altReg, JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
+  const opened = [];
+  const origOpen = fs.openSync, origRead = fs.readFileSync;
+  fs.openSync = (p, ...a) => { opened.push(path.resolve(String(p))); return origOpen.call(fs, p, ...a); };
+  fs.readFileSync = (p, ...a) => { opened.push(path.resolve(String(p))); return origRead.call(fs, p, ...a); };
+  let res;
+  try {
+    const env14 = { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: altReg };
+    delete env14.FEISHU_BRIDGE_CHAIN_TEMPLATE;
+    res = collectLegacyForCutover({ chain: "claude", env: env14 });
+  } finally { fs.openSync = origOpen; fs.readFileSync = origRead; }
+  const wantTpl = path.join(home, ".claude", "feishu-bridge", "chain-config.json");
+  const movedTpl = path.join(path.dirname(altReg), "chain-config.json");
+  assert.equal(res.ok, true, "只覆盖 registry 时整份快照仍可读：" + JSON.stringify(res));
+  assert.ok(opened.includes(path.resolve(altReg)), "registry 走覆盖路径：" + JSON.stringify(opened.slice(0, 8)));
+  assert.ok(opened.includes(path.resolve(wantTpl)), "template 仍走 <HOME> 下的默认路径（不被 registry 覆盖联动）：" + JSON.stringify(opened.slice(0, 8)));
+  assert.ok(!opened.includes(path.resolve(movedTpl)), "不得把 template 挪到 registry 同目录：" + JSON.stringify(opened.slice(0, 8)));
+  // 与 doctor 同源：registry 逐字等于 machineContext 的 registryFile；template 逐字等于 doctor 内联的那条派生。
+  const savedReg14 = process.env.FEISHU_BRIDGE_REGISTRY;
+  process.env.FEISHU_BRIDGE_REGISTRY = altReg;
+  let mc;
+  try { mc = machineContext({ home }); } finally {
+    if (savedReg14 === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedReg14;
+  }
+  assert.equal(mc.registryFile, altReg, "doctor registryFile 与覆盖路径同源：" + mc.registryFile);
+  assert.ok(opened.includes(path.resolve(mc.registryFile)), "adapter 打开的 registry == doctor 算出的 registry：" + mc.registryFile);
+  assert.equal(path.join(mc.home, ".claude", "feishu-bridge", "chain-config.json"), wantTpl, "doctor 的 template 派生与 adapter 打开的逐字相等");
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.reap 在场 → 停门 ledger_reap_residue、不记 done；清掉后收口", () => {
+  const f = r69Fixture("t5c");
+  try {
+    const EP = f.ep("t5c");
+    { const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true }); assert.ok(init.phase === "done", "前置 init：" + JSON.stringify(init)); }
+    // 场景：账本已翻转、ledger step 未 done（提交后崩溃）——恢复腿走到 intended_after。
+    f.crashAt.id = "written:ledger:" + EP + ":cutover";
+    let crashed = false;
+    try { LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true }); } catch (e) { crashed = e?.simulatedCrash === true; }
+    f.crashAt.id = null;
+    assert.ok(crashed, "提交后崩溃注入生效");
+    const token = readActive({ dir: f.dir }).token;
+    f.takeover(token);
+    const epDir = path.join(f.ledgerRoot, EP);
+    const ledgerStepState = () => f.journalOf(token).steps.find((x) => x.kind === "ledger").state;
+    assert.equal(ledgerStepState(), "prepared", "前置：ledger step 未 done：" + ledgerStepState());
+    // reap 残骸：形状合法的 symlink（present 即可 —— readLockOwner strict 的"在场"一支）
+    const reapPath = path.join(epDir, "ledger.lock.reap");
+    fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date(f.clockNow()).toISOString(), token: "r69-t5c-reap" }), reapPath);
+    const exit2 = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
+    assert.equal(exit2.ok, false, "① reap 残骸不许收口：" + JSON.stringify({ ok: exit2.ok, reason: exit2.reason, why: exit2.why }));
+    assert.equal(exit2.reason, "ledger_reap_residue", "① 拒因：" + JSON.stringify({ reason: exit2.reason, why: exit2.why }));
+    assert.equal(ledgerStepState(), "prepared", "① 不得 markStepDone");
+    assert.equal(fs.lstatSync(reapPath).isSymbolicLink(), true, "① 残骸不得自清（交 repair-publish-lock）");
+    // 清掉 → 才收口 done
+    fs.rmSync(reapPath, { force: true });
+    const exit3 = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
+    assert.equal(exit3.phase, "done", "② 清掉 reap 残骸后收口：" + JSON.stringify({ phase: exit3.phase, reason: exit3.reason, why: exit3.why }));
+    assert.equal(ledgerStepState(), "done", "② ledger step done");
   } finally { f.cleanup(); }
 });
 

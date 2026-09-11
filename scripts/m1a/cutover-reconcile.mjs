@@ -27,25 +27,31 @@ const homeOf = (env) => {
   return typeof real === "string" ? real : null;
 };
 
-/** registry.json 与 chain-config.json 同属一个 bridge home（`<bridge>/registry.json`、`<bridge>/chain-config.json`）：
- *  `FEISHU_BRIDGE_REGISTRY` 指到哪儿，链模板就跟到哪儿（两者是同一份现场）；没有覆盖才回落到 home。
- *  取不到 → null（调用方折成 fail-closed）。 */
+/** 一台机器的控制面目录（`<home>/.claude/feishu-bridge`）——与 doctor.machineContext 的 `bridge` 同一表达式。
+ *  取不到 home → null（调用方折成 fail-closed）。 */
 const claudeBridgeHome = (env) => {
-  const reg = env.FEISHU_BRIDGE_REGISTRY;
-  if (typeof reg === "string" && reg.length > 0) return path.dirname(reg);
   const home = homeOf(env);
   return home === null ? null : path.join(home, ".claude", "feishu-bridge");
 };
+
+/** 非空 env 覆盖，否则默认 —— 与 doctor/chain-template 的 `env.X || 默认` 同语义（空串按没设）。 */
+const envOr = (v, fallback) => (typeof v === "string" && v.length > 0 ? v : fallback);
+
+/** 控制面两份来源：registry 与 chain template **各自独立解析**（与 doctor.machineContext 的 registryFile、
+ *  以及 doctor 内联的 `path.join(ctx.home, ".claude", "feishu-bridge", "chain-config.json")` 逐字同源）。
+ *  两份文件同属一个 bridge home，但**覆盖一个不等于覆盖另一个**：只设 `FEISHU_BRIDGE_REGISTRY` 时 template
+ *  仍走 home 下的默认路径（返修一曾把 template 隐式挪到 registry 同目录 —— 探针一设就露）。 */
+const claudeSources = (env, bridge) => ({
+  registryFile: envOr(env.FEISHU_BRIDGE_REGISTRY, path.join(bridge, "registry.json")),
+  templateFile: envOr(env.FEISHU_BRIDGE_CHAIN_TEMPLATE, path.join(bridge, "chain-config.json")),
+});
 
 /** 固定维护适配器的 legacy 采集（两种链的路径都由 env 派生，不接受调用方自述路径）。 */
 export function collectLegacyForCutover({ chain, env = process.env } = {}) {
   if (chain === "claude") {
     const bridge = claudeBridgeHome(env);
     if (bridge === null) return { ok: false, reason: "legacy_source_unreadable", source: "args", why: "claude bridge home 说不清（env.HOME 与真实用户 home 都取不到且无 env 覆盖）" };
-    return collectClaudeLegacySnapshot({
-      registryFile: path.join(bridge, "registry.json"),
-      templateFile: env.FEISHU_BRIDGE_CHAIN_TEMPLATE ?? path.join(bridge, "chain-config.json"),
-    });
+    return collectClaudeLegacySnapshot(claudeSources(env, bridge));
   }
   try {
     return collectCodexLegacySnapshot({ home: bridgeHome(env) });

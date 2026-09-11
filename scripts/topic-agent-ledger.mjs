@@ -2567,17 +2567,25 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
 }
 
 /**
- * R69 返修一 P1-3：**已提交（intended_after）收口前置** —— 编排层在 markStepDone 之前必须过这三关：
- *   ① 账本主锁必须 absent（present / unreadable = 上次提交的归属证明没交还，归人；不替锁协议做决定）；
+ * R69 返修一 P1-3 / 返修二 P1-B：**已提交（intended_after）收口前置** —— 编排层在 markStepDone 之前必须过这三关：
+ *   ① 账本主锁（`ledger.lock`）与其归属转换锁（`ledger.lock.reap`）都必须 absent（present / unreadable =
+ *      上次提交的归属证明没交还，归人；不替锁协议做决定）；
  *   ② 持久化屏障必须**重做成功**（账本文件 fsync + endpoint 目录 fsync）—— loadLedger 的"读得到"证明不了耐久；
  *   ③ 账本 tmp 残骸一律不自清（交显式维护入口；在这里自清等于把"谁留下的"抹掉）。
  * @returns { ok: true } | { ok: false, reason, why }
  */
 export function ledgerSettlePrecondition({ dir, _inject = null } = {}) {
-  const lo = readLockOwner(ledgerPaths(dir).lock, { strict: true });
+  const lockPath = ledgerPaths(dir).lock;
+  const lo = readLockOwner(lockPath, { strict: true });
   if (!lo.absent) {
     return { ok: false, reason: "ledger_lock_residue",
       why: "账本主锁未交还（" + (lo.present ? "仍在盘上" : "读不出：" + String(lo.error ?? "?")) + "）：先人工核对再收口" };
+  }
+  // 主锁已删、`.reap` 交不还：归属转换锁是锁协议自己的资源（release 段失败留下的），同样不许在这里当"干净"收口。
+  const reap = readLockOwner(lockPath + ".reap", { strict: true });
+  if (!reap.absent) {
+    return { ok: false, reason: "ledger_reap_residue",
+      why: "账本锁的 reap 残骸在场（" + (reap.present ? "仍在盘上" : "读不出：" + String(reap.error ?? "?")) + "：" + lockPath + ".reap）：不自清，交 repair-publish-lock" };
   }
   const b = barrierLedgerDurability({ dir, claimsDir: null, dirsPendingFsync: [], _inject });
   if (!b.ok) return { ok: false, reason: "ledger_durability_unconfirmed", why: String(b.why ?? "持久化屏障重做失败") };

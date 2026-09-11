@@ -50082,6 +50082,9 @@ const r69Fixture = (tag) => {
   // R69 返修一 P1-2：cutover 的对账来源由固定适配器按 env 派生 —— 本地 env 也要把链模板指到本夹具（否则
   //   只剩全局登记表目录那条回落路径，链模板在别处缺席）。
   env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
+  // PK2-F5：本地 env 同样要钉住 registry（R69 返修二 P1-A 只钉了 process.env 侧；f.env 里萡下的是
+  //   套件级 bridge-test-registry 展开值 —— 直接调 authorityCutover 的用例，提交点对账读的不是夹具登记表）。
+  env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   const savedReg = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   // R69 返修二 P1-A：registry 与 template **各自独立**解析 —— 两处都要显式钉（钉一个不等于钉另一个）。
   const savedTpl69 = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
@@ -50230,7 +50233,7 @@ test("R69 T4a staging 后 legacy 变更 → 二次重验拒（bijection），停
   } finally { f.cleanup(); }
 });
 
-test("R69 T4b 账本 SHA 被旁路改 → 提交点拒（CAS：bind 层先拦或锁内 pre_sha），账本不翻转", () => {
+test("R69 T4b 账本 SHA 被旁路改 → 提交点拒（CAS：bind 层先拦或锁内账本 CAS），账本不翻转", () => {
   const f = r69Fixture("t4b");
   try {
     const EP = f.ep("t4b");
@@ -50249,14 +50252,14 @@ test("R69 T4b 账本 SHA 被旁路改 → 提交点拒（CAS：bind 层先拦或
     fs.writeFileSync(path.join(f.ledgerRoot, EP, "ledger.json"), JSON.stringify(doc, null, 4) + "\n", { mode: 0o600 });
     const r = TAL.authorityCutover({ endpointId: EP, capability, requestKey: token, chain: "claude", env: f.env });
     assert.equal(r.ok, false, "必须拒：" + JSON.stringify(r));
-    assert.match(String(r.why ?? r.reason), /plan_binding_mismatch|pre_sha_mismatch/u, "4c-1 CAS 拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.match(String(r.why ?? r.reason), /plan_binding_mismatch|ledger_identity_mismatch/u, "CAS 拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
     assert.equal(r.commit, "not_committed", "未提交");
     assert.equal(TAL.loadLedger(path.join(f.ledgerRoot, EP), { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
     releaseOperationLease(lease);
   } finally { f.cleanup(); }
 });
 
-test("R69 T4c sidecar 现场 SHA 被旁路改 → 提交点拒（sidecar_sha_mismatch，4c-3），账本不翻转", () => {
+test("R69 T4c sidecar 现场 SHA 被旁路改 → 提交点拒（sidecar_sha_mismatch，verifyCutoverPlan 现场等式），账本不翻转", () => {
   const f = r69Fixture("t4c");
   try {
     const EP = f.ep("t4c");
@@ -50273,7 +50276,7 @@ test("R69 T4c sidecar 现场 SHA 被旁路改 → 提交点拒（sidecar_sha_mis
     fs.writeFileSync(path.join(f.ledgerRoot, EP, "policy.json"), Buffer.from(JSON.stringify({ schema_version: "old-policy", endpoint_id: EP, entries: { tampered: "2026-01-01T00:00:00.000Z" } }, null, 2) + "\n", "utf-8"), { mode: 0o600 });
     const r = TAL.authorityCutover({ endpointId: EP, capability, requestKey: token, chain: "claude", env: f.env });
     assert.equal(r.ok, false, "必须拒：" + JSON.stringify(r));
-    assert.equal(r.reason, "sidecar_sha_mismatch", "4c-3 拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.equal(r.reason, "sidecar_sha_mismatch", "现场等式拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
     assert.equal(r.commit, "not_committed", "未提交");
     assert.equal(TAL.loadLedger(path.join(f.ledgerRoot, EP), { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
     releaseOperationLease(lease);
@@ -50473,7 +50476,7 @@ test("R69 返修一 P1-1 T12 锁内复核覆盖 blocker：提交前冒出待修�
   } finally { f.cleanup(); }
 });
 
-test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账本旁路改（纯字节、结构不变）→ pre_sha_mismatch、账本不翻转", () => {
+test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账本旁路改（纯字节、结构不变）→ 提交点拒（ledger_identity_mismatch）、账本不翻转", () => {
   const f = r69Fixture("t13");
   try {
     const s = r69PreCommit(f, "t13");
@@ -50483,7 +50486,7 @@ test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账
       fs.writeFileSync(ledgerFile, fs.readFileSync(ledgerFile, "utf-8").replace(/\n$/u, " \n"), { mode: 0o600 });
     } } });
     assert.equal(exit.ok, false, "T13 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
-    assert.equal(exit.reason, "pre_sha_mismatch", "T13 拒因：" + JSON.stringify({ reason: exit.reason, why: exit.why }));
+    assert.equal(exit.reason, "ledger_identity_mismatch", "T13 拒因（锁内 rawSha CAS 随 reconcile.ledger 进 verifyCutoverPlan）：" + JSON.stringify({ reason: exit.reason, why: exit.why }));
     assert.equal(s.mode(), "shadow", "账本未翻转");
   } finally { f.cleanup(); }
 });

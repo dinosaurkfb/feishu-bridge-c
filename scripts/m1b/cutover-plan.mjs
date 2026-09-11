@@ -5,11 +5,15 @@
  * 及第二次对账结果的交叉等式。五条等式 + 4f 五源 endpoint 相等：
  *
  *   ① plan.operation_token === doc.token；plan.endpoint_id === 受验账本顶层 endpoint_id
- *   ② 每个 sidecar：plan.sidecars[name].sha256 === step.intended_blob.sha256 === step.intended_after.sha256
+ *   ② 每个 sidecar：plan.sidecars[name].sha256 === step.intended_blob.sha256 === step.intended_after.sha256；
+ *      调用方提供 onDiskSidecars（锁内 fd 受验读的现场身份，与 converge 同一读法）时，加核**现场**等式：
+ *      每键 present ∧ 无 problem ∧ 现场 sha256 === plan.sidecars[key].sha256（PK2-F5：4c-3 判据收编，一个出处）
  *   ③ plan.ledger === ledgerStep.before（首次 reconciler 的账本身份）
  *   ④ plan.digest === ledgerStep.intended_after.bijection_digest
  *      === reconcile.digest；canonKey(reconcile.snapshot_identity) === canonKey(plan.snapshot_identity)；
- *      reconcile.ledger === plan.ledger（同快照同 revision 重验四件相等）
+ *      reconcile.ledger === plan.ledger（同快照同 revision 重验四件相等；**锁内 rawSha256 随 reconcile.ledger
+ *      进这条 CAS** —— 旁路纯字节改也当场拒，PK2-F5：4c-1 pre-SHA CAS 判据收编）；
+ *      reconcile.cutover_blockers 非空 → cutover_blocked（PK2-F5：4c-2 硬门收编，与编排层二次重验同名同门）
  *   ⑤ ledgerStep.intended_after.plan_sha256 === sha256(planBytes)
  *
  *   4f 五源 endpoint 相等：受验账本顶层 endpoint_id（①）、蓝图 fingerprint 输入
@@ -25,7 +29,7 @@ import { planProblem } from "./staged-plan.mjs";
 
 const SIDE_CAR_PAIRS = [["expiry", "expiry"], ["pending_claims", "pending-claims"], ["policy", "policy"]];
 
-export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, ledgerEndpointId, reconcile }) {
+export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, ledgerEndpointId, reconcile, onDiskSidecars }) {
   if (!(planBytes instanceof Uint8Array) || planBytes.length === 0) return { ok: false, reason: "plan_bytes_missing" };
   const planSha = createHash("sha256").update(planBytes).digest("hex");
   let plan;
@@ -46,12 +50,27 @@ export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, le
       return { ok: false, reason: "sidecar_sha_mismatch", why: fileBase };
     }
   }
+  // ②-b（PK2-F5 收编 4c-3）：sidecar **现场**等式 —— 只判传入的锁内 fd 受验读结果（与 converge 同一读法），
+  // 本函数仍不做 IO；未提供（旧调用方/单元）不核。现场缺席/形状坏/SHA ≠ plan 锚（与 ② 的 step 锚已互等）都拒。
+  if (onDiskSidecars !== undefined) {
+    for (const [key, fileBase] of SIDE_CAR_PAIRS) {
+      const cur = onDiskSidecars?.[key];
+      if (!cur || cur.present !== true || cur.problem !== undefined || cur.sha256 !== plan.sidecars[key].sha256) {
+        return { ok: false, reason: "sidecar_sha_mismatch", why: fileBase + " 现场与 plan 锚不一致（" + (!cur || !cur.present ? "absent" : (cur.problem ?? "sha 不等")) + "）" };
+      }
+    }
+  }
   // ③
   if (plan.ledger.revision !== ledgerStep?.before?.revision || plan.ledger.sha256 !== ledgerStep?.before?.ledger_sha256) {
     return { ok: false, reason: "ledger_identity_mismatch", why: "plan.ledger 与 prepared before 不一致" };
   }
   // ④
   if (plan.digest !== ledgerStep?.intended_after?.bijection_digest) return { ok: false, reason: "digest_mismatch", why: "plan.digest 与 bijection_digest 不一致" };
+  // blockers 硬门（PK2-F5 收编 4c-2，先于 ok 判 —— 与提交点旧序一致）：待修项非空直接点名，
+  // 与编排层二次重验（convergeSidecars）同名同门。字段缺席（旧单元最小 reconcile）视为空。
+  if ((reconcile?.cutover_blockers?.length ?? 0) > 0) {
+    return { ok: false, reason: "cutover_blocked", why: "提交点对账发现待修项（" + reconcile.cutover_blockers.length + " 条）" };
+  }
   if (reconcile?.ok !== true) return { ok: false, reason: "reconcile_not_ok" };
   if (reconcile.digest !== plan.digest) return { ok: false, reason: "digest_mismatch", why: "重验 digest 与 plan 不一致" };
   // 快照身份全量等价（P1-3）：plan 的身份现在由 identityOf 在受验读时点自带封闭域 source 标注，

@@ -30,7 +30,7 @@ export { canonKey, sha256 };
 // R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
 import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE } from "./shapes.mjs";
 import { SIDECAR_TMP_TAIL_RE } from "./verified-sidecar.mjs";
-import { readSidecarCurrent } from "./maintenance/sidecar-writer.mjs"; // R69：4c-3 与 converge 同一 fd 受验读
+import { readSidecarCurrent } from "./maintenance/sidecar-writer.mjs"; // PK2-F5：现场采集（与 converge 同一 fd 受验读），判据在 verifyCutoverPlan
 import { readStagedVerified } from "./m1b/staged-plan.mjs"; // R69 返修一 P1-1：锁内复核要 staged plan 的受验字节
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs"; // R69 返修一 P1-1：与门内二次重验**同一函数、同一等式**
 import { reconcileForCutover } from "./m1a/cutover-reconcile.mjs"; // R69 返修一 P1-2：对账来源固定在此，不由 capability 携带
@@ -2821,10 +2821,13 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   if (!loaded.ok) return { ok: false, commit: "not_committed", reason: loaded.reason, why: loaded.why ?? null };
   if (loaded.doc.authority_mode !== "shadow") return { ok: false, commit: "not_committed", reason: "mode_not_shadow", why: "authority_mode=" + loaded.doc.authority_mode };
   if (loaded.doc.chain !== chain) return { ok: false, commit: "not_committed", reason: "chain_mismatch", why: "账本 chain 与入参不符" };
-  // R69：4c 跨制品绑定核验（§4.1）移入 writeLedger 的 mutate —— 持账本锁内、翻转前逐项核：
-  //   ① pre SHA/revision CAS；② 重新对账（capability.reconcile，同一 adapter）ok + blockers 空 + digest 等蓝图；
-  //   ③ 三 sidecar 现场 SHA 等锚（fd 受验读，与 converge 同一读法）；④ cutoverPlanVerifier 过。
-  //   任一不等 → not_committed，reason：pre_sha_mismatch / bijection_digest_mismatch / sidecar_sha_mismatch / plan_mismatch。
+  // R69：4c 跨制品绑定核验（§4.1）移入 writeLedger 的 mutate —— 持账本锁内、翻转前逐项核。
+  // PK2-F5（Codex R65/R69 评审「少量重复」去重）：判据**只留在 verifyCutoverPlan 一个出处**（与门内二次重验
+  // 同一函数、同一等式）；mutate 只**采集**两样锁内事实喂进去：
+  //   ① 锁内 fd 受验读的账本原始字节 SHA（rawSha256，随 reconcile.ledger 进 ④ CAS —— 旁路纯字节改当场拒）；
+  //   ② 三 sidecar 现场身份（readSidecarCurrent，与 converge 同一读法，进 ② 现场等式）。
+  //   对账（固定适配器）同样只作输入：ok / blockers / digest / 快照身份 / 同源渲染字节全由 verifyCutoverPlan 判。
+  //   任一不等 → not_committed；reason 全集以 cutover-plan.mjs 的返回为准（本文件不再手写任何判据字面量）。
   //   旧 reconcileShadow 恒拒占位不再在生产路径使用（保留仅作单元被钉）。
   // R69：蓝图 result（七键封闭）在重建 plan 内，提交点各核验与重放输入都从它取。
   const cutResult = plan.doc?.operations?.[plan.operationId]?.result ?? null;
@@ -2845,25 +2848,13 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
       if (currentDoc.authority_mode !== "shadow") return { ok: false, reason: "mode_not_shadow" };
       if (Object.values(currentDoc.operations).some((op) => op.op_type === "authority_cutover")) return { ok: false, reason: "already_cutover" };
       if (currentDoc.revision !== plan.before.revision) return { ok: false, reason: "state_moved", why: "账本 revision 变过" };
-      // 4c-1：pre SHA CAS —— 用**锁内 fd 受验读到的原始字节**（R69 返修一 P1-3）：规范化重演算的 SHA
-      //   对"旁路改了一个空格"这类纯字节漂移是瞎的，那正是这条 CAS 要抓的东西。
-      if (rawSha256 === null || rawSha256 !== cutResult.pre_cutover_ledger_sha) {
-        return { ok: false, reason: "pre_sha_mismatch", why: "账本原始字节 SHA 与蓝图 pre_cutover_ledger_sha 不一致（旁路改动？）" };
-      }
-      // 4c-2：重新对账 —— 来源是 verifier 构造的**固定维护适配器**（capability 不携带回调）；先过 blockers 硬门。
+      // PK2-F5：判据不再在此手写（旧 4c-1 pre-SHA CAS / 4c-2 blockers+ok / 4c-3 现场SHA 三段先行短路已删 ——
+      // 与 verifyCutoverPlan 两套判据改一处漏一处的风险正是 R69 一轮/二轮的病 ）。这里只采集：
       const rec = cap.reconcile();
-      if ((rec?.cutover_blockers?.length ?? 0) > 0) return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + rec.cutover_blockers.length + " 条）" };
-      if (!rec || !rec.ok) return { ok: false, reason: rec?.reason ?? "reconcile_failed", why: rec?.why ?? "对账器未返回成功" };
-      // 4c-3（先行短路）：三 sidecar 现场 SHA === 对应 sidecar step 锚（fd 受验读，与 converge 同一读法）
       const sidecarFiles = [["expiry.json", "expiry"], ["pending-claims.json", "pending_claims"], ["policy.json", "policy"]];
-      for (const [fname, key] of sidecarFiles) {
-        const curS = readSidecarCurrent(path.join(d.dir, fname));
-        if (!curS.present || curS.problem !== undefined || curS.sha256 !== cap.sidecarShas[key]) {
-          return { ok: false, reason: "sidecar_sha_mismatch", why: fname + " 现场 SHA 与 sidecar step 锚不一致（" + (!curS.present ? "absent" : (curS.problem ?? "sha 不等")) + "）" };
-        }
-      }
-      // 4c-4（**最终以它为准**）：与门内二次重验**同一函数、同一等式** —— ①~⑤ + 4f + 快照身份 + 同源渲染字节
-      //   逐条核 plan 锚。上面三段只是先行短路；只有这一核才同时封住"拿旧 sidecar / 旧身份切权威"。
+      const onDiskSidecars = Object.fromEntries(sidecarFiles.map(([fname, key]) => [key, readSidecarCurrent(path.join(d.dir, fname))]));
+      // 4c（**最终以它为准**）：与门内二次重验**同一函数、同一等式** —— ①~⑤ + 4f + 快照身份 + 同源渲染字节
+      // + 现场等式 + 锁内 rawSha256 CAS（随 reconcile.ledger）+ blockers 硬门，逐项核 plan 锚。
       const v = verifyCutoverPlan({
         planBytes: cap.planBytes,
         doc: cap.doc,
@@ -2871,6 +2862,7 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
         sidecarSteps: cap.doc.steps.filter((s) => s.kind === "sidecar"),
         ledgerEndpointId: endpointId,
         reconcile: { ...rec, ledger: { revision: currentDoc.revision, sha256: rawSha256 } },
+        onDiskSidecars,
       });
       if (!v.ok) return { ok: false, reason: v.reason, why: v.why ?? null };
       return { ok: true, next: plan.doc };

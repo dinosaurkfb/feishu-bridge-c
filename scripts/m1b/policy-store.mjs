@@ -72,12 +72,12 @@ export function livePolicySubjects({ endpointId, env = process.env } = {}) {
     //   B4 历史代际 + 轮转中的 B1）—— 合法常态，允许重复并**去重成一个 subject**（renderer 同款：
     //   同 subject 等值去重）；`policy_store_subject_conflict` 只留给 **同一 root_om 命中多条 live
     //   记录** 这种真冲突（定位歧义，无法唯一解析）。
+    const rootOm = rec.aliases?.root_om ?? null;
     if (kinds[s.subjectId] === undefined) {
       kinds[s.subjectId] = s.kind;
-      subjects.set(s.subjectId, { kind: s.kind, id: s.id, rootOms: [], topicAgentIds: [], record: s.record });
+      subjects.set(s.subjectId, { kind: s.kind, id: s.id, rootOm: rootOm, topicAgentId: rec.topic_agent_id ?? null, rootOms: [], topicAgentIds: [], record: s.record });
     }
     const subjectEntry = subjects.get(s.subjectId);
-    const rootOm = rec.aliases?.root_om ?? null;
     subjectEntry.rootOms.push(rootOm);
     subjectEntry.topicAgentIds.push(rec.topic_agent_id ?? null);
     if (rootOm !== null) {

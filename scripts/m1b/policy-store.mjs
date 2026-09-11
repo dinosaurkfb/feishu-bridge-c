@@ -50,33 +50,54 @@ function subjectOfRecord(record, endpointId) {
 }
 
 /**
- * 账本现场 → `{ kinds, subjects }`：`kinds` 是整域声明（喂 store 层的逐条目派生自洽核验），
- * `subjects` 是 `Map<subjectId, {kind,id,rootOm,topicAgentId}>`（doctor ⑱ 的「键集 ⊆ live」判据、
- * 以及按 root_om 定位）。账本读不出 / 有 live 记录派不出 subject → fail-closed。
+ * 账本现场 → `{ kinds, subjects, byRootOm, records }`：
+ *   · `kinds` 整域声明（喂 store 层的逐条目派生自洽核验）；
+ *   · `subjects` = `Map<subjectId, {kind,id,topicAgentId,record}>` —— **按 `{kind,id}` 去重**：
+ *     同一条 lineage 下多代际 live 记录（B3 current + B4 历史代际 + 轮转中的 B1）是**合法常态**
+ *     （真机 B4×11 / B3×2 / B1×1），renderer 也按同 subject 等值去重（PK2-I1-fix2 P1）；
+ *   · `byRootOm` = `Map<rootOm, [{subjectId, kind, id, topicAgentId, record}]>` —— **逐记录**索引
+ *     （不去重）：查询时“恰命中一条 live 记录”才是完整判据；
+ *   · `records` 参与派生的 live 记录数（诊断用）。
+ * 账本读不出 / 有 live 记录派不出 subject / 同一个 subject 由**不同** `{kind,id}` 派生（哈希撞或
+ * 账本自相矛盾）→ fail-closed。
  */
 export function livePolicySubjects({ endpointId, env = process.env } = {}) {
   const L = loadByEndpoint(endpointId, { env });
   if (!L.ok) return { ok: false, reason: "policy_store_ledger_unreadable", why: L.why ?? L.reason ?? "账本读不出" };
   const kinds = {};
   const subjects = new Map();
+  const byRootOm = new Map();
+  let liveCount = 0;
   for (const rec of Object.values(L.doc.records ?? {})) {
     if (rec?.kind !== "live") continue;
+    liveCount += 1;
     const s = subjectOfRecord(rec, endpointId);
     if (s === null) {
       return { ok: false, reason: "policy_store_subject_unresolved", why: "live 记录 " + String(rec.topic_agent_id ?? "?") + " 派生不出 policy subject" };
     }
-    if (kinds[s.subjectId] !== undefined) {
-      return { ok: false, reason: "policy_store_subject_conflict", why: "两条 live 记录派生出同一个 subject：" + s.subjectId };
+    const prev = subjects.get(s.subjectId);
+    if (prev === undefined) {
+      kinds[s.subjectId] = s.kind;
+      subjects.set(s.subjectId, { kind: s.kind, id: s.id, topicAgentId: rec.topic_agent_id ?? null, record: s.record });
+    } else if (prev.kind !== s.kind || prev.id !== s.id) {
+      // 同一把键却来自不同 {kind,id} —— 这不是“多代际”，是自相矛盾（或哈希撞），不猜。
+      return { ok: false, reason: "policy_store_subject_conflict", why: "同一个 subject 由不同 {kind,id} 派生：" + s.subjectId };
     }
-    kinds[s.subjectId] = s.kind;
-    subjects.set(s.subjectId, { kind: s.kind, id: s.id, rootOm: rec.aliases?.root_om ?? null, topicAgentId: rec.topic_agent_id ?? null, record: s.record });
+    const om = rec.aliases?.root_om;
+    if (typeof om === "string" && om.length > 0) {
+      const hit = { subjectId: s.subjectId, kind: s.kind, id: s.id, topicAgentId: rec.topic_agent_id ?? null, record: rec };
+      const list = byRootOm.get(om);
+      if (list === undefined) byRootOm.set(om, [hit]);
+      else list.push(hit);
+    }
   }
-  return { ok: true, doc: L.doc, kinds, subjects };
+  return { ok: true, doc: L.doc, kinds, subjects, byRootOm, records: liveCount };
 }
 
 /**
- * 按 `root_om` 在账本里定位 live 记录 → 解析出 subject（P1-4 的主入口）。零条 / 多条 / 账本读不出
- * 一律 fail-closed（`policy_store_subject_unresolved` / `policy_store_subject_conflict`），不猜。
+ * 按 `root_om` 在账本里定位 live 记录 → 解析出 subject（主入口）。
+ * 判据：`root_om` **恰命中一条** live 记录（同一条 lineage 的多代际各有各的 root_om，不冲突）；
+ * 零条 → `policy_store_subject_unresolved`；多条 → `policy_store_subject_conflict`（真冲突）。
  */
 export function resolvePolicySubject({ endpointId, rootOm, env = process.env } = {}) {
   if (typeof rootOm !== "string" || rootOm.length === 0) {
@@ -84,11 +105,11 @@ export function resolvePolicySubject({ endpointId, rootOm, env = process.env } =
   }
   const live = livePolicySubjects({ endpointId, env });
   if (!live.ok) return live;
-  const hits = [...live.subjects.entries()].filter(([, s]) => s.rootOm === rootOm);
+  const hits = live.byRootOm.get(rootOm) ?? [];
   if (hits.length === 0) return { ok: false, reason: "policy_store_subject_unresolved", why: "账本里没有 root_om=" + rootOm + " 的 live 记录" };
   if (hits.length > 1) return { ok: false, reason: "policy_store_subject_conflict", why: "root_om 命中 " + hits.length + " 条 live 记录" };
-  const [subjectId, s] = hits[0];
-  return { ok: true, subjectId, kind: s.kind, id: s.id, topicAgentId: s.topicAgentId, record: s.record, kinds: live.kinds, ledger: live.doc };
+  const hit = hits[0];
+  return { ok: true, subjectId: hit.subjectId, kind: hit.kind, id: hit.id, topicAgentId: hit.topicAgentId, record: hit.record, rootOm, kinds: live.kinds, ledger: live.doc };
 }
 
 /**

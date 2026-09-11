@@ -29,7 +29,8 @@ import { setClaudeTopicBindingStatus } from "./topic-generation-store.mjs";
 import { activeGeneration, pendingGeneration, effectiveBindingId,
   TOPIC_GENERATION_AUTO_ROTATE_MESSAGES,
 } from "./topic-generation.mjs";
-import { interactionPolicyStateForLegacy, interactionPolicySummary } from "./interaction-policy.mjs";
+import { interactionPolicySummary } from "./interaction-policy.mjs";
+import { loadClaudeInteractionPolicyRouted } from "./interaction-policy-store.mjs"; // PK2-I1：authoritative 读 v2 policy store
 
 export const SUSPENDED = "suspended";
 
@@ -51,7 +52,9 @@ export function currentBinding({ root, claudeSessionId, registryFile, templateFi
   const topicState = m.topic_generation_state ?? null;
   const activeTopic = activeGeneration(topicState);
   const pendingTopic = pendingGeneration(topicState);
-  const interaction = interactionPolicyStateForLegacy(m, { bindingId: effectiveBindingId(m, { root }) });
+  // PK2-I1：authoritative 下策略在 v2 policy store（legacy 冻结）—— 展示面同走判源分派，
+  // 否则 status 会报 cutover 前那份旧模式（"status 说 mapping、实际是 dialogue"最难查）。
+  const interaction = loadClaudeInteractionPolicyRouted({ root, claudeSessionId: resolved.claudeSessionId, registryFile });
   const policy = interaction.ok ? interactionPolicySummary(interaction.state) : interaction;
   return {
     ok: true,

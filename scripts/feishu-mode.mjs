@@ -9,7 +9,7 @@ import {
   DIALOGUE_POLICY_ID, MAPPING_POLICY_ID, interactionPolicySummary,
 } from "./interaction-policy.mjs";
 import {
-  loadClaudeInteractionPolicy, setClaudeInteractionMode,
+  loadClaudeInteractionPolicyRouted, setClaudeInteractionMode,
 } from "./interaction-policy-store.mjs";
 
 const arg = (name) => {
@@ -40,7 +40,8 @@ function main() {
     console.error("模式只能是 mapping 或 dialogue。");
     process.exit(2);
   }
-  const current = loadClaudeInteractionPolicy({ root, claudeSessionId });
+  // PK2-I1：读面按账本判源分派（authoritative → v2 policy store）。
+  const current = loadClaudeInteractionPolicyRouted({ root, claudeSessionId });
   if (!current.ok) {
     console.error("当前上下文没有可用的飞书 binding（" + current.reason + "）。");
     process.exit(1);

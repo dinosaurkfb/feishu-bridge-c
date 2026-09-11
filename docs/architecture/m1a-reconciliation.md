@@ -327,7 +327,7 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 | rotate（建新代际） | create_b1。**W3**：outer 取锁**前置到 sendToChat 之前**（写事务从首个外显副作用起算；锁取不到话题不发、无孤儿、不降级） | ext=rotation operation id（topic-generation 既有、持久）；entity=lineage id |
 | rotate cancel / pending 过期 | void。W5：reason 映射 cancelled→manual、expired→expired（枚举不扩）| ext=rotation operation id |
 | 连接暂停/恢复（binding_status 翻转；五轮 P2-2：mode 属 policy 域非此路径） | **W4 对账兜底行**（同 enabled：无持久审计 id，M1a 不实时双写，doctor+repair 兜底）| —（W4）|
-| retarget（owner 终端） | retarget | 同上 |
+| retarget（owner 终端：`node scripts/m1a-retarget.mjs --endpoint <ep> --id <ta_id> --session <uuid> [--apply]`，PK2-I4；只做 项目级 null → 会话级，preview 默认，--apply 逐次授权且仅在账本 authoritative 期放行；请求身份确定性派生 ext=`retarget:<id>:<uuid>`、entity=目标 id，重跑幂等） | retarget | 同上 |
 | `enabled` 翻转 | **W4 对账兜底行**：M1a 不实时双写（无持久审计 id 的罕用终端写方）；doctor mismatch 暴露、owner 以 restore/unbind/migrate_repair 补齐；实时双写等审计 id 链路另单 | —（W4）|
 | 到期/续期 | expiry sidecar 写 | 不进账本 |
 | policy mode / reserve-finalize | policy store 写 | 不进账本 |
@@ -434,7 +434,7 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 - 仅作用于影子账本（`authority_mode==="shadow"`），受维护门管控；
 - 默认预览模式列出待补种的 B 族候选，严格核验双射与 blocker，零写入副作用；
 - `--apply` 需终端授权身份，调用 `migrateSeed` 幂等写入，并后置对账核验；
-- 对带有 `claude_session_id: null` 的项目级绑定记录，允许进账本（不报 `target_incomplete`），null→UUID 的 retarget 只留给将来持有真实本地 UUID 的显式 owner retarget；UUID→null 继续拒。权威投递消费路径（从账本 binding_target 读、项目级走 legacy 同款规则：有 delivery pin 用 pin，否则唯一 live 会话才投、多条拒）尚未接通，cutover 前由后续单 R66 补——本单只宣称 shadow 补种。
+- 对带有 `claude_session_id: null` 的项目级绑定记录，允许进账本（不报 `target_incomplete`），null→UUID 的 retarget 只留给显式 owner 终端命令 `scripts/m1a-retarget.mjs`（持有真实本地 Claude UUID 时由 owner 逐次授权执行；preview 默认零写入，--apply 仅在账本 authoritative 期放行）；UUID→null 继续拒。权威投递消费路径（从账本 binding_target 读、项目级走 legacy 同款规则：有 delivery pin 用 pin，否则唯一 live 会话才投、多条拒）尚未接通，cutover 前由后续单 R66 补——本单只宣称 shadow 补种。
 
 ## 9. 排期影响
 

@@ -6004,7 +6004,9 @@ test("会话级登记行带齐会话标识，且 id 能区分同项目的多条"
     claudeSessionId: "aaa-111-long-uuid", sessionName: "线A" });
   assert.equal(e.claude_session_id, "aaa-111-long-uuid");
   assert.equal(e.claude_session_name, "线A");
-  assert.equal(e.id, "r@aaa-111-");
+  // PK2-W1-fix1 P2-2：id（= 账本 lineage 前缀）用**完整**会话 UUID —— 前 8 位有碰撞面
+  //  （两个同目录工作线的 UUID 前 8 位相撞 → 同 lineage 两条 live B1，账本拒）。
+  assert.equal(e.id, "r@aaa-111-long-uuid");
   assert.equal(e.root_message_id, "om_a");
 });
 
@@ -50894,7 +50896,8 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const row = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
       assert.ok(row, "索引行在：" + JSON.stringify(x.registry().projects));
       assert.deepEqual([row.root_message_id, row.inbound_state, row.status], [om, "pending", "active"], "索引行字段：" + JSON.stringify(row));
-      assert.equal(row.id, path.basename(x.proj) + "@" + W1_UUID_A.slice(0, 8), "会话级 id 形状与 main 同");
+      // PK2-W1-fix1 P2-2：id（= lineage 前缀）用完整会话 UUID（前 8 位有碰撞面）。
+      assert.equal(row.id, path.basename(x.proj) + "@" + W1_UUID_A, "会话级 id 用完整 UUID（P2-2）");
       const ta = rec.topic_agent_id;
       const pending = readSidecarStore({ endpointId: x.EP, name: "pending-claims" });
       const expiry = readSidecarStore({ endpointId: x.EP, name: "expiry" });
@@ -51009,16 +51012,16 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
       const f4 = { matched_om: rec0.aliases.root_om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" };
       // 先真认领一次（→ active），再拿同一目标认领 → 拒 m1a_mode_not_shadow
-      const ok1 = WIRE.WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "d".repeat(64),
+      const ok1 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "d".repeat(64),
         sessionId: "aily_a", authorizedBy: "ou_f", f4, publishIndex: () => ({ ok: true }) });
       assert.equal(ok1.ok && ok1.legacy.ok, true, "第一次认领成功：" + JSON.stringify(ok1).slice(0, 200));
-      const again = WIRE.WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "e".repeat(64),
+      const again = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "e".repeat(64),
         sessionId: "aily_b", authorizedBy: "ou_f", f4, publishIndex: () => ({ ok: true }) });
       assert.deepEqual([again.ok, again.legacy.reason], [true, "m1a_mode_not_shadow"], "已 active 的目标再认领 → 拒（B3 rebind 属 W2）：" + JSON.stringify(again).slice(0, 260));
     } finally { x.f.cleanup(); }
   });
 
-  test("PK2-W1 T5 并发两笔 bind：outer 串行 + 锁内重读 → 登记表两行都在", () => {
+  test("PK2-W1 T5 顺序两笔 bind（真实子进程）：outer 串行 + 锁内重读 → 登记表两行都在", () => {
     const x = w1Fixture("t5");
     try {
       const envA = w1SessionEnv(x, { sessionId: W1_UUID_A, pid: 900001, name: "line-a" });
@@ -51098,6 +51101,107 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       } finally { f.cleanup(); }
     }
   });
+
+// ─────────── PK2-W1-fix1：P1-1 真入口 unclean 不崩 / P1-4 认领后重跑不退化 ───────────
+{
+  const FIX1_UUID = "11111111-1111-4111-8111-111111111111";
+
+  // P1-4：认领成功后（pending-claims 条目已删）同会话重跑 bind-session → 必须零写：
+  //   索引仍 bound、pending-claims 不复活（旧版判"不完整"，把 active 索引覆盖回 pending 快照）。
+  test("PK2-W1-fix1 T13 认领后重跑 bind-session：零写、索引仍 bound、pending-claims 不复活（P1-4）", () => {
+    const x = w1Fixture("fix1t13");
+    try {
+      const env = w1SessionEnv(x, { sessionId: FIX1_UUID });
+      const r0 = w1Bind(x, env);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const ta0 = rec0.topic_agent_id;
+      const om0 = rec0.aliases.root_om;
+      // 认领（复合直调，索引把行改成 bound —— 与真实 promoteBinding 的索引效果同）
+      const claim = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: om0,
+        claimKey: "a".repeat(64), sessionId: "aily_fix1_t13", authorizedBy: "ou_frank",
+        f4: { matched_om: om0, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+        publishIndex: () => {
+          const reg = x.registry();
+          const row = reg.projects.find((p) => p.claude_session_id === FIX1_UUID);
+          row.session_id = "aily_fix1_t13"; row.inbound_state = "bound";
+          fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+          return { ok: true, root: x.proj, sessionId: "aily_fix1_t13" };
+        } });
+      assert.deepEqual([claim.ok, claim.commit], [true, "committed_clean"], "认领成立：" + JSON.stringify(claim).slice(0, 250));
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], undefined, "前置：条目已删");
+      const regBefore = fs.readFileSync(x.regFile);
+      const ledgerRevBefore = x.ledger().revision;
+      // 重跑 bind-session（同会话）→ 必须零写早退
+      const r1 = w1Bind(x, env);
+      assert.equal(r1.status, 0, "重跑早退成功：" + r1.stdout + r1.stderr);
+      assert.match(r1.stdout, /已经绑过/u, "点名已绑定：" + r1.stdout.slice(0, 200));
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "登记表字节不变（不退化回 pending 快照）");
+      const row = x.registry().projects.find((p) => p.claude_session_id === FIX1_UUID);
+      assert.equal(row.inbound_state, "bound", "索引仍 bound");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], undefined, "pending-claims 不复活");
+      assert.equal(x.ledger().revision, ledgerRevBefore, "账本零写入");
+    } finally { x.f.cleanup(); }
+  });
+
+  // P1-1 + K7：真入口（spawn aily-inbound 走真实认领路径）—— 索引注入失败 → 进程不崩、unclean 回执
+  //   落盘、reason 点名；这条同时接住 K7（authoritative 分派必须在真入口真的走到复合）。
+  test("PK2-W1-fix1 T14 真入口认领 unclean：进程不崩、unclean 回执落盘、reason 点名（P1-1；K7 authoritative 分派真入口到达）", () => {
+    const x = w1Fixture("fix1t14");
+    try {
+      const env0 = w1SessionEnv(x, { sessionId: FIX1_UUID });
+      const r0 = w1Bind(x, env0);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const om0 = rec0.aliases.root_om;
+      const token = x.registry().projects.find((p) => p.claude_session_id === FIX1_UUID).pending_token;
+      // 索引失败注入：占住 registry.lock（promoteBinding 的索引写在它里面）。
+      const regLock = path.join(path.dirname(x.regFile), "registry.lock");
+      const held = acquirePublishLock(regLock);
+      assert.ok(held.ok, "夹具占 registry 锁");
+      // 绑定码必须出现在**引用块**里（bindingTokensInQuote 刻意只看引用，不看正文）。
+      const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 认领这条\n\n**[引用]**\n绑定码    " + token;
+      const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+        id: "om_fix1_claim_1", sessionID: "aily_fix1_claim", role: "user", createdBy: TPL.frank_sender_id,
+        createdAtMs: Date.now(), content } }) }] });
+      const ailyBin = path.join(x.bin, "aily-cli");
+      fs.writeFileSync(ailyBin, "#!/usr/bin/env node\nprocess.stdout.write(process.env.FAKE_AILY_ENVELOPE);\n", { mode: 0o700 });
+      const runInbound = () => spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+        env: { ...x.f.env, PATH: x.bin + path.delimiter + process.env.PATH, HOME: x.f.home,
+          FEISHU_BRIDGE_REGISTRY: x.regFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: x.tplFile,
+          AILY_CLI_CALLER_AGENT_UID: x.uid, AILY_CLI_SESSION_ID: "aily_fix1_claim", AILY_CLI_RUN_ID: "run_fix1",
+          AILY_CLI_CHANNEL_CHAT_ID: TPL.chat_id, FAKE_AILY_ENVELOPE: envelope } });
+      const rowTGS = x.registry().projects.find((p) => p.claude_session_id === FIX1_UUID).topic_generation_state;
+      let r1;
+      try { r1 = runInbound(); } finally { releasePublishLock(regLock); }
+      const out1 = (r1.stdout || "") + (r1.stderr || "");
+      // P1-1：旧码在 unclean 分支 TDZ 崩（"入站处理异常终止"）—— 修后必须体面收场。
+      assert.doesNotMatch(out1, /入站处理异常终止|ReferenceError|wrote is not defined/u, "进程不崩：" + out1.slice(0, 300));
+      // 夹具自证：row 的 TGS root_message_id 已是真 om（不再是占位符 —— 那会让真入口认领永远 locator_absent）。
+      assert.equal(rowTGS?.generations?.[0]?.root_message_id, rec0.aliases.root_om, "TGS 根 om 已固化");
+
+      // K7 + P1-1 证据：authoritative 复合真的在入口跑到了（账本 activate 已提交）+ unclean 回执落盘。
+      const doc1 = x.ledger();
+      const liveRecs = Object.values(doc1.records).filter((rec) => rec.kind === "live");
+      assert.equal(liveRecs.length, 1, "K7：恰一条 live：" + JSON.stringify(Object.values(doc1.records).map((r) => [r.kind, r.facts?.binding ?? null])));
+      assert.equal(liveRecs[0].facts.binding, "active", "K7：真入口走 authoritative 复合（账本已 activate）：" + JSON.stringify(liveRecs[0].aliases));
+      // 认领是**未路由流**（还没绑定到项目）→ 回执落在机器级 inbound 目录（UNROUTED_RT），不是项目目录。
+      const inboundReceipts = path.join(x.f.home, ".claude", "feishu-bridge", "inbound", "receipts");
+      const allReceipts = fs.existsSync(inboundReceipts) ? fs.readdirSync(inboundReceipts) : [];
+      const unc = allReceipts.filter((n) => n.startsWith("m1a-unclean-"));
+      assert.equal(unc.length, 1, "unclean 回执落盘（机器级 inbound 目录）：" + JSON.stringify(allReceipts));
+      const uncBody = JSON.parse(fs.readFileSync(path.join(inboundReceipts, unc[0]), "utf-8"));
+      assert.equal(uncBody.status, "unclean", "status unclean");
+      // 重放（锁已放）→ 幂等补齐：索引 bound、条目删、无 unclean。
+      const r2 = runInbound();
+      assert.equal(r2.status, 0, "重放补齐成功：" + (r2.stdout || "") + (r2.stderr || ""));
+      const row = x.registry().projects.find((p) => p.claude_session_id === FIX1_UUID);
+      assert.equal(row.inbound_state, "bound", "索引补齐");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[rec0.topic_agent_id], undefined, "pending-claims 仍已删");
+    } finally { x.f.cleanup(); }
+  });
+}
+
 }
 
 // ─────────── PK2-W1-fix1：P1-2 顺序可续跑 / P1-3 提交进度逐步记 / P1-5③ 登记表事务折释放 / P2-2 lineage 全 UUID ───────────

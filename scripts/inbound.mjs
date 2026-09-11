@@ -581,12 +581,14 @@ if (!routed.ok) {
 
   // PK2-W1：unclean 回执**先于** wrote.ok 分支 —— authoritative 复合是「账本已提交而后继（索引/sidecar）
   //   失败」，那条路径会走下面的 error 出口 exit，回执不能只在成功路径上写（"不能只靠 doctor 点名"）。
+  // PK2-W1-fix1 P1-1：wired.legacy 的解构必须**先于** unclean 投影 —— 旧版在声明前读 wrote（TDZ
+  //   ReferenceError），真入口走到 unclean 分支必崩，账本/索引可能已写而回执落不下来。
+  const wrote = wired.legacy;
   const promoteUnclean = uncleanWired(wired);
   if (!promoteUnclean.clean) writeReceipt("m1a-unclean-" + event.message_id, {
     status: "unclean", legacy: wrote.ok === true ? "ok" : "failed", ...promoteUnclean,
     claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
   });
-  const wrote = wired.legacy;
   if (!wrote.ok) {
     writeReceipt("bind-failed-" + event.message_id, {
       status: "error", reason: wrote.reason, message_id: event.message_id,

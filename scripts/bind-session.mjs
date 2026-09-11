@@ -35,7 +35,7 @@ import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { readSidecarStore } from "./m1b/sidecar-store.mjs";
-import { resolveLiveId } from "./topic-agent-ledger.mjs";
+import { resolveLiveId, loadByEndpoint } from "./topic-agent-ledger.mjs";
 import { withRegistryTransaction } from "./topic-generation-store.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
@@ -89,8 +89,9 @@ export function identifySelf({ env = process.env, sessionsDir } = {}) {
 export function newSessionEntry({ root, name, purpose, token, rootMessageId, claudeSessionId, sessionName, now }) {
   return {
     ...newRegistryEntry({ root, name, purpose, token, rootMessageId, now }),
-    // id 要能区分同一个项目下的多条：加会话 uuid 的前 8 位，人看得出、也够唯一。
-    id: path.basename(root) + "@" + String(claudeSessionId).slice(0, 8),
+    // PK2-W1-fix1 P2-2：id（= 账本 lineage 前缀）用**完整**会话 UUID —— 前 8 位有碰撞面
+    //   （两个同目录工作线的 UUID 前 8 位相撞 → 同一 lineage 两条 live B1，账本直接拒）。
+    id: path.basename(root) + "@" + String(claudeSessionId),
     claude_session_id: claudeSessionId,
     claude_session_name: sessionName ?? null,
     note: "会话级绑定（在该会话里用 bind-session 建立）。项目级绑定仍然独立存在、互不影响。",
@@ -150,6 +151,15 @@ const authoritativeComplete = (entry) => {
   const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
   if (!resolved.ok) return false;
   const ta = resolved.id;
+  const l = loadByEndpoint(endpointId, { env: process.env });
+  if (!l.ok) return false;
+  const rec = l.doc.records[ta];
+  if (!rec || rec.kind !== "live") return false;
+  // PK2-W1-fix1 P1-4：**按账本当前状态分支** —— 认领成功后（active/B3）这条绑定已完成、零写：
+  //   旧版只看 pending 条目在不在，认领把条目删了 → 同会话重跑被判"不完整"，把 active 索引
+  //   覆盖回 pending 快照、还复活 pending-claims 条目。仍 pending 才按 sidecar 条目判断补齐。
+  if (rec.facts.binding === "active") return true;
+  if (rec.facts.binding !== "pending") return false;
   const pending = readSidecarStore({ endpointId, name: "pending-claims" });
   const expiry = readSidecarStore({ endpointId, name: "expiry" });
   return pending.ok === true && expiry.ok === true
@@ -212,6 +222,12 @@ const indexTemplate = indexEntry("om_placeholder");
 //   两笔并发 bind 被 outer 串行后，后一笔仍会用陈旧快照盖掉前一笔）。同会话已有行 → 就地覆盖（幂等重跑）。
 const publishIndex = ({ rootMessageId }) => {
   const entry = { ...indexTemplate, root_message_id: rootMessageId };
+  // PK2-W1-fix1：TGS 里 pending 代际的 root_message_id（与 feishu_root_message_id_reference）也必须是
+  //   **真 om** —— 旧版模板里冻的是占位符，findPendingBinding/resolveLiveId 的 locator 断在
+  //   "om_placeholder" 上，真入口的认领永远 locator_absent（集成测试没接真入口所以绿）。
+  const gens = entry.topic_generation_state?.generations;
+  if (Array.isArray(gens)) for (const g of gens) if (g?.root_message_id === "om_placeholder") g.root_message_id = rootMessageId;
+  if (entry.feishu_root_message_id_reference === "om_placeholder") entry.feishu_root_message_id_reference = rootMessageId;
   const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
     const rows = reg.projects;
     const at = rows.findIndex((p) => p?.claude_session_id === me.sessionId || (p?.root === entry.root && p?.id === entry.id));

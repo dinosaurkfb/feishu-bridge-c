@@ -51185,7 +51185,114 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       assert.equal(x.read().ok, true, "修好后读面恢复");
     } finally { x.f.cleanup(); }
   });
+  // （PK2-I1-fix2 块并入本作用域，共享 i1AuthFixture 等夹具）
+
+// ─────────── PK2-I1-fix2：同 lineage 多代际 live 的 subject 去重（P1 三反例）+ topic_agent 分支走生产路由（P2） ───────────
+{
+  const F2_UUID_A = "11111111-1111-4111-8111-111111111111";
+  const F2_UUID_B = "22222222-2222-4222-8222-222222222222";
+  const f2F4 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+  // 夹具：真 cutover 后把账本演化成「同 lineage 三代际 live」—— B4（历史）+ B3（current）+ B1（轮转中），root_om 各异。
+  const f2MultiFixture = (tag, { policy = "mapping" } = {}) => {
+    const x = i1AuthFixture(tag, { policy });
+    try {
+      const doc0 = x.ledger();
+      const seededId = Object.keys(doc0.records).find((k) => doc0.records[k].kind === "live");
+      assert.equal(doc0.records[seededId].facts.binding, "active", "前置：seed 出的是已认领的 current（B3）");
+      const target = { runtime: "claude", project_root: x.proj, claude_session_id: x.sessionUuid };
+      // 轮转 gen2：新 B1（om_gen2，同 lineage）→ 激活 → 旧 B3 降 **B4**（历史代际）
+      const b1b = TAL.createB1({ endpointId: x.EP, requestKey: "req_f2_b1b", chatId: TPL.chat_id, rootOm: "om_f2gen2", lineageId: x.bindingId, bindingTarget: target });
+      assert.ok(b1b.ok, "gen2 B1：" + JSON.stringify(b1b).slice(0, 160));
+      const a1b = TAL.createA1({ endpointId: x.EP, requestKey: "req_f2_a1b", chatId: TPL.chat_id, sessionId: "aily_gen2" });
+      const act2 = TAL.activate({ endpointId: x.EP, requestKey: "req_f2_act2", b1Id: b1b.result.created_id, a1Id: a1b.result.created_id,
+        f4: f2F4("om_f2gen2"), authorizedBy: TPL.frank_sender_id });
+      assert.ok(act2.ok, "gen2 激活（旧 B3 降 B4）：" + JSON.stringify(act2).slice(0, 200));
+      // gen3：轮转中的 B1（om_gen3，pending）
+      const b1c = TAL.createB1({ endpointId: x.EP, requestKey: "req_f2_b1c", chatId: TPL.chat_id, rootOm: "om_f2gen3", lineageId: x.bindingId, bindingTarget: target });
+      assert.ok(b1c.ok, "gen3 B1：" + JSON.stringify(b1c).slice(0, 160));
+      const live = Object.values(x.ledger().records).filter((r) => r.kind === "live");
+      assert.equal(live.length, 3, "三代际 live 就位：" + JSON.stringify(live.map((r) => [TAL.familyOf(r.facts), r.aliases.root_om])));
+      assert.equal(new Set(live.map((r) => r.generation_lineage_id)).size, 1, "同一 lineage");
+      return { ...x, live, rootOms: live.map((r) => r.aliases.root_om) };
+    } catch (err) { try { x.f.cleanup(); } catch { /* 尽力 */ } throw err; }
+  };
+
+  // P1 反例①（读）：按 B3 的 root_om 读取 → 命中该 lineage 的 subject，不拒（旧码 subject_conflict）。
+  test("PK2-I1-fix2 T17 读：同 lineage 三代际 live（B4+B3+B1）按任一 root_om 读取 → 恰命中该 lineage subject、不拒", () => {
+    const x = f2MultiFixture("r1");
+    try {
+      for (const rootOm of x.rootOms) {
+        const r = resolvePolicySubject({ endpointId: x.EP, rootOm, env: process.env });
+        assert.deepEqual([r.ok, r.subjectId, r.kind], [true, x.subjectId, "lineage"],
+          "root_om=" + rootOm + " 命中该 lineage subject：" + JSON.stringify({ ok: r.ok, reason: r.reason, why: r.why }));
+      }
+      // 路由读面同样不拒（索引行 root_om = B4 那条的 om，按逐记录索引仍命中同 subject）
+      const routed = x.read();
+      assert.deepEqual([routed.ok, routed.subjectId, routed.kind], [true, x.subjectId, "lineage"], "路由读面不拒：" + JSON.stringify(routed).slice(0, 260));
+    } finally { x.f.cleanup(); }
+  });
+
+  // P1 反例②（写）：/feishu-mode 按 B3 写 → 落该 lineage subject，B4/B1 不另生条目。
+  test("PK2-I1-fix2 T18 写：/feishu-mode 落该 lineage subject，B4/B1 不另生条目", () => {
+    const x = f2MultiFixture("r2");
+    try {
+      const before = Object.keys(readPolicyStore({ endpointId: x.EP }).entries).sort();
+      const w = setClaudeInteractionMode({ root: x.proj, claudeSessionId: x.sessionUuid, mode: DIALOGUE_POLICY_ID, registryFile: x.regFile });
+      assert.deepEqual([w.ok, w.subjectId], [true, x.subjectId], "写落该 lineage subject：" + JSON.stringify(w).slice(0, 250));
+      const keys = Object.keys(readPolicyStore({ endpointId: x.EP }).entries).sort();
+      assert.deepEqual(keys, before, "条目键集不变（B4/B1 不另生条目 —— 同 subject 去重）：" + JSON.stringify(keys));
+      assert.equal(readPolicyStore({ endpointId: x.EP }).entries[x.subjectId].policy_id, DIALOGUE_POLICY_ID, "该 subject 的策略已切");
+    } finally { x.f.cleanup(); }
+  });
+
+  // P1 反例③（doctor ⑱）：同 lineage 三代际账本 + 一条 lineage 条目 → 绿（键集 ⊆ 派生集合去重后）。
+  test("PK2-I1-fix2 T19 doctor ⑱：同 lineage 三代际账本 + 一条 lineage 条目 → 绿", () => {
+    const x = f2MultiFixture("r3");
+    try {
+      const c = runDoctor({ home: x.f.home }).checks.find((k) => k.id === "policy_store");
+      assert.equal(c.ok, true, "⑱ 绿：" + JSON.stringify(c));
+      assert.match(c.detail, /1 条/u, "条目计数（去重后恰一条 subject）：" + c.detail);
+    } finally { x.f.cleanup(); }
+  });
+
+  // P2：带 root 的 A3 → 经 loadClaudeInteractionPolicyRouted / setClaudeInteractionMode 走通 topic_agent 分支（读写都落它自己名下）。
+  test("PK2-I1-fix2 T20 topic_agent 分支走生产路由：带 root 的 A3 读写都落它自己名下", () => {
+    const x = i1AuthFixture("p2", { policy: null });
+    try {
+      // A1 → attachF4 → A3（带 root_om，无 generation_lineage_id → topic_agent subject）
+      const a1 = TAL.createA1({ endpointId: x.EP, requestKey: "req_p2_a1", chatId: TPL.chat_id, sessionId: "aily_a3" });
+      assert.ok(a1.ok, "A1：" + JSON.stringify(a1).slice(0, 160));
+      const a1Id = a1.result.created_id;
+      const proj2 = path.join(x.f.base, "proj2"); fs.mkdirSync(proj2, { recursive: true });
+      const target2 = { runtime: "claude", project_root: proj2, claude_session_id: F2_UUID_B };
+      const att = TAL.attachF4({ endpointId: x.EP, requestKey: "req_p2_att", id: a1Id, bindingTarget: target2,
+        claimKey: "b".repeat(64), authorizedBy: TPL.frank_sender_id,
+        f4: { root_om: "om_a3root", matched_om: "om_a3root", matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" } });
+      assert.ok(att.ok, "attachF4 → A3：" + JSON.stringify(att).slice(0, 200));
+      const doc1 = x.ledger();
+      const a3 = Object.values(doc1.records).find((r) => r.kind === "live" && r.aliases.root_om === "om_a3root");
+      assert.ok(a3 && a3.aliases.root_om === "om_a3root" && !a3.generation_lineage_id, "A3 带 root、无 lineage（topic_agent 派生）：" + JSON.stringify(a3).slice(0, 300));
+      // 生产路由：第二行索引指到 A3 的 root —— 读面走 topic_agent 分支
+      const reg = x.registry();
+      reg.projects.push({ id: "a3row", root: proj2, name: "A3 线", root_message_id: "om_a3root",
+        status: "active", inbound_state: "bound", session_id: "aily_a3row",
+        claude_session_id: F2_UUID_B, expires_at: "2099-01-01T00:00:00.000Z" });
+      fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      const readR = loadClaudeInteractionPolicyRouted({ root: proj2, claudeSessionId: F2_UUID_B, registryFile: x.regFile, env: process.env });
+      const taSubject = i1Subject(x.EP, a1Id, "topic_agent");
+      assert.deepEqual([readR.ok, readR.kind, readR.subjectId, readR.synthesized], [true, "topic_agent", taSubject, true],
+        "路由读走 topic_agent 分支（合成默认条目）：" + JSON.stringify(readR).slice(0, 260));
+      // 写面：setClaudeInteractionMode 落 A3 自己名下
+      const w = setClaudeInteractionMode({ root: proj2, claudeSessionId: F2_UUID_B, mode: DIALOGUE_POLICY_ID, registryFile: x.regFile });
+      assert.deepEqual([w.ok, w.kind, w.subjectId], [true, "topic_agent", taSubject], "写落 A3 自己名下：" + JSON.stringify(w).slice(0, 250));
+      const entries = readPolicyStore({ endpointId: x.EP }).entries;
+      assert.equal(entries[taSubject].policy_id, DIALOGUE_POLICY_ID, "A3 自己的条目已切");
+      assert.equal(entries[x.subjectId] === undefined || entries[x.subjectId].policy_id !== DIALOGUE_POLICY_ID, true, "lineage subject 不被误写");
+    } finally { x.f.cleanup(); }
+  });
 }
+
+} // PK2-I1 作用域块收口（fix2 测试并入）
 
 sealSummary();
 

@@ -50,28 +50,45 @@ function subjectOfRecord(record, endpointId) {
 }
 
 /**
- * 账本现场 → `{ kinds, subjects }`：`kinds` 是整域声明（喂 store 层的逐条目派生自洽核验），
- * `subjects` 是 `Map<subjectId, {kind,id,rootOm,topicAgentId}>`（doctor ⑱ 的「键集 ⊆ live」判据、
- * 以及按 root_om 定位）。账本读不出 / 有 live 记录派不出 subject → fail-closed。
+ * 账本现场 → `{ kinds, subjects, byRootOm }`：`kinds` 是整域声明（喂 store 层的逐条目派生自洽核验），
+ * `subjects` 是 `Map<subjectId, {kind,id,rootOms,topicAgentIds,record}>`（doctor ⑱ 的「键集 ⊆ live」判据；
+ * **同 lineage 多代际 live 记录去重成一个 subject** —— 合法常态），`byRootOm` 是逐记录 root_om 索引
+ * （resolvePolicySubject 的定位入口；同一 root_om 命中多条 = 真冲突）。账本读不出 / 有 live 记录
+ * 派不出 subject → fail-closed。
  */
 export function livePolicySubjects({ endpointId, env = process.env } = {}) {
   const L = loadByEndpoint(endpointId, { env });
   if (!L.ok) return { ok: false, reason: "policy_store_ledger_unreadable", why: L.why ?? L.reason ?? "账本读不出" };
   const kinds = {};
   const subjects = new Map();
+  const byRootOm = new Map();
   for (const rec of Object.values(L.doc.records ?? {})) {
     if (rec?.kind !== "live") continue;
     const s = subjectOfRecord(rec, endpointId);
     if (s === null) {
       return { ok: false, reason: "policy_store_subject_unresolved", why: "live 记录 " + String(rec.topic_agent_id ?? "?") + " 派生不出 policy subject" };
     }
-    if (kinds[s.subjectId] !== undefined) {
-      return { ok: false, reason: "policy_store_subject_conflict", why: "两条 live 记录派生出同一个 subject：" + s.subjectId };
+    // PK2-I1-fix2 P1：同一 {kind,id} 派出同一 subject = **同 lineage 多代际 live 记录**（B3 current +
+    //   B4 历史代际 + 轮转中的 B1）—— 合法常态，允许重复并**去重成一个 subject**（renderer 同款：
+    //   同 subject 等值去重）；`policy_store_subject_conflict` 只留给 **同一 root_om 命中多条 live
+    //   记录** 这种真冲突（定位歧义，无法唯一解析）。
+    if (kinds[s.subjectId] === undefined) {
+      kinds[s.subjectId] = s.kind;
+      subjects.set(s.subjectId, { kind: s.kind, id: s.id, rootOms: [], topicAgentIds: [], record: s.record });
     }
-    kinds[s.subjectId] = s.kind;
-    subjects.set(s.subjectId, { kind: s.kind, id: s.id, rootOm: rec.aliases?.root_om ?? null, topicAgentId: rec.topic_agent_id ?? null, record: s.record });
+    const subjectEntry = subjects.get(s.subjectId);
+    const rootOm = rec.aliases?.root_om ?? null;
+    subjectEntry.rootOms.push(rootOm);
+    subjectEntry.topicAgentIds.push(rec.topic_agent_id ?? null);
+    if (rootOm !== null) {
+      const prior = byRootOm.get(rootOm);
+      if (prior !== undefined) {
+        return { ok: false, reason: "policy_store_subject_conflict", why: "root_om " + rootOm + " 命中多条 live 记录（" + prior.topicAgentId + " / " + String(rec.topic_agent_id ?? "?") + "）" };
+      }
+      byRootOm.set(rootOm, { subjectId: s.subjectId, kind: s.kind, id: s.id, record: s.record, topicAgentId: rec.topic_agent_id ?? null });
+    }
   }
-  return { ok: true, doc: L.doc, kinds, subjects };
+  return { ok: true, doc: L.doc, kinds, subjects, byRootOm };
 }
 
 /**
@@ -84,11 +101,11 @@ export function resolvePolicySubject({ endpointId, rootOm, env = process.env } =
   }
   const live = livePolicySubjects({ endpointId, env });
   if (!live.ok) return live;
-  const hits = [...live.subjects.entries()].filter(([, s]) => s.rootOm === rootOm);
-  if (hits.length === 0) return { ok: false, reason: "policy_store_subject_unresolved", why: "账本里没有 root_om=" + rootOm + " 的 live 记录" };
-  if (hits.length > 1) return { ok: false, reason: "policy_store_subject_conflict", why: "root_om 命中 " + hits.length + " 条 live 记录" };
-  const [subjectId, s] = hits[0];
-  return { ok: true, subjectId, kind: s.kind, id: s.id, topicAgentId: s.topicAgentId, record: s.record, kinds: live.kinds, ledger: live.doc };
+  // PK2-I1-fix2 P1：按**逐记录 root_om 索引**定位 —— 同 lineage 多代际的每条 live 记录都有自己的
+  //   root_om，都命中同一个 subject；恰命中一条才返回（多条已在 livePolicySubjects 里判真冲突）。
+  const hit = live.byRootOm.get(rootOm);
+  if (hit === undefined) return { ok: false, reason: "policy_store_subject_unresolved", why: "账本里没有 root_om=" + rootOm + " 的 live 记录" };
+  return { ok: true, subjectId: hit.subjectId, kind: hit.kind, id: hit.id, topicAgentId: hit.topicAgentId, record: hit.record, kinds: live.kinds, ledger: live.doc };
 }
 
 /**

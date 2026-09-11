@@ -64,6 +64,7 @@ import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
 import { forwardResultProblem, forwardStartedProblem, forwardReceiptResultProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
+import { readPolicyStore } from "./m1b/policy-store.mjs"; // PK2-I1 ⑱：authoritative 期策略 store 体检
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -1031,6 +1032,41 @@ export function runDoctor({
       const hasUnclear = rec.summary.unclear > 0 || rec.chain.unclear !== null;
       // P2-6：项名不硬编码 ⑰——编号在 R54 ⑯（#141）合并后核对
       add("owner_select_reconcile", "⑰ owner_select 对账", hasBlock || hasUnclear ? false : true, body, null);
+    }
+  }
+
+  // ── ⑱ policy store（PK2-I1；只读）：authoritative 的 endpoint，策略已在
+  // `ledger/<ep>/policy.json`（v2 store，legacy 字段冻结）。逐 endpoint 核：能受验读（0600 /
+  // 普通文件 / 单硬链接 / ≤**1MiB）+ `validateSidecarDoc("policy")` 过 → 报**条目计数**；
+  // 读不出 / 不合法 → 红（fail-closed）。正文只出计数与 subject 前缀（不输出 binding 原文）。
+  // 未 authoritative（legacy / shadow）不算病 —— 那些 endpoint 的策略仍在 legacy 面。
+  {
+    const dir18 = maintenanceDir();
+    if (dir18 === null) {
+      add("policy_store", "⑱ policy store", null, "家目录查不出来，维护目录未知", null);
+    } else {
+      const agg18 = aggregateEndpointReceipts({ dir: dir18 });
+      if (!agg18.ok) {
+        add("policy_store", "⑱ policy store", false, "收据 fail-closed（" + String(agg18.why ?? "读不出") + "）", null);
+      } else {
+        const authoritative18 = agg18.endpoints.filter((e) => e.cutoverDone === true).map((e) => e.endpointId).sort();
+        const problems18 = [];
+        const parts18 = [];
+        for (const ep18 of authoritative18) {
+          const store18 = readPolicyStore({ endpointId: ep18 });
+          if (!store18.ok) { problems18.push(ep18.slice(0, 20) + "：" + String(store18.why ?? store18.reason ?? "读不出")); continue; }
+          if (store18.absent) { problems18.push(ep18.slice(0, 20) + "：policy.json 缺席（cutover 之后不应缺席）"); continue; }
+          const subjects18 = Object.keys(store18.entries);
+          // subject 是 hash（ps_<32hex>），本来就不带 binding 明文；只出条数 + 每个的前 11 位。
+          parts18.push(ep18.slice(0, 16) + "（" + subjects18.length + " 条" +
+            (subjects18.length > 0 ? "：" + subjects18.slice(0, 3).map((s) => s.slice(0, 11) + "…").join("、") + (subjects18.length > 3 ? " 等" : "") : "") + "）");
+        }
+        const body18 = problems18.length > 0
+          ? "说不清 " + problems18.length + " 处：" + problems18.slice(0, 3).join("；")
+          : authoritative18.length === 0 ? "没有已 cutover 的 endpoint（authoritative 之后才出现）"
+            : "已切权威 " + authoritative18.length + " 个：" + parts18.join("、");
+        add("policy_store", "⑱ policy store", problems18.length === 0, body18, null);
+      }
     }
   }
 

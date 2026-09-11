@@ -60,6 +60,24 @@ export function resolveDeliveryTargetFromLedger({ endpointId, rootOm, env = proc
   };
 }
 
+/**
+ * PK2-I1：策略读写面的判源 —— 与投递目标**同一条矩阵**（`classifyLedgerAuthority`，不另立第二套），
+ * 只是账本 `authority_mode` 这次由这里自己读（策略面不靠 root_om 定位、不需要 live 记录）。
+ *   · never_initialized → legacy（连账本都不开）；
+ *   · 收据 init-only → shadow（账本读不出也算 shadow，与 R66 同口径）；
+ *   · 收据 cutoverDone → 账本必须可读且同为 authoritative，否则 reject；
+ *   · 收据本身坏（unreadable / conflict / in-progress）→ reject。
+ * 返回 `{mode:"legacy"|"shadow"|"authoritative"|"reject", why}`（与 classifyLedgerAuthority 同形）。
+ */
+export function decideLedgerRoute({ receipt = null, endpointId = null, env = process.env } = {}) {
+  let ledgerMode = null;
+  if (receipt?.ok === true && receipt.state !== "never_initialized" && typeof endpointId === "string") {
+    const L = loadByEndpoint(endpointId, { env });
+    ledgerMode = L.ok ? L.doc.authority_mode : null;
+  }
+  return classifyLedgerAuthority({ receipt, ledgerMode });
+}
+
 export function decideInboundDeliveryTarget({
   receipt = null,
   endpointId,

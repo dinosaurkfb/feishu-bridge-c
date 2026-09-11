@@ -155,10 +155,10 @@ async function main() {
   const { appendEvent, listPending, MAX_REPLY_CHARS, explainabilityGaps, classifyOutboxRecord } = await import("./outbox.mjs");
   const { checkBinding, bindingWarning } = await import("./binding-health.mjs");
   const { isBridgeOwnedSession } = await import("./live-session.mjs");
-  const { finalizeClaudeDialogueTurn } = await import("./interaction-policy-store.mjs");
+  const { finalizeClaudeDialogueTurn, loadClaudeInteractionPolicyRouted } = await import("./interaction-policy-store.mjs");
   const { recordClaimState } = await import("./claim.mjs");
   const {
-    DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS, interactionPolicyStateForLegacy,
+    DIALOGUE_POLICY_ID, DIALOGUE_TURN_STATUS,
   } = await import("./interaction-policy.mjs");
 
   // 桥自己起的会话不产生答复：转发那个只会说「sent」，跑活那个的结果归守望者发
@@ -232,8 +232,11 @@ async function main() {
     // Dialogue 的现场投递没有后台 watcher；精确目标会话的 Stop 就是该回合的终局观察点。
     // 只结束 active_turn.runtime_target_id 与本会话严格相同的回合，其他会话的 Stop 不得碰它。
     if (!ownedByBridge && speakingSession && bound.ok) {
-      const interaction = interactionPolicyStateForLegacy(bound.mapping, {
-        bindingId: effectiveBindingId(bound.mapping, { root: project.root }),
+      // PK2-I1：authoritative 下策略住在 v2 policy store（legacy 冻结）—— 读面走判源分派；
+      // 否则这里读的永远是 cutover 前那份快照，active_turn 永远为 null，对话回合永远收不了尾。
+      const interaction = loadClaudeInteractionPolicyRouted({
+        root: project.root,
+        claudeSessionId: boundSession,
       });
       const activeTurn = interaction.ok ? interaction.state.dialogue?.active_turn : null;
       if (interaction.ok && interaction.state.policy_id === DIALOGUE_POLICY_ID &&

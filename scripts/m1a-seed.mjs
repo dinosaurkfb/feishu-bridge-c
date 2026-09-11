@@ -344,6 +344,31 @@ export function seedShadowEndpoint({
   }
 }
 
+/**
+ * R68（Codex #160 一轮 P2）：CLI 格式化层抽成纯函数 —— 各非成功分支直接输出核心返回的 res.why
+ * （seedShadowEndpoint 已按状态给出精确 why，如 already_consistent 时释放失败 →
+ * 「未写入；排序锁释放不干净（…）：先 doctor」；写后收口脏 → 「已写但收口不干净（…）」），
+ * 不再自行拼旧文案把 why 丢了；有 commit/lock_state/residue/rejected_dirs 等结构字段时追加一行 JSON 摘要。
+ * 成功与 already_consistent 保留现有一行。退出码由 CLI 调用方按 ok 分派，不在本函数。
+ */
+export function formatSeedResult(res, endpointId) {
+  if (res.ok === true) {
+    if (res.status === "already_consistent") {
+      return [`[m1a-seed] 账本已一致，无需补种（端点: ${endpointId}, revision: ${res.revision}）`];
+    }
+    return [`[m1a-seed] 补种成功（端点: ${endpointId}, revision: ${res.revision}, 补种条数: ${res.seeded.length}）`];
+  }
+  const lines = [`[m1a-seed] ${res.status ?? res.reason}：${res.why ?? ""}`];
+  const structural = {};
+  for (const k of ["commit", "lock_state", "residue", "rejected_dirs"]) {
+    if (res[k] !== undefined) structural[k] = res[k];
+  }
+  if (Object.keys(structural).length > 0) lines.push("结构字段: " + JSON.stringify(structural));
+  if (res.mismatches) lines.push("差异项: " + JSON.stringify(res.mismatches, null, 2));
+  if (res.blockers) lines.push("阻塞项: " + JSON.stringify(res.blockers, null, 2));
+  return lines;
+}
+
 if (isDirectRun(import.meta.url)) {
   const arg = (n) => {
     const i = process.argv.indexOf("--" + n);
@@ -379,25 +404,13 @@ if (isDirectRun(import.meta.url)) {
       }
       process.exit(0);
     } else {
-      if (res.status === "already_consistent") {
-        console.log(`[m1a-seed] 账本已一致，无需补种（端点: ${endpointId}, revision: ${res.revision}）`);
-      } else {
-        console.log(`[m1a-seed] 补种成功（端点: ${endpointId}, revision: ${res.revision}, 补种条数: ${res.seeded.length}）`);
-      }
+      // R68：成功与 already_consistent 保留现有一行（格式化层统一出处）
+      for (const line of formatSeedResult(res, endpointId)) console.log(line);
       process.exit(0);
     }
   } else {
-    if (res.status === "seeded_unclean") {
-      console.error(`[m1a-seed] 已写但收口不干净（${res.commit}/${res.lock_state}）：不要重跑 apply，先 doctor`);
-      process.exit(1);
-    }
-    console.error(`[m1a-seed] 失败 (${res.reason}): ${res.why ?? ""}`);
-    if (res.mismatches) {
-      console.error("差异项:", JSON.stringify(res.mismatches, null, 2));
-    }
-    if (res.blockers) {
-      console.error("阻塞项:", JSON.stringify(res.blockers, null, 2));
-    }
+    // R68：各非成功分支统一输出 res.why 原文（格式化层），退出码逻辑不变
+    for (const line of formatSeedResult(res, endpointId)) console.error(line);
     process.exit(1);
   }
 }

@@ -133,7 +133,10 @@ export function runMaintenanceLedger(argv, { ctx = null, out = (s) => process.st
       if (!rec.ok) { out("[cutover 预览] 对账不一致：" + String(rec.reason ?? "") + (rec.why ? "：" + rec.why : "") + " —— 加了 --apply 也会被拒（什么都不动）"); return 1; }
       out("[cutover 预览] " + parsed.endpoint + "（" + chain + "）：对账一致（双射 digest " + String(rec.digest) + "）");
       out("  sidecar 目标：ledger/" + parsed.endpoint + "/expiry.json、ledger/" + parsed.endpoint + "/pending-claims.json、ledger/" + parsed.endpoint + "/policy.json");
-      out("  停两链定时器 → 两链 current 切维护桩 → 建门 → converge 三 sidecar → 二次对账重验 → 停在 authority cutover 提交点之前（等逐次授权）。加 --apply 执行。");
+      // PK2-F7：R69 之后一次 --apply 直达提交与重开 —— 不再印「停在提交点之前（等逐次授权）」（那会让授权者
+      //   以为还要再点一次；Codex 清单第 4 条：预览不出现「未武装」语义）。锁内复核四项 = pre SHA / 双射 digest /
+      //   三 sidecar SHA / 蓝图（verifyCutoverPlan 一处，见 cutover-plan.mjs）。
+      out("  停两链定时器 → 两链 current 切维护桩 → 建门 → converge 三 sidecar → 二次对账重验 → 账本锁内复核（pre SHA / 双射 digest / 三 sidecar SHA / 蓝图）→ 提交 authority_cutover → 重开（一次 --apply 覆盖全程，不可回滚、只向前）。加 --apply 执行。");
       return 0;
     }
     out("[预览] 预检通过，账本 init→shadow revision1（" + parsed.endpoint + "）：停两链定时器 → 两链 current 切维护桩 → 建门 → 等既有进程退出最多 " + (r.plan?.waitMs ?? parsed.waitMs) + " ms → 门内写账本。加 --apply 执行。");

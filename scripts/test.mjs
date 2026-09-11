@@ -52570,6 +52570,145 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
     } finally { x.f.cleanup(); }
   });
 
+  // ── 返修四（fix4）：P1-A / P1-B / P2 的反例 ─────────────────────────────
+  test("PK2-W1-fix4 T22 反例（P1-A）：bind repair 与 promote 交错 —— 冻结行必须在 outer 锁内确定，不许把 active 覆盖回 pending", () => {
+    const f = w1ClaimableFixture("t22");
+    const { x, om, ta, env } = f;
+    try {
+      // 前置：造出「待认领且现场不齐」——把待认领条目的 token 改错。这样 bind 侧的完整性判定必然
+      //   得 repair（否则它会直接早退，交错就无从发生）：这正是票面「bind 判定之后、写索引之前」的起点。
+      const drift = mutateSidecarEntry({ endpointId: x.EP, name: "pending-claims", key: ta,
+        mutate: () => ({ ok: true, changed: true, value: { token: "f".repeat(6), claim_expires_at: null } }) });
+      assert.deepEqual([drift.ok, drift.changed], [true, true], "夹具：把待认领条目改错（造出 repair 现场）：" + JSON.stringify(drift).slice(0, 180));
+      // 注入点 = 「bind 取到 outer 锁之前、启动快照与判定之后」那一瞬：预载把 fs.symlinkSync 挂钩，
+      //   在 bind 即将造 m1a-order.lock 时，先在**子进程**里跑一次**真 promote**（create_a1→activate
+      //   + 删待认领条目 + 索引改 bound）。这正是票面说的交错：另一路写方在 bind 的「读」与「写」之间落地。
+      const promoteScript = path.join(x.f.base, "promote-once.mjs");
+      fs.writeFileSync(promoteScript, [
+        'const R = ' + JSON.stringify(path.resolve("scripts")) + ';',
+        'const WIRE = await import(R + "/m1a/wiring.mjs");',
+        'const IB = await import(R + "/inbound-route.mjs");',
+        'const [endpointId, om, authorizedBy, regFile, tplFile, sessionId] = process.argv.slice(2);',
+        'const pending = IB.findPendingBinding({ content: "", registryFile: regFile, templateFile: tplFile });',
+        'if (!pending.ok) { process.stdout.write(JSON.stringify({ ok: false, why: "findPendingBinding：" + String(pending.reason) })); process.exit(0); }',
+        'const f4 = { matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" };',
+        'const wired = WIRE.wirePromoteAuthoritative({ endpointId, env: process.env, locator: om, claimKey: "d".repeat(64),',
+        '  sessionId, authorizedBy, f4, publishIndex: () => IB.promoteBinding({ root: pending.root, id: pending.id, source: pending.source,',
+        '    generationId: pending.generationId, operationId: pending.operationId, sessionId, registryFile: regFile }) });',
+        'process.stdout.write(JSON.stringify({ ok: wired.ok === true, commit: wired.commit, reason: wired.reason ?? null }));',
+      ].join("\n"));
+      const logFile = path.join(x.f.base, "promote-log.json");
+      const preload = path.join(x.f.base, "before-order-lock.cjs");
+      fs.writeFileSync(preload, [
+        'const fs = require("node:fs");',
+        'const cp = require("node:child_process");',
+        'const orig = fs.symlinkSync;',
+        'fs.symlinkSync = (target, p, ...rest) => {',
+        '  if (String(p).endsWith("m1a-order.lock") && !process.env.W1_FIX4_DONE) {',
+        '    process.env.W1_FIX4_DONE = "1";',
+        '    const r = cp.spawnSync(process.execPath, [process.env.W1_FIX4_PROMOTE, ...JSON.parse(process.env.W1_FIX4_ARGS)],',
+        '      { encoding: "utf-8", env: { ...process.env, W1_FIX4_DONE: "1" } });',
+        '    fs.writeFileSync(process.env.W1_FIX4_LOG, JSON.stringify({ status: r.status, out: r.stdout, err: r.stderr }));',
+        '  }',
+        '  return orig(target, p, ...rest);',
+        '};',
+      ].join("\n"));
+      const opsBefore = Object.keys(x.ledger().operations).length;
+      const r2 = w1Bind(x, { ...env, NODE_OPTIONS: "--require " + preload,
+        W1_FIX4_PROMOTE: promoteScript, W1_FIX4_LOG: logFile,
+        W1_FIX4_ARGS: JSON.stringify([x.EP, om, TPL.frank_sender_id, x.regFile, x.tplFile, "aily_t22"]) });
+      // 注入确实生效：那一笔真 promote 在 bind 取锁之前落地了
+      assert.ok(fs.existsSync(logFile), "注入的 promote 没跑起来（bind 那条真入口没走到取 outer 锁）：" + r2.stdout + r2.stderr);
+      const plog = JSON.parse(fs.readFileSync(logFile, "utf-8"));
+      assert.match(String(plog.out), /"ok":true/u, "交错注入的 promote 必须成功（否则测的不是这个交错）：" + JSON.stringify(plog).slice(0, 300));
+      // 断言（P1-A）：bind 要么拒、要么报「已经绑过了」，但**绝不许零字节以外地覆盖**：
+      assert.ok([0, 1].includes(r2.status), "bind 要么成功收口要么拒：" + r2.status + " " + r2.stdout + r2.stderr);
+      if (r2.status === 0) assert.match(r2.stdout, /已经绑过了/u, "成功那一支只能是「已经绑过了」：" + r2.stdout.slice(0, 300));
+      const rowAfter = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      assert.deepEqual([rowAfter.inbound_state, rowAfter.session_id], ["bound", "aily_t22"],
+        "索引行必须仍是**认领后**的 active/bound（不许被 bind 的旧 pending 整行覆盖回来）：" + JSON.stringify(rowAfter).slice(0, 300));
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta], undefined,
+        "待认领条目**不许复活**（bind 的 sidecar 补齐不得把认领删掉的条目写回来）");
+      const liveAfter = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      assert.equal(liveAfter.facts.binding, "active", "账本记录仍是 active：" + JSON.stringify(liveAfter.facts));
+      // promote 本身两笔（create_a1 → activate）；bind 那一侧必须**一个 op 都没记**（重放命中）。
+      assert.equal(Object.keys(x.ledger().operations).length, opsBefore + 2,
+        "账本只多了 promote 的两笔（bind 一个 op 都没记）：" + Object.keys(x.ledger().operations).length + " vs " + (opsBefore + 2));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1-fix4 T23 反例（P1-B）：不带 --apply 的 bind-session 零写 —— 一次目录 fsync 都不做、目录条目/字节全不变", () => {
+    const x = w1Fixture("t23");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r1 = w1Bind(x, env);
+      assert.equal(r1.status, 0, "首次绑定：" + r1.stdout + r1.stderr);
+      const names = () => fs.readdirSync(x.epDir).sort();
+      const snap = () => ({
+        entries: names(),
+        dirMtime: fs.statSync(x.epDir).mtimeMs,
+        ledger: fs.readFileSync(path.join(x.epDir, "ledger.json")),
+        sidecars: ["pending-claims", "expiry", "policy"].map((n) => { try { return [n, fs.readFileSync(x.sidecar(n))]; } catch { return [n, null]; } }),
+        reg: fs.readFileSync(x.regFile),
+      });
+      const before = snap();
+      // 刀：数一遍这次运行做了几次**目录 fsync**（预载在进程退出时落盘计数）——预览必须 0 次。
+      const counter = path.join(x.f.base, "fsync-count.cjs");
+      const countFile = path.join(x.f.base, "fsync-count.json");
+      fs.writeFileSync(counter, [
+        'const fs = require("node:fs");',
+        'const orig = fs.fsyncSync;',
+        'let dirs = 0;',
+        'fs.fsyncSync = (fd) => { if (fs.fstatSync(fd).isDirectory()) dirs += 1; return orig(fd); };',
+        'process.on("exit", () => { try { fs.writeFileSync(process.env.W1_FIX4_COUNT, String(dirs)); } catch {} });',
+      ].join("\n"));
+      // 真入口，**不带 --apply**（w1Bind 恒带 --apply，这里直接 spawn）
+      const r2 = spawnSync(process.execPath, [path.resolve("scripts", "bind-session.mjs")],
+        { encoding: "utf-8", cwd: x.proj, env: { ...env, NODE_OPTIONS: "--require " + counter, W1_FIX4_COUNT: countFile } });
+      assert.equal(r2.status, 0, "预览退出码 0：" + r2.stdout + r2.stderr);
+      // 预览两支都合法：现场完整 → 只读早退（这里就是这一支，旧版在这里做屏障=写）；
+      //   现场不完整 → dry-run 提示。关键判据是下面的「零 fsync + 零字节变化」。
+      assert.match(r2.stdout, /已经绑过了|dry-run/u, "确实是预览那一支：" + r2.stdout.slice(-300));
+      assert.equal(fs.readFileSync(countFile, "utf-8"), "0", "预览路径**一次目录 fsync 都不做**（旧版在这里走 mutateSidecarEntry 建锁 + fsync）");
+      const after = snap();
+      assert.deepEqual(after.entries, before.entries, "账本目录条目没变（尤其不许留下 sidecar 锁）：" + JSON.stringify([before.entries, after.entries]));
+      assert.equal(after.dirMtime, before.dirMtime, "账本目录 mtime 不变（建/删锁那次也会改它）");
+      assert.deepEqual(after.ledger, before.ledger, "账本字节不变");
+      assert.deepEqual(after.sidecars, before.sidecars, "sidecar 字节不变");
+      assert.deepEqual(after.reg, before.reg, "登记表字节不变");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1-fix4 T24 反例（P2）：既有行 pending_token 非法（待认领且现场有漂移）→ 拒 bad_frozen_row、点名字段、零写", () => {
+    const x = w1Fixture("t24");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r1 = w1Bind(x, env);
+      assert.equal(r1.status, 0, "首次绑定：" + r1.stdout + r1.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const ta = rec0.topic_agent_id;
+      const token0 = readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta].token;
+      // 夹具：把索引行的 pending_token 抹成 null（旧版会"回退到新算的 token"→ 索引行 null 与 sidecar 新 token 永久不一致）
+      const reg = x.registry();
+      reg.projects.find((p) => p.claude_session_id === W1_UUID_A).pending_token = null;
+      fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      const ledgerBefore = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const regBefore = fs.readFileSync(x.regFile);
+      const prevBefore = (() => { try { return fs.statSync(x.regFile + ".prev").mtimeMs; } catch { return null; } })();
+      const sideBefore = fs.readFileSync(x.sidecar("pending-claims"));
+      const r2 = w1Bind(x, env);
+      assert.notEqual(r2.status, 0, "非法冻结行必须拒：" + r2.stdout.slice(0, 200));
+      assert.match(String(r2.stderr), /bad_frozen_row/u, "拒因点名 bad_frozen_row：" + String(r2.stderr).slice(0, 400));
+      assert.match(String(r2.stderr), /pending_token/u, "拒因点名字段 pending_token：" + String(r2.stderr).slice(0, 400));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledgerBefore, "账本零写");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "登记表零写（不覆盖那一行）");
+      assert.deepEqual(fs.readFileSync(x.sidecar("pending-claims")), sideBefore, "sidecar 零写（不许拿新算的 token 写进去）");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta].token, token0, "待认领 token 逐字不变");
+      assert.equal((() => { try { return fs.statSync(x.regFile + ".prev").mtimeMs; } catch { return null; } })(), prevBefore,
+        "拒的路径不重写登记表（连 .prev 备份都不该被动到）");
+    } finally { x.f.cleanup(); }
+  });
+
   test("PK2-W1 T19b 返修二 P1-4：认领后 expiry 值被篡改 → 重跑 bind 判不完整（拒，不重跑复合、不复活待认领）", () => {
     const f = w1ClaimableFixture("t19b");
     const { x, om, ta, env } = f;

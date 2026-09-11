@@ -23,6 +23,13 @@ export function expectationFromMapping(mapping, { root = null } = {}) {
 export function claudeControlPrecondition({ claimsDir, key, root = null }) {
   return (record, meta = {}) => {
     if (!record || typeof record !== "object") return false;
+    // PK2-I1：authoritative 下 record = v2 policy store 条目 —— binding_id 是唯一在锁内的身份锚；
+    // logical_task_key 由 claim key 自证（claimProblem），会话身份 authoritative 由账本治理（R66），
+    // 这里带调用方入参核对。事务核验与策略写入之间换了绑定 → binding_id 对不上 → 拒写。
+    if (meta.source === "policy-store") {
+      return readClaimState({ claimsDir, key,
+        expect: { bindingId: meta.bindingId, claudeSessionId: meta.claudeSessionId ?? null } }).status === "valid";
+    }
     const live = meta.source === "registry" ? mappingFromRegistryEntry(record) : record;
     return readClaimState({ claimsDir, key, expect: expectationFromMapping(live, { root: meta.root ?? root }) }).status === "valid";
   };

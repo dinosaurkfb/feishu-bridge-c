@@ -64,6 +64,7 @@ import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
 import { forwardResultProblem, forwardStartedProblem, forwardReceiptResultProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
+import { readPolicyStore } from "./m1b/policy-store.mjs";
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
 /** 到期预警阈值：7 天内到期就点名。**明写**，不藏在比较式里。 */
@@ -1031,6 +1032,35 @@ export function runDoctor({
       const hasUnclear = rec.summary.unclear > 0 || rec.chain.unclear !== null;
       // P2-6：项名不硬编码 ⑰——编号在 R54 ⑯（#141）合并后核对
       add("owner_select_reconcile", "⑰ owner_select 对账", hasBlock || hasUnclear ? false : true, body, null);
+    }
+  }
+
+  // ── ⑱ policy store（PK2-I1；只读不修）：authoritative  endpoint 的 v2 policy store 受验读 + 条目计数；
+  // 读不出/不合法/缺席 → 红（fail-closed，与运行时同口径）。只报计数，不透条目内容。
+  {
+    const dir18 = maintenanceDir();
+    if (dir18 === null) {
+      add("policy_store", "⑱ policy store", null, "家目录查不出来，维护目录未知", null);
+    } else {
+      const agg18 = aggregateEndpointReceipts({ dir: dir18 });
+      const authEp18 = agg18.ok && Array.isArray(agg18.endpoints) ? agg18.endpoints.filter((e) => e.state === "ok" && e.cutoverDone) : [];
+      if (!agg18.ok) {
+        add("policy_store", "⑱ policy store", null, "收据聚合 fail-closed，authoritative 集合查不清", null);
+      } else if (authEp18.length === 0) {
+        add("policy_store", "⑱ policy store", true, "无 authoritative endpoint（policy store 不适用）", null);
+      } else {
+        const parts18 = [];
+        const problems18 = [];
+        for (const e of authEp18) {
+          const s = readPolicyStore({ endpointId: e.endpointId });
+          if (!s.ok) problems18.push(e.endpointId.slice(0, 16) + "：policy store 读不出（" + s.reason + "）");
+          else if (s.absent) problems18.push(e.endpointId.slice(0, 16) + "：policy store 缺席（cutover 后不应缺席）");
+          else parts18.push(e.endpointId.slice(0, 16) + "（policy 条目 " + Object.keys(s.entries).length + "）");
+        }
+        const body18 = "authoritative " + authEp18.length + " 个：" + (parts18.join("、") || "无")
+          + (problems18.length ? "；问题：" + problems18.slice(0, 3).join("；") : "");
+        add("policy_store", "⑱ policy store", problems18.length === 0, body18, null);
+      }
     }
   }
 

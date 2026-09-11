@@ -649,6 +649,16 @@ const interaction = loadClaudeInteractionPolicy({
   root: routed.root,
   claudeSessionId: routed.mapping?.claude_session_id ?? null,
 });
+if (!interaction.ok && interaction.reason === "ledger_route_unavailable") {
+  // PK2-I1：authoritative 判源拒（收据不明/模式不符/policy store 读不出）—— 与 R66 投递目标同款拒收：
+  // 拒绝态回执、不取 claim、不投不回退。授权要按策略模式判（下方 authorize），策略读不出就没法放行。
+  writeReceipt("ledger-route-" + (event.message_id ?? "unknown"), {
+    status: "rejected", reason: interaction.reason,
+    message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
+  });
+  finish("rejected", { reasonText: "账本权威但策略 store 读不出，没有投递", taskName: config.task_display_name },
+    { reason: interaction.reason });
+}
 if (!interaction.ok) {
   writeReceipt("policy-state-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
     status: "error", reason: interaction.reason, message_id: event.message_id ?? null,

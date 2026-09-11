@@ -46917,6 +46917,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       "00000000-0000-4000-8000-0000000006d2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r66_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r66_up", endpoint, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint, from_schema: "1.0", to_schema: "1.1-transition" } },
     }, records: {} };
     fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    // PK2-I1：authoritative 下入站取策略读 v2 policy store —— 夹具补上 cutover 时 renderer 固化的
+    // policy.json（空 entries；缺条目在读取端折 renderer 同款默认）。
+    fs.writeFileSync(path.join(epDir, "policy.json"), JSON.stringify({ schema_version: "policy-1", endpoint_id: endpoint, entries: {} }, null, 2) + "\n", { mode: 0o600 });
     const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
     process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
     const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => Date.parse("2026-09-20T00:00:00.000Z") });
@@ -50393,10 +50396,13 @@ test("R69 T7 入口级（两腿）：cutover 进行中（门已撤、WAL 未完�
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "om_msg_t7_reject", sessionID: "aily_t7", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
     const p = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
       env: { ...fA.env, FEISHU_BRIDGE_REGISTRY: path.join(fA.bridge, "registry.json"), FEISHU_BRIDGE_CHAIN_TEMPLATE: path.join(fA.bridge, "chain-config.json"), PATH: bin + path.delimiter + process.env.PATH, AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_t7", AILY_CLI_RUN_ID: "run_t7", FAKE_AILY_ENVELOPE: envelope } });
-    assert.equal(p.status, 0, p.stdout + p.stderr);
-    const failedJson = path.join(proj, ".runtime-data", "inbound", "delivery-claims", claimKey("om_msg_t7_reject", "t7") + ".failed.json");
-    assert.ok(fs.existsSync(failedJson), "failed 终态落盘：" + p.stdout.slice(0, 200));
-    assert.equal(JSON.parse(fs.readFileSync(failedJson, "utf-8")).reason, "ledger_route_unavailable", "拒因点名");
+    assert.equal(p.status, 0, "入站拒（rejected 终态）：" + p.stdout + p.stderr);
+    // PK2-I1：authoritative 判源在入站取策略处也拦（与 R66 同款拒因与同形回执）——mid-cutover 在
+    // 策略读入处 fail-closed；claim 未取，无 failed claim，只有 ledger-route 拒收回执。
+    const routeReceipts = fs.readdirSync(path.join(proj, ".runtime-data", "inbound", "receipts")).filter((n) => n.startsWith("ledger-route-om_msg_t7_reject"));
+    assert.equal(routeReceipts.length, 1, "ledger-route 拒收回执落盘：" + routeReceipts.join(","));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(proj, ".runtime-data", "inbound", "receipts", routeReceipts[0]), "utf-8")).reason, "ledger_route_unavailable", "回执拒因点名");
+    assert.equal(fs.existsSync(path.join(proj, ".runtime-data", "inbound", "delivery-claims", claimKey("om_msg_t7_reject", "t7") + ".consumed.json")), false, "不写 consumed");
     rejectOk = true;
   } finally { fA.cleanup(); }
   // done 腿：seed → 真 cutover 到 done → 真收据 + 决策层 authoritative 项目级（唯一 live 顺手钉）
@@ -50643,6 +50649,7 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
 // ─────────── PK2-I1：authoritative 下 interaction policy 读写切到 v2 policy store（ledger/<ep>/policy.json） ───────────
 {
   // T1 store 原语：readPolicyStore fail-closed 封闭读 + mutatePolicyEntry 锁内原子写/校验/锁互斥。
+  // T1 store 原语：readPolicyStore fail-closed 封闭读 + mutatePolicyEntry 锁内原子写/校验/锁互斥。
   test("PK2-I1 T1 policy store 原语：缺席→absent；0644/坏 JSON/超限→unreadable 族；合法→读回；mutate 原子写+拒非法状态+锁被占拒", () => {
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2i1-t1-")));
     const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
@@ -50704,6 +50711,174 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
       fs.rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  // T2–T6 共用夹具：真编排 init → 登记+mapping+seed（双射一对）→ 真 cutover → authoritative + renderer 固化的 policy.json。
+  const pk2i1UUID = "22222222-2222-4222-8222-222222222222";
+  const pk2i1AuthFixture = (tag) => {
+    const f = r69Fixture(tag);
+    // 判源从链模板 agent_uid 派生 endpointId（与 inbound R66 同源）—— 夹具的账本必须用同一个 endpoint。
+    const EP = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+    const proj = path.join(f.base, "proj"); fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+    const OM = "om_" + "c".repeat(10);
+    const SESS = "sess_" + tag;
+    const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true });
+    assert.ok(init.ok && init.phase === "done", "前置 init：" + JSON.stringify(init).slice(0, 200));
+    const registryFile = path.join(f.bridge, "registry.json");
+    fs.writeFileSync(registryFile, JSON.stringify({ projects: [{ root: proj, id: "p1", claude_session_id: pk2i1UUID }] }, null, 2) + "\n", { mode: 0o600 });
+    const mapDir = path.join(proj, ".runtime-data", "inbound");
+    fs.mkdirSync(mapDir, { recursive: true, mode: 0o700 });
+    const mappingFile = path.join(mapDir, "active-mapping.json");
+    fs.writeFileSync(mappingFile, JSON.stringify({ binding_id: "p1@registry", status: "active", root_message_id: OM,
+      session_id: SESS, channel_generation_id: "g1", claude_session_id: pk2i1UUID, expires_at: "2099-01-01T00:00:00.000Z",
+      topic_generation_state: { schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations",
+        binding_id: "p1@registry", binding_status: "active", active_generation_id: "g1", rotation: null,
+        generations: [{ channel_generation_id: "g1", generation: 1, status: "active", root_message_id: OM,
+          session_id: SESS, created_at: "2026-08-01T00:00:00.000Z", pending_token: null, claim_expires_at: null }] } }, null, 2) + "\n", { mode: 0o600 });
+    const seeded = TAL.seedRecords({ endpointId: EP, requestKey: "req_pk2i1_" + tag, candidates: [{
+      kind: "live",
+      topic_agent_id: topicAgentIdForLegacy(EP, "p1@registry", "g1"), chat_id: TPL.chat_id,
+      aliases: { session_id: SESS, root_om: OM },
+      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+      binding_target: { runtime: "claude", project_root: proj, claude_session_id: pk2i1UUID },
+      binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: "2026-08-01T00:00:00.000Z", matched_om: OM, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+      locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: "2026-01-01T00:00:00.000Z", matched_om: OM, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+      anchor_candidate: null, generation_lineage_id: "p1@registry" }] });
+    assert.ok(seeded.ok, "seed 成对：" + JSON.stringify(seeded).slice(0, 300));
+    const cut = LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true });
+    assert.ok(cut.phase === "done", "真 cutover 到 done（authoritative）：" + JSON.stringify({ phase: cut.phase, reason: cut.reason, why: cut.why }).slice(0, 400));
+    const epDir = path.join(f.ledgerRoot, EP);
+    return { f, EP, proj, epDir, registryFile, mappingFile, UUID: pk2i1UUID };
+  };
+
+  test("PK2-I1 T2 authoritative：/feishu-mode 写 v2 store（registry/mapping 字节不变＝legacy 冻结）；入站读 store 条目按 dialogue 处置", () => {
+    const fx = pk2i1AuthFixture("t2");
+    try {
+      const { EP, proj, epDir, registryFile, mappingFile, UUID } = fx;
+      const policyFile = path.join(epDir, "policy.json");
+      assert.ok(fs.existsSync(policyFile), "cutover 后 policy.json 在场（renderer 固化）");
+      const shaOf = (p) => TAL.sha256(fs.readFileSync(p));
+      const beforeReg = shaOf(registryFile), beforeMap = shaOf(mappingFile);
+      const r = setClaudeInteractionMode({ root: proj, claudeSessionId: UUID, mode: DIALOGUE_POLICY_ID });
+      assert.equal(r.ok, true, "写 v2 store：" + JSON.stringify(r).slice(0, 300));
+      assert.equal(r.source, "policy-store", "写路径点名来源");
+      assert.equal(r.changed, true, "changed=true");
+      assert.equal(shaOf(registryFile), beforeReg, "registry 字节不变（legacy 冻结）");
+      assert.equal(shaOf(mappingFile), beforeMap, "mapping 字节不变（legacy 冻结）");
+      const back = readPolicyStore({ endpointId: EP });
+      const [subject, entry] = Object.entries(back.entries)[0];
+      assert.equal(entry.policy_id, DIALOGUE_POLICY_ID, "policy.json 条目已切 dialogue");
+      // 入站取策略：authoritative 下从 store 取（不再读 legacy 字段）
+      const loaded = loadClaudeInteractionPolicy({ root: proj, claudeSessionId: UUID });
+      assert.equal(loaded.ok, true, "入站读 v2 store：" + JSON.stringify(loaded).slice(0, 200));
+      assert.equal(loaded.source, "policy-store", "读路径点名来源");
+      assert.equal(loaded.state.policy_id, DIALOGUE_POLICY_ID, "入站拿到 dialogue 模式（按 dialogue 处置）");
+      // 切回 mapping 同样走 store
+      const r2 = setClaudeInteractionMode({ root: proj, claudeSessionId: UUID, mode: MAPPING_POLICY_ID });
+      assert.ok(r2.ok && r2.changed === true, "切回 mapping 走 store：" + JSON.stringify(r2).slice(0, 200));
+      assert.equal(shaOf(registryFile), beforeReg, "registry 仍冻结");
+      assert.equal(subject && entry && true, true, "subject 在场");
+    } finally { fx.f.cleanup(); }
+  });
+
+  test("PK2-I1 T3 shadow / never_initialized：行为与 main 完全一致（写 registry；policy.json 不碰）", () => {
+    // shadow：init-only 收据 + shadow 账本
+    {
+      const f = r69Fixture("pk2i1t3s");
+      try {
+        const EP = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+        const proj = path.join(f.base, "proj"); fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+        assert.ok(LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true }).ok, "前置 init");
+        const registryFile = path.join(f.bridge, "registry.json");
+        fs.writeFileSync(registryFile, JSON.stringify({ projects: [{ root: proj, id: "p1", claude_session_id: pk2i1UUID, root_message_id: "om_" + "d".repeat(10), expires_at: "2099-01-01T00:00:00Z", session_id: "sess_pk2i1t3s", inbound_state: "bound", status: "active", bound_at: "2026-09-01T00:00:00.000Z" }] }, null, 2) + "\n", { mode: 0o600 });
+        const epDir = path.join(f.ledgerRoot, EP);
+        assert.equal(fs.existsSync(path.join(epDir, "policy.json")), false, "前置：shadow 期无 policy.json");
+        const r = setClaudeInteractionMode({ root: proj, claudeSessionId: pk2i1UUID, mode: DIALOGUE_POLICY_ID });
+        assert.equal(r.ok, true, "shadow 下照旧写 registry：" + JSON.stringify(r).slice(0, 200));
+        assert.equal(r.source, "registry", "来源还是 registry（不走 v2 store）");
+        assert.equal(fs.existsSync(path.join(epDir, "policy.json")), false, "policy.json 仍未被碰");
+      } finally { f.cleanup(); }
+    }
+    // never_initialized：无任何收据 → 纯 legacy，连账本都不读
+    {
+      const f = r69Fixture("pk2i1t3n");
+      try {
+        const EP = legacyEndpointId({ runtime: "claude", agentUid: TPL.agent_uid });
+        const proj = path.join(f.base, "proj"); fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+        const registryFile = path.join(f.bridge, "registry.json");
+        fs.writeFileSync(registryFile, JSON.stringify({ projects: [{ root: proj, id: "p1", claude_session_id: pk2i1UUID, root_message_id: "om_" + "d".repeat(10), expires_at: "2099-01-01T00:00:00Z", session_id: "sess_pk2i1t3n", inbound_state: "bound", status: "active", bound_at: "2026-09-01T00:00:00.000Z" }] }, null, 2) + "\n", { mode: 0o600 });
+        const r = setClaudeInteractionMode({ root: proj, claudeSessionId: pk2i1UUID, mode: DIALOGUE_POLICY_ID });
+        assert.equal(r.ok, true, "never_initialized 下照旧写 registry：" + JSON.stringify(r).slice(0, 200));
+        assert.equal(r.source, "registry", "来源还是 registry");
+        assert.equal(fs.existsSync(path.join(f.ledgerRoot, EP)), false, "账本目录未创建（不碰账本）");
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test("PK2-I1 T4 authoritative + policy.json 读不出：入站拒 ledger_route_unavailable、/feishu-mode 写拒（fail-closed 不回退 legacy）", () => {
+    const fx = pk2i1AuthFixture("t4");
+    try {
+      const { proj, epDir, registryFile, mappingFile, UUID } = fx;
+      const policyFile = path.join(epDir, "policy.json");
+      const good = fs.readFileSync(policyFile);
+      const regSha = TAL.sha256(fs.readFileSync(registryFile));
+      const mapSha = TAL.sha256(fs.readFileSync(mappingFile));
+      fs.writeFileSync(policyFile, "{corrupt", { mode: 0o600 });
+      const loaded = loadClaudeInteractionPolicy({ root: proj, claudeSessionId: UUID });
+      assert.equal(loaded.ok, false, "入站读拒：" + JSON.stringify(loaded));
+      assert.equal(loaded.reason, "ledger_route_unavailable", "点名拒因（与 R66 投递目标同款，不回退 legacy）");
+      const r = setClaudeInteractionMode({ root: proj, claudeSessionId: UUID, mode: DIALOGUE_POLICY_ID });
+      assert.equal(r.ok, false, "/feishu-mode 写拒：" + JSON.stringify(r));
+      assert.equal(TAL.sha256(fs.readFileSync(registryFile)), regSha, "registry 未被写（没有静默回退 legacy）");
+      assert.equal(TAL.sha256(fs.readFileSync(mappingFile)), mapSha, "mapping 未被写");
+      fs.writeFileSync(policyFile, good, { mode: 0o600 });
+      assert.equal(loadClaudeInteractionPolicy({ root: proj, claudeSessionId: UUID }).ok, true, "内容级恢复后读绿");
+    } finally { fx.f.cleanup(); }
+  });
+
+  test("PK2-I1 T5 dialogue 回合 reserve/finalize 落 policy.json；并发 reserve 互斥（锁）", () => {
+    const fx = pk2i1AuthFixture("t5");
+    try {
+      const { EP, proj, epDir, UUID } = fx;
+      const setMode = setClaudeInteractionMode({ root: proj, claudeSessionId: UUID, mode: DIALOGUE_POLICY_ID });
+      assert.ok(setMode.ok, "先切 dialogue：" + JSON.stringify(setMode).slice(0, 200));
+      const reserve = () => reserveClaudeDialogueTurn({ root: proj, claudeSessionId: UUID,
+        eventId: "evt_pk2i1_t5", runId: "run_pk2i1_t5", localTargetId: "local_x", originChannelGenerationId: "g1" });
+      const r1 = reserve();
+      assert.equal(r1.ok, true, "reserve 成立：" + JSON.stringify(r1).slice(0, 250));
+      assert.equal(r1.source, "policy-store", "reserve 走 v2 store");
+      const back = readPolicyStore({ endpointId: EP });
+      const [subject, entry] = Object.entries(back.entries)[0];
+      assert.ok(entry.dialogue?.active_turn, "active_turn 落 policy.json");
+      const fin = finalizeClaudeDialogueTurn({ root: proj, claudeSessionId: UUID, runId: "run_pk2i1_t5", status: "completed" });
+      assert.equal(fin.ok, true, "finalize 成立：" + JSON.stringify(fin).slice(0, 250));
+      const back2 = readPolicyStore({ endpointId: EP });
+      assert.equal(back2.entries[subject].dialogue.active_turn, null, "active_turn 清");
+      assert.ok(back2.entries[subject].dialogue.last_turn, "last_turn 落盘");
+      // 并发互斥：外持 policy.lock → 第二笔 reserve 拒
+      const lockPath = path.join(epDir, "policy.lock");
+      const held = acquireLedgerLock(lockPath);
+      assert.ok(held.ok, "测试自持锁：" + JSON.stringify(held));
+      const busy = reserve();
+      assert.equal(busy.ok, false, "并发第二笔拒（互斥）：" + JSON.stringify(busy));
+      assert.equal(busy.reason, "binding_busy", "点名 busy（与 legacy 写路径同一外显）：" + JSON.stringify(busy));
+      releaseLedgerLock(lockPath);
+    } finally { fx.f.cleanup(); }
+  });
+
+  test("PK2-I1 T6 doctor ⑱：authoritative 下 policy store 合法→绿+计数；0644→红（fail-closed）", () => {
+    const fx = pk2i1AuthFixture("t6");
+    try {
+      const { f, epDir } = fx;
+      const rep = runDoctor({ home: f.home });
+      const c = rep.checks.find((x) => x.id === "policy_store");
+      assert.ok(c, "⑱ policy store 在场");
+      assert.equal(c.ok, true, "合法 → 绿：" + JSON.stringify(c));
+      assert.match(c.detail, /policy 条目 1/u, "只报计数（不透 subject 原文以外的信息）：" + c.detail);
+      fs.chmodSync(path.join(epDir, "policy.json"), 0o644);
+      const c2 = runDoctor({ home: f.home }).checks.find((x) => x.id === "policy_store");
+      assert.equal(c2.ok, false, "0644 → 红：" + JSON.stringify(c2));
+    } finally { fx.f.cleanup(); }
   });
 }
 

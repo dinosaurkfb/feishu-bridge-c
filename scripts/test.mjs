@@ -50749,7 +50749,7 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
   // ── 夹具 A：真 cutover（authoritative）+ **在 cutover 之前**就在登记表里的那条 binding ──
   // P2：冻结集里的策略必须来自 cutover 那一刻的 legacy 快照（真 renderer 写的 policy.json），不是
   // 「切完之后再新建的 legacy binding」。所以顺序是：登记表先写 → init → seed 补种 → 真 cutover。
-  const i1AuthFixture = (tag, { policy = "dialogue", sessionLevel = true } = {}) => {
+  const i1AuthFixture = (tag, { policy = "dialogue", sessionLevel = true, multi = false } = {}) => {
     const f = r69Fixture("i1" + tag);
     try {
       const uid = "agent_i1_" + tag;
@@ -50761,12 +50761,31 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const rootOm = "om_" + "7".repeat(24);
       const sessionUuid = "33333333-3333-4333-8333-333333333333";
       const ailySession = "aily_i1_" + tag;
+      // PK2-I1-fix2 P1：同一 lineage 下**多代际**是合法常态（真机 B4×11 / B3×2 / B1×1）——
+      //   multi 夹具按真形状放三个代际：active（→B3 current）/ read-only（→B4 历史）/ pending（→B1 轮转中），
+      //   三条各占一个 root_msg。subject 由 {kind,id} 去重成一个。
+      const genOf = (id2, n, status, om, sid, over = {}) => ({ channel_generation_id: id2, generation: n, status, root_message_id: om,
+        session_id: sid, pending_token: null, claim_expires_at: null, created_at: "2026-09-01T00:00:00.000Z", ...over });
+      const omRO = "om_" + "8".repeat(24);
+      const omPending = "om_" + "9".repeat(24);
+      const generations = multi
+        ? [genOf("g_active", 1, "active", rootOm, ailySession),
+          genOf("g_readonly", 2, "read-only", omRO, ailySession + "-old"),
+          genOf("g_pending", 3, "pending", omPending, null, { pending_token: "abc123" })]
+        : [genOf("g1", 1, "active", rootOm, ailySession)];
+      const topicState = {
+        schema_version: "1.0", artifact_type: "feishu_bridge_topic_generations", binding_id: bindingId,
+        binding_status: "active", active_generation_id: multi ? "g_active" : "g1",
+        rotation: multi ? { operation_id: "rot-i1-" + tag, status: "awaiting_claim", pending_generation_id: "g_pending" } : null,
+        generations,
+      };
       const policyState = policy === null || policy === undefined ? null : i1Mode(bindingId, policy === "dialogue" ? DIALOGUE_POLICY_ID : MAPPING_POLICY_ID);
       const row = {
         id: "i1" + tag, root: proj, name: "I1 " + tag, root_message_id: rootOm,
         status: "active", inbound_state: "bound", session_id: ailySession,
         pending_token: null, pending_expires_at: null,
         expires_at: "2099-01-01T00:00:00.000Z", bound_at: "2026-09-01T00:00:00.000Z",
+        topic_generation_state: topicState,
         ...(sessionLevel ? { claude_session_id: sessionUuid } : {}),
         ...(policyState === null ? {} : { interaction_policy_state: policyState }),
       };
@@ -50783,7 +50802,7 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const cut = LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true });
       if (cut.phase !== "done") throw new Error("I1 夹具 cutover：" + JSON.stringify(cut));
       const epDir = path.join(f.ledgerRoot, EP);
-      return { f, EP, uid, proj, bindingId, rootOm, sessionUuid, ailySession, policyState, subjectId: i1Subject(EP, bindingId),
+      return { f, EP, uid, proj, bindingId, rootOm, omRO, omPending, sessionUuid, ailySession, policyState, topicState, subjectId: i1Subject(EP, bindingId),
         regFile, tplFile, epDir, policyFile: path.join(epDir, POLICY_STORE_FILE),
         lockFile: path.join(epDir, POLICY_STORE_LOCK_NAME),
         ledger: () => JSON.parse(fs.readFileSync(path.join(epDir, "ledger.json"), "utf-8")),
@@ -50943,7 +50962,9 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       assert.equal(live.ok, true, "live subject 集合读得出：" + JSON.stringify(live).slice(0, 160));
       const taSubject = i1Subject(x.EP, taId, "topic_agent");
       const taSub = live.subjects.get(taSubject);
-      assert.deepEqual([taSub?.kind, taSub?.id, taSub?.topicAgentId, taSub?.rootOm], ["topic_agent", taId, taId, null], "A 记录 → kind=topic_agent、id=自身：" + JSON.stringify(taSub)?.slice(0, 160));
+      assert.deepEqual([taSub?.kind, taSub?.id, taSub?.topicAgentId], ["topic_agent", taId, taId], "A 记录 → kind=topic_agent、id=自身：" + JSON.stringify(taSub)?.slice(0, 160));
+      // root_om 落在**逐记录**索引上（fix2 P1：一个 subject 可以对应多条记录，各自有各自的话题）
+      assert.equal(live.byRootOm.has(null), false, "A1 没有 root_om（不入逐记录索引）");
       // 写：条目落在它自己的 subject 下（binding_id = 自身 id），读回一致
       const w = mutatePolicyEntry({ endpointId: x.EP, env: process.env,
         identity: () => ({ ok: true, subjectId: taSubject, kind: "topic_agent", id: taId }),
@@ -51183,6 +51204,97 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const ok = setClaudeInteractionMode({ root: x.proj, claudeSessionId: x.sessionUuid, mode: MAPPING_POLICY_ID, registryFile: x.regFile });
       assert.equal(ok.ok, true, "修好后写面恢复：" + JSON.stringify(ok).slice(0, 200));
       assert.equal(x.read().ok, true, "修好后读面恢复");
+    } finally { x.f.cleanup(); }
+  });
+  test("PK2-I1 T11 返修二 P1：同 lineage 多代际（B3 current + B4 历史 + B1 轮转）→ 读/写/doctor 都走同一个 subject", () => {
+    const x = i1AuthFixture("t11", { policy: null, multi: true });
+    try {
+      // 账本真形状：三条 live 记录、同一条 lineage、三个各不相同的 root_om
+      const live = Object.values(x.ledger().records).filter((rec) => rec.kind === "live");
+      assert.equal(live.length, 3, "夹具：三条 live 记录：" + JSON.stringify(live.map((r) => [r.topic_agent_id, r.facts, r.aliases.root_om])));
+      assert.equal(new Set(live.map((r) => r.generation_lineage_id)).size, 1, "夹具：同一条 lineage：" + JSON.stringify(live.map((r) => r.generation_lineage_id)));
+      assert.equal(new Set(live.map((r) => r.aliases.root_om)).size, 3, "夹具：三个不同的 root_om：" + JSON.stringify(live.map((r) => r.aliases.root_om)));
+      // ① 读：按 B3 的 root_om 走生产读路径 → 命中那条 lineage 的 subject（默认条目），不拒
+      const r1 = x.read();
+      assert.deepEqual([r1.ok, r1.source, r1.kind, r1.subjectId, r1.bindingId], [true, "policy-store", "lineage", x.subjectId, x.bindingId],
+        "多代际不许判冲突（旧版在这里 policy_store_subject_conflict）：" + JSON.stringify(r1).slice(0, 300));
+      // ② 同一 lineage 的另外两条 root_om 也各自命中同一个 subject（查询只要求"恰命中一条记录"）
+      for (const om of [x.omRO, x.omPending]) {
+        const subj = resolvePolicySubject({ endpointId: x.EP, rootOm: om, env: process.env });
+        assert.deepEqual([subj.ok, subj.subjectId, subj.kind], [true, x.subjectId, "lineage"],
+          "root_om=" + om + " 命中同一条 lineage 的 subject：" + JSON.stringify(subj).slice(0, 200));
+      }
+      // 派生集合去重后只有一个键（kinds 声明也是）
+      const liveSet = livePolicySubjects({ endpointId: x.EP });
+      assert.deepEqual([liveSet.ok, liveSet.subjects.size, Object.keys(liveSet.kinds).length], [true, 1, 1],
+        "逐记录去重成一个 subject：" + JSON.stringify([liveSet.ok, liveSet.subjects.size, Object.keys(liveSet.kinds).length]));
+      // ③ 写：/feishu-mode 按 B3 写 → 落该 subject，B4/B1 不另生条目
+      const sw = setClaudeInteractionMode({ root: x.proj, claudeSessionId: x.sessionUuid, mode: DIALOGUE_POLICY_ID, registryFile: x.regFile });
+      assert.deepEqual([sw.ok, sw.subjectId, sw.changed], [true, x.subjectId, true], "写落同一条 subject：" + JSON.stringify(sw).slice(0, 260));
+      const store = readPolicyStore({ endpointId: x.EP });
+      assert.deepEqual(Object.keys(store.entries), [x.subjectId], "store 里恰一条（多代际不各生一条）：" + JSON.stringify(Object.keys(store.entries)));
+      assert.equal(store.entries[x.subjectId].binding_id, x.bindingId, "条目 binding_id 是那条 lineage：");
+      assert.equal(x.read().state.policy_id, DIALOGUE_POLICY_ID, "读回是刚写的那条");
+      // ④ doctor ⑱：这份账本 + 一条 lineage 条目 → 绿（键集 ⊆ 去重后的 live 派生集合）
+      const c1 = runDoctor({ home: x.f.home }).checks.find((c) => c.id === "policy_store");
+      assert.equal(c1.ok, true, "多代际账本 → ⑱ 绿（旧版在这里红：整档读不出）：" + JSON.stringify(c1));
+      assert.match(c1.detail, /1 条/u, "报去重后的条目计数：" + c1.detail);
+      // ⑤ 逐记录 root_om 索引**不去重**（查询判据是"恰命中一条记录"，不是"恰命中一个 subject"）。
+      //   注：同一 root_om 命中多条那份拒因（policy_store_subject_conflict）是**纵深防御** ——
+      //   账本自身的 locator 唯一性（liveLocatorInUse / G3）已经不许两条 live 记录共用 root_om，
+      //   所以走合法账本造不出它，这里只把索引形状钉住。
+      assert.deepEqual([liveSet.records, liveSet.byRootOm.size, [...liveSet.byRootOm.values()].map((v) => v.length)],
+        [3, 3, [1, 1, 1]], "逐记录索引：三条记录各占一个 root_om 键：" + JSON.stringify([liveSet.records, liveSet.byRootOm.size]));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-I1 T12 返修二 P2：带 root 的 A3/A4 走生产路由（读 + /feishu-mode 写）落 topic_agent 分支", () => {
+    const x = i1AuthFixture("t12", { policy: null });
+    try {
+      // 真 op 链造一条**带 root 的 A 记录**：create_a1 → attach（A2）→ anchor（A3，root_om = omA）
+      const omA = "om_" + "a".repeat(24);
+      const kA1 = DW.requestKeyFor({ opType: "create_a1", externalRequestId: "i1-fix2-a1", entityId: "aily_i1_a3" });
+      const a1 = TAL.createA1({ endpointId: x.EP, requestKey: kA1.request_key, chatId: TPL.chat_id, sessionId: "aily_i1_a3", env: process.env });
+      assert.equal(a1.ok, true, "夹具 createA1：" + JSON.stringify(a1).slice(0, 200));
+      const taId = a1.result.created_id;
+      const kAtt = DW.requestKeyFor({ opType: "attach", externalRequestId: "i1-fix2-att", entityId: taId });
+      // 目标换成**另一条会话**：同 target 上谱系与无谱系占用者并存会撞 G7（真 op 的守卫，不去绕它）。
+      const att = TAL.attach({ endpointId: x.EP, requestKey: kAtt.request_key, id: taId, claimKey: "a".repeat(64), authorizedBy: "ou_frank",
+        bindingTarget: { runtime: "claude", project_root: x.proj, claude_session_id: "44444444-4444-4444-8444-444444444444" }, anchorCandidate: omA, env: process.env });
+      assert.equal(att.ok, true, "夹具 attach：" + JSON.stringify(att).slice(0, 240));
+      const kAnc = DW.requestKeyFor({ opType: "anchor", externalRequestId: "i1-fix2-anc", entityId: taId });
+      const anc = TAL.anchor({ endpointId: x.EP, requestKey: kAnc.request_key, id: taId, authorizedBy: "ou_frank",
+        f4: { root_om: omA, matched_om: omA, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" }, env: process.env });
+      assert.equal(anc.ok, true, "夹具 anchor：" + JSON.stringify(anc).slice(0, 240));
+      // 索引行指向这条 A 记录的话题（legacy 索引只是索引；subject 由账本记录解析）
+      const reg = x.registry();
+      const st = reg.projects[0].topic_generation_state;
+      for (const g of st.generations) if (g.channel_generation_id === st.active_generation_id) g.root_message_id = omA;
+      reg.projects[0].root_message_id = omA;
+      fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      const taSubject = i1Subject(x.EP, taId, "topic_agent");
+      // ① 生产读路径：kind=topic_agent、id=自身
+      const r1 = x.read();
+      assert.deepEqual([r1.ok, r1.source, r1.kind, r1.subjectId, r1.bindingId], [true, "policy-store", "topic_agent", taSubject, taId],
+        "带 root 的 A3 走 topic_agent 分支：" + JSON.stringify(r1).slice(0, 300));
+      // ② 生产写路径：/feishu-mode 落它自己名下（binding_id = 自身 id）
+      const sw = setClaudeInteractionMode({ root: x.proj, claudeSessionId: x.sessionUuid, mode: DIALOGUE_POLICY_ID, registryFile: x.regFile });
+      assert.deepEqual([sw.ok, sw.subjectId, sw.kind], [true, taSubject, "topic_agent"], "写落 topic_agent subject：" + JSON.stringify(sw).slice(0, 260));
+      const store = readPolicyStore({ endpointId: x.EP });
+      assert.equal(store.entries[taSubject].binding_id, taId, "条目按自身 id 落：" + JSON.stringify(Object.keys(store.entries)));
+      assert.equal(store.entries[x.subjectId].policy_id, MAPPING_POLICY_ID, "谱系那条没被顺手改（仍是 cutover 冻结的默认条目）：" + JSON.stringify(store.entries[x.subjectId]).slice(0, 160));
+      assert.notEqual(x.subjectId, taSubject, "两条 subject 互不相同");
+      assert.equal(x.read().state.policy_id, DIALOGUE_POLICY_ID, "读回是刚写的那条");
+      // ③ A4（unbind 那条 A）仍走 topic_agent 分支（root 不变、lineage 本来就为 null）
+      const kUn = DW.requestKeyFor({ opType: "unbind", externalRequestId: "i1-fix2-un", entityId: taId });
+      const un = TAL.unbind({ endpointId: x.EP, requestKey: kUn.request_key, id: taId, env: process.env });
+      assert.equal(un.ok, true, "夹具 unbind：" + JSON.stringify(un).slice(0, 200));
+      const r2 = x.read();
+      assert.deepEqual([r2.ok, r2.kind, r2.subjectId], [true, "topic_agent", taSubject], "A4 同分支：" + JSON.stringify(r2).slice(0, 240));
+      assert.equal(r2.state.policy_id, DIALOGUE_POLICY_ID, "A4 读回同一条策略");
+      // ④ doctor ⑱：这份账本（谱系 + topic_agent 两条 subject）→ 绿
+      const c1 = runDoctor({ home: x.f.home }).checks.find((c) => c.id === "policy_store");
+      assert.equal(c1.ok, true, "混合两分支 → ⑱ 绿：" + JSON.stringify(c1));
     } finally { x.f.cleanup(); }
   });
 }

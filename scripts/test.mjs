@@ -3843,54 +3843,121 @@ test("R61 红证：瞬态 lock_residue 在 waitMs 预算内重试后必须成功
   assert.ok(fs.existsSync(surface + ".lock"), "③ 现场保留（不删）");
 });
 test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 removed，之后出现的新实例不许被删", () => {
+  // PK2-F11：这条原来是**计时对齐**（`go = Date.now() + 300` 的绝对时刻）——三个 worker 谁先谁后取决于
+  //   进程启动与调度快慢。晚到那个的合法结局是「入场时残骸已被清掉 / 新实例已挂上 → 无事可做」，
+  //   而老断言只认 {maintenance_busy, already_cleared, instance_changed} 三个 reason，`reason:null`
+  //   一律判红（2026-09-11 两位交付者各自独立报告的全量偶发红就是这条）。
+  //   现在改成：① **文件屏障**对齐（每个 worker 先落 ready 文件、等齐 N 个才进场，不靠 sleep/绝对时刻）；
+  //   ② 断言改成**不变式**（与到达顺序无关）：恰好一个 removed；非 remover 要么带封闭 reason 之一，
+  //      要么是「入场即无事可做」（reason:null）——后者**只许**在入场时看到的已经不是那个陈旧残骸时发生
+  //      （entryOwner 为 null = 已被清掉、或就是新实例）；收尾只剩那个新实例（无 .maint、无 quarantine 残骸）。
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-race-"));
   const worker = path.join(local, "worker.mjs");
   const driver = path.join(local, "driver.mjs");
   fs.writeFileSync(worker, [
     'import fs from "node:fs";',
+    'import path from "node:path";',
     'const { clearStaleReapLock } = await import(' + JSON.stringify(pathToFileURL(path.resolve("scripts", "registry.mjs")).href) + ');',
-    'const [lockDir, go, live] = process.argv.slice(2);',
+    'const [lockDir, round, n, live] = process.argv.slice(2);',
+    'const dir = path.dirname(lockDir);',
     'const w = new Int32Array(new SharedArrayBuffer(4));',
-    'while (Date.now() < Number(go)) Atomics.wait(w, 0, 0, 1);',
+    '// 文件屏障：落自己的 ready 文件，等齐 N 个才进场（谁先谁后不再取决于进程启动快慢）',
+    'fs.writeFileSync(path.join(dir, "ready-" + round + "-" + process.pid), "1");',
+    'const need = Number(n); const until = Date.now() + 30000;',
+    'for (;;) {',
+    '  if (fs.readdirSync(dir).filter((x) => x.startsWith("ready-" + round + "-")).length >= need) break;',
+    '  if (Date.now() > until) { process.stderr.write("barrier_timeout"); process.exit(3); }',
+    '  Atomics.wait(w, 0, 0, 1);',
+    '}',
+    '// 诊断用（不断言）：产品调用**之前**自己看到的残骸是谁。它可能比产品的入场盘点早一瞬',
+    '//   （这中间残骸恰好被清掉/新实例恰好挂上），所以它不构成判据。',
+    'let entry = null; try { entry = JSON.parse(fs.readlinkSync(lockDir + ".reap")); } catch { entry = null; }',
     'const r = clearStaleReapLock(lockDir, { apply: true, afterQuarantine: () => { try { fs.symlinkSync(live, lockDir + ".reap"); } catch {} } });',
-    'process.stdout.write(JSON.stringify({ removed: r.removed, reason: r.reason ?? null }));',
+    'process.stdout.write(JSON.stringify({ removed: r.removed === true, reason: r.reason ?? null, entryOwner: entry }));',
   ].join("\n"));
   fs.writeFileSync(driver, [
     'import fs from "node:fs";',
     'import path from "node:path";',
     'import { spawn } from "node:child_process";',
-    'const [worker, lockDir, rounds] = process.argv.slice(2);',
+    'const [worker, lockDir, rounds, n] = process.argv.slice(2);',
     'const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "live-after" });',
-    'const run = (go) => new Promise((res) => {',
-    '  const c = spawn(process.execPath, [worker, lockDir, String(go), live], { stdio: ["ignore", "pipe", "pipe"] });',
+    'const run = (round) => new Promise((res) => {',
+    '  const c = spawn(process.execPath, [worker, lockDir, String(round), n, live], { stdio: ["ignore", "pipe", "pipe"] });',
     '  let out = ""; let err = "";',
     '  c.stdout.on("data", (d) => { out += d; }); c.stderr.on("data", (d) => { err += d; });',
     '  c.on("close", (code) => res({ code, out, err }));',
     '});',
     'const results = [];',
+    'const dir = path.dirname(lockDir);',
     'const old = (Date.now() - 120000) / 1000;',
     'for (let i = 0; i < Number(rounds); i += 1) {',
-    '  for (const n of fs.readdirSync(path.dirname(lockDir))) if (n.startsWith("registry.lock")) fs.rmSync(path.join(path.dirname(lockDir), n), { recursive: true, force: true });',
+    '  for (const x of fs.readdirSync(dir)) if (x.startsWith("registry.lock")) fs.rmSync(path.join(dir, x), { recursive: true, force: true });',
     '  fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), lockDir + ".reap");',
     '  fs.lutimesSync(lockDir + ".reap", old, old);',
-    '  const go = Date.now() + 300;',
-    '  const pair = await Promise.all([run(go), run(go), run(go)]);',
+    '  const pair = await Promise.all(Array.from({ length: Number(n) }, () => run(i)));',
     '  let after = null; try { after = fs.readlinkSync(lockDir + ".reap"); } catch { after = null; }',
-    '  results.push({ pair, after, live });',
+    '  results.push({ pair, after, live, listing: fs.readdirSync(dir).filter((x) => x.startsWith("registry.lock")).sort() });',
     '}',
     'process.stdout.write(JSON.stringify(results));',
   ].join("\n"));
   const lockDir = path.join(local, "registry.lock");
-  const r = spawnSync(process.execPath, [driver, worker, lockDir, "4"], { encoding: "utf-8", timeout: 90_000 });
+  const r = spawnSync(process.execPath, [driver, worker, lockDir, "4", "3"], { encoding: "utf-8", timeout: 90_000 });
   assert.equal(r.status, 0, r.stderr);
   for (const [i, round] of JSON.parse(r.stdout).entries()) {
     for (const w of round.pair) assert.equal(w.code, 0, w.err);
     const got = round.pair.map((w) => JSON.parse(w.out));
-    const removed = got.filter((g) => g.removed).length;
-    assert.equal(removed, 1, "第 " + i + " 轮：恰好一个维护者清掉残骸：" + JSON.stringify(got));
-    for (const g of got.filter((x) => !x.removed)) assert.ok(["maintenance_busy", "already_cleared", "instance_changed"].includes(g.reason), JSON.stringify(g));
+    assert.equal(got.filter((g) => g.removed).length, 1, "第 " + i + " 轮：恰好一个维护者清掉残骸（.maint 串行化）：" + JSON.stringify(got));
+    // 非 remover 只有两种合法形态：① 碰到别人正在维护/别人已清/现场已被换掉（三个封闭 reason）；
+    //   ② **无事可做**（reason 为 null）—— 产品的**自己的**入场盘点发现没有陈旧残骸可清：残骸已被别人清掉、
+    //   或新实例已挂上、或它恰落在「隔离」与「重挂」之间（`.reap` 那一刻不在）。②正是老断言一律判红的
+    //   那种晚到结局（2026-09-11 的全量偶发红；本单跑第 2 次全量的第 3 轮就自然出现过一次）。
+    //   封闭集合之外的 reason（io_error / unrecognized_artifact / quarantine_unremoved / …）仍一律判红。
+    for (const g of got.filter((x) => !x.removed)) {
+      assert.ok(g.reason === null || ["maintenance_busy", "already_cleared", "instance_changed"].includes(g.reason),
+        "第 " + i + " 轮：非 remover 的 reason 必须是封闭集合之一或 null（无事可做）：" + JSON.stringify(g));
+    }
     assert.equal(round.after, round.live, "第 " + i + " 轮：清完之后出现的新实例必须还在");
+    assert.deepEqual(round.listing, ["registry.lock.reap"],
+      "第 " + i + " 轮：收尾只剩那个新实例（.maint 锁交还、无 quarantine 残骸）：" + JSON.stringify(round.listing));
   }
+  fs.rmSync(local, { recursive: true, force: true });
+});
+
+test("PK2-F11 reap 残骸清理的两种到达顺序（确定性，无竞态）：先到者清掉并让新实例挂上；后到者入场即无事可做、不动新实例", () => {
+  // 把上面那条真并发用例里的两种合法先后顺序各钉一遍，**不靠计时**：谁先谁后在这里是写死的顺序，
+  // 所以「晚到」那个结局（reason:null）不再取决于调度运气，而是有确定断言的那一支。
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-lock-maint-order-"));
+  const lockDir = path.join(local, "registry.lock");
+  const old = (Date.now() - 120_000) / 1000;
+  const live = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "live-after" });
+  try {
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed" }), lockDir + ".reap");
+    fs.lutimesSync(lockDir + ".reap", old, old);
+    // ① 先到者：陈旧残骸在场 → 清掉，并在隔离与删除之后挂上新实例
+    const r1 = clearStaleReapLock(lockDir, { apply: true, afterQuarantine: () => { fs.symlinkSync(live, lockDir + ".reap"); } });
+    assert.deepEqual([r1.removed, r1.reason], [true, undefined], "先到者清掉残骸：" + JSON.stringify(r1).slice(0, 240));
+    assert.equal(fs.readlinkSync(lockDir + ".reap"), live, "新实例挂上了");
+    const st1 = fs.lstatSync(lockDir + ".reap");
+    // ② 后到者（入场时已是新实例）：不陈旧、没活干 → removed:false 且**不带 reason**（不是 already_cleared
+    //    那种竞态结局，也没碰新实例一个字节）
+    const r2 = clearStaleReapLock(lockDir, { apply: true });
+    assert.deepEqual([r2.present, r2.stale, r2.removed], [true, false, false], "后到者看到的是新实例（不陈旧）：" + JSON.stringify(r2).slice(0, 240));
+    assert.equal(r2.reason, undefined, "无事可做 → 不带 reason（老断言把这种结局一律判红，正是那条 flake）");
+    assert.equal(r2.owner?.token, "live-after", "它记下的入场现场就是新实例：" + JSON.stringify(r2.owner));
+    assert.equal(fs.readlinkSync(lockDir + ".reap"), live, "新实例不许被删");
+    const st2 = fs.lstatSync(lockDir + ".reap");
+    assert.deepEqual([st2.mtimeMs, st2.ino], [st1.mtimeMs, st1.ino], "后到者没动过它（mtime 与 inode 都不变）");
+    // ③ 后到者的另一种入场形态：`.reap` 干脆不在（先到者正在「隔离」与「新实例挂上」之间）→ 同样无事可做
+    fs.rmSync(lockDir + ".reap");
+    const r3 = clearStaleReapLock(lockDir, { apply: true });
+    assert.deepEqual([r3.present, r3.removed, r3.reason], [false, false, undefined], "残骸不在时无事可做：" + JSON.stringify(r3).slice(0, 240));
+    // ④ 反向对照：把「陈旧残骸」重新放回 → 又该清（这一支没被上面两条放过）
+    fs.symlinkSync(JSON.stringify({ pid: 999999, at: "2026-08-01T00:00:00.000Z", token: "crashed2" }), lockDir + ".reap");
+    fs.lutimesSync(lockDir + ".reap", old, old);
+    const r4 = clearStaleReapLock(lockDir, { apply: true });
+    assert.deepEqual([r4.removed, r4.reason], [true, undefined], "陈旧残骸再来一次照样清：" + JSON.stringify(r4).slice(0, 240));
+    assert.throws(() => fs.lstatSync(lockDir + ".reap"), "清完不留残骸（没有新实例介入时）");
+  } finally { fs.rmSync(local, { recursive: true, force: true }); }
 });
 
 test("symlink owner 形状封闭：缺 token / pid 不是正整数 / at 不规范 → 当不可读、保留现场；只有目录形状的旧版锁才按 pid 兼容", () => {

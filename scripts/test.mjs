@@ -60,7 +60,7 @@ import {
   recordClaimState, watcherExpectEnv, CLAIM_STATE } from "./claim.mjs";
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
-import { machineContext, runDoctor, firstDanglingSymlinkInChain } from "./doctor.mjs";
+import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { resolveDeliveryTargetFromLedger, decideInboundDeliveryTarget, appendShadowDivergenceNote, classifyLedgerAuthority } from "./m1a/delivery-target.mjs"; // R66：入站投递目标解析/判源/决策
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
@@ -51304,14 +51304,17 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
   });
 }
 
-// ─────────────────── PK2-I6：doctor 切后语义（authoritative 下 legacy 已冻结） ────────────────
-// 判源一处 = authoritySource()（R66 classifyLedgerAuthority 同一函数）；authoritative 下读 legacy 得结论的项
-// 降为信息态（note：不红不绿、不计入 overall/退出码）+ 标题后缀 + 正文补账本视角计数；其余三态一字不改。
+// ─────────────────── PK2-I6 / fix1：doctor 切后语义（判源 + 降级范围收窄） ────────────────
+// 判源一处 = authoritySource(ctx)（R66 classifyLedgerAuthority 同一函数，绑 runDoctor 的运行上下文）。
+// **降级范围收窄（fix1 P1-1）**：只有「读已被账本/sidecar 接管的冻结 legacy 事实」的项才降；
+// 登记表/路由表/话题登记/chat 认领账本仍是活的路由索引 → 不降（恢复 main 行为，逐字快照断言）；
+// ⑤ 绑定到期改由**权威 expiry.json**接替（读不出/不合法 → 红）。
 // 夹具走真蓝图真收据（initPlan/migrateSeed/cutoverPlan + 真 journal），doctor 走真入口子进程。
 
-const PK2I6_LEGACY_SUFFIX = "（legacy 已冻结，以账本为准）";
 const PK2I6_VIEW = "账本视角：live 记录 3 条（项目级（会话未选）2 / 会话级 1 / 待认领（B1）1）";
 const PK2I6_ITEMS = ["registry", "routes", "session_route_missing", "default_route_handler", "binding_expiry", "chat_ledger"];
+// 这六项在 **shadow / reject /（fix1 之后的）authoritative** 下都必须与 main 逐字一致
+// （快照：从 main 的真实入口跑出来抄下的字面，不经任何常量拼）。
 // shadow/reject 下这六项必须与 main 逐字一致（快照；从 main 的真实入口跑出来抄下的，不经任何常量拼）。
 const PK2I6_UNCHANGED = {
   registry: ["项目登记表", true, "已登记 1 个项目"],
@@ -51325,7 +51328,8 @@ const PK2I6_UNCHANGED = {
 /** PK2-I6 夹具：真机器夹具（doctorMachine）+ 真账本（三条 live：会话级 / 项目级 / 待认领 B1）+ 真收据 journal。
  *  cutover=true 种 cutover 收据；authoritative=true 必须同时 cutover=true（收据与账本一致才判 authoritative），
  *  否则得到的就是 T3 的 reject 态（收据已 cutover、账本仍是 shadow）。 */
-function pk2i6Fixture({ cutover = false, authoritative = false } = {}) {
+function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = null, expiryRaw = null,
+  secondEndpointNoLedger = null, badReceipt = false, noReceipts = false } = {}) {
   const m = doctorMachine();
   const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({
@@ -51370,7 +51374,7 @@ function pk2i6Fixture({ cutover = false, authoritative = false } = {}) {
     before: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
     intended_after: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
     after: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }, state: "done", at, chain: "claude" };
-  write600(path.join(m.maintDir, initOpId + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: initOpId, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(initOpId), gateDone(initOpId), initStep], notes: [] }));
+  if (!noReceipts) write600(path.join(m.maintDir, initOpId + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: initOpId, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(initOpId), gateDone(initOpId), initStep], notes: [] }));
   const shadow = TAL.loadByEndpoint(EP, { env });
   assert.equal(shadow.ok, true, JSON.stringify(shadow.ok ? shadow.doc.authority_mode : shadow));
   if (cutover) {
@@ -51384,33 +51388,160 @@ function pk2i6Fixture({ cutover = false, authoritative = false } = {}) {
     // 收据与账本必须一致：authoritative=true 才把账本写成 authoritative；否则（T3）= 收据切了、账本仍 shadow → reject
     if (authoritative) write600(ledgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
   }
-  return { m, EP };
+  // ⑤ 在 authoritative 下读**权威** expiry.json（readSidecarFile：0600 + 单硬链接 + schema 校验）
+  if (authoritative && expiryEntries !== null) {
+    write600(path.join(epDir, "expiry.json"), expiryRaw ?? JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP, entries: expiryEntries }, null, 2) + "\n");
+  }
+  // P1-2 反例用①：**第二个 Claude 端点有 init 收据、但账本缺席**（旧版会「有可读端点就忽略它」）
+  if (secondEndpointNoLedger !== null) {
+    const tok2 = "00000000-0000-0000-0000-000000000009";
+    const initStep2 = { ...initStep, id: "ledger:" + secondEndpointNoLedger + ":init", target: secondEndpointNoLedger,
+      before: { endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
+      intended_after: { endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
+      after: { endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha } };
+    write600(path.join(m.maintDir, tok2 + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok2, reason: "第二端点收据（账本缺席）", started_at: at, updated_at: at, phase: "done", steps: [...enter(tok2), gateDone(tok2), initStep2], notes: [] }));
+  }
+  // P1-2 反例用②：一份读不出的 journal（收据聚合 fail-closed）
+  if (badReceipt) write600(path.join(m.maintDir, "11111111-1111-4111-8111-111111111111.json"), '{"schema_version":"1.2","operation_kind":"ledger_init"}\n');
+  return { m, EP, ledgerFile, maintDir: m.maintDir, epDir };
 }
 
-test("PK2-I6 T1：authoritative 下六项降为信息态（标题带后缀 + 正文带账本视角计数），⑳ 判源绿（真实入口）", () => {
-  const fx = pk2i6Fixture({ cutover: true, authoritative: true });
+test("PK2-I6-fix1 T1：authoritative 下**六项都不降级**（逐字等于 main），⑤ 改读权威 expiry.json（真实入口）", () => {
+  const fx = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-06-01T00:00:00.000Z" } });
   const rep = doctorReport(fx.m.run());
-  for (const id of PK2I6_ITEMS) {
+  // P1-1：登记表 / 路由表 / ③ / ⑦ / ⑨ **不降** —— 与 main 逐字一致（判源是 authoritative 也不改它们）
+  for (const id of PK2I6_ITEMS.filter((x) => x !== "binding_expiry")) {
     const c = checkOf(rep, id);
-    assert.equal(c.ok, "note", id + " 在 authoritative 下必须是信息态（不红不绿）：" + JSON.stringify(c));
-    assert.ok(c.name.endsWith(PK2I6_LEGACY_SUFFIX), id + " 标题必须带后缀：" + c.name);
-    assert.ok(c.detail.endsWith(PK2I6_VIEW), id + " 正文必须带账本视角计数：" + c.detail);
-    assert.equal(c.next, null, id + " 信息态不给动作");
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 authoritative 下也不许降级（活的路由索引/认领账本）：" + JSON.stringify(c));
   }
-  assert.equal(rep.noteCount, PK2I6_ITEMS.length, "汇总单列信息态计数：" + rep.noteCount);
-  // 判源行：四态里的 authoritative + 依据（收据与账本一致）+ 端点 + 计数
+  // ⑤ 改判据：读**权威** expiry.json（不是 legacy expires_at，也不是账本计数）
+  const c5 = checkOf(rep, "binding_expiry");
+  assert.equal(c5.ok, true, "⑤ 该绿：" + JSON.stringify(c5));
+  assert.match(c5.detail, /权威 expiry\.json：1 个端点、2 条/u, "⑤ 必须说清读的是权威 sidecar 与条数：" + c5.detail);
+  assert.match(c5.detail, /都在有效期内/u, c5.detail);
+  assert.equal(rep.noteCount, 0, "fix1 之后本夹具没有信息态（六项都不降）：" + rep.noteCount);
+  // 判源行：authoritative + 依据 + 端点 + 账本视角计数
   const src = checkOf(rep, "authority_source");
   assert.equal(src.ok, true, JSON.stringify(src));
   assert.match(src.detail, /^authoritative —— 以账本为准/u, src.detail);
   assert.match(src.detail, /收据与账本一致（authoritative）/u, src.detail);
   assert.match(src.detail, new RegExp(fx.EP, "u"), src.detail);
   assert.ok(src.detail.includes(PK2I6_VIEW), "⑳ 也带账本视角：" + src.detail);
-  // 信息态不进结论与退出码：本夹具没有 false 项的话 overall 就是 ready —— 这里 ⑬ ⑭ 都绿，只有 runtime/②/⑥ 那几项与单无关
-  assert.equal(rep.checks.some((c) => c.id === "authority_source" && c.ok === false), false, "⑳ 不得红");
-  // 渲染面：信息态用 · 且汇总单列
+  // 渲染面：没有信息态就不出那一行
   const text = fx.m.run({}, []).stdout;
-  assert.match(text, /信息态 6 项：legacy 已冻结，以账本为准 —— 不红不绿，不计入结论。/u, text);
-  assert.match(text, /项目登记表（legacy 已冻结，以账本为准）/u, text);
+  assert.doesNotMatch(text, /信息态/u, "没有信息态时不该有那一行：" + text.split("\n").filter((l) => l.includes("信息态")).join(" | "));
+});
+
+test("PK2-I6-fix1 T4：authoritative 下 ⑤ 按权威 expiry.json 判到期 —— 过期 → 红；读不出/不合法 → 红（fail-closed）", () => {
+  // ① 有一条已过期（阈值 7 天内的「即将到期」也单独验）
+  const stale = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2020-01-01T00:00:00.000Z" } });
+  const rep1 = doctorReport(stale.m.run());
+  const c1 = checkOf(rep1, "binding_expiry");
+  assert.equal(c1.ok, false, "过期条目必须红：" + JSON.stringify(c1));
+  assert.match(c1.detail, /已过期：/u, c1.detail);
+  assert.match(c1.detail, /权威 expiry\.json：1 个端点、1 条/u, c1.detail);
+  assert.equal(rep1.overall, "blocked", "红要进结论：" + rep1.overall);
+  // ② 即将到期（7 天内）也红（阈值不变）
+  const soon = pk2i6Fixture({ cutover: true, authoritative: true, expiryEntries: { ["ta_" + "2".repeat(32)]: new Date(Date.now() + 3 * 86400000).toISOString() } });
+  const c2 = checkOf(doctorReport(soon.m.run()), "binding_expiry");
+  assert.equal(c2.ok, false, "7 天内到期也算红：" + JSON.stringify(c2));
+  assert.match(c2.detail, /即将到期：/u, c2.detail);
+  // ③ sidecar 缺席 → 红（fail-closed；账本视角的计数不许替代到期判断）
+  const missing = pk2i6Fixture({ cutover: true, authoritative: true, expiryEntries: null });
+  const c3 = checkOf(doctorReport(missing.m.run()), "binding_expiry");
+  assert.equal(c3.ok, false, "expiry.json 缺席 → 红（fail-closed）：" + JSON.stringify(c3));
+  assert.match(c3.detail, /expiry\.json 读不出/u, c3.detail);
+  // ④ sidecar 不合法（schema 不对）→ 红
+  const bad = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: {}, expiryRaw: JSON.stringify({ schema_version: "expiry-9", endpoint_id: "endpoint_" + "a".repeat(24), entries: {} }) + "\n" });
+  const c4 = checkOf(doctorReport(bad.m.run()), "binding_expiry");
+  assert.equal(c4.ok, false, "sidecar schema 不对 → 红：" + JSON.stringify(c4));
+  // ⑤ 条目值不是时间 → 由 sidecar 校验器拦下、整份读不出 → 红（fail-closed；doctor 不自己再判一次时间）
+  const notTime = pk2i6Fixture({ cutover: true, authoritative: true, expiryEntries: { ["ta_" + "3".repeat(32)]: "说不清" } });
+  const c5 = checkOf(doctorReport(notTime.m.run()), "binding_expiry");
+  assert.equal(c5.ok, false, "到期值不是时间 → 红：" + JSON.stringify(c5));
+  assert.match(c5.detail, /expiry\.json 读不出（值不是规范化 ISO/u, c5.detail);
+});
+
+test("PK2-I6-fix1 T5：判源 fail-closed —— 任一端点账本读不出 / 收据坏 → ⑳ 红，且**一项都不降级**", () => {
+  // ① 两个 Claude 端点：一个可读且 authoritative，另一个**有收据但账本缺席**
+  const EP2 = "endpoint_" + "b".repeat(24);
+  const two = pk2i6Fixture({ cutover: true, authoritative: true, secondEndpointNoLedger: EP2,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const rep1 = doctorReport(two.m.run());
+  const s1 = checkOf(rep1, "authority_source");
+  assert.equal(s1.ok, false, "任一端点账本读不出 → 判源必须红（不据部分事实下结论）：" + JSON.stringify(s1));
+  assert.match(s1.detail, /^reject/u, s1.detail);
+  assert.match(s1.detail, new RegExp(EP2, "u"), "红要说清是哪个端点：" + s1.detail);
+  // 不降级任何项：六项仍与 main 逐字一致（⑤ 也回到 legacy 判据 —— reject 态下不看 sidecar）
+  for (const id of PK2I6_ITEMS) {
+    const c = checkOf(rep1, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], "reject 下 " + id + " 不许被降级/改写：" + JSON.stringify(c));
+  }
+  assert.equal(rep1.noteCount, 0, "reject 下没有信息态");
+  // ② 收据本身读不出（坏 journal）→ 同样 reject
+  const bad = pk2i6Fixture({ cutover: true, authoritative: true, badReceipt: true });
+  const s2 = checkOf(doctorReport(bad.m.run()), "authority_source");
+  assert.equal(s2.ok, false, "收据 fail-closed → 判源红：" + JSON.stringify(s2));
+  assert.match(s2.detail, /^reject.*收据 fail-closed/u, s2.detail);
+});
+
+test("PK2-I6-fix1 T6：判源绑这次体检的 home（home ≠ process.env.HOME 时按 home 派生，不看环境覆盖点）", () => {
+  const fx = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  // 环境覆盖点指向一个**别处**（空维护目录 + 空账本根）：判源若读它 → 会是 legacy（且⑤走 legacy 判据）。
+  const decoy = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pk2i6-decoy-"));
+  fs.mkdirSync(path.join(decoy, "maintenance"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(decoy, "ledger"), { recursive: true, mode: 0o700 });
+  const saved = { HOME: process.env.HOME, M: process.env.FEISHU_BRIDGE_MAINTENANCE_DIR, L: process.env.FEISHU_BRIDGE_LEDGER_DIR };
+  try {
+    process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(decoy, "maintenance");
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(decoy, "ledger");
+    process.env.HOME = decoy;                       // home ≠ process.env.HOME 的字面情形
+    const report = runDoctor({ home: fx.m.home });
+    const src = report.checks.find((c) => c.id === "authority_source");
+    assert.equal(src.ok, true, "判源必须按传入 home 判（那台机器是 authoritative）：" + JSON.stringify(src));
+    assert.match(src.detail, /^authoritative/u, src.detail);
+    assert.match(src.detail, new RegExp(fx.EP, "u"), "端点必须是夹具 home 下那个（不是环境覆盖点里的）：" + src.detail);
+    const c5 = report.checks.find((c) => c.id === "binding_expiry");
+    assert.match(c5.detail, /权威 expiry\.json：1 个端点、1 条/u, "⑤ 也要读夹具 home 下的 sidecar：" + c5.detail);
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.M === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = saved.M;
+    if (saved.L === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved.L;
+    fs.rmSync(decoy, { recursive: true, force: true });
+  }
+});
+
+test("PK2-I6-fix1 T7：⑳ 无收据 → legacy 且绿；六项与 main 逐字一致（边界常驻）", () => {
+  const fx = pk2i6Fixture({ cutover: false, noReceipts: true });   // 不种任何收据（维护目录里没有任何 journal）
+  const rep = doctorReport(fx.m.run());
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, true, "无收据 → legacy 且绿（未接入 M1a 不是故障）：" + JSON.stringify(src));
+  assert.match(src.detail, /^legacy/u, src.detail);
+  assert.match(src.detail, /没有 Claude 链的账本收据/u, src.detail);
+  for (const id of PK2I6_ITEMS) {
+    const c = checkOf(rep, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], "legacy 下 " + id + " 与 main 逐字一致：" + JSON.stringify(c));
+  }
+  assert.equal(rep.noteCount, 0, "legacy 下没有信息态");
+});
+
+test("PK2-I6-fix1 T8：四态汇总唯一判据 —— note 不遮蔽 red/unknown，也不构成 incomplete", () => {
+  const note = { id: "n", name: "n", ok: "note", detail: "", next: null };
+  assert.deepEqual(summarizeDoctorChecks([note]), { overall: "ready", next: [], noteCount: 1 }, "只有 note → ready（不构成 incomplete）");
+  assert.equal(summarizeDoctorChecks([note, { ok: false, next: "x" }]).overall, "blocked", "note 与 red 同存 → blocked（不遮蔽 red）");
+  assert.deepEqual(summarizeDoctorChecks([note, { ok: false, next: "x" }]).next, ["x"], "note 不进 next（它没有动作）");
+  assert.equal(summarizeDoctorChecks([note, { ok: null }]).overall, "incomplete", "note 与 unknown 同存 → incomplete（不遮蔽 unknown）");
+  assert.equal(summarizeDoctorChecks([{ ok: "note" }, { ok: "note" }]).noteCount, 2, "计数按四态里的 note 数");
+  // 渲染面：note 用 ·，red 用 ✗，结论行仍是 blocked
+  const text = renderDoctor({ overall: "blocked", checks: [{ id: "a", name: "信息项", ok: "note", detail: "d", next: null }, { id: "b", name: "故障项", ok: false, detail: "d", next: null }], next: [], noteCount: 1 });
+  assert.match(text, /· 信息项/u, text);
+  assert.match(text, /✗ 故障项/u, text);
+  assert.match(text, /结论：blocked/u, text);
+  assert.match(text, /信息态 1 项/u, text);
 });
 
 test("PK2-I6 T2：shadow 收据下六项与 main 逐字一致（快照断言），⑳ 判源绿且不打 legacy 后缀", () => {

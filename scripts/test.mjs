@@ -32102,43 +32102,58 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   const planBytes45 = () => Buffer.from(stableStringify(mkPlan45(), 2) + "\n", "utf-8");
   const reconcile45 = () => ({ ok: true, digest: "e".repeat(64), snapshot_identity: mkPlan45().snapshot_identity, ledger: { revision: 3, sha256: "a".repeat(64) }, sidecars: { expiry: { sha256: shaB45("expiry"), bytes: BLOB45.expiry }, pending_claims: { sha256: shaB45("pending_claims"), bytes: BLOB45.pending_claims }, policy: { sha256: shaB45("policy"), bytes: BLOB45.policy } } });
   const shaPlan45 = () => createHash("sha256").update(planBytes45()).digest("hex");
+  // PK2-F5：现场 sidecar 读数（readSidecarCurrent 的形状）——盘上那份的 SHA 与 plan 锚分开递，
+  // 校验器不再只信任两侧冻结值（plan 字节 / journal step）。
+  const CUR45 = Object.freeze({
+    expiry: Object.freeze({ present: true, sha256: shaB45("expiry") }),
+    pending_claims: Object.freeze({ present: true, sha256: shaB45("pending_claims") }),
+    policy: Object.freeze({ present: true, sha256: shaB45("policy") }),
+  });
   const lsOk45 = () => { const ls = ledgerStep45(); ls.intended_after = { ...ls.intended_after, plan_sha256: shaPlan45() }; return ls; };
-  const ok45 = () => verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() });
+  const ok45 = () => verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() });
 
   test("#R45 A cutover-plan：五交叉等式 + 4f 五源 endpoint 相等，任一不等拒（纯校验器）", () => {
     const good = ok45();
     assert.equal(good.ok, true, "锚组合法 → ok：" + JSON.stringify(good));
     const badToken = doc45(); badToken.token = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: badToken, ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "token_mismatch", "① token 不等拒");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: "endpoint_" + "z".repeat(24), reconcile: reconcile45() }).reason, "endpoint_mismatch", "① 受验账本顶层 endpoint_id 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: badToken, ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "token_mismatch", "① token 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: "endpoint_" + "z".repeat(24), currentSidecars: CUR45, reconcile: reconcile45() }).reason, "endpoint_mismatch", "① 受验账本顶层 endpoint_id 不等拒");
     const badSide = mkPlan45(); badSide.sidecars.expiry.sha256 = "9".repeat(64);
-    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badSide, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "② plan sidecar SHA 与 step 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badSide, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "② plan sidecar SHA 与 step 不等拒");
     const stepsBad = threeSidecars45(); stepsBad[1] = { ...stepsBad[1], intended_blob: { ...stepsBad[1].intended_blob, sha256: "8".repeat(64) } };
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: stepsBad, ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "② step 内部 intended_blob/after 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: stepsBad, ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "② step 内部 intended_blob/after 不等拒");
     const badLedger = mkPlan45(); badLedger.ledger = { revision: 9, sha256: "a".repeat(64) };
-    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badLedger, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "ledger_identity_mismatch", "③ plan.ledger 与 prepared before 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badLedger, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "ledger_identity_mismatch", "③ plan.ledger 与 prepared before 不等拒");
     const badDigest = mkPlan45(); badDigest.digest = "7".repeat(64);
-    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badDigest, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "digest_mismatch", "④ plan.digest 与 bijection_digest 不等拒");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ...reconcile45(), digest: "6".repeat(64) } }).reason, "digest_mismatch", "④ 重验 digest 与 plan 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badDigest, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "digest_mismatch", "④ plan.digest 与 bijection_digest 不等拒");
+    // PK2-F5：这条 pin 的是 ④ 里 plan.digest vs **journal 锚**那一行（两侧都是冻结值）。
+    // 只 tamper plan 侧会被下一行“重验 digest vs plan”接住，钉不住这一行 —— 所以从 step 侧 tamper。
+    const stepDigest45 = ledgerStep45({ intended_after: { ...ledgerStep45().intended_after, bijection_digest: "5".repeat(64) } });
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: stepDigest45, sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "digest_mismatch", "④ journal 锚 bijection_digest 与 plan.digest 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: { ...reconcile45(), digest: "6".repeat(64) } }).reason, "digest_mismatch", "④ 重验 digest 与 plan 不等拒");
     const badSnap = { ...reconcile45(), snapshot_identity: [{ source: "registry", path: "/other/registry.json", sha256: null }] };
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: badSnap }).reason, "snapshot_identity_mismatch", "④ 快照身份深等（快照变了拒）");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ...reconcile45(), ledger: { revision: 4, sha256: "g".repeat(64) } } }).reason, "ledger_identity_mismatch", "④ CAS revision 变了拒");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ...reconcile45(), ledger: { revision: 3, sha256: "5".repeat(64) } } }).reason, "ledger_identity_mismatch", "④ CAS sha 变了拒");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45({ intended_after: { ...ledgerStep45().intended_after, plan_sha256: "2".repeat(64) } }), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "plan_anchor_mismatch", "⑤ intended_after.plan_sha256 ≠ sha256(planBytes) 拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: badSnap }).reason, "snapshot_identity_mismatch", "④ 快照身份深等（快照变了拒）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: { ...reconcile45(), ledger: { revision: 4, sha256: "g".repeat(64) } } }).reason, "ledger_identity_mismatch", "④ CAS revision 变了拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: { ...reconcile45(), ledger: { revision: 3, sha256: "5".repeat(64) } } }).reason, "ledger_identity_mismatch", "④ CAS sha 变了拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45({ intended_after: { ...ledgerStep45().intended_after, plan_sha256: "2".repeat(64) } }), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "plan_anchor_mismatch", "⑤ intended_after.plan_sha256 ≠ sha256(planBytes) 拒");
     const fpTampered = lsOk45(); fpTampered.before = { ...fpTampered.before, fingerprint: "c".repeat(64) };
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: fpTampered, sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f before.fingerprint 与七键重算不等拒（P1-6 反自证）");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45({ id: "ledger:endpoint_" + "f".repeat(24) + ":cutover", intended_after: { ...ledgerStep45().intended_after, plan_sha256: shaPlan45() } }), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f ledger step id 的 endpoint 不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: fpTampered, sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f before.fingerprint 与七键重算不等拒（P1-6 反自证）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: ledgerStep45({ id: "ledger:endpoint_" + "f".repeat(24) + ":cutover", intended_after: { ...ledgerStep45().intended_after, plan_sha256: shaPlan45() } }), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f ledger step id 的 endpoint 不等拒");
     const badTarget = threeSidecars45(); badTarget[2] = { ...badTarget[2], target: "ledger/" + EP45 + "/other.json" };
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: badTarget, ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f sidecar target 重算不等拒");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: { ok: false, reason: "bijection_mismatch" } }).reason, "reconcile_not_ok", "对账非 ok 拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: badTarget, ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "endpoint_cross_mismatch", "4f sidecar target 重算不等拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: { ok: false, reason: "bijection_mismatch" } }).reason, "reconcile_not_ok", "对账非 ok 拒");
     const badShape = mkPlan45(); badShape.digest = "nothex";
-    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badShape, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "plan_shape", "plan 形状坏拒");
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: { ...doc45(), operation_kind: "ledger_init" }, ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "not_a_cutover", "init journal 传进来拒");
+    assert.equal(verifyCutoverPlan({ planBytes: Buffer.from(stableStringify(badShape, 2) + "\n", "utf-8"), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "plan_shape", "plan 形状坏拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: { ...doc45(), operation_kind: "ledger_init" }, ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: reconcile45() }).reason, "not_a_cutover", "init journal 传进来拒");
     // P1-3 返修：对账必须携带同源渲染字节 —— 只回 digest 的对账结果过不了（旧版这里会绿）
     const noSide45 = { ...reconcile45() }; delete noSide45.sidecars;
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: noSide45 }).reason, "sidecar_reconcile_mismatch", "④ 对账无同源渲染字节拒（reconcile.sidecars 缺席）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: noSide45 }).reason, "sidecar_reconcile_mismatch", "④ 对账无同源渲染字节拒（reconcile.sidecars 缺席）");
     const tampered45 = { ...reconcile45(), sidecars: { expiry: { sha256: shaB45("expiry"), bytes: BLOB45.expiry }, pending_claims: { sha256: shaB45("pending_claims"), bytes: BLOB45.pending_claims }, policy: { sha256: shaB45("policy"), bytes: Buffer.from("tampered r45\n", "utf-8") } } };
-    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: tampered45 }).reason, "sidecar_reconcile_mismatch", "④ 对账字节被换拒（对 plan.sidecars 重算）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: tampered45 }).reason, "sidecar_reconcile_mismatch", "④ 对账字节被换拒（对 plan.sidecars 重算）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: { ...CUR45, policy: { present: true, sha256: shaBuf45(Buffer.from("tampered r45\n", "utf-8")) } }, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "②b 现场 sidecar SHA 与 plan 锚不等拒（拿旧 sidecar 切权威）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: { ...CUR45, policy: { present: false } }, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "②b 现场 sidecar 缺席拒");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, reconcile: reconcile45() }).reason, "sidecar_sha_mismatch", "②b 现场读数整体缺席拒（提交点必供，不许静默跳过）");
+    assert.equal(verifyCutoverPlan({ planBytes: planBytes45(), doc: doc45(), ledgerStep: lsOk45(), sidecarSteps: threeSidecars45(), ledgerEndpointId: EP45, currentSidecars: CUR45, reconcile: { ...reconcile45(), cutover_blockers: [{ code: "binding_retired" }] } }).reason, "cutover_blocked", "②c 对账带待修项拒（blocker 支 ok 可为 true，只有这一支拦得住）");
   });
 
   test("#R45-R3 返修 P1-6：cutover 蓝图绑 sidecar 锚 —— sidecarShas 缺/坏拒（bad_sidecar_shas）；result 七键封闭；换锚换指纹", () => {
@@ -50513,7 +50528,7 @@ test("R69 返修一 P1-1 T12 锁内复核覆盖 blocker：提交前冒出待修�
   } finally { f.cleanup(); }
 });
 
-test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账本旁路改（纯字节、结构不变）→ pre_sha_mismatch、账本不翻转", () => {
+test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账本旁路改（纯字节、结构不变）→ 拒（CAS，PK2-F5 后 reason = ledger_identity_mismatch）、账本不翻转", () => {
   const f = r69Fixture("t13");
   try {
     const s = r69PreCommit(f, "t13");
@@ -50523,7 +50538,7 @@ test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账
       fs.writeFileSync(ledgerFile, fs.readFileSync(ledgerFile, "utf-8").replace(/\n$/u, " \n"), { mode: 0o600 });
     } } });
     assert.equal(exit.ok, false, "T13 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
-    assert.equal(exit.reason, "pre_sha_mismatch", "T13 拒因：" + JSON.stringify({ reason: exit.reason, why: exit.why }));
+    assert.equal(exit.reason, "ledger_identity_mismatch", "T13 拒因（PK2-F5：pre_sha 短路已删，同一等式在 verifyCutoverPlan ④ 的 CAS 支）：" + JSON.stringify({ reason: exit.reason, why: exit.why }));
     assert.equal(s.mode(), "shadow", "账本未翻转");
   } finally { f.cleanup(); }
 });

@@ -51396,7 +51396,7 @@ const PK2I6_UNCHANGED = {
  *  cutover=true 种 cutover 收据；authoritative=true 必须同时 cutover=true（收据与账本一致才判 authoritative），
  *  否则得到的就是 T3 的 reject 态（收据已 cutover、账本仍是 shadow）。 */
 function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = null, expiryRaw = null,
-  secondEndpointNoLedger = null, badReceipt = false, noReceipts = false } = {}) {
+  secondEndpointNoLedger = null, secondEndpointFull = null, badReceipt = false, noReceipts = false } = {}) {
   const m = doctorMachine();
   const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({
@@ -51409,7 +51409,6 @@ function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = 
   const env = { ...process.env, HOME: m.home,
     FEISHU_BRIDGE_REGISTRY: m.files.registry, FEISHU_BRIDGE_LEDGER_DIR: m.ledgerDir,
     FEISHU_BRIDGE_MAINTENANCE_DIR: m.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: m.gateFile };
-  const ledgerFile = path.join(epDir, "ledger.json");
   const write600 = (file, text) => { fs.writeFileSync(file, text, { mode: 0o600 }); fs.chmodSync(file, 0o600); };
   const initOpId = "00000000-0000-0000-0000-000000000001";
   const cutOpId = "00000000-0000-0000-0000-000000000002";
@@ -51417,44 +51416,53 @@ function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = 
   const sha = "b".repeat(64);
   const digest = "c".repeat(64);
   const uuid = "11111111-2222-4333-8444-555555555555";
-  const initPlan19 = TAL.initPlan({ endpointId: EP, chain: "claude", requestKey: "rk_init", operationId: initOpId });
-  assert.equal(initPlan19.ok, true, JSON.stringify(initPlan19));
-  write600(ledgerFile, JSON.stringify(initPlan19.doc, null, 2) + "\n");
-  // 三条 live 记录：真 migrateSeed（B3 会话级 / B3 项目级 / B1 待认领）——每个 target 各自 lineage（G7）
-  const cand = (id, aliases, facts, target, lin) => ({ topic_agent_id: id, chat_id: "oc_good", aliases, facts, binding_target: target,
-    generation_lineage_id: lin, legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null });
-  const B3 = { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" };
-  const seed = TAL.migrateSeed({ endpointId: EP, requestKey: "rk_seed", authorizedBy: "ou_owner", now: Date.parse(at), env,
-    candidates: [
-      cand("ta_" + "1".repeat(32), { session_id: "sess_one", root_om: "om_A1" }, B3, { runtime: "claude", project_root: good, claude_session_id: uuid }, "lin_one"),
-      cand("ta_" + "2".repeat(32), { session_id: "sess_two", root_om: "om_A2" }, B3, { runtime: "claude", project_root: path.join(m.home, "p2"), claude_session_id: null }, "lin_two"),
-      cand("ta_" + "3".repeat(32), { session_id: null, root_om: "om_A3" }, { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, { runtime: "claude", project_root: path.join(m.home, "p3"), claude_session_id: null }, "lin_three"),
-    ] });
-  assert.equal(seed.ok, true, JSON.stringify(seed));
-  // 收据 journal：init 永远有；cutover 按需（token 必须等于账本里那笔 op id，⑬ 要核不可变事务祖先）
-  const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
-  const stubDone = (ch, tok) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
-  const curDone = (ch, tok) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
-  const gateDone = (tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
-  const enter = (tok) => [timerDone("claude"), timerDone("codex"), stubDone("claude", tok), stubDone("codex", tok), curDone("claude", tok), curDone("codex", tok)];
-  const initStep = { id: "ledger:" + EP + ":init", kind: "ledger", target: EP, backup: null, backup_sha256: null, backup_bytes: null,
-    before: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
-    intended_after: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
-    after: { endpoint_id: EP, operation_id: initOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }, state: "done", at, chain: "claude" };
-  if (!noReceipts) write600(path.join(m.maintDir, initOpId + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: initOpId, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(initOpId), gateDone(initOpId), initStep], notes: [] }));
-  const shadow = TAL.loadByEndpoint(EP, { env });
-  assert.equal(shadow.ok, true, JSON.stringify(shadow.ok ? shadow.doc.authority_mode : shadow));
-  if (cutover) {
-    const cp = TAL.cutoverPlan({ endpointId: EP, chain: "claude", requestKey: "rk_cut", operationId: cutOpId, shadowDoc: shadow.doc, shadowSha: shadow.sha256, digest, sidecarShas: { expiry: digest, pending_claims: digest, policy: digest } });
-    assert.equal(cp.ok, true, JSON.stringify(cp));
-    const cutStep = { id: "ledger:" + EP + ":cutover", kind: "ledger", target: EP, backup: null, backup_sha256: null, backup_bytes: null,
-      before: { endpoint_id: EP, operation_id: cutOpId, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha, bijection_digest: null },
-      intended_after: { endpoint_id: EP, operation_id: cutOpId, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest },
-      after: { endpoint_id: EP, operation_id: cutOpId, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest }, state: "done", at, chain: "claude" };
-    write600(path.join(m.maintDir, cutOpId + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_cutover", token: cutOpId, reason: "cut 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(cutOpId), gateDone(cutOpId), cutStep], notes: [] }));
-    // 收据与账本必须一致：authoritative=true 才把账本写成 authoritative；否则（T3）= 收据切了、账本仍 shadow → reject
-    if (authoritative) write600(ledgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
-  }
+  // 端点建造器（PK2-I6-fix2 抽出：第二个完整 Claude 端点同款复用，不另写一份蓝图序列）
+  const buildEndpoint = (epId, tokInit, tokCut) => {
+    fs.mkdirSync(path.join(m.ledgerDir, epId), { recursive: true, mode: 0o700 }); fs.chmodSync(path.join(m.ledgerDir, epId), 0o700);
+    const epLedgerFile = path.join(m.ledgerDir, epId, "ledger.json");
+    const ip = TAL.initPlan({ endpointId: epId, chain: "claude", requestKey: "rk_init_" + epId.slice(-4), operationId: tokInit });
+    assert.equal(ip.ok, true, JSON.stringify(ip));
+    write600(epLedgerFile, JSON.stringify(ip.doc, null, 2) + "\n");
+    // 三条 live 记录：真 migrateSeed（B3 会话级 / B3 项目级 / B1 待认领）——每个 target 各自 lineage（G7）
+    const cand = (id, aliases, facts, target, lin) => ({ topic_agent_id: id, chat_id: "oc_good", aliases, facts, binding_target: target,
+      generation_lineage_id: lin, legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null });
+    const B3 = { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" };
+    const seedE = TAL.migrateSeed({ endpointId: epId, requestKey: "rk_seed_" + epId.slice(-4), authorizedBy: "ou_owner", now: Date.parse(at), env,
+      candidates: [
+        cand("ta_" + "1".repeat(32), { session_id: "sess_one", root_om: "om_A1" }, B3, { runtime: "claude", project_root: good, claude_session_id: uuid }, "lin_one"),
+        cand("ta_" + "2".repeat(32), { session_id: "sess_two", root_om: "om_A2" }, B3, { runtime: "claude", project_root: path.join(m.home, "p2"), claude_session_id: null }, "lin_two"),
+        cand("ta_" + "3".repeat(32), { session_id: null, root_om: "om_A3" }, { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, { runtime: "claude", project_root: path.join(m.home, "p3"), claude_session_id: null }, "lin_three"),
+      ] });
+    assert.equal(seedE.ok, true, JSON.stringify(seedE));
+    // 收据 journal：init 永远有；cutover 按需（token 必须等于账本里那笔 op id，⑬ 要核不可变事务祖先）
+    const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (ch, tok) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (ch, tok) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = (tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const enter = (tok) => [timerDone("claude"), timerDone("codex"), stubDone("claude", tok), stubDone("codex", tok), curDone("claude", tok), curDone("codex", tok)];
+    const initStepE = { id: "ledger:" + epId + ":init", kind: "ledger", target: epId, backup: null, backup_sha256: null, backup_bytes: null,
+      before: { endpoint_id: epId, operation_id: tokInit, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
+      intended_after: { endpoint_id: epId, operation_id: tokInit, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
+      after: { endpoint_id: epId, operation_id: tokInit, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }, state: "done", at, chain: "claude" };
+    if (!noReceipts) write600(path.join(m.maintDir, tokInit + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tokInit, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(tokInit), gateDone(tokInit), initStepE], notes: [] }));
+    const shadowE = TAL.loadByEndpoint(epId, { env });
+    assert.equal(shadowE.ok, true, JSON.stringify(shadowE.ok ? shadowE.doc.authority_mode : shadowE));
+    if (cutover) {
+      const cp = TAL.cutoverPlan({ endpointId: epId, chain: "claude", requestKey: "rk_cut_" + epId.slice(-4), operationId: tokCut, shadowDoc: shadowE.doc, shadowSha: shadowE.sha256, digest, sidecarShas: { expiry: digest, pending_claims: digest, policy: digest } });
+      assert.equal(cp.ok, true, JSON.stringify(cp));
+      const cutStep = { id: "ledger:" + epId + ":cutover", kind: "ledger", target: epId, backup: null, backup_sha256: null, backup_bytes: null,
+        before: { endpoint_id: epId, operation_id: tokCut, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha, bijection_digest: null },
+        intended_after: { endpoint_id: epId, operation_id: tokCut, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest },
+        after: { endpoint_id: epId, operation_id: tokCut, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest }, state: "done", at, chain: "claude" };
+      write600(path.join(m.maintDir, tokCut + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_cutover", token: tokCut, reason: "cut 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(tokCut), gateDone(tokCut), cutStep], notes: [] }));
+      // 收据与账本必须一致：authoritative=true 才把账本写成 authoritative；否则（T3）= 收据切了、账本仍 shadow → reject
+      if (authoritative) write600(epLedgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
+    }
+    return epLedgerFile;
+  };
+  const ledgerFile = buildEndpoint(EP, initOpId, cutOpId);
+  // PK2-I6-fix2 P2 反例：第二个 Claude 端点**完整**（init+cutover 收据 + authoritative 账本）→ 视图要汇总它
+  if (secondEndpointFull !== null) buildEndpoint(secondEndpointFull, "00000000-0000-0000-0000-000000000101", "00000000-0000-0000-0000-000000000102");
   // ⑤ 在 authoritative 下读**权威** expiry.json（readSidecarFile：0600 + 单硬链接 + schema 校验）
   if (authoritative && expiryEntries !== null) {
     write600(path.join(epDir, "expiry.json"), expiryRaw ?? JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP, entries: expiryEntries }, null, 2) + "\n");
@@ -51462,11 +51470,17 @@ function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = 
   // P1-2 反例用①：**第二个 Claude 端点有 init 收据、但账本缺席**（旧版会「有可读端点就忽略它」）
   if (secondEndpointNoLedger !== null) {
     const tok2 = "00000000-0000-0000-0000-000000000009";
-    const initStep2 = { ...initStep, id: "ledger:" + secondEndpointNoLedger + ":init", target: secondEndpointNoLedger,
-      before: { endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
-      intended_after: { endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
-      after: { endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha } };
-    write600(path.join(m.maintDir, tok2 + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok2, reason: "第二端点收据（账本缺席）", started_at: at, updated_at: at, phase: "done", steps: [...enter(tok2), gateDone(tok2), initStep2], notes: [] }));
+    const st2 = (over = {}) => ({ endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const initStep2 = { id: "ledger:" + secondEndpointNoLedger + ":init", kind: "ledger", target: secondEndpointNoLedger,
+      backup: null, backup_sha256: null, backup_bytes: null,
+      before: st2(),
+      intended_after: st2({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }),
+      after: st2({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }), state: "done", at, chain: "claude" };
+    const timerDone2 = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone2 = (ch, tok) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone2 = (ch, tok) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone2 = (tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    write600(path.join(m.maintDir, tok2 + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok2, reason: "第二端点收据（账本缺席）", started_at: at, updated_at: at, phase: "done", steps: [timerDone2("claude"), timerDone2("codex"), stubDone2("claude", tok2), stubDone2("codex", tok2), curDone2("claude", tok2), curDone2("codex", tok2), gateDone2(tok2), initStep2], notes: [] }));
   }
   // P1-2 反例用②：一份读不出的 journal（收据聚合 fail-closed）
   if (badReceipt) write600(path.join(m.maintDir, "11111111-1111-4111-8111-111111111111.json"), '{"schema_version":"1.2","operation_kind":"ledger_init"}\n');
@@ -51475,7 +51489,7 @@ function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = 
 
 test("PK2-I6-fix1 T1：authoritative 下**六项都不降级**（逐字等于 main），⑤ 改读权威 expiry.json（真实入口）", () => {
   const fx = pk2i6Fixture({ cutover: true, authoritative: true,
-    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-06-01T00:00:00.000Z" } });
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-06-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
   const rep = doctorReport(fx.m.run());
   // P1-1：登记表 / 路由表 / ③ / ⑦ / ⑨ **不降** —— 与 main 逐字一致（判源是 authoritative 也不改它们）
   for (const id of PK2I6_ITEMS.filter((x) => x !== "binding_expiry")) {
@@ -51485,9 +51499,8 @@ test("PK2-I6-fix1 T1：authoritative 下**六项都不降级**（逐字等于 ma
   // ⑤ 改判据：读**权威** expiry.json（不是 legacy expires_at，也不是账本计数）
   const c5 = checkOf(rep, "binding_expiry");
   assert.equal(c5.ok, true, "⑤ 该绿：" + JSON.stringify(c5));
-  assert.match(c5.detail, /权威 expiry\.json：1 个端点、2 条/u, "⑤ 必须说清读的是权威 sidecar 与条数：" + c5.detail);
+  assert.match(c5.detail, /权威 expiry\.json：1 个端点、3 条/u, "⑤ 必须说清读的是权威 sidecar 与条数（fix2：恰覆盖 3 条 live B）：" + c5.detail);
   assert.match(c5.detail, /都在有效期内/u, c5.detail);
-  assert.equal(rep.noteCount, 0, "fix1 之后本夹具没有信息态（六项都不降）：" + rep.noteCount);
   // 判源行：authoritative + 依据 + 端点 + 账本视角计数
   const src = checkOf(rep, "authority_source");
   assert.equal(src.ok, true, JSON.stringify(src));
@@ -51547,7 +51560,6 @@ test("PK2-I6-fix1 T5：判源 fail-closed —— 任一端点账本读不出 / �
     const c = checkOf(rep1, id);
     assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], "reject 下 " + id + " 不许被降级/改写：" + JSON.stringify(c));
   }
-  assert.equal(rep1.noteCount, 0, "reject 下没有信息态");
   // ② 收据本身读不出（坏 journal）→ 同样 reject
   const bad = pk2i6Fixture({ cutover: true, authoritative: true, badReceipt: true });
   const s2 = checkOf(doctorReport(bad.m.run()), "authority_source");
@@ -51593,22 +51605,56 @@ test("PK2-I6-fix1 T7：⑳ 无收据 → legacy 且绿；六项与 main 逐字�
     const c = checkOf(rep, id);
     assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], "legacy 下 " + id + " 与 main 逐字一致：" + JSON.stringify(c));
   }
-  assert.equal(rep.noteCount, 0, "legacy 下没有信息态");
 });
 
-test("PK2-I6-fix1 T8：四态汇总唯一判据 —— note 不遮蔽 red/unknown，也不构成 incomplete", () => {
-  const note = { id: "n", name: "n", ok: "note", detail: "", next: null };
-  assert.deepEqual(summarizeDoctorChecks([note]), { overall: "ready", next: [], noteCount: 1 }, "只有 note → ready（不构成 incomplete）");
-  assert.equal(summarizeDoctorChecks([note, { ok: false, next: "x" }]).overall, "blocked", "note 与 red 同存 → blocked（不遮蔽 red）");
-  assert.deepEqual(summarizeDoctorChecks([note, { ok: false, next: "x" }]).next, ["x"], "note 不进 next（它没有动作）");
-  assert.equal(summarizeDoctorChecks([note, { ok: null }]).overall, "incomplete", "note 与 unknown 同存 → incomplete（不遮蔽 unknown）");
-  assert.equal(summarizeDoctorChecks([{ ok: "note" }, { ok: "note" }]).noteCount, 2, "计数按四态里的 note 数");
-  // 渲染面：note 用 ·，red 用 ✗，结论行仍是 blocked
-  const text = renderDoctor({ overall: "blocked", checks: [{ id: "a", name: "信息项", ok: "note", detail: "d", next: null }, { id: "b", name: "故障项", ok: false, detail: "d", next: null }], next: [], noteCount: 1 });
-  assert.match(text, /· 信息项/u, text);
+test("PK2-I6-fix2 P2：ok 三态合同 —— 非布尔一律视为 unknown（不得当 ready）；NOTE 四态已删", () => {
+  assert.equal(summarizeDoctorChecks([{ ok: "note" }]).overall, "incomplete", "非布尔 ok 视为 unknown，不构成 ready");
+  assert.equal(summarizeDoctorChecks([{ ok: undefined }]).overall, "incomplete", "缺 ok 同样视为 unknown");
+  assert.equal(summarizeDoctorChecks([{ ok: "note" }, { ok: false, next: "x" }]).overall, "blocked", "unknown 不遮蔽 red");
+  assert.equal(summarizeDoctorChecks([{ ok: null }]).overall, "incomplete", "null 仍 = unknown");
+  assert.equal(summarizeDoctorChecks([{ ok: true }]).overall, "ready", "全 true → ready");
+  assert.equal(summarizeDoctorChecks([{ ok: true }]).noteCount, undefined, "noteCount 已随四态删除");
+  // 渲染面：非布尔用 ?，red 用 ✗；不再有「信息态」行
+  const text = renderDoctor({ overall: "blocked", checks: [{ id: "a", name: "怪项", ok: "note", detail: "d", next: null }, { id: "b", name: "故障项", ok: false, detail: "d", next: null }], next: [] });
+  assert.match(text, /\? 怪项/u, text);
   assert.match(text, /✗ 故障项/u, text);
   assert.match(text, /结论：blocked/u, text);
-  assert.match(text, /信息态 1 项/u, text);
+  assert.doesNotMatch(text, /信息态/u, "四态已删：渲染面不再有信息态行");
+});
+
+test("PK2-I6-fix2 P1：⑤ 键集覆盖核（§4e）—— live B 缺条目 / 多无主条目都红并点名 id 前缀，恰覆盖才绿", () => {
+  // ① 夹具账本 3 条 live B，expiry.json 只有 2 条 → 红并点名缺的那条（旧版判绿 = 假绿）
+  const miss = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const c1 = checkOf(doctorReport(miss.m.run()), "binding_expiry");
+  assert.equal(c1.ok, false, "缺覆盖必须红：" + JSON.stringify(c1));
+  assert.match(c1.detail, /缺条目/u, c1.detail);
+  assert.ok(c1.detail.includes(("ta_" + "3".repeat(32)).slice(0, 12)), "点名缺项 id 前缀：" + c1.detail);
+  // ② 恰覆盖 + 多一条无主键 → 红
+  const orphan = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "f".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const c2 = checkOf(doctorReport(orphan.m.run()), "binding_expiry");
+  assert.equal(c2.ok, false, "无主条目必须红：" + JSON.stringify(c2));
+  assert.match(c2.detail, /多出无主条目/u, c2.detail);
+  assert.ok(c2.detail.includes(("ta_" + "f".repeat(32)).slice(0, 12)), "点名无主键前缀：" + c2.detail);
+  // ③ 恰好覆盖 → 绿
+  const exact = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const c3 = checkOf(doctorReport(exact.m.run()), "binding_expiry");
+  assert.equal(c3.ok, true, "恰覆盖要绿：" + JSON.stringify(c3));
+});
+
+test("PK2-I6-fix2 P2：多 Claude 端点 authoritative → ⑳ 账本视角**汇总**全部端点（不再只取第一本）", () => {
+  const EP2 = "endpoint_" + "b".repeat(24);
+  const two = pk2i6Fixture({ cutover: true, authoritative: true, secondEndpointFull: EP2,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const rep = doctorReport(two.m.run());
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, true, JSON.stringify(src));
+  assert.match(src.detail, /endpoint_a{8}/u, "主端点在列：" + src.detail);
+  assert.match(src.detail, /endpoint_b{8}/u, "第二端点也在列：" + src.detail);
+  assert.ok(src.detail.includes("live 记录 6 条"), "两个端点各 3 条 live → 汇总 6 条：" + src.detail);
+  assert.ok(src.detail.includes(EP2), "端点列表要含第二个端点：" + src.detail);
 });
 
 test("PK2-I6 T2：shadow 收据下六项与 main 逐字一致（快照断言），⑳ 判源绿且不打 legacy 后缀", () => {
@@ -51618,7 +51664,6 @@ test("PK2-I6 T2：shadow 收据下六项与 main 逐字一致（快照断言）�
     const c = checkOf(rep, id);
     assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 shadow 下必须与 main 逐字一致");
   }
-  assert.equal(rep.noteCount, 0, "shadow 下没有信息态");
   const src = checkOf(rep, "authority_source");
   assert.equal(src.ok, true, JSON.stringify(src));
   assert.match(src.detail, /^shadow —— 账本只做旁路对账，legacy 仍是判据/u, src.detail);
@@ -51636,7 +51681,6 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
     const c = checkOf(rep, id);
     assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 reject 下必须一字不改（reject 不是 legacy，也不许当 authoritative）");
   }
-  assert.equal(rep.noteCount, 0, "reject 下没有信息态");
 });
 
 sealSummary();

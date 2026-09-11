@@ -16,12 +16,11 @@
  * loadStatusProviders、resolveProject、auditOutbox、inventoryRuns、verifyRuntime、loadedPhase）做汇总，
  * Codex 侧那一项以子进程引用 scripts/codex/doctor.mjs 的结论，不另写判断。
  *
- * **四态（PK2-I6 / 修于 I6-fix1）**：每项 ok ∈ {true, false, null, "note"}。
- *   true/false = 通过/故障；null = 本地查不出来（既不是通过也不是故障）；
- *   **"note" = 信息态**（不红不绿）：只有当某项读的是「已被账本/sidecar 接管的冻结 legacy 事实」时才会出现。
- * 汇总（唯一判据 `summarizeDoctorChecks`）：任一 false → blocked；无 false 有 null → incomplete；
- *   **note 既不算 false 也不算 null**（不遮蔽 red/unknown，自己也不构成 incomplete）；全 true（+note）→ ready。
- * 退出码 0 / 1 / 2 只看 blocked/incomplete，与 note 无关。`--json` 报告另带 `noteCount`（信息态条数）。
+ * **三态（PK2-I6-fix2 删四态）**：每项 ok ∈ {true, false, null}。true/false = 通过/故障；
+ *   null = 本地查不出来（既不是通过也不是故障）。
+ * 汇总（唯一判据 `summarizeDoctorChecks`）：任一 false → blocked；无 false 有非布尔（含 null）→
+ *   incomplete —— **非布尔 ok 一律视为 unknown，不得当 ready**；全 true → ready。
+ * 退出码 0 / 1 / 2 只看 blocked/incomplete。零外部副作用。
  * 零外部副作用。
  *
  * **doctor 自己的代码不写任何文件、不装、不发飞书、不给"一键修复"**：每条 fail 的 next 只能是既有
@@ -125,12 +124,9 @@ const NOT_PROBED = () => ({ ok: false, reason: "not_probed" });
  *   · 判源**只有一处**：`authoritySource(ctx)` 在 runDoctor 开头算，结果作为上下文传进各项，
  *     各项不再各自读收据（R66 `classifyLedgerAuthority` 同一函数，四态矩阵不重写第二份）。
  *   · **绑定运行上下文**（I6-fix1 P1-2）：维护目录与账本根都从 `runDoctor({ home })` 的 home 派生
- *     （环境覆盖点仍优先 —— 那是既有的隔离契约），不回退 passwd 真实家目录、不另读 process.env。
+ *     （那两个覆盖环境变量仅供测试注入，判源不读它们），不回退 passwd 真实家目录、不另读 process.env。
  *   · **任一端点收据/账本读不出 → 判源 fail-closed（reject）**：不据部分事实给人下结论。
  */
-
-/** 信息态取值（第四态）：不红不绿、不计入 overall 与退出码。 */
-export const NOTE_STATE = "note";
 
 /**
  * 判源用的运行上下文：**全部从这次体检的 home 派生**（`<home>/.claude/feishu-bridge/{maintenance,ledger}`）。
@@ -207,23 +203,33 @@ export function authoritySource({ dir, env } = {}) {
     return { mode: "reject", why: "多个 Claude 端点判源不一致（" + claude.map((c) => c.cls.mode).join("、") + "），不挑一个当准", ...empty };
   }
   const first = claude[0];
+  // PK2-I6-fix2 P2：authoritative 时账本视角**汇总全部** Claude 端点（不再只取第一本 —— 多端点视图会误导总计）。
+  let view = null;
+  if (first.cls.mode === "authoritative") {
+    view = { live: 0, project_level: 0, session_level: 0, pending: 0 };
+    for (const c of claude) {
+      const v = ledgerPerspective(c.doc);
+      for (const k of Object.keys(view)) view[k] += v[k];
+    }
+  }
   return {
-    mode: first.cls.mode, why: first.cls.why, endpoints: claude.map((c) => c.endpointId),
-    view: first.cls.mode === "authoritative" ? ledgerPerspective(first.doc) : null,
+    mode: first.cls.mode, why: first.cls.why, endpoints: claude.map((c) => c.endpointId), view,
   };
 }
 
 /**
- * 四态汇总（唯一判据，runDoctor 与用例共用一个出处）：note 既不遮 red 也不会被算成 unknown。
- * @returns {{overall:"ready"|"blocked"|"incomplete", next:string[], noteCount:number}}
+ * 三态汇总（唯一判据，runDoctor 与用例共用一个出处）：
+ * PK2-I6-fix2 P2：ok 三态合同 —— **非布尔（含历史四态 "note"）一律视为 unknown**，不得当 ready；
+ * unknown 不遮蔽 red，也不被 red 遮蔽。
+ * @returns {{overall:"ready"|"blocked"|"incomplete", next:string[]}}
  */
 export function summarizeDoctorChecks(checks = []) {
+  const unknown = (c) => c.ok !== true && c.ok !== false;   // null / undefined / 非布尔 → unknown
   const overall = checks.some((c) => c.ok === false) ? "blocked"
-    : checks.some((c) => c.ok === null) ? "incomplete" : "ready";
+    : checks.some(unknown) ? "incomplete" : "ready";
   return {
     overall,
     next: [...new Set(checks.filter((c) => c.ok !== true && c.next).map((c) => c.next))],
-    noteCount: checks.filter((c) => c.ok === NOTE_STATE).length,
   };
 }
 
@@ -476,6 +482,7 @@ export function runDoctor({
   {
     const parts = [];
     const problems = [];
+    const coverage = [];
     const expiredTa = [];
     const expiringTa = [];
     let checked = 0;
@@ -485,7 +492,23 @@ export function runDoctor({
         if (!d.ok) { problems.push(short(ep) + "：账本目录解析不了（" + String(d.reason ?? "unknown") + "）"); continue; }
         const r = readSidecarFile({ file: path.join(d.dir, "expiry.json"), endpointId: ep, name: "expiry" });
         if (r.ok !== true) { problems.push(short(ep) + "：expiry.json 读不出（" + String(r.why ?? r.reason ?? "unknown") + "）"); continue; }
-        for (const [ta, v] of Object.entries(r.doc.entries ?? {})) {
+        // PK2-I6-fix2 P1：键集覆盖核（§4e：expiry-1 entries **恰为**该端点 live B 记录 id 集）——
+        // 值域形状由校验器核，覆盖面这里核：live B 缺条目 / 多无主条目都红并点名 id 前缀（否则假绿）。
+        const liveB = new Set();
+        const LB = loadByEndpoint(ep, { env: authorityCtx.env });
+        if (LB.ok === true) {
+          for (const [key, rec] of Object.entries(LB.doc.records ?? {})) {
+            if (rec?.kind !== "live") continue;
+            const fam = familyOf(rec.facts);
+            if (typeof fam === "string" && fam.startsWith("B")) liveB.add(key);
+          }
+        } else { coverage.push(short(ep) + "：账本读不出，覆盖核不了（" + String(LB.reason ?? "unknown") + "）"); }
+        const entries = r.doc.entries ?? {};
+        const missing = [...liveB].filter((id) => !(id in entries));
+        const orphan = Object.keys(entries).filter((id) => !liveB.has(id));
+        if (missing.length > 0) coverage.push(short(ep) + "：expiry 缺条目 " + missing.map((id) => id.slice(0, 12) + "…").join("、"));
+        if (orphan.length > 0) coverage.push(short(ep) + "：expiry 多出无主条目 " + orphan.map((id) => id.slice(0, 12) + "…").join("、"));
+        for (const [ta, v] of Object.entries(entries)) {
           checked += 1;
           // 值域由 `readSidecarFile → validateSidecarDoc("expiry")` 保证（规范化 ISO），这里不再二次判时间：
           // 校验器已经把「不是时间」的条目变成整份 sidecar 读不出 → 上面那条 fail-closed 分支。
@@ -495,11 +518,12 @@ export function runDoctor({
         }
       }
       if (problems.length > 0) parts.push("说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；"));
+      if (coverage.length > 0) parts.push("覆盖不符 " + coverage.length + " 处：" + coverage.slice(0, 3).join("；"));
       parts.push("权威 expiry.json：" + authority.endpoints.length + " 个端点、" + checked + " 条");
       if (expiredTa.length) parts.push("已过期：" + expiredTa.join("、"));
       if (expiringTa.length) parts.push("即将到期：" + expiringTa.join("、"));
-      if (problems.length === 0 && expiredTa.length + expiringTa.length === 0) parts.push("都在有效期内");
-      add("binding_expiry", "⑤ 绑定未到期（阈值 7 天）", problems.length === 0 && expiredTa.length + expiringTa.length === 0,
+      if (problems.length === 0 && coverage.length === 0 && expiredTa.length + expiringTa.length === 0) parts.push("都在有效期内");
+      add("binding_expiry", "⑤ 绑定未到期（阈值 7 天）", problems.length === 0 && coverage.length === 0 && expiredTa.length + expiringTa.length === 0,
         parts.join("；"), expiredTa.length + expiringTa.length ? PREVIEW.bindProject : null);
     } else {
       const expiryOk = !registry.ok ? null : (expired.length + expiring.length + pendingExpired.length === 0 ? (unclear.length === 0 ? true : null) : false);
@@ -1269,19 +1293,17 @@ export function runDoctor({
       (MODE_TEXT[authority.mode] ?? String(authority.mode)) + "；依据：" + authority.why + where + view, null);
   }
 
-  // ── 汇总：四态唯一判据（`summarizeDoctorChecks`；note 不遮 red/unknown、也不构成 incomplete）
+  // ── 汇总：三态唯一判据（`summarizeDoctorChecks`；非布尔 ok 一律视为 unknown，不得当 ready）
   const summary = summarizeDoctorChecks(checks);
-  return { overall: summary.overall, checks, next: summary.next, noteCount: summary.noteCount };
+  return { overall: summary.overall, checks, next: summary.next };
 }
 
 export function renderDoctor(report) {
   const lines = ["飞书桥 · 机器级体检（只读，不修）", ""];
   for (const c of report.checks) {
-    const mark = c.ok === true ? "✓ " : c.ok === false ? "✗ " : c.ok === NOTE_STATE ? "· " : "? ";
+    const mark = c.ok === true ? "✓ " : c.ok === false ? "✗ " : "? ";
     lines.push(mark + c.name + "：" + c.detail);
   }
-  const notes = report.checks.filter((c) => c.ok === NOTE_STATE).length;
-  if (notes > 0) lines.push("", "信息态 " + notes + " 项：不红不绿、不计入结论（读的是已冻结的 legacy 事实，以账本为准）。");
   lines.push("");
   lines.push(report.overall === "ready" ? "结论：ready —— 没有发现跨项目说不通的地方。"
     : report.overall === "blocked" ? "结论：blocked —— 上面标 ✗ 的是真故障，需要人处理。"

@@ -51689,6 +51689,7 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
     assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 reject 下必须一字不改（reject 不是 legacy，也不许当 authoritative）");
   }
 });
+
 // ─────────────────── PK2-I4：显式 owner retarget 终端命令（m1a-retarget.mjs） ───────────────────
 // 只做 项目级（claude_session_id: null）→ 会话级（本机 Claude uuid）；preview 默认零副作用，
 // --apply 走外层 m1a-order 锁 + 账本 retarget（精确 CAS），事后重读。夹具全在 tmp。
@@ -53260,6 +53261,50 @@ test("PK2-I4-fix1 P2 探测口径与文案：预览只声称「会话记录存�
     assert.equal(sessionTranscriptPath({ projectRoot: "/a/b-c/d", sessionId: I4_UUID, env: { HOME: "/h" } }),
       path.join("/h", ".claude", "projects", transcriptSlug("/a/b-c/d"), I4_UUID + ".jsonl"),
       "路径由 transcriptSlug 派生（同一助手）");
+  } finally { x.cleanup(); }
+});
+
+test("PK2-I4-fix2 P1-1：判源拒 + 注入外层释放失败 → 返回带上折的 lockUncleared，不报普通拒绝", () => {
+  const x = i4Fixture({ ledgerShadow: true, receipts: "none" });   // 判源必拒（非 authoritative）
+  try {
+    const res = retargetEndpoint({ endpointId: x.EP, id: I4_TA_A, sessionId: I4_UUID, apply: true, env: x.env, _inject: {
+      probeSession: () => true,
+      outerRelease: () => ({ ok: false, reason: "release_threw", path: "injected", why: "EIO: injected" }),
+    } });
+    assert.equal(res.ok, false, JSON.stringify(res).slice(0, 300));
+    assert.equal(res.reason, "m1a_mode_not_shadow", "仍是模式拒绝：" + JSON.stringify(res).slice(0, 300));
+    assert.ok(res.lockUncleared, "锁释放失败必须上折（不得丢在 finally 里被报成普通拒绝）：" + JSON.stringify(res).slice(0, 300));
+    assert.notEqual(res.lockUncleared.lock_state, "released", JSON.stringify(res.lockUncleared));
+    assert.match(res.why, /EIO|释放不干净/u, "why 要提释放失败：" + res.why);
+    assert.equal(x.opsOf("retarget"), 0, "零写不变");
+  } finally { x.cleanup(); }
+});
+
+test("PK2-I4-fix2 P1-2：重放 clean 判据 —— idempotent:true + committed_with_residue 不得算 clean（收口红、点名 residue）", () => {
+  const x = i4Fixture();
+  try {
+    x.transcript(I4_UUID);
+    const r1 = x.runCli(["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID, "--apply"]);
+    assert.equal(r1.status, 0, "首跑成功：" + r1.stdout + r1.stderr);
+    // 注入伪造的「带 lease 残骸的重放」（账本层语义：replayed 带残骸折成 committed_with_residue）
+    const res2 = retargetEndpoint({ endpointId: x.EP, id: I4_TA_A, sessionId: I4_UUID, apply: true, env: x.env, _inject: {
+      probeSession: () => true,
+      retargetOp: () => ({ ok: true, commit: "committed_with_residue", idempotent: true,
+        residue: ["<ledger>/ledger.lock.reaped-injected"], result: { affected_ids: [I4_TA_A, I4_TA_B] }, result_revision: 4 }),
+    } });
+    assert.equal(res2.ok, false, "带 residue 的重放不得报 clean：" + JSON.stringify(res2).slice(0, 300));
+    assert.equal(res2.status, "retarget_unclean", JSON.stringify(res2).slice(0, 300));
+    assert.match(res2.why, /residue|committed_with_residue|收口不干净/u, res2.why);
+  } finally { x.cleanup(); }
+});
+
+test("PK2-I4-fix2 P2：预览提示项目根须字面一致（探测按字面 cwd slug，不做 realpath 归一）", () => {
+  const x = i4Fixture();
+  try {
+    x.transcript(I4_UUID);
+    const r = x.runCli(["--endpoint", x.EP, "--id", I4_TA_A, "--session", I4_UUID]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /项目根须字面一致/u, "预览要提示字面一致口径：" + r.stdout);
   } finally { x.cleanup(); }
 });
 

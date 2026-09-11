@@ -140,6 +140,7 @@ export function formatRetargetResult(res) {
       "  会话记录    " + (res.sessionPresent
         ? "存在（" + res.sessionFile + "）"
         : "不存在（" + res.sessionFile + "）—— --apply 会拒 session_absent"),
+      "  注：会话记录探测按字面项目根（PK2-I4-fix2 P2：target.project_root 原样 slug、不做 realpath 归一）—— 项目根须字面一致",
       "  执行：node scripts/m1a-retarget.mjs --endpoint " + res.endpointId + " --id " + res.id
         + " --session " + String(res.newTarget?.claude_session_id ?? "") + " --apply",
     ];
@@ -238,7 +239,20 @@ export function retargetEndpoint({
       why: acq.why ?? acq.error ?? "取 m1a-order 锁失败（另一个写方正持锁 / 锁残骸）", ...base };
   }
   let released = null;
-  const releaseOuter = () => { if (released === null) released = acq.release(); return released; };
+  const releaseOuter = () => { if (released === null) released = (_inject?.outerRelease ? _inject.outerRelease(acq) : acq.release()); return released; };
+  // PK2-I4-fix2 P1-1：**所有**从锁内返回的路径统一经释放分类后再返回 ——
+  // 释放不干净（residue / unclear）→ lockUncleared 上折、why 追加说明，不得把锁残骸报成普通拒绝。
+  const finish = (extra) => {
+    const rel = releaseOuter();
+    const lockState = foldLockReleaseState(rel);
+    const ok = lockState === "released";
+    return {
+      lock_state: lockState,
+      ...(ok ? {} : { lockUncleared: { lock_state: lockState, path: rel?.path ?? rel?.reapUncleared?.path ?? acq.lock ?? null, reason: rel?.reason ?? null, why: rel?.why ?? null } }),
+      ...extra,
+    };
+  };
+  const lockNote = (f) => (f.lockUncleared ? "；另：外层锁释放不干净（" + f.lockUncleared.lock_state + "），先 doctor" : "");
   try {
     // PK2-I4-fix1 P1-1：outer 锁内**重读**收据 × 账本，只放行 authoritative（与 W1/R66 同一判源，不另写）。
     // retarget 是 ledger-only 写方：影子期写它会造成双写分歧；未接入 / 收据说不清 / 交叉不符一律 fail-closed。
@@ -249,14 +263,16 @@ export function retargetEndpoint({
     const Li = loadByEndpoint(endpointId, { env });
     const cls = classifyLedgerAuthority({ receipt, ledgerMode: Li.ok ? Li.doc.authority_mode : null });
     if (cls.mode !== "authoritative") {
+      const f = finish({});
       return { ok: false, reason: "m1a_mode_not_shadow",
-        why: "retarget 是 ledger-only 写方，只在账本 authoritative 放行（判源 " + cls.mode + "：" + cls.why + "）", ...base };
+        why: "retarget 是 ledger-only 写方，只在账本 authoritative 放行（判源 " + cls.mode + "：" + cls.why + "）" + lockNote(f), ...f, ...base };
     }
     if (typeof _inject?.beforeRetarget === "function") _inject.beforeRetarget();
     // PK2-I4-fix1 P1-2：请求身份确定性派生（同一条命令重跑 = 同一笔 op）；_inject.requestKey 仅测试用。
     const requestKey = typeof _inject?.requestKey === "string" ? _inject.requestKey : retargetRequestKey({ id, sessionId });
     // CAS：expectedOldTarget = 本次运行开头受验读到的 target（重放确认时 = 那笔 null → UUID 的字面输入）。
-    const res = retarget({ endpointId, requestKey, id, expectedOldTarget, newTarget, authorizedBy: authRes.authorizedBy, now, env });
+    // _inject.retargetOp 仅测试注入（伪造重放/残骸形状用）；生产恒为账本 op 本尊。
+    const res = (_inject?.retargetOp ?? retarget)({ endpointId, requestKey, id, expectedOldTarget, newTarget, authorizedBy: authRes.authorizedBy, now, env });
     let post = null;
     if (res.ok === true) {
       const L2 = loadByEndpoint(endpointId, { env });
@@ -268,21 +284,24 @@ export function retargetEndpoint({
           : { ok: false, why: "事后重读仍不等的记录：" + bad.map((k) => short(k, 12)).join("、") };
       }
     }
-    const rel = releaseOuter();
-    const lockState = foldLockReleaseState(rel);
-    // PK2-I4-fix1 P1-2：账本 replay 命中（同请求身份幂等）与首次 committed_clean 都是合法收口。
-    const replayed = res.ok === true && (res.idempotent === true || res.commit === "replayed");
+    const f = finish({});
+    const lockState = f.lock_state;
+    // PK2-I4-fix2 P1-2：clean 必须**实际** committed_clean（真重放返回 committed_clean + idempotent:true；
+    // 带 lease 残骸的重放被账本折成 committed_with_residue —— 不得当 clean）且无 residue / lockUncleared。
+    // 旧写法的 `res.commit === "replayed"` 半句是冗余判据（已删）；idempotent 只作诊断字段保留。
+    const replayed = res.ok === true && res.idempotent === true;
+    const residue = [
+      ...(Array.isArray(res.residue) ? res.residue : (res.residue ? [res.residue] : [])),
+      ...(f.lockUncleared?.path ? [f.lockUncleared.path] : []),
+    ];
     const wrote = res.ok === true;
-    const clean = wrote && (res.commit === "committed_clean" || replayed) && post?.ok === true && lockState === "released";
+    const clean = wrote && res.commit === "committed_clean" && residue.length === 0 && post?.ok === true && lockState === "released";
     if (!clean) {
-      const residue = [
-        ...(Array.isArray(res.residue) ? res.residue : (res.residue ? [res.residue] : [])),
-        ...(rel?.reapUncleared?.path ? [rel.reapUncleared.path] : (rel?.reason === "reap_uncleared" && rel?.path ? [rel.path] : [])),
-      ];
       const why = wrote
         ? "已写但收口不干净（commit=" + String(res.commit) + "/lock=" + lockState
+          + (residue.length > 0 ? "/residue=" + JSON.stringify(residue) : "")
           + (post && post.ok !== true ? "/post:" + post.why : "") + "）：不要重跑 apply，先 doctor"
-        : String(res.why ?? "retarget 未提交") + (lockState !== "released" ? "；另：排序锁释放不干净（" + lockState + "）" : "");
+        : String(res.why ?? "retarget 未提交") + lockNote(f);
       return { ok: false, status: wrote ? "retarget_unclean" : (res.reason ?? "retarget_failed"), reason: wrote ? "retarget_unclean" : (res.reason ?? "retarget_failed"),
         commit: res.commit ?? "not_committed", lock_state: lockState, residue, why, ...base };
     }

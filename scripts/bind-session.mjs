@@ -359,11 +359,19 @@ const publishIndex = ({ rootMessageId }) => {
   const entry = { ...retargetRoot(indexTemplate, rootMessageId), root_message_id: rootMessageId };
   const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
     const rows = reg.projects;
-    const at = rows.findIndex((p) => p?.claude_session_id === me.sessionId || (p?.root === entry.root && p?.id === entry.id));
+    // 查找面：先按**本会话**找，找不到再按 root+id 找（同一条工作线的幂等重跑）。
+    const own = rows.findIndex((p) => p?.claude_session_id === me.sessionId);
+    const at = own >= 0 ? own : rows.findIndex((p) => p?.root === entry.root && p?.id === entry.id);
+    // PK2-W1-fix5 P1：**命中的不是本会话那一行 → 拒，绝不覆盖**。
+    //   `newSessionEntry.id` 只含会话 uuid 的前 8 位十六进制（4e9 分之一才撞，但撞了就是真的）：
+    //   旧版在这条路上会把**另一个会话**的索引行整行盖掉（那条工作线静默丢索引）。宁拒不猜。
+    if (at >= 0 && rows[at]?.claude_session_id !== me.sessionId) {
+      return { ok: false, reason: "registry_index_conflict",
+        why: "索引行 id（" + String(entry.id) + "）撞上另一个会话的绑定（claude_session_id=" + String(rows[at]?.claude_session_id ?? "null") + "）—— 绝不覆盖：先处理那条绑定，或换一个会话" };
+    }
     if (frozenRow === null) {
-      // 首跑：锁内读说"我没有行"，写时却看见**我自己**的行 → 有人在这两拍之间插了行，不覆盖。
-      //   （行只按 root+id 撞上、而 claude_session_id 是**别的会话**：这是既有查找面的语义，不在这里改。）
-      if (at >= 0 && rows[at]?.claude_session_id === me.sessionId) {
+      // 首跑：锁内读说"我没有行"，写时却看见**我自己**的行（at>=0 且就是本会话）→ 有人在这两拍之间插了行，不覆盖。
+      if (at >= 0) {
         return { ok: false, reason: "cas_mismatch", why: "锁内没有该会话的索引行，写索引时却出现了 —— 不覆盖" };
       }
     } else if (at < 0 || canonKey(rows[at]) !== canonKey(frozenRow)) {

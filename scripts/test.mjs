@@ -52351,6 +52351,15 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
       assert.equal(ra.status, 0, "第一条绑上：" + ra.stdout + ra.stderr);
       const rowABefore = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
       assert.ok(rowABefore, "第一条的索引行在：" + JSON.stringify(x.registry().projects.map((p) => [p.id, p.claude_session_id])));
+      // PK2-W1-fix6 P1 的快照：冲突必须在 outer 锁内 prepare 阶段就被拒 —— 所以第二笔**一个字节**也不许落下。
+      //   旧顺序（① 建话题 → ② create_b1 → ③ publishIndex 才发现撞行）在这里会看到：话题已发出（lark 调用
+      //   多一条）、账本多一条 B1 且 revision +1 —— 而且重跑还是撞同一行，第二条永远补不齐。
+      const larkCallsBefore = x.larkCalls().length;
+      const ledgerDocBefore = x.ledger();
+      const ledgerBytesBefore = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const pendingBytesBefore = fs.readFileSync(x.sidecar("pending-claims"));
+      const expiryBytesBefore = fs.readFileSync(x.sidecar("expiry"));
+      const regBytesBefore = fs.readFileSync(x.regFile);
       const rc = w1Bind(x, w1SessionEnv(x, { sessionId: SID_C, pid: 900202, name: "line-c" }));
       // PK2-W1-fix5 P1：第二条**拒**（索引行 id 只含会话 uuid 前 8 位 → 与第一条同 id；绝不覆盖别人的索引行）。
       //   旧版在这里静默把第一条的行整行盖掉（那条工作线从此没有索引）。
@@ -52361,6 +52370,21 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
       assert.equal(projRows.length, 1, "只有第一条的索引行（第二条绝不覆盖、也不留半条）：" + JSON.stringify(projRows.map((p) => [p.id, p.claude_session_id])));
       assert.deepEqual(projRows[0], rowABefore, "第一条的索引行逐字未变：" + JSON.stringify(projRows[0]).slice(0, 300));
       assert.equal(projRows[0].claude_session_id, W1_UUID_A, "没有被改成第二条的会话");
+      // PK2-W1-fix6 P1：**零写**拒绝 —— 锁内 prepare 就拒了，话题没建、账本没记、sidecar 没写。
+      const afterCalls = x.larkCalls();
+      assert.equal(afterCalls.length - larkCallsBefore, 0,
+        "createTopic 被调用 0 次（第二条连一次 lark 调用都没有）：" + JSON.stringify(afterCalls.slice(larkCallsBefore)));
+      const ledgerDocAfter = x.ledger();
+      assert.equal(ledgerDocAfter.revision, ledgerDocBefore.revision,
+        "账本 revision 不变：" + String(ledgerDocAfter.revision) + "（旧版在这里 +1）");
+      assert.deepEqual(Object.keys(ledgerDocAfter.records), Object.keys(ledgerDocBefore.records),
+        "账本记录数/键不变（第二条不留半条 B1）：" + JSON.stringify(Object.keys(ledgerDocAfter.records)));
+      assert.deepEqual(Object.keys(ledgerDocAfter.operations), Object.keys(ledgerDocBefore.operations),
+        "账本 operations 不变（create_b1 一笔都没多）：" + JSON.stringify(Object.values(ledgerDocAfter.operations).map((o) => o.op_type)));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledgerBytesBefore, "账本整份字节不变");
+      assert.deepEqual(fs.readFileSync(x.sidecar("pending-claims")), pendingBytesBefore, "pending-claims sidecar 字节不变");
+      assert.deepEqual(fs.readFileSync(x.sidecar("expiry")), expiryBytesBefore, "expiry sidecar 字节不变");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBytesBefore, "登记表整份字节不变（只剩第一条那一行，逐字节）");
       // 账本侧：lineage 仍按**完整会话 UUID** 派生（本单没动这条），第二条那一笔半成品不影响第一条
       const lin = projRows[0].topic_generation_state?.generations?.[0]?.channel_generation_id ?? null;
       assert.ok(lin === null || typeof lin === "string", "（诊断）lineage/代际字段仍在：" + String(lin));

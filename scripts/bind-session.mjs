@@ -298,13 +298,29 @@ const frozenRowProblem = (row) => {
   return null;
 };
 
-/** 锁内**新鲜读**登记表里这一行（不用启动时那份快照 —— P1-A 的起点）。读不出就返 null（当首跑）。 */
-const readRowNow = () => {
+/** 锁内**新鲜读**整份登记表（不用启动时那份快照 —— P1-A 的起点）。读不出就当没有（首跑）。 */
+const readRowsNow = () => {
   try {
     const fresh = JSON.parse(fs.readFileSync(regFile, "utf-8"));
-    return (fresh.projects ?? []).find((p) => p?.claude_session_id === me.sessionId) ?? null;
-  } catch { return null; }
+    return Array.isArray(fresh.projects) ? fresh.projects : [];
+  } catch { return []; }
 };
+/** 锁内新鲜读**本会话**那一行（读不出就返 null）。 */
+const readRowNow = () => readRowsNow().find((p) => p?.claude_session_id === me.sessionId) ?? null;
+
+/** 索引行查找面 + 「同 root+id、异会话」冲突判据 —— **唯一一处**：锁内预检（decideInLock）与写索引
+ *  的 CAS 后盾（publishIndex）共用它，免得多一份判据漂移成两套。
+ *  先按本会话找，找不到再按 root+id 找；命中的行不属于本会话 → 冲突。
+ *  为什么宁拒不猜：`newSessionEntry.id` 只含会话 uuid 的**前 8 位**十六进制 —— 撞上就是真的撞上，
+ *  覆盖别人那一行等于把另一条工作线的索引静默抹掉。 */
+const indexLookup = (rows, entry) => {
+  const own = rows.findIndex((p) => p?.claude_session_id === me.sessionId);
+  const at = own >= 0 ? own : rows.findIndex((p) => p?.root === entry.root && p?.id === entry.id);
+  const hit = at >= 0 ? rows[at] : null;
+  return { at, hit, conflict: at >= 0 && hit?.claude_session_id !== me.sessionId };
+};
+const conflictWhy = (entry, hit) => "索引行 id（" + String(entry.id) + "）撞上另一个会话的绑定（claude_session_id="
+  + String(hit?.claude_session_id ?? "null") + "）—— 绝不覆盖：先处理那条绑定，或换一个会话";
 
 /**
  * PK2-W1-fix4 P1-A：**冻结行在 outer 锁内确定**。整段「读既有行 → 校验冻结字段 → 判完整性 →
@@ -316,9 +332,23 @@ const readRowNow = () => {
  * @returns {{ok:true, pendingToken:string, expiresAt:string}|{ok:false, reason:string, why:string}}
  */
 const decideInLock = () => {
-  const rowNow = readRowNow();
-  if (rowNow === null || !rowNow.root_message_id) {
-    indexTemplate = indexEntry(ROOT_PLACEHOLDER);   // 首跑：新模板（now 也在锁内取）
+  const rowsNow = readRowsNow();
+  const rowNow = rowsNow.find((p) => p?.claude_session_id === me.sessionId) ?? null;
+  const firstRun = rowNow === null || !rowNow.root_message_id;
+  // PK2-W1-fix6 P1：**异会话 root+id 冲突在锁内 prepare 阶段零写拒绝**。
+  //   旧顺序（① 建话题 → ② create_b1 → ③ publishIndex 才发现撞行）的问题不是"发现得晚"，是
+  //   **永久卡住**：话题已经进群、账本 B1 已经提交，而重跑还是撞同一行（publishIndex 每次都拒），
+  //   于是第二条既不能产生、回退也补不齐。判据与 publishIndex 共用 `indexLookup`（一处，不漂移）。
+  //   注意这条判定只看"本会话有没有行"：既有我自己那行 → `indexLookup` 命中 own → 不算冲突
+  //   （与 publishIndex 的查找面逐字同口径）。
+  const candidate = firstRun ? indexEntry(ROOT_PLACEHOLDER) : rowNow;
+  const hit = indexLookup(rowsNow, candidate);
+  if (hit.conflict) {
+    return { ok: false, reason: "registry_index_conflict",
+      why: conflictWhy(candidate, hit.hit) + "（锁内预检：话题 / 账本 / sidecar 一个字节都没写）" };
+  }
+  if (firstRun) {
+    indexTemplate = candidate;                      // 首跑：新模板（now 也在锁内取）
     frozenRow = null;
     return { ok: true, pendingToken: indexTemplate.pending_token, expiresAt: indexTemplate.expires_at };
   }
@@ -359,16 +389,12 @@ const publishIndex = ({ rootMessageId }) => {
   const entry = { ...retargetRoot(indexTemplate, rootMessageId), root_message_id: rootMessageId };
   const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
     const rows = reg.projects;
-    // 查找面：先按**本会话**找，找不到再按 root+id 找（同一条工作线的幂等重跑）。
-    const own = rows.findIndex((p) => p?.claude_session_id === me.sessionId);
-    const at = own >= 0 ? own : rows.findIndex((p) => p?.root === entry.root && p?.id === entry.id);
-    // PK2-W1-fix5 P1：**命中的不是本会话那一行 → 拒，绝不覆盖**。
-    //   `newSessionEntry.id` 只含会话 uuid 的前 8 位十六进制（4e9 分之一才撞，但撞了就是真的）：
-    //   旧版在这条路上会把**另一个会话**的索引行整行盖掉（那条工作线静默丢索引）。宁拒不猜。
-    if (at >= 0 && rows[at]?.claude_session_id !== me.sessionId) {
-      return { ok: false, reason: "registry_index_conflict",
-        why: "索引行 id（" + String(entry.id) + "）撞上另一个会话的绑定（claude_session_id=" + String(rows[at]?.claude_session_id ?? "null") + "）—— 绝不覆盖：先处理那条绑定，或换一个会话" };
-    }
+    // PK2-W1-fix5 P1：查找面 + 冲突判据在 `indexLookup`（与锁内预检同一处）——
+    //   **命中的不是本会话那一行 → 拒，绝不覆盖**（旧版这条路上会把另一个会话的索引行整行盖掉，
+    //   那条工作线静默丢索引）。fix6 起这道闸是**CAS 后盾**：正常路径在锁内预检就拒了，
+    //   走到这里说明"预检之后、写之前"有人插了行 —— 照旧拒，不覆盖。
+    const { at, hit, conflict } = indexLookup(rows, entry);
+    if (conflict) return { ok: false, reason: "registry_index_conflict", why: conflictWhy(entry, hit) };
     if (frozenRow === null) {
       // 首跑：锁内读说"我没有行"，写时却看见**我自己**的行（at>=0 且就是本会话）→ 有人在这两拍之间插了行，不覆盖。
       if (at >= 0) {

@@ -52349,15 +52349,22 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
       assert.equal(W1_UUID_A.slice(0, 8), SID_C.slice(0, 8), "夹具前提：两条会话前 8 位相同");
       const ra = w1Bind(x, w1SessionEnv(x, { sessionId: W1_UUID_A, pid: 900201, name: "line-a" }));
       assert.equal(ra.status, 0, "第一条绑上：" + ra.stdout + ra.stderr);
+      const rowABefore = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      assert.ok(rowABefore, "第一条的索引行在：" + JSON.stringify(x.registry().projects.map((p) => [p.id, p.claude_session_id])));
       const rc = w1Bind(x, w1SessionEnv(x, { sessionId: SID_C, pid: 900202, name: "line-c" }));
-      assert.equal(rc.status, 0, "第二条（同 8 位前缀）也必须绑上 —— 旧形 basename@<sid8> 会撞成同一条 lineage、create_b1 报 lineage_pending_exists：\n" + rc.stdout + rc.stderr);
-      const live = Object.values(x.ledger().records).filter((rec) => rec.kind === "live");
-      assert.equal(live.length, 2, "账本两条 live B1：" + JSON.stringify(live.map((r) => r.generation_lineage_id)));
-      const lins = live.map((r) => r.generation_lineage_id).sort();
-      assert.equal(new Set(lins).size, 2, "两条 lineage 必须不同：" + JSON.stringify(lins));
-      for (const lin of lins) {
-        assert.ok(String(lin).includes(W1_UUID_A) || String(lin).includes(SID_C), "lineage 用**完整**会话 UUID（不再只用前 8 位）：" + lin);
-      }
+      // PK2-W1-fix5 P1：第二条**拒**（索引行 id 只含会话 uuid 前 8 位 → 与第一条同 id；绝不覆盖别人的索引行）。
+      //   旧版在这里静默把第一条的行整行盖掉（那条工作线从此没有索引）。
+      assert.notEqual(rc.status, 0, "第二条（同 8 位前缀）必须被判冲拒绝：" + rc.stdout + rc.stderr);
+      assert.match(String(rc.stderr), /registry_index_conflict/u, "拒因点名索引行冲突：" + String(rc.stderr).slice(0, 400));
+      // 索引行：**第一条原封不动**（逐字比对），第二条没有插进来
+      const projRows = x.registry().projects.filter((p) => p.claude_session_id === W1_UUID_A || p.claude_session_id === SID_C);
+      assert.equal(projRows.length, 1, "只有第一条的索引行（第二条绝不覆盖、也不留半条）：" + JSON.stringify(projRows.map((p) => [p.id, p.claude_session_id])));
+      assert.deepEqual(projRows[0], rowABefore, "第一条的索引行逐字未变：" + JSON.stringify(projRows[0]).slice(0, 300));
+      assert.equal(projRows[0].claude_session_id, W1_UUID_A, "没有被改成第二条的会话");
+      // 账本侧：lineage 仍按**完整会话 UUID** 派生（本单没动这条），第二条那一笔半成品不影响第一条
+      const lin = projRows[0].topic_generation_state?.generations?.[0]?.channel_generation_id ?? null;
+      assert.ok(lin === null || typeof lin === "string", "（诊断）lineage/代际字段仍在：" + String(lin));
+      assert.ok(String(projRows[0].id).includes(W1_UUID_A.slice(0, 8)), "id 仍是 basename@<sid8> 的旧形（本单不改 id 派生）：" + projRows[0].id);
     } finally { x.f.cleanup(); }
   });
   // ── 返修二（fix2）：三条剩余 P1 的反例 ─────────────────────────────────
@@ -52676,6 +52683,58 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
       assert.deepEqual(after.ledger, before.ledger, "账本字节不变");
       assert.deepEqual(after.sidecars, before.sidecars, "sidecar 字节不变");
       assert.deepEqual(after.reg, before.reg, "登记表字节不变");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1-fix5 T25 反例（P2）：prepare 锁内判定之后篡改冻结行 → 索引 CAS 必拒 cas_mismatch（绝不覆盖）", () => {
+    const x = w1Fixture("t25");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r1 = w1Bind(x, env);
+      assert.equal(r1.status, 0, "首跑：" + r1.stdout + r1.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const ta = rec0.topic_agent_id;
+      // 造「要补齐」现场：把待认领条目改错 → 下一次 --apply 必进 repair（冻结既有行）
+      const drift = mutateSidecarEntry({ endpointId: x.EP, name: "pending-claims", key: ta,
+        mutate: () => ({ ok: true, changed: true, value: { token: "f".repeat(6), claim_expires_at: null } }) });
+      assert.deepEqual([drift.ok, drift.changed], [true, true], "夹具：造 repair 现场：" + JSON.stringify(drift).slice(0, 180));
+      // 注入点：复合里的 createTopic（假 lark-cli）—— 它**在 prepare（锁内判定/冻结）之后、写索引之前**跑。
+      //   在这一刻旁路改登记表那一行，正是「锁内冻结 → 写索引」之间被改过的那一类。
+      const tamperTag = "tampered-by-knife";
+      const sentinel = path.join(x.f.base, "tampered.once");
+      const larkCli = path.join(x.bin, "lark-cli");
+      fs.writeFileSync(larkCli, [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const crypto = require('node:crypto');",
+        "const argv = process.argv.slice(2);",
+        "fs.appendFileSync(process.env.W1_LARK_LOG, JSON.stringify(argv) + '\\n');",
+        "if (process.env.W1_TAMPER_REG_FILE && process.env.W1_TAMPER_SENTINEL && !fs.existsSync(process.env.W1_TAMPER_SENTINEL)) {",
+        "  fs.writeFileSync(process.env.W1_TAMPER_SENTINEL, '1');",
+        "  const reg = JSON.parse(fs.readFileSync(process.env.W1_TAMPER_REG_FILE, 'utf-8'));",
+        "  const row = (reg.projects ?? []).find((p) => p.claude_session_id === process.env.W1_TAMPER_SID);",
+        "  if (row) { row.note = " + JSON.stringify(tamperTag) + "; fs.writeFileSync(process.env.W1_TAMPER_REG_FILE, JSON.stringify(reg, null, 2) + '\\n', { mode: 0o600 }); }",
+        "}",
+        "const keyAt = argv.indexOf('--idempotency-key');",
+        "const key = keyAt >= 0 ? argv[keyAt + 1] : 'none';",
+        "const id = 'om_' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 24);",
+        "process.stdout.write(JSON.stringify({ ok: true, data: { message_id: id } }));",
+      ].join("\n") + "\n", { mode: 0o700 });
+      const rowBefore = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      const r2 = w1Bind(x, { ...env, W1_TAMPER_REG_FILE: x.regFile, W1_TAMPER_SENTINEL: sentinel, W1_TAMPER_SID: W1_UUID_A });
+      assert.equal(fs.existsSync(sentinel), true, "夹具：篡改确实发生在复合里的 createTopic 那一步");
+      assert.notEqual(r2.status, 0, "篡改后写索引必须失败：" + r2.stdout.slice(0, 300));
+      assert.match(String(r2.stderr), /不覆盖/u, "拒因要说清不覆盖：" + String(r2.stderr).slice(0, 400));
+      const receipts = w1UncleanReceipts(x);
+      assert.ok(receipts.length >= 1, "落 unclean 回执：" + JSON.stringify(receipts));
+      const body = fs.readFileSync(path.join(x.f.home, ".claude", "feishu-bridge", "receipts", receipts[receipts.length - 1]), "utf-8");
+      assert.match(body, /cas_mismatch/u, "回执点名索引 CAS 拒因：" + body.slice(0, 500));
+      // 行：仍是被篡改后的那一份（本命令没有拿冻结行覆盖回去）
+      const rowAfter = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      assert.equal(rowAfter.note, tamperTag, "被篡改的行原样留着（绝不覆盖）：" + JSON.stringify(rowAfter).slice(0, 300));
+      assert.equal(rowAfter.bound_at, rowBefore.bound_at, "（对照）冻结行其余字段没被动过：" + String(rowAfter.bound_at));
+      // 账本侧：这一跑是幂等重放，不该多记 op
+      assert.equal(Object.values(x.ledger().records).filter((rec) => rec.kind === "live").length, 1, "账本仍恰一条 live");
     } finally { x.f.cleanup(); }
   });
 

@@ -7979,6 +7979,46 @@ test("R60 返修三 P1：绊线根纳入不可变基线——根被删/根换外
   }
 });
 
+test("PK2-F3：绊线根同路径/同类型/同 mode 但 inode 漂移（rename 走 + 原地重建）→ 点名 dev/ino 且零删除", () => {
+  let suiteHome = null;
+  try {
+    const iso = installTestHomeIsolation({ env: {}, registerInvariants: false });
+    suiteHome = iso.suiteHome();
+    const root = iso.tripwire().ledger;
+    // 对照：原地不动 → 身份完整（null）。
+    assert.equal(iso.checkRoots(), null, "对照：原地不动 → 根身份完整");
+    const before = fs.lstatSync(root);
+    fs.writeFileSync(path.join(root, "sentinel-keep.txt"), "keep-me", { mode: 0o600 });
+
+    // 原根 rename 到旁边、原路径原地重建（同 mode 0700）：类型 / realpath 字符串 / mode 全不变，只有
+    // dev:ino 变了 —— 这正是 #152 四轮 P2 里没有独立反例的那一支。
+    // **旧目录刻意不删**：它带着原 inode 继续活着，新目录就不可能复用到同一个 ino —— 这一支不靠运气。
+    const aside = path.join(suiteHome, "aside-ledger"); // 同一文件系统内 rename（拷贝拷不出「同一个目录换 inode」）
+    fs.renameSync(root, aside);
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const after = fs.lstatSync(root);
+
+    assert.notEqual(before.dev + ":" + before.ino, after.dev + ":" + after.ino, "夹具成立：dev:ino 确实变了");
+    assert.equal(after.isDirectory() && !after.isSymbolicLink(), true, "重建后还是普通目录（类型没变）");
+    assert.equal(after.mode & 0o7777, before.mode & 0o7777, "重建后 mode 没变（那支由 chmod 用例守）");
+    assert.equal(fs.realpathSync(root), root, "realpath 字符串没变（不是换 symlink 那一支）");
+
+    const msg = String(iso.checkRoots());
+    assert.match(msg, /绊线根 dev\/ino 发生变化/u, "同路径同类型同 mode 但 inode 变了，必须点名 dev/ino：" + msg);
+    assert.match(msg, new RegExp("原 " + before.dev + ":" + before.ino), "点名原 dev:ino：" + msg);
+    assert.match(msg, new RegExp("现 " + after.dev + ":" + after.ino), "点名现 dev:ino：" + msg);
+    assert.match(msg, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体根：" + msg);
+
+    // 零删除：rename 走的那份（带哨兵）与原地重建的目录都必须在。
+    assert.doesNotThrow(() => iso.cleanTree(), "dev/ino 漂移时 cleanTree 必须跳过该根、不报错");
+    assert.equal(fs.existsSync(aside), true, "rename 走的那份目录必须仍在（零删除）");
+    assert.equal(fs.readFileSync(path.join(aside, "sentinel-keep.txt"), "utf-8"), "keep-me", "原根下哨兵文件内容完整（绝不遍历身份不符的根）");
+    assert.equal(fs.existsSync(root), true, "原路径（重建的那份）也不能被误删");
+  } finally {
+    if (suiteHome !== null) { try { fs.rmSync(suiteHome, { recursive: true, force: true }); } catch {} }
+  }
+});
+
 test("R60 返修三 P2：并发时 new Error 保留 cause 与原始 stack——失败信息含原断言位置", () => {
   const seen = [];
   const h = createTestHarness({

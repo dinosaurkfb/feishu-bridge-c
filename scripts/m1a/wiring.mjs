@@ -28,6 +28,8 @@ import { legacyEndpointId } from "../subscription.mjs";
 import { readSidecarStore, mutateSidecarEntry } from "../m1b/sidecar-store.mjs";
 
 const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
+/** activate 步取回 create_a1 步受验过的 f4（跨步骤传递，不重铸）。 */
+const f4UseOf = (byOp) => byOp.get("__f4Used") ?? null;
 
 /* P1-2 收尾：F4 封闭四项 —— wirePromoteBinding 只**消费**认领校验处受验的 f4，不自铸。 */
 const F4_FIELDS = ["chat_id", "sender", "body", "thread_root"];
@@ -280,23 +282,44 @@ function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy })
     }
     const shadow = [];
     const byOp = new Map();
-    let ledgerCommitted = false;
+    // PK2-W1-fix1 P1-3：**逐步**记提交进度。一步算「已提交」当且仅当
+    //   · ok:true 且 commit 以 "committed" 开头（committed_clean / committed_with_residue /
+    //     committed_durability_uncertain —— 后两个也是已提交，只是不干净），或
+    //   · ok:false 但显式 committed === true（sidecar 目录屏障失败那类：数据已 rename）。
+    // 任一步失败：前面已有任何提交 → committed_unclean（并带失败点与前序证据）；全无 → not_committed。
+    // 全部成功：所有提交步都 committed_clean → committed_clean；任一不干净 → committed_unclean（证据上折）。
+    let anyCommitted = false;
+    let anyUncleanCommit = false;
+    const commits = {};
     for (const st of steps) {
       let r;
-      try { r = st.run({ ledgerCommitted, byOp }); }
+      try { r = st.run({ byOp }); }
       catch (err) { r = { ok: false, reason: st.op + "_threw", why: String(err?.code ?? err?.message ?? err) }; }
+      // capture 的字段名是 `committed`（值 = 提交态字符串）；sidecar 原语的 `committed` 是布尔。
+      const commit = typeof r?.commit === "string" ? r.commit
+        : typeof r?.committed === "string" ? r.committed
+        : r?.committed === true ? "committed_clean" : null;
+      const stepCommitted = r?.ok === true ? (commit !== null && commit.startsWith("committed")) : r?.committed === true;
       const step = { op: st.op, ok: r?.ok === true, ...(r ?? {}) };
       shadow.push(step);
       byOp.set(st.op, step);
+      if (commit !== null) commits[st.op] = commit;
+      if (stepCommitted) {
+        anyCommitted = true;
+        if (commit !== "committed_clean") anyUncleanCommit = true;
+      }
       if (step.ok !== true) {
-        result = { ok: true, authoritative: true, commit: ledgerCommitted ? "committed_unclean" : "not_committed",
+        result = { ok: true, authoritative: true, commit: anyCommitted ? "committed_unclean" : "not_committed",
           reason: step.reason ?? (st.op + "_failed"), why: step.why ?? null,
+          ledgerCommitted: anyCommitted ? { ops: { ...commits }, failedOp: st.op } : null, commits: { ...commits },
+          failedStep: st.op,
           legacy: buildLegacy({ byOp, shadow, failedOp: st.op }), shadow, release: null };
         return result;
       }
-      if (st.op === "ledger") ledgerCommitted = true;
     }
-    result = { ok: true, authoritative: true, commit: "committed_clean", legacy: buildLegacy({ byOp, shadow, failedOp: null }), shadow, release: null };
+    result = { ok: true, authoritative: true,
+      commit: anyUncleanCommit ? "committed_unclean" : "committed_clean",
+      commits: { ...commits }, legacy: buildLegacy({ byOp, shadow, failedOp: null }), shadow, release: null };
     return result;
   } finally {
     const rel = acq.release();
@@ -315,7 +338,7 @@ function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy })
  */
 export function wireBindAuthoritative({
   endpointId, env = process.env, externalRequestId, lineageId, chatId, bindingTarget,
-  pendingToken, expiresAt, createTopic, publishIndex, now = Date.now(),
+  pendingToken, expiresAt, createTopic, publishIndex, now = Date.now(), _inject = null,
 }) {
   return runAuthoritative({ endpointId, env, steps: [
     { op: "topic", run: () => {
@@ -333,7 +356,7 @@ export function wireBindAuthoritative({
       if (!en(om)) return { ok: false, reason: "bad_external_id", why: "根话题 om 缺失" };
       const k = rk("create_b1", "bind:" + externalRequestId, lineageId);
       if (!k.ok) return { op: "create_b1", ...k };
-      const r = capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env }));
+      const r = capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env, _inject }));
       if (r.ok !== true) return r;
       const id = r.result?.created_id ?? null;
       return { ...r, root_message_id: om, topic_agent_id: id };
@@ -376,10 +399,12 @@ export function wireBindAuthoritative({
  */
 export function wirePromoteAuthoritative({
   endpointId, env = process.env, locator, claimKey, sessionId, authorizedBy, f4 = null, verify = null,
-  publishIndex, now = Date.now(),
+  publishIndex, now = Date.now(), _inject = null,
 }) {
+  // PK2-W1-fix1 P1-3：create_a1 与 activate 拆成**两个独立步骤**（各自记提交进度）——
+  //   旧版包成一个 "ledger" 步：create_a1 已提交而 activate 失败时外层谎报 not_committed。
   return runAuthoritative({ endpointId, env, steps: [
-    { op: "ledger", run: ({ byOp }) => {
+    { op: "create_a1", run: ({ byOp }) => {
       if (!en(claimKey) || !en(sessionId) || !en(locator)) return { ok: false, reason: "bad_external_id", why: "claimKey/sessionId/locator 必填 1..256 字符串" };
       if (typeof verify === "function") {
         const pf = verify();
@@ -407,34 +432,47 @@ export function wirePromoteAuthoritative({
       }
       const f4Use = (byOp.get("__preflight")?.f4 ?? null) !== null ? byOp.get("__preflight").f4 : f4;
       if (!f4Ok(f4Use, locator)) return { op: "create_a1", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭判别联合（matched_om=locator）" };
+      byOp.set("__f4Used", f4Use);
       const chatId0 = typeof target.chat_id === "string" ? target.chat_id : null;
       if (!en(chatId0)) return { op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" };
       const kA1 = rk("create_a1", claimKey, sessionId);
       if (!kA1.ok) return { op: "create_a1", ...kA1 };
-      const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId: chatId0, sessionId, now, env }));
+      const injA1 = typeof _inject === "function" ? _inject("create_a1") : _inject;
+      const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId: chatId0, sessionId, now, env, _inject: injA1 }));
       if (a1.ok !== true) return a1;
+      return { ...a1, b1Id, topic_agent_id: target.topic_agent_id ?? null, chat_id: chatId0 };
+    } },
+    { op: "activate", run: ({ byOp }) => {
+      const b1Id = byOp.get("create_a1")?.b1Id ?? null;
+      const a1Id = byOp.get("create_a1")?.result?.created_id ?? null;
+      const chatId0 = byOp.get("create_a1")?.chat_id ?? null;
+      if (!en(b1Id) || !en(a1Id)) return { ok: false, reason: "a1_missing", why: "前一步 create_a1 未产出 a1Id（不应到达）" };
       const kAct = rk("activate", claimKey, b1Id);
       if (!kAct.ok) return { op: "activate", ...kAct };
-      const act = capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: f4Use, authorizedBy, now, env }));
+      const injAct = typeof _inject === "function" ? _inject("activate") : _inject;
+      const act = capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id, f4: f4UseOf(byOp), authorizedBy, now, env, _inject: injAct }));
       if (act.ok !== true) return { ...act, op: "activate" };
       // topic_agent_id 直接取账本里那条记录自己的 id（权威事实，不重算）。
-      return { ok: true, op: "activate", b1Id, a1_id: a1.result?.created_id ?? null, topic_agent_id: target.topic_agent_id ?? null, chat_id: chatId0 };
+      return { ...act, b1Id, a1_id: a1Id, topic_agent_id: byOp.get("create_a1")?.topic_agent_id ?? null, chat_id: chatId0 };
     } },
-    { op: "index", run: ({ byOp }) => publishIndex({ b1Id: byOp.get("ledger")?.b1Id ?? null, endpointId, env }) },
     { op: "sidecars", run: ({ byOp }) => {
-      const ta = byOp.get("ledger")?.topic_agent_id ?? null;
+      // PK2-W1-fix1 P1-2：**先删 pending-claims 条目、后更新索引** —— 索引一改，legacy 现场就不是
+      //   pending 了，真实入站的下一次认领在 findPendingBinding 就被挡、到不了复合重放；sidecar 条目
+      //   在、索引未动时，重放照常进得来（幂等续跑的入口不被自己焊死）。
+      const ta = byOp.get("create_a1")?.topic_agent_id ?? null;
       if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本未给出 topic_agent_id（无法删 pending-claims 条目）" };
       const del = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env,
         mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
       if (del.ok !== true) return { ok: false, reason: "pending_claims_" + String(del.reason ?? "failed"), why: del.why ?? null };
       return { ok: true, deleted: del.changed === true };
     } },
+    { op: "index", run: ({ byOp }) => publishIndex({ b1Id: byOp.get("create_a1")?.b1Id ?? null, endpointId, env }) },
   ], buildLegacy: ({ byOp, failedOp }) => {
     if (failedOp === null) {
       const idx = byOp.get("index") ?? {};
       return { ok: true, root: idx.root ?? null, sessionId, generation: idx.generation ?? null };
     }
-    const phase = failedOp === "ledger" ? "promote" : failedOp === "index" ? "registry" : "sidecar";
+    const phase = failedOp === "create_a1" || failedOp === "activate" ? "promote" : failedOp === "index" ? "registry" : "sidecar";
     return { ok: false, phase, reason: byOp.get(failedOp)?.reason ?? failedOp, message: byOp.get(failedOp)?.why ?? "（无 why）" };
   } });
 }

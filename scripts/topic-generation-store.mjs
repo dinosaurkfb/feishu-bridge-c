@@ -152,7 +152,9 @@ export function withRegistryTransaction({ regFile = registryPath(), root = null,
   if (!lock.ok) return lock.reason === "publisher_busy"
     ? { ok: false, kind: "busy", reason: lock.reason }
     : { ok: false, kind: "lock_io_error", reason: "lock_io_error", error: lock.error ?? lock.reason };
-  try {
+  // PK2-W1-fix1 P1-5③：主体收进内层闭包 —— **每个返回路径**都经过外层的释放折叠（旧版忽略
+  //   releasePublishLock 的结果：锁交不还照样 ok，下一次同锁写方全部 busy）。
+  const run = () => {
     const fresh = loadRegistryStrict(regFile);
     if (!fresh.ok) return { ok: false, kind: "unreadable", reason: fresh.reason + "：" + fresh.error };
     const reg = { ...fresh.raw, projects: fresh.projects };
@@ -169,8 +171,26 @@ export function withRegistryTransaction({ regFile = registryPath(), root = null,
       return { ok: false, kind: "write_failed", reason: String(err.message).slice(0, 200) };
     }
     return { ...decided, count: reg.projects.length };
+  };
+  let result = null;
+  try {
+    result = run();
+    return result;
   } finally {
-    releasePublishLock(lockDir);
+    let rel;
+    try { rel = releasePublishLock(lockDir); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const unclean = rel.reapUncleared
+      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap" }
+      : rel.absent === true ? { reason: "lock_absent", path: lockDir }
+        : rel.ok !== true ? { reason: String(rel.reason ?? "release_failed"), path: lockDir } : null;
+    if (unclean !== null && result !== null && typeof result === "object") {
+      result.ok = false;
+      result.kind = "release_failed";
+      result.reason = "registry_lock_release_failed";
+      result.why = unclean.reason;
+      result.lockUncleared = unclean;
+    }
   }
 }
 

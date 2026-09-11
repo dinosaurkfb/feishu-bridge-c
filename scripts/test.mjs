@@ -304,7 +304,7 @@ import {
 import {
   prepareClaudeTopicRotation, recordClaudeTopicActivity, registerClaudeTopicRotation,
   setClaudeTopicBindingStatus, reserveClaudeClaimReminder,
-  topicGenerationLockDir,
+  topicGenerationLockDir, withRegistryTransaction,
 } from "./topic-generation-store.mjs";
 import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, reserveClaudeDialogueTurn,
@@ -50958,7 +50958,9 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const afterW1 = Object.values(x.ledger().records).find((rec) => rec.kind === "live" && rec.facts.binding === "active");
       assert.ok(afterW1, "账本已 active（这就是那个必须先被记下的中间态）：" + JSON.stringify(Object.values(x.ledger().records).map((r) => r.facts)));
       assert.equal(afterW1.topic_agent_id, ta0, "同一条 B1 被激活（不是新建）");
-      assert.ok(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], "索引失败时 sidecar 条目还在（后续步骤没跑）");
+      // PK2-W1-fix1 P1-2：顺序改为 ledger → 删 pending-claims → index —— 索引失败时条目**已删**
+      //   （旧序：索引先行，pending 现场被改掉，重跑进不了 findPendingBinding —— 那正是要修的病）。
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], undefined, "索引失败前 pending-claims 条目已删（新顺序）");
       // 重跑（同 claimKey，索引这次成功）→ 幂等补齐：activate 重放命中、索引更新、pending 条目删
       const w2 = WIRE.wirePromoteAuthoritative({ ...base, publishIndex: () => publishIndex({ err: false }) });
       assert.deepEqual([w2.ok, w2.commit, w2.legacy.ok], [true, "committed_clean", true], "重跑补齐：" + JSON.stringify(w2).slice(0, 260));
@@ -51007,10 +51009,10 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
       const f4 = { matched_om: rec0.aliases.root_om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" };
       // 先真认领一次（→ active），再拿同一目标认领 → 拒 m1a_mode_not_shadow
-      const ok1 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "d".repeat(64),
+      const ok1 = WIRE.WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "d".repeat(64),
         sessionId: "aily_a", authorizedBy: "ou_f", f4, publishIndex: () => ({ ok: true }) });
       assert.equal(ok1.ok && ok1.legacy.ok, true, "第一次认领成功：" + JSON.stringify(ok1).slice(0, 200));
-      const again = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "e".repeat(64),
+      const again = WIRE.WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "e".repeat(64),
         sessionId: "aily_b", authorizedBy: "ou_f", f4, publishIndex: () => ({ ok: true }) });
       assert.deepEqual([again.ok, again.legacy.reason], [true, "m1a_mode_not_shadow"], "已 active 的目标再认领 → 拒（B3 rebind 属 W2）：" + JSON.stringify(again).slice(0, 260));
     } finally { x.f.cleanup(); }
@@ -51095,6 +51097,157 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
         assert.equal(fs.existsSync(path.join(f.ledgerRoot, EP, "pending-claims.json")), false, "shadow 不写 sidecar（cutover 才有）");
       } finally { f.cleanup(); }
     }
+  });
+}
+
+// ─────────── PK2-W1-fix1：P1-2 顺序可续跑 / P1-3 提交进度逐步记 / P1-5③ 登记表事务折释放 / P2-2 lineage 全 UUID ───────────
+{
+  const FIX1_UUID_A = "11111111-1111-4111-8111-111111111111";
+  const FIX1_UUID_B = "22222222-2222-4222-8222-222222222222";
+  const fix1LedgerRoot = () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2w1fix1-")));
+    const EP = "endpoint_" + "7".repeat(24);
+    const epDir = path.join(base, "ledger", EP);
+    fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+    return { base, EP, epDir,
+      ledger: () => JSON.parse(fs.readFileSync(path.join(epDir, "ledger.json"), "utf-8")),
+      cleanup: () => fs.rmSync(base, { recursive: true, force: true }) };
+  };
+  const fix1WithLedger = (root, run) => {
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    const savedMaint = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR;
+    try { process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(root, "ledger"); process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(root, "maint"); return run(); }
+    finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      if (savedMaint === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaint;
+    }
+  };
+  const fix1Seed = (x) => {
+    fs.writeFileSync(path.join(x.epDir, "ledger.json"), JSON.stringify({ schema_version: "1.0", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: x.EP, chain: "claude", authority_mode: "shadow", revision: 1, operations: { "00000000-0000-0000-0000-000000000001": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "seed_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: x.EP, chain: "claude" }), result_revision: 1, result: { revision: 1 } } }, records: {} }, null, 2) + "\n", { mode: 0o600 });
+    const lp = TAL.loadLedger(x.epDir, { endpointId: x.EP });
+    assert.ok(lp.ok, "种子账本自洽");
+    const plan = TAL.cutoverPlan({ endpointId: x.EP, chain: "claude", requestKey: "fix1_cut", operationId: "00000000-0000-0000-0000-000000000002", shadowDoc: lp.doc, shadowSha: lp.sha256, digest: "e".repeat(64), sidecarShas: { expiry: "e".repeat(64), pending_claims: "f".repeat(64), policy: "a".repeat(64) } });
+    assert.ok(plan.ok, "cutoverPlan：" + JSON.stringify(plan).slice(0, 200));
+    fs.writeFileSync(path.join(x.epDir, "ledger.json"), JSON.stringify(plan.doc, null, 2) + "\n", { mode: 0o600 });
+    // 收据：init journal + surgery cutover journal → cutoverDone（authoritative 判源要读收据）
+    const maintDir = path.join(x.base, "maint");
+    fs.mkdirSync(maintDir, { recursive: true, mode: 0o700 });
+    const at = "2026-08-31T12:00:00.000Z";
+    const tok = "da88566e-d8d3-48ba-914e-7f96f4dfaeaa";
+    const sha = "b".repeat(64);
+    const initState = (over = {}) => ({ endpoint_id: x.EP, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const timerDone = (chain) => ({ id: "timer:" + chain, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (chain) => ({ id: "stub:" + chain, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (chain) => ({ id: "current:" + chain, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = () => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const enterDone = [timerDone("claude"), timerDone("codex"), stubDone("claude"), stubDone("codex"), curDone("claude"), curDone("codex"), gateDone()];
+    const afterState = initState({ authority_mode: "shadow", revision: 1, ledger_sha256: sha });
+    const ledgerStep = { id: "ledger:" + x.EP + ":init", kind: "ledger", target: x.EP, backup: null, backup_sha256: null, backup_bytes: null, before: initState(), intended_after: afterState, after: afterState, state: "done", at, chain: "claude" };
+    fs.writeFileSync(path.join(maintDir, tok + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enterDone, ledgerStep], notes: [] }), { mode: 0o600 });
+    surgeryCutoverJournal(maintDir, tok, x.EP);
+    assert.equal(endpointReceipt(maintDir, x.EP).cutoverDone, true, "夹具 cutover 收据");
+    return TAL.createB1({ endpointId: x.EP, requestKey: "req_fix1_b1", chatId: "oc_x", rootOm: "om_fix1", lineageId: "linfix1", bindingTarget: { runtime: "claude", project_root: "/p/fix1", claude_session_id: FIX1_UUID_A } });
+  };
+  const fix1F4 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
+
+  // P1-2：顺序 ledger → 删 pending sidecar → index —— sidecar 删除失败时索引**未动**（重放入口不被焊死），重跑补齐。
+  test("PK2-W1-fix1 T9 认领顺序：sidecar 删除失败 → 索引未动（pending 现场保留）；重跑同认领补齐", () => {
+    const x = fix1LedgerRoot();
+    try {
+      fix1WithLedger(x.base, () => {
+        const seed = fix1Seed(x);
+        assert.ok(seed.ok, "B1 就位：" + JSON.stringify(seed).slice(0, 200));
+        const doc0 = x.ledger();
+        const b1Id = Object.keys(doc0.records).find((k) => doc0.records[k].kind === "live");
+        mutateSidecarEntry({ endpointId: x.EP, name: "pending-claims", key: b1Id, env: process.env,
+          mutate: () => ({ ok: true, changed: true, value: { token: "abcdef", claim_expires_at: null } }) });
+        // 注入：pending-claims 那把锁被占 → 删除步失败（新顺序里它在 index **之前**）
+        const lockPath = path.join(x.epDir, "pending-claims.json") + ".lock";
+        const held = acquirePublishLock(lockPath);
+        assert.ok(held.ok, "夹具取锁");
+        const regFile = path.join(x.base, "registry.json");
+        fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [] }, null, 2) + "\n", { mode: 0o600 });
+        const w1 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: "om_fix1",
+          claimKey: "a".repeat(64), sessionId: "aily_fix1", authorizedBy: "ou_o", f4: fix1F4("om_fix1"),
+          publishIndex: () => { const rows = JSON.parse(fs.readFileSync(regFile, "utf-8")).projects; rows.push({ root: "/p/fix1", session_id: "aily_fix1", inbound_state: "bound" }); fs.writeFileSync(regFile, JSON.stringify({ projects: rows }, null, 2) + "\n", { mode: 0o600 }); return { ok: true, root: "/p/fix1", sessionId: "aily_fix1" }; } });
+        releasePublishLock(lockPath);
+        assert.equal(w1.ok, true, "复合跑完（失败记在 legacy/commit）：" + JSON.stringify(w1).slice(0, 300));
+        assert.equal(w1.commit, "committed_unclean", "账本已提交：" + JSON.stringify(w1).slice(0, 200));
+        assert.equal(w1.legacy.ok, false, "legacy 折失败：" + JSON.stringify(w1.legacy));
+        assert.equal(w1.failedStep, "sidecars", "停在 sidecar 步");
+        // 顺序证据（落在真实登记表上）：索引**未动**（旧序这里已被改成 bound —— pending 现场被焊死，
+        //   真实入站的下一次认领在 findPendingBinding 就被挡、到不了复合重跑）。
+        assert.equal(w1.legacy.phase, "sidecar", "失败步 = sidecar（index 还没跑）");
+        assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8")).projects.length, 0, "登记表零写入（索引未动，pending 现场保留）");
+        // 重跑同认领 → 幂等补齐：activate 重放命中、条目删除、索引更新。
+        const w2 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: "om_fix1",
+          claimKey: "a".repeat(64), sessionId: "aily_fix1", authorizedBy: "ou_o", f4: fix1F4("om_fix1"),
+          publishIndex: () => { const rows = JSON.parse(fs.readFileSync(regFile, "utf-8")).projects; rows.push({ root: "/p/fix1", session_id: "aily_fix1", inbound_state: "bound" }); fs.writeFileSync(regFile, JSON.stringify({ projects: rows }, null, 2) + "\n", { mode: 0o600 }); return { ok: true, root: "/p/fix1", sessionId: "aily_fix1" }; } });
+        assert.deepEqual([w2.ok, w2.commit], [true, "committed_clean"], "重跑补齐：" + JSON.stringify(w2).slice(0, 300));
+        assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[b1Id], undefined, "条目已删");
+        assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8")).projects.length, 1, "重跑补齐索引");
+      });
+    } finally { x.cleanup(); }
+  });
+
+  // P1-3：create_a1 已提交、activate 注入失败 → committed_unclean 且点名 a1 已提交；重跑 → a1 重放命中 + activate 成功。
+  test("PK2-W1-fix1 T10 提交进度逐步记：create_a1 已提交/activate 失败 → committed_unclean 点名 a1；重跑重放命中", () => {
+    const x = fix1LedgerRoot();
+    try {
+      fix1WithLedger(x.base, () => {
+        const seed = fix1Seed(x);
+        assert.ok(seed.ok, "B1 就位");
+        const doc0 = x.ledger();
+        const b1Id = Object.keys(doc0.records).find((k) => doc0.records[k].kind === "live");
+        const om = doc0.records[b1Id].aliases.root_om;
+        const failInj = { beforeLedgerRename: () => { const e = new Error("injected activate failure"); e.code = "EIO"; throw e; } };
+        const w1 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: om,
+          claimKey: "a".repeat(64), sessionId: "aily_fix1", authorizedBy: "ou_o", f4: fix1F4(om),
+          publishIndex: () => ({ ok: true }), _inject: (stepOp) => (stepOp === "activate" ? failInj : null) });
+        assert.equal(w1.ok, true, "复合跑完：" + JSON.stringify(w1).slice(0, 300));
+        assert.equal(w1.commit, "committed_unclean", "create_a1 已提交 → committed_unclean（旧码谎报 not_committed）：" + JSON.stringify(w1).slice(0, 300));
+        assert.equal(w1.commits?.create_a1, "committed_clean", "点名 a1 已提交：" + JSON.stringify(w1.commits));
+        assert.equal(w1.ledgerCommitted?.failedOp, "activate", "失败点名 activate");
+        const doc1 = x.ledger();
+        const a1s = Object.values(doc1.records).filter((r) => r.kind === "live" && TAL.familyOf(r.facts) === "A1");
+        assert.equal(a1s.length, 1, "a1 确实在账本里");
+        // 重跑（不注入）→ a1 重放命中 + activate 成功
+        const w2 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: om,
+          claimKey: "a".repeat(64), sessionId: "aily_fix1", authorizedBy: "ou_o", f4: fix1F4(om),
+          publishIndex: () => ({ ok: true }) });
+        assert.deepEqual([w2.ok, w2.commit], [true, "committed_clean"], "重跑补齐：" + JSON.stringify(w2).slice(0, 300));
+        const doc2 = x.ledger();
+        assert.deepEqual(Object.values(doc2.operations).filter((o) => o.op_type === "create_a1").length, 1, "create_a1 恰一笔（重放命中）");
+        assert.equal(Object.values(doc2.records).find((r) => r.kind === "live" && r.aliases.root_om === om).facts.binding, "active", "B1 已 active");
+      });
+    } finally { x.cleanup(); }
+  });
+
+  // P1-5③：withRegistryTransaction 的释放不净必须折进返回并降级 ok（旧码忽略 release 结果）。
+  test("PK2-W1-fix1 T11 登记表事务折释放：mutate 里锁目录被删 → ok:false + lockUncleared（旧码 ok）", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2w1fix1-reg-")));
+    const regFile = path.join(base, "registry.json");
+    fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [] }, null, 2) + "\n", { mode: 0o600 });
+    try {
+      const lockDir = path.join(path.dirname(regFile), "registry.lock");
+      const done = withRegistryTransaction({ regFile, root: base, mutate: () => {
+        fs.rmSync(lockDir, { recursive: true, force: true }); // 释放时锁已不在 → absent → 不净
+        return { ok: true, changed: true };
+      } });
+      assert.equal(done.ok, false, "释放不净 → 降级 ok：" + JSON.stringify(done).slice(0, 300));
+      assert.equal(done.reason, "registry_lock_release_failed", "点名：" + JSON.stringify(done));
+      assert.ok(done.lockUncleared, "lockUncleared 在场");
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  // P2-2：lineage 用完整 UUID（basename@<uuid>@registry）—— UUID 前 8 位有碰撞面。
+  test("PK2-W1-fix1 T12 lineage 全 UUID：不同会话的同名项目 lineage 必不相同（前 8 位碰撞反例）", () => {
+    const a = "aaaaaaa1-1111-4111-8111-111111111111";
+    const b = "aaaaaaa2-2222-4222-8222-222222222222";
+    const mk = (sid) => path.basename("/p/proj") + "@" + sid + "@registry";
+    assert.notEqual(mk(a), mk(b), "完整 UUID → 不同会话 lineage 必不同（前 8 位 collide 的那对也分得开）");
+    assert.equal(mk(a), "proj@" + a + "@registry", "lineage 形状 = basename@<full-uuid>@registry");
+    for (const l of [mk(a), mk(b)]) assert.match(l, /^[A-Za-z0-9_.:@+-]{1,128}$/u, "lineage 形状受验：" + l);
   });
 }
 

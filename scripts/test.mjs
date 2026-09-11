@@ -50146,6 +50146,11 @@ const r69Fixture = (tag) => {
   const savedReg = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   // R69 返修二 P1-A：registry 与 template **各自独立**解析 —— 两处都要显式钉（钉一个不等于钉另一个）。
   const savedTpl69 = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
+  // PK2-F8：同款纪律再来一遍，这次钉的是**夹具本地 env** 的 registry —— `env` 在上面第 2 行**之前**
+  //   就快照了，它里的 FEISHU_BRIDGE_REGISTRY 装的是**套件级**登记表（bridge-test-registry）。直调
+  //   `authorityCutover({ env: f.env })` 的用例（T4b / T4c / T13 一族）提交点对账走 `claudeSources(f.env, …)`，
+  //   于是去读别人的登记表 —— 现在没红只因那份恰好空（结构合法但读错文件的夹具）。
+  env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
   const node = pickClaudeNodeB();
@@ -50335,6 +50340,41 @@ test("R69 T4c sidecar 现场 SHA 被旁路改 → 提交点拒（sidecar_sha_mis
     const r = TAL.authorityCutover({ endpointId: EP, capability, requestKey: token, chain: "claude", env: f.env });
     assert.equal(r.ok, false, "必须拒：" + JSON.stringify(r));
     assert.equal(r.reason, "sidecar_sha_mismatch", "4c-3 拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.equal(r.commit, "not_committed", "未提交");
+    assert.equal(TAL.loadLedger(path.join(f.ledgerRoot, EP), { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
+    releaseOperationLease(lease);
+  } finally { f.cleanup(); }
+});
+
+test("PK2-F8：R69 夹具的 env.FEISHU_BRIDGE_REGISTRY 必须钉在本夹具 —— 直调 authorityCutover(f.env) 的提交点读的就是它", () => {
+  // 夹具的 env 是在 `process.env.FEISHU_BRIDGE_REGISTRY = <本夹具 registry>` **之前**快照的，所以它的
+  // 那一项装的是**套件级**登记表（bridge-test-registry）—— 直调 authorityCutover({ env: f.env }) 的用例，
+  // 提交点对账（collectLegacyForCutover → claudeSources(env, bridge)）会去读别的登记表。
+  // 这里放一条能产生 cutover_blockers 的 legacy 条目作探针：读错文件 → 看不见它 → 走到别的拒因。
+  const f = r69Fixture("f8");
+  try {
+    const EP = f.ep("f8");
+    { const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true }); assert.ok(init.phase === "done", "前置 init：" + JSON.stringify(init)); }
+    f.crashAt.id = "written:sidecar:policy:" + EP;
+    try { LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true }); } catch { /* 崩在 sidecar 收敛 */ }
+    f.crashAt.id = null;
+    const token = readActive({ dir: f.dir }).token;
+    f.takeover(token);
+    const lease = acquireOperationLease({ dir: f.dir, token });
+    assert.ok(lease.ok, "取 operation 租约：" + JSON.stringify(lease));
+    // staging 已经过去（蓝图里的双射是空对空）——现在往**夹具登记表**里写一条 retired binding（T12 同形）：
+    // 提交点重对账若读的是本夹具，它必然报 cutover_blocked（blockers 早于 digest / 快照身份那几支）。
+    const proj = path.join(f.base, "proj-f8"); fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(f.bridge, "registry.json"), JSON.stringify({ projects: [{ root: proj, id: "p1",
+      claude_session_id: "ps_" + "a".repeat(32), root_message_id: "om_" + "b".repeat(20), status: "retired" }] }, null, 2) + "\n", { mode: 0o600 });
+    const capability = { token, kind: "authority_cutover", endpointId: EP };
+    const r = TAL.authorityCutover({ endpointId: EP, capability, requestKey: token, chain: "claude", env: f.env });
+    assert.equal(r.ok, false, "必须拒：" + JSON.stringify(r));
+    // 选 cutover_blocked 这条：夹具里那条脏条目是个 retired binding（投影出 binding_retired），而 blockers
+    // 硬门在 verifyCutoverPlan 里排在 digest / 快照身份之前 —— 所以读对文件就一定是它。
+    // 读错登记表（env 没钉）则看不见这条脏条目，只剩快照身份不等 → snapshot_identity_mismatch。
+    assert.equal(r.reason, "cutover_blocked", "拒因必须是夹具登记表里那条待修项：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.match(String(r.why ?? ""), /待修项|1 条/u, "why 点名待修项：" + String(r.why));
     assert.equal(r.commit, "not_committed", "未提交");
     assert.equal(TAL.loadLedger(path.join(f.ledgerRoot, EP), { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
     releaseOperationLease(lease);

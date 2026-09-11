@@ -35,7 +35,7 @@ import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { readSidecarStore } from "./m1b/sidecar-store.mjs";
-import { resolveLiveId } from "./topic-agent-ledger.mjs";
+import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
 import { withRegistryTransaction } from "./topic-generation-store.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
@@ -143,12 +143,21 @@ const already = registry.projects.find((p) => p?.claude_session_id === me.sessio
 const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
 // PK2-W1：判源分派。authoritative → 复合写（账本为准，登记表降为索引行）；shadow / 未接入 → 原路径。
 const writeRoute = m1aWriteRoute({ endpointId, env: process.env });
-// authoritative 下的**完整性**判断：索引行在、但 sidecar 条目缺（上一次半途失败）→ 不许早退，
-//   得走同一条幂等复合把 sidecar upsert 补齐（否则 unclean 只能靠 doctor 点名，绑定永远不完整）。
+// authoritative 下的**完整性**判断 —— 按账本当前 pending / active 分支（P1-4）：
+//   · active（已被认领）→ 已完成、**零写**。旧版一律要求 pending-claims 条目还在，而认领成功恰恰
+//     会删掉它 —— 于是同一条会话再跑 bind 被判"不完整"，把 active 索引盖回 pending 快照、
+//     并把 pending-claims 条目复活：一条已认领的工作线被退回待认领。
+//   · pending → 按 sidecar 条目补齐（缺条目 = 上一次半途失败，走同一条幂等复合 upsert；
+//     否则 unclean 只能靠 doctor 点名，绑定永远不完整）。
 const authoritativeComplete = (entry) => {
   if (writeRoute.mode !== "authoritative" || !entry?.root_message_id) return false;
   const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
   if (!resolved.ok) return false;
+  const led = loadByEndpoint(endpointId, { env: process.env });
+  if (!led.ok) return false;
+  const rec = led.doc.records[resolved.id];
+  if (!rec || rec.kind !== "live") return false;
+  if (rec.facts?.binding === "active") return true;
   const ta = resolved.id;
   const pending = readSidecarStore({ endpointId, name: "pending-claims" });
   const expiry = readSidecarStore({ endpointId, name: "expiry" });
@@ -207,11 +216,22 @@ const indexEntry = (rootMessageId) => newSessionEntry({
 });
 // authoritative 路径用**同一份**条目模版（同一个 now）：索引行里的 expires_at 必须与写进 expiry sidecar
 // 的那一个逐字相同 —— 两次各自 newSessionEntry 会让两边差几毫秒。
-const indexTemplate = indexEntry("om_placeholder");
+const ROOT_PLACEHOLDER = "om_placeholder";
+const indexTemplate = indexEntry(ROOT_PLACEHOLDER);
+// 模板里那个占位根 om → 真 om。**不能只换顶层 root_message_id**：行内嵌的 topic_generation_state 是
+//   **这一行自己的**投影，代际里的 root_message_id 也是同一个话题的 om。留着占位的后果是真入口上的：
+//   `findPendingBinding` 读 generation.root_message_id → 认领现场指向一个**不存在**的话题
+//   （evaluatePromotion 的 matched_om 与 wirePromoteAuthoritative 的 locator 都跟着它），
+//   账本侧 resolveLiveId 永远 locator_absent —— 新绑定再也认领不了（真机 2026-09-11 等这单的原因）。
+const retargetRoot = (node, rootMessageId) => (node !== null && typeof node === "object"
+  ? Array.isArray(node)
+    ? node.map((v) => retargetRoot(v, rootMessageId))
+    : Object.fromEntries(Object.entries(node).map(([k, v]) => [k, k === "root_message_id" && v === ROOT_PLACEHOLDER ? rootMessageId : retargetRoot(v, rootMessageId)]))
+  : node);
 // ③ 索引行 upsert（authoritative 路径）：**锁内重读当前文件再局部更新**（不许拿锁外那份快照写回 ——
 //   两笔并发 bind 被 outer 串行后，后一笔仍会用陈旧快照盖掉前一笔）。同会话已有行 → 就地覆盖（幂等重跑）。
 const publishIndex = ({ rootMessageId }) => {
-  const entry = { ...indexTemplate, root_message_id: rootMessageId };
+  const entry = { ...retargetRoot(indexTemplate, rootMessageId), root_message_id: rootMessageId };
   const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
     const rows = reg.projects;
     const at = rows.findIndex((p) => p?.claude_session_id === me.sessionId || (p?.root === entry.root && p?.id === entry.id));
@@ -226,10 +246,13 @@ const publishIndex = ({ rootMessageId }) => {
 const wired = writeRoute.mode === "authoritative"
   ? wireBindAuthoritative({
       endpointId, env: process.env, externalRequestId: idemKey,
-      // lineage 取**会话级登记行的 id**（= basename@<sid8>）+ "@registry" —— 与 legacy 快照的
-      //   registry 分支同一算法（entry.id + "@registry"）。用项目级 @project-files 会让同一项目里
-      //   两条工作线撞同一个 lineage（账本一条 lineage 只许一条 live B1）。
-      lineageId: indexTemplate.id + "@registry", chatId: template.chat_id, bindingTarget: bindTarget,
+      // lineage 取**会话级**：`basename@<完整会话 UUID>@registry`（P2-2）。
+      //   旧形 basename@<sid8>@registry 只用 UUID 前 8 位十六进制 —— 两条会话前缀撞上就是同一条
+      //   lineage，而账本一条 lineage 只许一条 live B1（第二条 create_b1 直接 lineage_pending_exists）。
+      //   选**完整 UUID**而不是摘要：不引哈希、id 直接对得上那条会话（长度仍受 LINEAGE_SHAPE 128 限）。
+      //   与 legacy 快照的 registry 分支（entry.id + "@registry"）不再是同一算法 —— 那只适用于切换前
+      //   已存在的旧行，切后新建的以账本这条 lineage 为准。
+      lineageId: path.basename(root) + "@" + me.sessionId + "@registry", chatId: template.chat_id, bindingTarget: bindTarget,
       pendingToken: token, expiresAt: indexTemplate.expires_at,
       createTopic, publishIndex,
     })

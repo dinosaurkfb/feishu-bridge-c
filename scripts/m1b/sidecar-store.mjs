@@ -12,7 +12,10 @@
  *     + `validateSidecarDoc`（**唯一 schema**，不写第二套）；
  *   · 写 = tmp（O_EXCL 0600）→ 写满 → **文件 fsync（失败即失败：删 tmp、不 rename、盘上不变）**
  *     → rename → **目录 fsync（失败也拒，但如实报 committed:true）** → **写后受验读回**（逐字比对）；
- *   · 释放不干净按 R57d 折成 `lockUncleared` 并把 ok 降级（不谎报 clean）。
+ *   · 释放不干净按 R57d 折成 `lockUncleared` 并把 ok 降级（不谎报 clean）—— **每一条返回路径都折**，
+ *     包括 `changed:false` 的零写返回；
+ *   · `changed:false` 也不跳过目录屏障（P1-5① 返修）：上一笔可能正是死在 rename 之后的目录 fsync 上，
+ *     “盘上已经是这一份”不等于“已证实落盘”，所以零写返回同样重做一次目录 fsync。
  *
  * 调用方拿到的 union：`{ok:false, reason, why?}`（拒）或
  * `{ok:true, changed, value, entries, committed, persistence, file, …}`（`changed:false` = 零写返回）。
@@ -71,6 +74,17 @@ export function readSidecarStore({ endpointId, name, env = process.env } = {}) {
   return { ok: true, absent: false, file: p.file, doc: r.doc, entries: r.doc.entries, bytes: r.bytes };
 }
 
+/** 目录屏障：rename 之后必须让父目录也落盘，崩溃后这一笔才存在。返回 null（成功）或错误串。 */
+function fsyncDir(dir) {
+  try {
+    const dfd = fs.openSync(dir, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+  } catch (err) {
+    return String(err?.code ?? err?.message ?? err);
+  }
+  return null;
+}
+
 /** 同目录 tmp（O_EXCL 0600）→ 写满 → 文件 fsync → rename → 目录 fsync。文件 fsync 失败：删 tmp、不 rename。 */
 function writeSidecarAtomic(file, content) {
   const dir = path.dirname(file);
@@ -95,12 +109,10 @@ function writeSidecarAtomic(file, content) {
   }
   try { fs.renameSync(tmp, file); }
   catch (err) { try { fs.rmSync(tmp, { force: true }); } catch { /* 同上 */ } return { ok: false, reason: "sidecar_write_failed", why: "rename：" + String(err?.code ?? err?.message ?? err) }; }
-  try {
-    const dfd = fs.openSync(dir, fs.constants.O_RDONLY);
-    try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
-  } catch (err) {
+  const dirErr = fsyncDir(dir);
+  if (dirErr !== null) {
     // 已提交但持久性没证实：拒（调用方折 unclean），并如实报 committed。
-    return { ok: false, reason: "sidecar_durability_unconfirmed", why: String(err?.code ?? err?.message ?? err), committed: true };
+    return { ok: false, reason: "sidecar_durability_unconfirmed", why: dirErr, committed: true };
   }
   return { ok: true, committed: true, persistence: "fsynced" };
 }
@@ -123,20 +135,34 @@ export function mutateSidecarEntry({ endpointId, name, key, mutate, env = proces
   if (!lock.ok) {
     return { ok: false, reason: lock.reason === "maintenance" ? "maintenance" : "sidecar_busy", why: String(lock.reason ?? "lock_unavailable") };
   }
+  // P1-5②（返修）：**每一条返回路径都先赋给 result** —— 只有 result 非 null 才会在 finally 里折
+  //   释放残骸；早退（含 changed:false 的零写返回）直接 return 字面量会让那一折被吞掉，
+  //   “锁没交还”被报成 clean。
   let result = null;
   try {
     // 锁内 fd 受验重读（不在锁外先读：那是个漂移窗口）。
     const cur = readSidecarStore({ endpointId, name, env });
-    if (!cur.ok) return { ok: false, reason: cur.reason, why: cur.why };
+    if (!cur.ok) {
+      result = { ok: false, reason: cur.reason, why: cur.why };
+      return result;
+    }
     const present = cur.absent === true ? null : (Object.prototype.hasOwnProperty.call(cur.entries, key) ? cur.entries[key] : null);
     const changed = mutate(present, { key, file: p.file, entries: cur.entries, absent: cur.absent === true });
     if (!changed || typeof changed !== "object" || changed.ok !== true) {
-      return changed && typeof changed === "object" && changed.ok === false
+      result = changed && typeof changed === "object" && changed.ok === false
         ? changed
         : { ok: false, reason: "sidecar_bad_mutate", why: "mutate 必须返回 {ok:true, changed?, value?} 或 {ok:false, reason}" };
+      return result;
     }
     if (changed.changed === false) {
-      return { ok: true, changed: false, value: present, entries: cur.entries ?? {}, file: p.file, committed: false };
+      // P1-5①（返修）：零写返回**不等于持久性已证实** —— 上一笔很可能正是死在 rename 之后的目录
+      //   fsync 上（盘上已是这一份、这一跳没做成）。所以每次零写返回都重做一次目录屏障，
+      //   屏障成不成如实报（失败 → 拒 + committed，交给调用方折 unclean），不因"字节没变"跳过。
+      const dirErr = fsyncDir(path.dirname(p.file));
+      result = dirErr !== null
+        ? { ok: false, changed: false, reason: "sidecar_durability_unconfirmed", why: dirErr, committed: true, entries: cur.entries ?? {}, file: p.file }
+        : { ok: true, changed: false, value: present, entries: cur.entries ?? {}, file: p.file, committed: false, persistence: "fsynced" };
+      return result;
     }
     const nextEntries = { ...(cur.entries ?? {}) };
     const value = Object.prototype.hasOwnProperty.call(changed, "value") ? changed.value : present;
@@ -144,14 +170,24 @@ export function mutateSidecarEntry({ endpointId, name, key, mutate, env = proces
     else nextEntries[key] = value;
     const nextDoc = { schema_version: (cur.doc?.schema_version ?? SIDECAR_SCHEMAS[name]), endpoint_id: endpointId, entries: nextEntries };
     const invalid = validateSidecarDoc(nextDoc, name, { endpointId });
-    if (invalid !== null) return { ok: false, reason: "sidecar_invalid", why: invalid };
+    if (invalid !== null) {
+      result = { ok: false, reason: "sidecar_invalid", why: invalid };
+      return result;
+    }
     const w = writeSidecarAtomic(p.file, stableStringify(nextDoc, 2) + "\n");
-    if (!w.ok) return { ok: false, reason: w.reason, why: w.why, committed: w.committed === true, entries: w.committed === true ? nextEntries : cur.entries };
+    if (!w.ok) {
+      result = { ok: false, reason: w.reason, why: w.why, committed: w.committed === true, entries: w.committed === true ? nextEntries : cur.entries };
+      return result;
+    }
     // 写后受验读回：整文档再过一遍，且条目逐字一致（读不回/不一致 → 已提交但不干净）。
     const back = readSidecarStore({ endpointId, name, env });
-    if (!back.ok) return { ok: false, reason: "sidecar_readback_failed", why: back.why ?? back.reason, committed: true, entries: nextEntries, file: p.file };
+    if (!back.ok) {
+      result = { ok: false, reason: "sidecar_readback_failed", why: back.why ?? back.reason, committed: true, entries: nextEntries, file: p.file };
+      return result;
+    }
     if (stableStringify(back.entries, 2) !== stableStringify(nextEntries, 2)) {
-      return { ok: false, reason: "sidecar_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, entries: nextEntries, file: p.file };
+      result = { ok: false, reason: "sidecar_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, entries: nextEntries, file: p.file };
+      return result;
     }
     result = { ok: true, changed: true, value, entries: nextEntries, doc: nextDoc, file: p.file, committed: true, persistence: "fsynced" };
     return result;

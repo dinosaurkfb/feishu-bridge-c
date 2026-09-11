@@ -252,8 +252,12 @@ const isoOf = (v) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? ne
  * 判源（必须是 authoritative；账本读不出/模式不符 → `m1a_mode_not_shadow`/`m1a_ledger_absent`）
  * → 逐步骤跑（`steps` 顺序即提交顺序；第一个失败即停）→ 释放。
  *
- * 返回 union 与 shadow 写方同形（`ok` / `legacy` / `shadow` / `release`），另加 `commit`：
- *   `not_committed`（账本未提交）| `committed_clean` | `committed_unclean`（账本已提交而后继失败）。
+ * 返回 union 与 shadow 写方同形（`ok` / `legacy` / `shadow` / `release`），另加：
+ *   · `commit`：`not_committed`（账本未提交）| `committed_clean` | `committed_unclean`
+ *     （账本已提交而后继失败，或任何一笔原语的提交本身不干净：residue / durability_uncertain）；
+ *   · `commits`：**逐原语**的提交证据（顺序即提交顺序）。一个步骤里可能有两笔原语
+ *     （认领 = create_a1 → activate），所以提交进度必须逐笔记 —— 只记"步骤成没成"会把
+ *     "a1 已提交、activate 未成"那半笔误报成 `not_committed`（P1-3）。
  * `buildLegacy(steps)` 由各复合自己给 —— 它决定调用方看到的 "legacy 结果" 是什么。
  */
 function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy }) {
@@ -269,34 +273,47 @@ function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy })
   if (!acq.ok) {
     return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, lockPath: acq.path ?? null, lockError: acq.error ?? null, legacy: null, shadow: null, release: null };
   }
+  // P1-3（返修）：早退路径也先把结果赋给 `result` —— 只有 result 非 null 才在 finally 里
+  //   把释放证据折上去（旧版这几条直接 return 字面量，`release: null` 把 "锁没交还" 吞了）。
   let result = null;
   try {
     const L = loadByEndpoint(endpointId, { env });
     if (!L.ok) {
-      return { ok: false, commit: "not_committed", reason: "m1a_ledger_absent", why: "账本现场不可读/缺席（" + String(L.reason ?? "unknown") + "）：fail-closed", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      result = { ok: false, commit: "not_committed", reason: "m1a_ledger_absent", why: "账本现场不可读/缺席（" + String(L.reason ?? "unknown") + "）：fail-closed", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      return result;
     }
     if (L.doc.authority_mode !== "authoritative") {
-      return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "账本 authority_mode=" + String(L.doc.authority_mode) + "（W1 复合只开 authoritative）", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      result = { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "账本 authority_mode=" + String(L.doc.authority_mode) + "（W1 复合只开 authoritative）", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+      return result;
     }
     const shadow = [];
     const byOp = new Map();
-    let ledgerCommitted = false;
+    const commits = [];
     for (const st of steps) {
       let r;
-      try { r = st.run({ ledgerCommitted, byOp }); }
+      try { r = st.run({ ledgerCommitted: commits.length > 0, byOp }); }
       catch (err) { r = { ok: false, reason: st.op + "_threw", why: String(err?.code ?? err?.message ?? err) }; }
       const step = { op: st.op, ok: r?.ok === true, ...(r ?? {}) };
       shadow.push(step);
       byOp.set(st.op, step);
+      // 逐原语记提交进度：步自报的 `commits`（先提交的先入）在前，步级 capture 的证据（本步最后一笔）在后。
+      for (const c of (Array.isArray(step.commits) ? step.commits : [])) commits.push({ ...c });
+      if (typeof step.committed === "string" && step.committed.startsWith("committed")) {
+        commits.push({ op: step.op, commit: step.committed, idempotent: step.idempotent === true,
+          residue: step.residue ?? null, lockUncleared: step.lockUncleared ?? null, path: step.path ?? null, error: step.error ?? null });
+      }
       if (step.ok !== true) {
-        result = { ok: true, authoritative: true, commit: ledgerCommitted ? "committed_unclean" : "not_committed",
-          reason: step.reason ?? (st.op + "_failed"), why: step.why ?? null,
+        result = { ok: true, authoritative: true, commit: commits.length > 0 ? "committed_unclean" : "not_committed",
+          reason: step.reason ?? (st.op + "_failed"), why: step.why ?? null, commits: [...commits],
           legacy: buildLegacy({ byOp, shadow, failedOp: st.op }), shadow, release: null };
         return result;
       }
-      if (st.op === "ledger") ledgerCommitted = true;
     }
-    result = { ok: true, authoritative: true, commit: "committed_clean", legacy: buildLegacy({ byOp, shadow, failedOp: null }), shadow, release: null };
+    // 全绿也按**真实 commit** 联合判：committed_with_residue / committed_durability_uncertain
+    //   不是 clean（与 uncleanWired 的②类同口径）—— 一律落 committed_unclean。
+    const uncleanCommit = commits.some((c) => c.commit !== "committed_clean" || c.residue || c.lockUncleared || c.path || c.error);
+    result = { ok: true, authoritative: true, commit: uncleanCommit ? "committed_unclean" : "committed_clean",
+      commits: [...commits], legacy: buildLegacy({ byOp, shadow, failedOp: null }), shadow, release: null };
     return result;
   } finally {
     const rel = acq.release();
@@ -370,8 +387,9 @@ export function wireBindAuthoritative({
 /**
  * wirePromoteAuthoritative —— 认领（pending B1 → active）的 authoritative 复合（顺序固定）：
  *   ① 账本 create_a1 → activate（与 §5.1 同；f4 判别照旧由调用方受验）
- *   ② 索引更新（调用方给 `publishIndex` 闭包 —— 现行 promoteBinding：session_id / inbound_state …）
- *   ③ 删 `pending-claims` 里该 B1 的条目（幂等）
+ *   ② 删 `pending-claims` 里该 B1 的条目（幂等）—— **在索引之前**：索引一更新，legacy 现场就不再
+ *      pending（inbound 的 findPendingBinding 直接挡），删失败就成了不可续跑的半笔（P1-2）
+ *   ③ 索引更新（调用方给 `publishIndex` 闭包 —— 现行 promoteBinding：session_id / inbound_state …）
  * **只开 pending B1**：目标是 B3（换会话 rebind）/其它族 → 拒 `m1a_mode_not_shadow`（W2 另单）。
  */
 export function wirePromoteAuthoritative({
@@ -413,14 +431,23 @@ export function wirePromoteAuthoritative({
       if (!kA1.ok) return { op: "create_a1", ...kA1 };
       const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId: chatId0, sessionId, now, env }));
       if (a1.ok !== true) return a1;
+      // create_a1 的提交证据单独带出（步级 capture 只会留得下 activate 那一笔）—— P1-3。
+      const a1Commit = [{ op: "create_a1", commit: a1.committed ?? "committed_clean", idempotent: a1.idempotent === true,
+        residue: a1.residue ?? null, lockUncleared: a1.lockUncleared ?? null, path: a1.path ?? null, error: a1.error ?? null,
+        a1_id: a1.result?.created_id ?? null }];
       const kAct = rk("activate", claimKey, b1Id);
-      if (!kAct.ok) return { op: "activate", ...kAct };
+      if (!kAct.ok) return { op: "activate", ...kAct, commits: a1Commit };
       const act = capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: f4Use, authorizedBy, now, env }));
-      if (act.ok !== true) return { ...act, op: "activate" };
+      // 失败也带上 a1 的证据："create_a1 已提交、activate 未成" 是半笔，调用方要能点名。
+      if (act.ok !== true) return { ...act, op: "activate", commits: a1Commit };
       // topic_agent_id 直接取账本里那条记录自己的 id（权威事实，不重算）。
-      return { ok: true, op: "activate", b1Id, a1_id: a1.result?.created_id ?? null, topic_agent_id: target.topic_agent_id ?? null, chat_id: chatId0 };
+      // act 的 capture 证据（committed/idempotent/residue/lockUncleared）一并保留，不丢。
+      return { ...act, ok: true, op: "activate", b1Id, a1_id: a1.result?.created_id ?? null, topic_agent_id: target.topic_agent_id ?? null, chat_id: chatId0, commits: a1Commit };
     } },
-    { op: "index", run: ({ byOp }) => publishIndex({ b1Id: byOp.get("ledger")?.b1Id ?? null, endpointId, env }) },
+    // 顺序固定（P1-2）：账本 → **删 pending 条目** → 索引。
+    //   反过来的话，索引一更新 legacy 现场就不再 pending（inbound 的 findPendingBinding 直接就挡），
+    //   而删条目那一步失败时这笔就没法续跑了。删在前面：删失败 → 索引还没写 → 现场仍可认领，
+    //   同一条命令重跑就能补齐（删除是条目级幂等的）。
     { op: "sidecars", run: ({ byOp }) => {
       const ta = byOp.get("ledger")?.topic_agent_id ?? null;
       if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本未给出 topic_agent_id（无法删 pending-claims 条目）" };
@@ -429,6 +456,7 @@ export function wirePromoteAuthoritative({
       if (del.ok !== true) return { ok: false, reason: "pending_claims_" + String(del.reason ?? "failed"), why: del.why ?? null };
       return { ok: true, deleted: del.changed === true };
     } },
+    { op: "index", run: ({ byOp }) => publishIndex({ b1Id: byOp.get("ledger")?.b1Id ?? null, endpointId, env }) },
   ], buildLegacy: ({ byOp, failedOp }) => {
     if (failedOp === null) {
       const idx = byOp.get("index") ?? {};

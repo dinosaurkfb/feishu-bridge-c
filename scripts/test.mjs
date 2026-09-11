@@ -50146,6 +50146,10 @@ const r69Fixture = (tag) => {
   const savedReg = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   // R69 返修二 P1-A：registry 与 template **各自独立**解析 —— 两处都要显式钉（钉一个不等于钉另一个）。
   const savedTpl69 = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
+  // PK2-F8：f.env 同样要钉 registry —— 顶上的 env 快照在这两行之前展开，f.env.FEISHU_BRIDGE_REGISTRY 里
+  //   装的是套件级 bridge-test-registry 展开值；直调 authorityCutover(f.env …) 的提交点对账
+  //  （collectLegacyForCutover → claudeSources(env, bridge)）读 f.env，不钉就会读错登记表。
+  env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
   const node = pickClaudeNodeB();
@@ -50531,6 +50535,26 @@ test("R69 返修一 P1-1 T12 锁内复核覆盖 blocker：提交前冒出待修�
     assert.equal(exit.ok, false, "T12 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
     assert.match(String(exit.reason), /cutover_blocked|bijection|projection|reconcile/u, "T12 拒因点名待修项：" + exit.reason);
     assert.equal(s.mode(), "shadow", "账本未翻转");
+  } finally { f.cleanup(); }
+});
+
+test("PK2-F8 夹具反例：f.env 钉 registry —— 直调 authorityCutover 的提交点对账读夹具登记表（retired 脏条目 → cutover_blocked），不是套件级登记表", () => {
+  const f = r69Fixture("f8");
+  try {
+    const s = r69PreCommit(f, "f8");
+    // 夹具登记表塞一条 retired binding（投影出 cutover_blockers 的脏条目）—— 写在 staging 之后、直调之前
+    //（与 T12 的 beforeCommitCheck 同一窗口）：staging 冻结的是空登记表的 digest/身份，拒因只能来自
+    // 提交点重对账**重读到的这份登记表**。
+    const proj = path.join(f.base, "proj-f8"); fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(f.bridge, "registry.json"), JSON.stringify({ projects: [
+      { root: proj, id: "p1", claude_session_id: "22222222-2222-4222-8222-222222222222", root_message_id: "om_" + "b".repeat(20), status: "retired" },
+    ] }, null, 2) + "\n", { mode: 0o600 });
+    const lease = s.lease();
+    const r = TAL.authorityCutover({ endpointId: s.EP, capability: { token: s.token, kind: "authority_cutover", endpointId: s.EP }, requestKey: s.token, chain: "claude", env: f.env });
+    assert.equal(r.ok, false, "提交点必须拒：" + JSON.stringify(r));
+    assert.equal(r.reason, "cutover_blocked", "拒因点名 blockers（对账读的是夹具登记表，不是套件级登记表）：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.equal(s.mode(), "shadow", "账本未翻转");
+    releaseOperationLease(lease);
   } finally { f.cleanup(); }
 });
 

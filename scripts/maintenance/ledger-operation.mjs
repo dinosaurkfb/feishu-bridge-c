@@ -287,10 +287,10 @@ function convergeSidecars(ctx, { token, lease, gateFile, env, endpointId, chain,
   if (!pb.ok) return { ok: false, reason: "staged_plan_unreadable", why: pb.why ?? pb.reason };
   const rec2 = prepareFor({ ctx, chain, endpointId, ledgerDir, env });
   if (!rec2.ok) return { ok: false, reason: rec2.reason, why: rec2.why ?? null };
-  // P1-4：二次重验同样过 blockers 硬门——staging 后清了项又冒出新待修项（或 staging 本就不该过）都在这里拦。
-  if (rec2.cutover_blockers.length > 0) {
-    return { ok: false, reason: "cutover_blocked", why: "二次重验发现待修项（" + rec2.cutover_blockers.length + " 条：" + rec2.cutover_blockers.map((b) => b.code).join("、") + "）" };
-  }
+  // PK2-F9："staging 后冒出待修项"不再在这里手写第二份判据 —— `reconcile.cutover_blockers` 非空由下面那次
+  //   `verifyCutoverPlan`（②c，唯一出处）独拦，reason 同为 `cutover_blocked`（why 也带同样是封闭枚举的 code 列表）。
+  //   `!rec2.ok`（对账本身没成功）那一支保留：那不是 blockers，而是"重验时对账跑不出结论"，
+  //   在铸 plan 之后仍要先于 verifier 报出来（否则只能拿到笼统的 `reconcile_not_ok`）。
   // 账本 CAS：重验时刻的活读（M1a 对账返回不带账本身份，CAS 由编排器供）。
   const L2 = loadLedger(ledgerDir, { endpointId });
   if (!L2.ok) return { ok: false, reason: L2.reason, why: L2.why ?? null };

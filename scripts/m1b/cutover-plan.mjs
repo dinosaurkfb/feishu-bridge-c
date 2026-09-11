@@ -84,8 +84,11 @@ export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, le
   // ②c 对账待修项硬门（PK2-F5：从提交点搬进来 —— 从前 mutate 先判一次、这里看不见，同一事实两套 reason）。
   //   注意顺序：blockers 先于 digest / ok / 身份。blocker 支的 ok 可能是 true（如 retired binding 被排除出投影，
   //   digest 两边都是空集），只有这一支拦得住「带着待修项切权威」。
+  //   why 带 code 列表（PK2-F9）：blocker code 是**封闭枚举**（不带 binding/路径明文），操作员靠它知道该清哪一类；
+  //   铸 plan 前那道硬门与 doctor ⑭ 也这么报 —— 信息量只放这一处，不在调用方再拼第二份。
   if ((reconcile?.cutover_blockers?.length ?? 0) > 0) {
-    return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + reconcile.cutover_blockers.length + " 条）" };
+    const codes = reconcile.cutover_blockers.map((b) => b?.code ?? "unknown").join("、");
+    return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + reconcile.cutover_blockers.length + " 条：" + codes + "）" };
   }
   // ③
   if (plan.ledger.revision !== ledgerStep?.before?.revision || plan.ledger.sha256 !== ledgerStep?.before?.ledger_sha256) {

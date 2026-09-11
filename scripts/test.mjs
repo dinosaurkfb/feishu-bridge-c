@@ -50276,6 +50276,33 @@ test("R69 T3 提交后崩溃（intended_after 场景）：不重写、只补 ste
   } finally { f.cleanup(); }
 });
 
+// PK2-F9：converge 二次重验的 blockers 不再手写短路 —— 由 verifyCutoverPlan ②c 拦（唯一出处）。
+test("PK2-F9 converge 二次重验冒出待修项 → cutover_blocked（verifyCutoverPlan ②c，why 带 code 清单）、ledger step 不 done", () => {
+  const f = r69Fixture("f9");
+  try {
+    const EP = f.ep("f9");
+    { const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true }); assert.ok(init.phase === "done", "前置 init：" + JSON.stringify(init)); }
+    // 崩在第一条 sidecar 写完（converge 段内、rec2 之前）→ 接管 → staging 后向夹具登记表塞 retired 脏条目
+    //（投影出 cutover_blockers；digest 不变 —— retired 被排除出投影，只有 blockers 这一支拦得住）。
+    f.crashAt.id = "written:sidecar:expiry:" + EP;
+    try { LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true }); } catch { /* 崩住 */ }
+    f.crashAt.id = null;
+    const token = readActive({ dir: f.dir }).token;
+    f.takeover(token);
+    const proj = path.join(f.base, "proj-f9"); fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(f.bridge, "registry.json"), JSON.stringify({ projects: [
+      { root: proj, id: "p1", claude_session_id: "22222222-2222-4222-8222-222222222222", root_message_id: "om_" + "b".repeat(20), status: "retired" },
+    ] }, null, 2) + "\n", { mode: 0o600 });
+    const exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
+    assert.equal(exit.ok, false, "converge 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
+    assert.equal(exit.reason, "cutover_blocked", "拒因 cutover_blocked（②c，不再有手写短路）：" + JSON.stringify({ reason: exit.reason, why: exit.why }));
+    assert.match(String(exit.why ?? ""), /binding_retired/u, "why 带 blocker code 清单（信息量不降级）：" + exit.why);
+    const ls = f.journalOf(token).steps.find((x) => x.kind === "ledger");
+    assert.equal(ls.state, "prepared", "ledger step 不 done（停在 cutting_over）");
+    assert.equal(TAL.loadLedger(path.join(f.ledgerRoot, EP), { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
+  } finally { f.cleanup(); }
+});
+
 test("R69 T4a staging 后 legacy 变更 → 二次重验拒（bijection），停在 cutting_over 且账本未翻转", () => {
   const f = r69Fixture("t4a");
   try {

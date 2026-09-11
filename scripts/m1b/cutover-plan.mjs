@@ -85,7 +85,9 @@ export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, le
   //   注意顺序：blockers 先于 digest / ok / 身份。blocker 支的 ok 可能是 true（如 retired binding 被排除出投影，
   //   digest 两边都是空集），只有这一支拦得住「带着待修项切权威」。
   if ((reconcile?.cutover_blockers?.length ?? 0) > 0) {
-    return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + reconcile.cutover_blockers.length + " 条）" };
+    // PK2-F9：why 带 blocker code 清单 —— 原先 convergeSidecars 手写短路的同量信息收编到这一处（唯一出处）。
+    return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + reconcile.cutover_blockers.length + " 条："
+      + reconcile.cutover_blockers.map((b) => b.code).join("、") + "）" };
   }
   // ③
   if (plan.ledger.revision !== ledgerStep?.before?.revision || plan.ledger.sha256 !== ledgerStep?.before?.ledger_sha256) {

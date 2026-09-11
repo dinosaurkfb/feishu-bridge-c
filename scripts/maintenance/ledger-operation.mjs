@@ -287,10 +287,9 @@ function convergeSidecars(ctx, { token, lease, gateFile, env, endpointId, chain,
   if (!pb.ok) return { ok: false, reason: "staged_plan_unreadable", why: pb.why ?? pb.reason };
   const rec2 = prepareFor({ ctx, chain, endpointId, ledgerDir, env });
   if (!rec2.ok) return { ok: false, reason: rec2.reason, why: rec2.why ?? null };
-  // P1-4：二次重验同样过 blockers 硬门——staging 后清了项又冒出新待修项（或 staging 本就不该过）都在这里拦。
-  if (rec2.cutover_blockers.length > 0) {
-    return { ok: false, reason: "cutover_blocked", why: "二次重验发现待修项（" + rec2.cutover_blockers.length + " 条：" + rec2.cutover_blockers.map((b) => b.code).join("、") + "）" };
-  }
+  // PK2-F9：blockers 不在这里手写短路 —— 与模块注释一致，二次重验的拒因**只从 verifier 取**
+  // （verifyCutoverPlan ②c：reconcile.cutover_blockers 非空 → cutover_blocked，why 带 code 清单）。
+  // staging 前那道 planOf 硬门不动：它在铸 plan 之前，verifier 那时还没有 plan 可核，不是重复。
   // 账本 CAS：重验时刻的活读（M1a 对账返回不带账本身份，CAS 由编排器供）。
   const L2 = loadLedger(ledgerDir, { endpointId });
   if (!L2.ok) return { ok: false, reason: L2.reason, why: L2.why ?? null };

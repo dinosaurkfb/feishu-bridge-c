@@ -30363,6 +30363,84 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
     }
   });
+
+  // PK2-F1：doctor ⑭ 的模板必须认 FEISHU_BRIDGE_CHAIN_TEMPLATE 覆盖（与 cutover / chain-template 同一覆盖表达式）。
+  // 判据是行为不是路径探针：账本种子按 alt 模板的 chat_id —— 对账读到哪份模板，投影 chat_id 就跟哪份走；
+  // 读对 alt → 双射一致绿；错用 home 那份 → chat_id 字段不等红。刀口：doctor 改回纯 home 路径 → 上半段红。
+  test("PK2-F1 doctor ⑭ 认 FEISHU_BRIDGE_CHAIN_TEMPLATE 覆盖：设 → 对账用 alt；不设 → home 那份", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "m1a-doctor-tpl-"));
+    const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+      execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
+    }
+    const node = pickClaudeNodeB();
+    const claudeLabel = "com.frank.feishu-bridge-cc.drain";
+    const launchd = { [claudeLabel]: { loaded: true, args: [...claudeDrainExpectedJobB({ home, node }).args] } };
+    const fakeLaunchctl = (args) => {
+      if (args[0] === "list") { const st = launchd[args[1]]; if (!st?.loaded) return { ok: false, detail: "Could not find service \"" + args[1] + "\" in domain" }; return { ok: true, stdout: "{\n\t\"ProgramArguments\" = (\n" + st.args.map((a) => "\t\t\"" + a + "\";").join("\n") + "\n\t);\n};\n" }; }
+      if (args[0] === "bootout") { const label = args[1].split("/").pop(); const st = launchd[label]; if (!st?.loaded) return { ok: false, detail: "Could not find service" }; st.loaded = false; return { ok: true, stdout: "" }; }
+      if (args[0] === "bootstrap") { const xml = fs.readFileSync(args[2], "utf-8"); const label = /<key>Label<\/key>\s*<string>([^<]+)<\/string>/u.exec(xml)[1]; const arr = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(xml)[1]; const a2 = [...arr.matchAll(/<string>([^<]*)<\/string>/gu)].map((m) => m[1]); launchd[label] = { loaded: true, args: a2 }; return { ok: true, stdout: "" }; }
+      return { ok: false, detail: "unknown" };
+    };
+    const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
+    const gateFile = path.join(base, "maintenance.gate"); const dir = path.join(base, "maintenance");
+    let clock = Date.parse("2026-08-31T12:00:00.000Z");
+    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node,
+      launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000 });
+    const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m1a-doctor-tpl-ledger-")));
+    const savedTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE;
+    const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    const savedGate = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
+    const savedMaintDir = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
+    const savedRegistry = process.env.FEISHU_BRIDGE_REGISTRY;
+    const d14 = () => { const rep = runDoctor({ home }); const c = rep.checks.find((x) => x.id === "m1a_shadow_reconcile"); assert.ok(c, "⑭ 在场"); return c; };
+    try {
+      // home 那份（CHAT1）与 alt 覆盖（CHAT2）内容不同：对账读到哪份模板，投影 chat_id 就跟哪份走。
+      const tplHome = writeTpl(home);
+      const CHAT2 = "oc_" + "f".repeat(32);
+      const altFile = path.join(base, "alt", "chain-config.json");
+      fs.mkdirSync(path.dirname(altFile), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(altFile, JSON.stringify({ ...tplHome.tpl, chat_id: CHAT2 }, null, 2) + "\n", { mode: 0o600 });
+      const proj = path.join(home, "pk2f1-proj");
+      fs.mkdirSync(proj, { recursive: true, mode: 0o700 });
+      process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = altFile;
+      process.env.FEISHU_BRIDGE_REGISTRY = writeRegistry(home, [{ root: proj, id: "p1", claude_session_id: UUID1 }]);
+      writeMapping(proj, MAPPING());
+      const EPt = legacyEndpointId({ runtime: "claude", agentUid: "agent_pk2f1" });
+      assert.ok(LEDGER_OP.ledgerEnter(ctx, { kind: "init", endpointId: EPt, chain: "claude", apply: true }).ok, "真 init 收据");
+      // 账本种子按 alt 的 chat_id（CHAT2）：用 alt → 双射一致绿；错用 home（CHAT1）→ chat_id 字段不等红。
+      const iso = "2026-08-01T00:00:00.000Z";
+      const seeded = TAL.seedRecords({ endpointId: EPt, requestKey: "req_pk2f1_seed", candidates: [{
+        kind: "live",
+        topic_agent_id: topicAgentIdForLegacy(EPt, "p1@registry", "g1"), chat_id: CHAT2,
+        aliases: { session_id: "sess_u1", root_om: OM1 },
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        binding_target: { runtime: "claude", project_root: proj, claude_session_id: UUID1 },
+        binding_proof: { kind: "pairing", authorized_by: "ou_o", authorized_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+        locator_link_proof_ref: { kind: "pairing_merge", by_identity: "user", matched_at: iso, matched_om: OM1, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+        anchor_candidate: null, generation_lineage_id: "p1@registry" }] });
+      assert.ok(seeded.ok, "账本种子成立：" + JSON.stringify(seeded).slice(0, 300));
+      // 设覆盖 → 对账用 alt（CHAT2 对上账本 → 一致绿）。刀口：doctor 改回纯 home 路径 → 这里红。
+      const viaAlt = d14();
+      assert.equal(viaAlt.ok, true, "覆盖 → 对账用 alt：" + JSON.stringify(viaAlt));
+      assert.match(viaAlt.detail, /一致/u, "点名一致：" + viaAlt.detail);
+      // 对照：不设覆盖 → 用 home 那份（CHAT1 ≠ 账本 CHAT2 → 双射红）。
+      delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE;
+      const viaHome = d14();
+      assert.equal(viaHome.ok, false, "无覆盖 → 对账用 home 那份（chat 不等 → 红）：" + JSON.stringify(viaHome));
+      assert.match(viaHome.detail, /双射不成立/u, "点名双射不成立：" + viaHome.detail);
+    } finally {
+      if (savedTpl === undefined) delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; else process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = savedTpl;
+      if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
+      if (savedGate === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; else process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = savedGate;
+      if (savedMaintDir === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = savedMaintDir;
+      if (savedRegistry === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY; else process.env.FEISHU_BRIDGE_REGISTRY = savedRegistry;
+      fs.rmSync(base, { recursive: true, force: true }); fs.rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  });
 }
 
   test("policy-store #R31：ipsp-1 封闭校验器逐支 + policy.json 原语 fail-closed + subject 派生碰撞域", () => {

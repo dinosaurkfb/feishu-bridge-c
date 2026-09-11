@@ -6,11 +6,20 @@
  *
  *   ① plan.operation_token === doc.token；plan.endpoint_id === 受验账本顶层 endpoint_id
  *   ② 每个 sidecar：plan.sidecars[name].sha256 === step.intended_blob.sha256 === step.intended_after.sha256
+ *   ②b 现场 sidecar（`currentSidecars`，调用方 fd 受验读出的值）：三键 SHA === plan.sidecars[*].sha256
+ *   ②c reconcile.cutover_blockers 非空 → cutover_blocked
  *   ③ plan.ledger === ledgerStep.before（首次 reconciler 的账本身份）
  *   ④ plan.digest === ledgerStep.intended_after.bijection_digest
  *      === reconcile.digest；canonKey(reconcile.snapshot_identity) === canonKey(plan.snapshot_identity)；
- *      reconcile.ledger === plan.ledger（同快照同 revision 重验四件相等）
+ *      reconcile.ledger === plan.ledger（同快照同 revision 重验四件相等）；reconcile.ok 非 true → 拒
  *   ⑤ ledgerStep.intended_after.plan_sha256 === sha256(planBytes)
+ *
+ * **封闭理由码表（唯一的 reason 出处，PK2-F5）**：plan_bytes_missing / plan_shape / not_a_cutover / token_mismatch /
+ * endpoint_mismatch / sidecar_sha_mismatch（②锚、②b 现场、②c 之后的现场读数形状）/ cutover_blocked /
+ * ledger_identity_mismatch（③ 与 ④ 的账本 CAS）/ digest_mismatch / reconcile_not_ok / snapshot_identity_mismatch /
+ * sidecar_reconcile_mismatch / plan_anchor_mismatch / endpoint_cross_mismatch。
+ * 提交点（`authorityCutover` 的 mutate）与门内二次重验（`convergeSidecars`）都只能从这份表里拿到拒因，
+ * 不许另立同义不同名的第二套。
  *
  *   4f 五源 endpoint 相等：受验账本顶层 endpoint_id（①）、蓝图 fingerprint 输入
  *   endpoint_id、ledger step（id/target）、三条 sidecar step 的 id/target（target 按
@@ -18,14 +27,24 @@
  *
  * 纯校验：只读入参，不做 IO。plan 自身形状经 planProblem（读侧不信任 staged 写面）；
  * journal / staged blob 的自身形状归 readJournal / verifyStagedPlan，这里只核**交叉**等式。
+ *
+ * **一个出处（PK2-F5）**：cutover 提交点的全部交叉等式只在这一个函数里（包括现场 sidecar 与 blockers 硬门）。
+ * 从前 `authorityCutover` 的 mutate 在调本函数之前又手写了三段同等式短路（pre-SHA / blockers / 现场 sidecar），
+ * 同一事实两套判据、两套 reason，改一处漏一处（R69 一轮/二轮各中一次）。现场读盘归调用方（本函数收值不收路径）：
+ * IO 在提交点一处，判据在这里一处。
  */
 import { createHash } from "node:crypto";
 import { canonKey, fingerprintOf } from "../topic-agent-ledger.mjs";
 import { planProblem } from "./staged-plan.mjs";
 
-const SIDE_CAR_PAIRS = [["expiry", "expiry"], ["pending_claims", "pending-claims"], ["policy", "policy"]];
+/** 三条 sidecar：`key` = plan.sidecars 的键，`fileBase` = journal step 名与盘上文件名。
+ *  导出给调用方拼 `currentSidecars` 与读盘文件名 —— 键↔文件名的映射也只有这一份（PK2-F5）。 */
+export const SIDE_CAR_PAIRS = Object.freeze([["expiry", "expiry"], ["pending_claims", "pending-claims"], ["policy", "policy"]]);
 
-export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, ledgerEndpointId, reconcile }) {
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const SHA_SHAPE = /^[0-9a-f]{64}$/u;
+
+export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, ledgerEndpointId, reconcile, currentSidecars }) {
   if (!(planBytes instanceof Uint8Array) || planBytes.length === 0) return { ok: false, reason: "plan_bytes_missing" };
   const planSha = createHash("sha256").update(planBytes).digest("hex");
   let plan;
@@ -39,12 +58,34 @@ export function verifyCutoverPlan({ planBytes, doc, ledgerStep, sidecarSteps, le
   if (plan.endpoint_id !== ledgerEndpointId) return { ok: false, reason: "endpoint_mismatch" };
   // ②
   const steps = Array.isArray(sidecarSteps) ? sidecarSteps : [];
+  // 现场读数（②b）缺席 / 不是一个对象 → 当场拒（fail-closed）：这是提交点必供的一项，
+  // 不给「忘了传就静默跳过」留口。
+  if (!isObj(currentSidecars)) {
+    return { ok: false, reason: "sidecar_sha_mismatch", why: "缺现场 sidecar 读数（currentSidecars：fd 受验读出的三条现场 SHA）" };
+  }
   for (const [key, fileBase] of SIDE_CAR_PAIRS) {
     const st = steps.find((s) => s?.id === "sidecar:" + fileBase + ":" + plan.endpoint_id);
     if (!st) return { ok: false, reason: "sidecar_sha_mismatch", why: "缺 " + fileBase + " 的 sidecar step" };
     if (plan.sidecars[key].sha256 !== st.intended_blob?.sha256 || plan.sidecars[key].sha256 !== st.intended_after?.sha256) {
       return { ok: false, reason: "sidecar_sha_mismatch", why: fileBase };
     }
+    // ②b：盘上那份现场的 SHA === plan 锚。②的两侧都是冻结值（staged plan 字节 / journal step），
+    //   **看不见盘上第三份** —— 这一支才是「拿旧 sidecar 切权威」的封口。
+    const cur = currentSidecars[key];
+    if (!(isObj(cur) && cur.present === true && cur.problem === undefined
+      && typeof cur.sha256 === "string" && SHA_SHAPE.test(cur.sha256))) {
+      return { ok: false, reason: "sidecar_sha_mismatch",
+        why: fileBase + ".json 现场读数不合法（" + (!isObj(cur) || cur.present !== true ? "缺席" : (cur.problem !== undefined ? String(cur.problem) : "无可用 SHA")) + "）" };
+    }
+    if (cur.sha256 !== plan.sidecars[key].sha256) {
+      return { ok: false, reason: "sidecar_sha_mismatch", why: fileBase + ".json 现场 SHA 与 plan 锚不一致" };
+    }
+  }
+  // ②c 对账待修项硬门（PK2-F5：从提交点搬进来 —— 从前 mutate 先判一次、这里看不见，同一事实两套 reason）。
+  //   注意顺序：blockers 先于 digest / ok / 身份。blocker 支的 ok 可能是 true（如 retired binding 被排除出投影，
+  //   digest 两边都是空集），只有这一支拦得住「带着待修项切权威」。
+  if ((reconcile?.cutover_blockers?.length ?? 0) > 0) {
+    return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + reconcile.cutover_blockers.length + " 条）" };
   }
   // ③
   if (plan.ledger.revision !== ledgerStep?.before?.revision || plan.ledger.sha256 !== ledgerStep?.before?.ledger_sha256) {

@@ -30,7 +30,7 @@ import { switchCurrentTarget } from "../runtime-install.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "../m1a/legacy-snapshot.mjs";
 import { prepareLegacyCutoverEndpoint, reconcileLegacyEndpoint } from "../m1a/reconcile.mjs";
 import { readStagedVerified, removeStagedPlan, stageBackupFiles, stageCutoverPlan, stagedIntendedFile } from "../m1b/staged-plan.mjs";
-import { verifyCutoverPlan } from "../m1b/cutover-plan.mjs";
+import { verifyCutoverPlan, SIDE_CAR_PAIRS } from "../m1b/cutover-plan.mjs";
 import { chainFacts } from "./precheck.mjs";
 import { removeStubVersion } from "./stub.mjs";
 import { bootstrapTimer, timerPhase } from "./timers.mjs";
@@ -294,7 +294,9 @@ function convergeSidecars(ctx, { token, lease, gateFile, env, endpointId, chain,
   // 账本 CAS：重验时刻的活读（M1a 对账返回不带账本身份，CAS 由编排器供）。
   const L2 = loadLedger(ledgerDir, { endpointId });
   if (!L2.ok) return { ok: false, reason: L2.reason, why: L2.why ?? null };
-  const v = verifyCutoverPlan({ planBytes: pb.buf, doc, ledgerStep: ls, sidecarSteps, ledgerEndpointId: endpointId, reconcile: { ...rec2, ledger: { revision: L2.doc.revision, sha256: L2.sha256 } } });
+  // PK2-F5：现场 sidecar 读数由调用方供（本函数刚铸写它们，同一 fd 受验读法）——判据在 verifyCutoverPlan 一处。
+  const currentSidecars = Object.fromEntries(SIDE_CAR_PAIRS.map(([key, base]) => [key, readSidecarCurrent(path.join(ledgerDir, base + ".json"))]));
+  const v = verifyCutoverPlan({ planBytes: pb.buf, doc, ledgerStep: ls, sidecarSteps, ledgerEndpointId: endpointId, currentSidecars, reconcile: { ...rec2, ledger: { revision: L2.doc.revision, sha256: L2.sha256 } } });
   if (!v.ok) return { ok: false, reason: v.reason, why: v.why ?? null };
   return { ok: true, planSha };
 }

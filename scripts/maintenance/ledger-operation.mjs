@@ -52,7 +52,7 @@ const readlinkOrNull = (p) => { try { return { state: "value", value: fs.readlin
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
 // capability 只携带身份（token/kind/endpointId）；维护目录 / 门位置由 verifier 从 env 派生（评审 F1），不写自述路径
-const capabilityOf = (ctx, token, kind, endpointId) => ({ token, kind, endpointId });
+const capabilityOf = (ctx, token, kind, endpointId, extras = {}) => ({ token, kind, endpointId, ...extras });
 // 评审 P1-8：释放失败不许静默吞（release() 自身已包 try/catch，这里只兜“非函数 / 意外抛错”，失败如实报出）。
 const releaseSurface = (surface) => {
   if (typeof surface?.release !== "function") return { ok: true };
@@ -167,7 +167,6 @@ function planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env }) {
   if (kind === "init") return initPlan({ endpointId, chain, requestKey, operationId: token });
   const L1 = loadLedger(ledgerDir, { endpointId });
   if (!L1.ok) return { ok: false, reason: L1.reason, why: L1.why ?? null };
-  if (L1.doc.authority_mode !== "shadow") return { ok: false, reason: "not_shadow", why: "切权威前置要求 shadow（实际 " + L1.doc.authority_mode + "）" };
   const rec = prepareFor({ ctx, chain, endpointId, ledgerDir, env });
   if (!rec.ok) return { ok: false, reason: rec.reason, why: rec.why ?? (rec.mismatches ? "双射不等（" + rec.mismatches.length + " 条）" : null) };
   // 对账期间账本被旁路改写（revision / 整文件 SHA 任一变）→ 蓝图作废，fail-closed。
@@ -198,7 +197,8 @@ function doWrite(ctx, { token, kind, endpointId, chain, ledgerDir, env, _inject 
   // P2-2：planOf 接 ctx/env——env 注入（registry 路径等）在 planOf 内的 reconcileFor 同样生效。
   const plan = planOf({ kind, endpointId, chain, token, ledgerDir, ctx, env });
   if (!plan.ok) return plan;
-  const cap = capabilityOf(ctx, token, kind === "init" ? "initialize_shadow" : "authority_cutover", endpointId);
+  const cap = capabilityOf(ctx, token, kind === "init" ? "initialize_shadow" : "authority_cutover", endpointId,
+    kind === "cutover" ? { reconcile: () => reconcileFor({ ctx, chain, endpointId, ledgerDir, env }) } : {});
   return kind === "init"
     ? initializeShadow({ endpointId, capability: cap, requestKey, chain, env, _inject })
     : authorityCutover({ endpointId, capability: cap, requestKey, chain, env, _inject });
@@ -396,9 +396,8 @@ export function ledgerForward(ctx, { token, lease, intent = null, env = process.
           // R45 复合提交：①三条 sidecar 窄写 + ②门内二次重验（都过才到提交点）。
           const cv = convergeSidecars(ctx, { token, lease, gateFile: ctx.gateFile, env, endpointId, chain, ledgerDir: d.dir, doc, ls });
           if (!cv.ok) return { ok: false, reason: cv.reason, why: cv.why ?? null, phase, lockUncleared: cv.lockUncleared ?? null };
-          // 唯一提交点 authority_cutover：本单只武装到提交前（capability 门与真翻转账本归 M1b 后续单），停在门内。
-          return { ok: false, reason: "authority_cutover_not_armed", why: "sidecar 已收敛、二次重验已过；authority_cutover 提交点未武装，停在 ledger_cutting_over", phase };
         }
+        // R69：唯一提交点已武装 —— cutover 在 sidecar 收敛 + 二次重验通过后提交（4c 在账本锁内复核），随后同 init 收口。
         const wr = doWrite(ctx, { token, kind: sub, endpointId, chain, ledgerDir: d.dir, env, _inject });
         if (!wr.ok) return { ok: false, reason: wr.reason, why: wr.why ?? null, phase, commit: wr.commit ?? "not_committed", residue: wr.residue ?? null, lockUncleared: wr.lockUncleared ?? null };
         // 评审 P1-5：只有 committed_clean 才视为可推进；committed_with_residue / committed_durability_uncertain 保留门+active，退出码 3。

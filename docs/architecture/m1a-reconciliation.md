@@ -181,6 +181,10 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
    reconciler**；只接受同一 ledger before revision/SHA 上的**完整 cutover plan 联合**
    （4e 定义；仅 {ok:true,digest} 的窄结果不足以翻转）；snapshot_moved 或 digest 改变均不得
    翻转 authority_mode。
+   **提交点已武装（R69，M1b 收官）**：一次 `--apply` 覆盖进门→三条 sidecar→二次重验→提交→重开；
+   提交前 4c 四项（pre SHA CAS / 重新对账 digest / 三 sidecar 现场 SHA / 蓝图验证）在账本锁内
+   由 `authorityCutover` 的 mutate 逐项复核；对账来源只经受验 capability 携带（与 prepareFor 同一
+   adapter 闭包），不接调用方裸注入、不回退恒拒占位。
 4e. **sidecar 封闭 schema 与确定性 renderer（十二轮 P1 定稿）**：
    三个 renderer 共同输入 = **同一冻结 legacy snapshot + §3 期望集 E**；输出 = 规范字节
    `JSON.stringify(stable(doc), null, 2) + "\n"`（stable = canonKey 同源键排序递归）；
@@ -410,5 +414,5 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 ## 9. 排期影响
 
 - **新前置块 = v2 policy store 抽取**（§4；T3 之后、M1b 之前；含读写方迁移与 cutover step 接线）；
-- cutover 复合事务（§4.1）扩展 R16 编排——归 T4/M1b；
+- cutover 复合事务（§4.1）已接 R45/R69 编排（提交点已武装）；
 - T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v14 为合同。

@@ -21,7 +21,7 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { CUTOVER_JOURNAL_SCHEMA, JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
 import { campaignIdFor } from "./maintenance/owner-select-derived.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
@@ -30,6 +30,7 @@ export { canonKey, sha256 };
 // R57b 返修六 P2：形状常量下沉到叶子 scripts/shapes.mjs（selection-plan 与账本共用，不各写一份）。
 import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE } from "./shapes.mjs";
 import { SIDECAR_TMP_TAIL_RE } from "./verified-sidecar.mjs";
+import { readSidecarCurrent } from "./maintenance/sidecar-writer.mjs"; // R69：4c-3 与 converge 同一 fd 受验读
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -2428,6 +2429,8 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   const wantKind = isOsm ? null : opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
   const wantPhase = isOsm ? null : opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
   const wantSub = isOsm ? null : opType === "initialize_shadow" ? "init" : "cutover";
+  // R69：cutover 的 journal 是 1.3（含 sidecar steps 家族）——未武装时代该支不可达，武装后这是必经核验。
+  const wantJournalSchema = isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : wantSub === "cutover" ? CUTOVER_JOURNAL_SCHEMA : JOURNAL_SCHEMA;
   const { token } = capability;
   // 维护目录 / 门位置一律从环境派生（评审 F1）：capability 只带 token/kind/endpointId，不信任其自述路径
   const maintDir = maintenanceDir(env);
@@ -2441,7 +2444,7 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   if (active.token !== token) return fail("operation_token_mismatch", "active 指向的 token 与 capability 不一致");
   const j = readJournal({ dir: maintDir, token });
   if (j.state !== "valid") return fail("journal_unreadable", "journal " + j.state + (j.why ? "：" + j.why : ""));
-  if (j.doc.schema_version !== (isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : JOURNAL_SCHEMA)) return fail("journal_schema", "journal 不是 " + (isOsm ? OWNER_SELECT_JOURNAL_SCHEMA : JOURNAL_SCHEMA));
+  if (j.doc.schema_version !== wantJournalSchema) return fail("journal_schema", "journal 不是 " + wantJournalSchema);
   // 门 + 租约共用核（init/cutover 与 owner_select 迁移同一段；原地提取不改顺序与语义）。
   const gateLeaseProblem = () => {
     const gate = readGate({ file: gateFile, now: Date.now() });
@@ -2532,11 +2535,17 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   // 评审 P1-3：WAL 所有权转换后 reap 锁残骸没收干净（收成 reapUncleared 挂在 binding 上）→ fail-closed 拒写，不许带着残骸继续落盘。
   if (binding.reapUncleared) return fail("lease_reap_uncleared", "WAL 所有权转换后 reap 残骸未清（" + (binding.reapUncleared.path ?? "?") + "）");
   if (!binding.run.ok) return fail("plan_rebuild", binding.run.reason + (binding.run.why !== undefined ? "：" + binding.run.why : ""));
-  return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls, plan: binding.run.plan };
+  // R69：cutover 的对账来源只经受验 capability 携带（与 prepareFor 同一 adapter 闭包，由维护层构造）——
+  //   不接调用方裸注入、不回退恒拒占位。形状校验在此封闭：非函数 → 拒；其余字段集不变。
+  if (wantSub === "cutover" && typeof capability.reconcile !== "function") {
+    return fail("maintenance_capability_required", "cutover capability 必须携带受验对账闭包 reconcile（R69：对账来源只经受验 capability 携带）");
+  }
+  return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls, plan: binding.run.plan,
+    ...(wantSub === "cutover" ? { reconcile: capability.reconcile, sidecarShas } : {}) };
 }
 
 /** 由 journal 里已落盘的 ledger step 幂等重建 WAL 蓝图（P1-3：不接受调用方任意 planIn）。 */
-function rebuildPlanFromStep({ endpointId, chain, token, ledgerDir, step }) {
+function rebuildPlanFromStep({ endpointId, chain, token, ledgerDir, step, sidecarShas }) {
   const sub = step.id.endsWith(":init") ? "init" : "cutover";
   if (sub === "init") return initPlan({ endpointId, chain, requestKey: token, operationId: token });
   const L = loadLedger(ledgerDir, { endpointId });
@@ -2759,14 +2768,12 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   if (!loaded.ok) return { ok: false, commit: "not_committed", reason: loaded.reason, why: loaded.why ?? null };
   if (loaded.doc.authority_mode !== "shadow") return { ok: false, commit: "not_committed", reason: "mode_not_shadow", why: "authority_mode=" + loaded.doc.authority_mode };
   if (loaded.doc.chain !== chain) return { ok: false, commit: "not_committed", reason: "chain_mismatch", why: "账本 chain 与入参不符" };
-  // 评审 P1-4：cutover 不接调用方注入的 reconciler——真对账未接，恒 fail-closed（reconciler_absent），不许测试/旁路自行对账。
-  const rec = reconcileShadow({ endpointId, shadowDoc: loaded.doc });
-  if (!rec.ok) return { ok: false, commit: "not_committed", reason: "reconciler_absent", why: rec.why };
-  // 评审 P2：T4 蓝图验证独立于 T3a 对账门——一个函数只做一件事，不再把 digest 形状检查与 plan 绑定混在手写块里。
-  const t4 = cutoverPlanVerifier(plan, rec.digest, endpointId);
-  if (!t4.ok) return { ok: false, commit: "not_committed", reason: t4.reason, why: t4.why };
-  // P1-6：重放输入从蓝图 result 派生七键封闭集（与 fingerprintOf 的键一致）——复合升级的幂等重放
-  // 不能只对三键，否则换 sidecar 锚的重放会被误认成同一笔。
+  // R69：4c 跨制品绑定核验（§4.1）移入 writeLedger 的 mutate —— 持账本锁内、翻转前逐项核：
+  //   ① pre SHA/revision CAS；② 重新对账（capability.reconcile，同一 adapter）ok + blockers 空 + digest 等蓝图；
+  //   ③ 三 sidecar 现场 SHA 等锚（fd 受验读，与 converge 同一读法）；④ cutoverPlanVerifier 过。
+  //   任一不等 → not_committed，reason：pre_sha_mismatch / bijection_digest_mismatch / sidecar_sha_mismatch / plan_mismatch。
+  //   旧 reconcileShadow 恒拒占位不再在生产路径使用（保留仅作单元被钉）。
+  // R69：蓝图 result（七键封闭）在重建 plan 内，提交点各核验与重放输入都从它取。
   const cutResult = plan.doc?.operations?.[plan.operationId]?.result ?? null;
   if (!isObj(cutResult)) return { ok: false, commit: "not_committed", reason: "plan_rebuild", why: "蓝图里没有 cutover operation result" };
   const res = writeLedger({
@@ -2781,6 +2788,24 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
       if (currentDoc.authority_mode !== "shadow") return { ok: false, reason: "mode_not_shadow" };
       if (Object.values(currentDoc.operations).some((op) => op.op_type === "authority_cutover")) return { ok: false, reason: "already_cutover" };
       if (currentDoc.revision !== plan.before.revision) return { ok: false, reason: "state_moved", why: "账本 revision 变过" };
+      // 4c-1：pre SHA CAS（账本字节与蓝图锚逐字）
+      if (sha256(serializeLedger(currentDoc)) !== cutResult.pre_cutover_ledger_sha) return { ok: false, reason: "pre_sha_mismatch", why: "账本 SHA 与蓝图 pre_cutover_ledger_sha 不一致（旁路改动？）" };
+      // 4c-2：重新对账（capability 携带的受验闭包）：ok + blockers 空 + digest 等蓝图
+      const rec = cap.reconcile();
+      if (!rec || !rec.ok) return { ok: false, reason: rec?.reason ?? "reconcile_failed", why: rec?.why ?? "对账器未返回成功" };
+      if ((rec.cutover_blockers?.length ?? 0) > 0) return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + rec.cutover_blockers.length + " 条）" };
+      if (rec.digest !== cutResult.bijection_digest) return { ok: false, reason: "bijection_digest_mismatch", why: "提交前对账 digest 与蓝图不一致（staging 后 legacy 变了）" };
+      // 4c-4：蓝图验证（与对账 digest 绑定）
+      const t4 = cutoverPlanVerifier(plan, rec.digest, endpointId);
+      if (!t4.ok) return { ok: false, reason: t4.reason, why: t4.why };
+      // 4c-3：三 sidecar 现场 SHA === 对应 sidecar step 锚（fd 受验读，与 converge 同一读法）
+      const sidecarFiles = [["expiry.json", "expiry"], ["pending-claims.json", "pending_claims"], ["policy.json", "policy"]];
+      for (const [fname, key] of sidecarFiles) {
+        const cur = readSidecarCurrent(path.join(d.dir, fname));
+        if (!cur.present || cur.problem !== undefined || cur.sha256 !== cap.sidecarShas[key]) {
+          return { ok: false, reason: "sidecar_sha_mismatch", why: fname + " 现场 SHA 与 sidecar step 锚不一致（" + (!cur.present ? "absent" : (cur.problem ?? "sha 不等")) + "）" };
+        }
+      }
       return { ok: true, next: plan.doc };
     },
   });

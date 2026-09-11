@@ -52855,6 +52855,82 @@ test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六�
       assert.ok(JSON.stringify(unc).includes("registry_lock_release_failed"), "回执点名释放失败：" + JSON.stringify(unc).slice(0, 320));
     } finally { x.f.cleanup(); }
   });
+
+  // ── PK2-W1-fix7（Codex #198 唯一 P1）：锁内预检对「登记表读不出」零写拒 ────────────────────
+  // `readRowsNow()` 旧版把**坏 JSON / 权限错 / 形状非法**全静默折成空表 —— 预检于是当"首跑"，
+  //   建话题 + create_b1 都落盘，最后才由 withRegistryTransaction 拒 → 同类型的半笔。
+  //   现：复用 `loadRegistryStrict`，**只有 ENOENT 算空表**，其余在 prepare 零写拒 `registry_unreadable`。
+  /** 零写快照：登记表/账本/两份 sidecar 的字节 + 账本目录条目 + 假 lark 调用条数。 */
+  const w7Snap = (x) => ({
+    reg: (() => { try { return fs.readFileSync(x.regFile); } catch { return null; } })(),
+    ledger: (() => { try { return fs.readFileSync(path.join(x.epDir, "ledger.json")); } catch { return null; } })(),
+    sidecars: ["pending-claims", "expiry", "policy"].map((n) => { try { return fs.readFileSync(x.sidecar(n)); } catch { return null; } }),
+    entries: fs.readdirSync(x.epDir).sort(),
+    calls: x.larkCalls().length,
+  });
+  /** 三条例例共用：锁内预检拒 → 零写（不建话题、不写账本/sidecar、不留 tmp）且回执点名。 */
+  const w7ExpectZeroWriteReject = (x, before, r, tag) => {
+    assert.notEqual(r.status, 0, tag + " → 拒：" + r.stdout + r.stderr);
+    assert.match(String(r.stderr), /registry_unreadable/u, tag + " 拒因点名 registry_unreadable：" + String(r.stderr).slice(0, 400));
+    assert.equal(x.larkCalls().length - before.calls, 0,
+      tag + "：createTopic 被调用 0 次（一个 lark 调用都没有）：" + JSON.stringify(x.larkCalls().slice(before.calls)));
+    const after = w7Snap(x);
+    assert.deepEqual(after.reg, before.reg, tag + "：登记表字节不变");
+    assert.deepEqual(after.ledger, before.ledger, tag + "：账本字节不变（不留半笔 B1）");
+    assert.deepEqual(after.sidecars, before.sidecars, tag + "：三份 sidecar 字节不变");
+    assert.deepEqual(after.entries, before.entries, tag + "：账本目录条目不变（尤其不许留锁/tmp 残骸）：" + JSON.stringify(after.entries));
+  };
+
+  test("PK2-W1-fix7 T26 锁内预检：登记表**坏 JSON** → 零写拒 registry_unreadable（不许折成空表当首跑）", () => {
+    const x = w1Fixture("w7t26");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      fs.writeFileSync(x.regFile, "{ 这不是 JSON\n", { mode: 0o600 });
+      const before = w7Snap(x);
+      w7ExpectZeroWriteReject(x, before, w1Bind(x, env), "坏 JSON");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1-fix7 T27 锁内预检：登记表**读不出**（权限 0000 / 路径换成目录）→ 零写拒 registry_unreadable", () => {
+    const x = w1Fixture("w7t27");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const good = fs.readFileSync(x.regFile);
+      // ① 权限 0000（root 不受权限约束，那一支跳过并明说）
+      if (process.getuid?.() !== 0) {
+        fs.chmodSync(x.regFile, 0o000);
+        try {
+          const r = w1Bind(x, env);
+          w7ExpectZeroWriteReject(x, w7Snap(x), r, "权限 0000");
+        } finally { fs.chmodSync(x.regFile, 0o600); }
+      }
+      // ② 读错（路径被换成目录 → EISDIR）：与 uid 无关，root 下也成立 —— 根因是「非 ENOENT 的读错」
+      fs.rmSync(x.regFile);
+      fs.mkdirSync(x.regFile);
+      const before = w7Snap(x);
+      w7ExpectZeroWriteReject(x, before, w1Bind(x, env), "读错 EISDIR");
+      assert.deepEqual(fs.readdirSync(x.regFile), [], "（目录原样，不被当文件盖掉）");
+      fs.rmdirSync(x.regFile);
+      fs.writeFileSync(x.regFile, good, { mode: 0o600 });
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1-fix7 T28 回归钉：登记表**不存在**（ENOENT）算空表 → 首跑照常成功（不许把首跑也拒了）", () => {
+    const x = w1Fixture("w7t28");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      fs.rmSync(x.regFile); // 真首跑：登记表还没建
+      const r = w1Bind(x, env);
+      assert.equal(r.status, 0, "ENOENT = 空表 → 首跑照常成功：" + r.stdout + r.stderr);
+      const reg = x.registry();
+      assert.equal(reg.projects.length, 1, "首跑建了一行：" + JSON.stringify(reg.projects.map((p) => [p.id, p.claude_session_id])));
+      assert.equal(reg.projects[0].claude_session_id, W1_UUID_A, "就是这条会话：" + JSON.stringify(reg.projects[0].id));
+      const live = Object.values(x.ledger().records).filter((rec) => rec.kind === "live");
+      assert.equal(live.length, 1, "账本恰一条 live B1：" + JSON.stringify(Object.keys(x.ledger().records)));
+      assert.deepEqual([live[0].facts.binding, live[0].binding_target.claude_session_id], ["pending", W1_UUID_A], "B1 pending 且 target 对：" + JSON.stringify(live[0].facts));
+      assert.ok(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[live[0].topic_agent_id], "待认领条目照常写：" + JSON.stringify(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries));
+    } finally { x.f.cleanup(); }
+  });
 }
 
 sealSummary();

@@ -29,7 +29,7 @@ import path from "node:path";
 
 import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
-import { registryPath } from "./registry.mjs";
+import { loadRegistryStrict, registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
@@ -298,15 +298,25 @@ const frozenRowProblem = (row) => {
   return null;
 };
 
-/** 锁内**新鲜读**整份登记表（不用启动时那份快照 —— P1-A 的起点）。读不出就当没有（首跑）。 */
+/** 锁内**新鲜读**整份登记表（不用启动时那份快照 —— P1-A 的起点）。
+ *  PK2-W1-fix7 P1：复用 `loadRegistryStrict` ——**只有 ENOENT 算空表**；坏 JSON / 权限错 / 形状非法都是
+ *  「现场说不清」，**不许静默折成空表**：折了预检就看不见任何行 → 当首跑继续建话题 + create_b1，
+ *  最后才被 withRegistryTransaction 拒 —— 那正是本单要收掉的半笔（Codex #198 唯一 P1）。
+ *  返回 `{ok:true, rows, missing}` 或 `{ok:false, reason, why}`（调用方自己决定怎么处置）。 */
 const readRowsNow = () => {
-  try {
-    const fresh = JSON.parse(fs.readFileSync(regFile, "utf-8"));
-    return Array.isArray(fresh.projects) ? fresh.projects : [];
-  } catch { return []; }
+  const r = loadRegistryStrict(regFile);
+  if (r.ok !== true) {
+    return { ok: false, reason: r.reason ?? "unreadable", error: r.error ?? null,
+      why: "登记表读不出（" + String(r.reason ?? "unknown") + "）：" + String(r.error ?? "") };
+  }
+  return { ok: true, rows: r.projects ?? [], missing: r.missing === true };
 };
-/** 锁内新鲜读**本会话**那一行（读不出就返 null）。 */
-const readRowNow = () => readRowsNow().find((p) => p?.claude_session_id === me.sessionId) ?? null;
+/** 锁内新鲜读**本会话**那一行。读不出 → `{ok:false,...}` 原样透传（调用方自己决定拒还是当预览素材）。 */
+const readRowNow = () => {
+  const r = readRowsNow();
+  if (r.ok !== true) return r;
+  return { ok: true, row: r.rows.find((p) => p?.claude_session_id === me.sessionId) ?? null, missing: r.missing === true };
+};
 
 /** 索引行查找面 + 「同 root+id、异会话」冲突判据 —— **唯一一处**：锁内预检（decideInLock）与写索引
  *  的 CAS 后盾（publishIndex）共用它，免得多一份判据漂移成两套。
@@ -332,7 +342,15 @@ const conflictWhy = (entry, hit) => "索引行 id（" + String(entry.id) + "）�
  * @returns {{ok:true, pendingToken:string, expiresAt:string}|{ok:false, reason:string, why:string}}
  */
 const decideInLock = () => {
-  const rowsNow = readRowsNow();
+  const rowsRead = readRowsNow();
+  // P1（fix7）：锁内预检**看不见现场**时不许往前走 —— 旧版把坏 JSON/权限错/非法形状静默折成空表，
+  //   于是判定成「首跑」、建话题与 create_b1 都落盘，最后才被 withRegistryTransaction 拒（留下半笔：
+  //   话题 + 账本 B1，重跑又撞同一张说不清的表）。零写拒绝，理由点名 registry_unreadable。
+  if (rowsRead.ok !== true) {
+    return { ok: false, reason: "registry_unreadable",
+      why: rowsRead.why + " —— 锁内预检不能在读不出登记表的情况下判冲突/首跑（零写：话题 / 账本 / sidecar 一个字节都没写）" };
+  }
+  const rowsNow = rowsRead.rows;
   const rowNow = rowsNow.find((p) => p?.claude_session_id === me.sessionId) ?? null;
   const firstRun = rowNow === null || !rowNow.root_message_id;
   // PK2-W1-fix6 P1：**异会话 root+id 冲突在锁内 prepare 阶段零写拒绝**。
@@ -462,7 +480,7 @@ if (writeRoute.mode === "authoritative" && wired.reason === "already_bound") {
     die("这条会话的绑定已完整，但排序锁没交还干净（" + lockState + "）—— 先 doctor",
       "不要重跑 apply；锁残骸要人工核对。");
   }
-  const rowNowBound = readRowNow();
+  const rowNowBound = readRowNow().row ?? null;
   console.log("这条会话已经绑过了，没有重复建话题。");
   console.log("  话题  " + String(rowNowBound?.root_message_id ?? already?.root_message_id ?? "?"));
   console.log("  入站  " + (rowNowBound?.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));

@@ -7979,6 +7979,44 @@ test("R60 返修三 P1：绊线根纳入不可变基线——根被删/根换外
   }
 });
 
+// PK2-F3：inode 漂移支的独立反例（Codex #152 四轮 P2，返修三只钉了缺席/symlink/chmod 三支，
+// 同路径同类型同 mode 但 inode 变了这支无用例 —— 把 dev/ino 那行改成 if(false) 套件仍绿）。
+test("PK2-F3 绊线根 dev/ino 漂移：原地 rename+重建（同 mode）必须点名原/现 dev:ino 且零删除；对照原地不动 → null", () => {
+  const tmpBase = fs.realpathSync(fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pk2f3-roots-")));
+  try {
+    // 反例：根目录 rename 走、原路径重新 mkdir（同 mode 0700）—— realpath 字符串/类型/mode 都不变，只有 inode 变。
+    {
+      const env1 = { HOME: path.join(tmpBase, "home1") };
+      const iso1 = installTestHomeIsolation({ env: env1, registerInvariants: false });
+      const ledgerRoot = iso1.tripwire().ledger;
+      assert.equal(iso1.checkRoots(), null, "初始根身份完整");
+
+      const sidecar = path.join(tmpBase, "renamed-away-ledger");
+      fs.renameSync(ledgerRoot, sidecar);
+      // 夹具只在根路径本身重建（包装器只拦根下建目录，根自身合法）；mkdirSync 受 umask，末了 chmodSync 钳准 0700。
+      fs.mkdirSync(ledgerRoot, { recursive: true });
+      fs.chmodSync(ledgerRoot, 0o0700);
+
+      const prob = iso1.checkRoots();
+      assert.match(String(prob), /绊线根 dev\/ino 发生变化/u, "同路径原地重建必须点名 dev/ino 漂移：" + prob);
+      assert.match(String(prob), /原 \d+:\d+，现 \d+:\d+/u, "点名原/现 dev:ino 数字：" + prob);
+      assert.match(String(prob), new RegExp(ledgerRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "点名具体根");
+      // 零删除：rename 走的旧目录（连同原有内容）仍在，cleanTree 也绝不能动它。
+      assert.equal(fs.statSync(sidecar).isDirectory(), true, "rename 走的旧目录仍在（零删除）");
+      assert.doesNotThrow(() => iso1.cleanTree(), "根身份漂移时 cleanTree 不报错");
+      assert.equal(fs.statSync(sidecar).isDirectory(), true, "cleanTree 后 rename 走的旧目录仍在");
+    }
+    // 对照：原地不动 → 根身份完整（null）。
+    {
+      const env2 = { HOME: path.join(tmpBase, "home2") };
+      const iso2 = installTestHomeIsolation({ env: env2, registerInvariants: false });
+      assert.equal(iso2.checkRoots(), null, "原地不动 → 根身份完整（null）");
+    }
+  } finally {
+    try { fs.rmSync(tmpBase, { recursive: true, force: true }); } catch {}
+  }
+});
+
 test("R60 返修三 P2：并发时 new Error 保留 cause 与原始 stack——失败信息含原断言位置", () => {
   const seen = [];
   const h = createTestHarness({

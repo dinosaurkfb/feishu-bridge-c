@@ -163,6 +163,28 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 
 处置表外字段承担路由语义 → `legacy_field_unmapped` 拒。
 
+### 4.0 cutover 之后（authoritative）：账本 + sidecar 是权威，登记表/mapping 降为**索引行**（M1B-W1）
+
+切权威之后写方仍要建新绑定、认领、轮转，但不能再用「legacy 是真、账本是镜像」那套双写假定。
+不变量（W1 起生效，写进代码注释与用例）：
+
+1. **权威事实 = 账本 + 三条 sidecar**（`ledger/<ep>/{expiry,pending-claims,policy}.json`）。
+   `binding_target`、认领 token、`expires_at`、policy 一律以它们为准；写入顺序固定为
+   **账本先、索引/sidecar 后**。
+2. **登记表 / active-mapping 只是索引行**：只有**仍被旧读方需要**的当前路由字段必须正确维护 ——
+   `root_message_id`、`chat_id`、`claude_session_id`，以及认领后的 `session_id` / `inbound_state` /
+   状态。索引行里的**同名字段是写入时快照**，只供尚未切换的读方过渡（I2 expiry / I3 pending-claims
+   切完之后不再被读）；它们**不再回写、不参与对账判定**（doctor 侧标注 legacy 冻结）。
+   出站与项目解析**不改读法**（仍读索引行的 `root_message_id`）。
+3. **索引写入必须锁内重读**（`withRegistryTransaction` 那类事务入口）：拿锁外快照整体写回，
+   会把并发那一笔的索引行盖掉。
+4. **账本已提交而后继（索引/sidecar）失败 = `committed_unclean`**：按**同一 request key 确定性幂等续跑**
+   （重跑同一条命令：话题幂等、`create_b1`/`activate` 重放命中、索引 upsert、sidecar 条目 upsert/删除幂等），
+   不新开 WAL；unclean 回执照写（不许只靠 doctor 点名）。
+5. **写方清单仍然封闭**：只有`wireBindAuthoritative`（会话级绑定）与`wirePromoteAuthoritative`
+   （pending B1 → active 的认领）两条具名复合走 authoritative；项目级绑定、换会话 rebind（W2）、
+   轮转/作废（W2）、暂停/恢复（W3）仍按 shadow 契约拒 `m1a_mode_not_shadow`。
+
 ### 4.1 复合切换事务（T4；维护 journal step 机制）
 
 1. 每 sidecar 一个 prepared step（`sidecar:expiry:<ep>` 等：before/intended SHA/备份落 journal）；

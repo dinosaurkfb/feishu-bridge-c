@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { projectMappingPath, resolveProject, selectBindingEntry } from "./project-resolve.mjs";
 import {
-  acquirePublishLock, registryPath, releasePublishLock,
+  acquirePublishLock, loadRegistryStrict, registryPath, releasePublishLock,
 } from "./registry.mjs";
 import {
   ROTATION_STATUS, closePendingTopicGeneration, failTopicRotation, materializeLegacyTopicFields, prepareTopicRotation, registerPendingTopicGeneration, recordTopicGenerationActivity, resolveMappingOutboundGeneration, topicGenerationStateForLegacy, markPendingClaimReminder, markPendingClaimReminderAbandoned, reserveClaimReminderAttempt, supersedeExpiredAndPrepareTopicRotation,
@@ -133,6 +133,64 @@ function mutateClaudeTopicBinding({
     return { ok: false, reason: "binding_unwritable", error: String(err.message).slice(0, 200) };
   } finally {
     releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * 登记表行的事务入口（PK2-W1）：**锁内重读 → mutate(reg) → 原子写**。
+ * 为什么必须有它：拿锁外那份快照写回去，并发的另一个写方就会被整体覆盖（两笔 bind 被 outer 串行后，
+ * 后一笔仍会用陈旧快照盖掉前一笔）。锁与 promoteBinding / topic-generation / interaction-policy 同族
+ * （`topicGenerationLockDir`），锁内一律不 exit/die，退出码与文案由调用方在锁外决定。
+ * mutant 返回 `{ok:true, …}` 才写盘；`{ok:true, skipWrite:true, …}` = 不需要写。
+ */
+export function withRegistryTransaction({ regFile = registryPath(), root = null, mutate }) {
+  const lockDir = topicGenerationLockDir({ source: "registry", registryFile: regFile });
+  if (lockDir === null) return { ok: false, kind: "busy", reason: "binding_source_unknown" };
+  const lock = acquirePublishLock(lockDir);
+  // kind 是调用方（bind-project 的四条 die 分支）的措辞依据：只有"别人正拿着"才是 busy，
+  // 锁目录不可写之类的 I/O 错误原样报出去（曾被折叠成 busy 静默跳过）。
+  if (!lock.ok) return lock.reason === "publisher_busy"
+    ? { ok: false, kind: "busy", reason: lock.reason }
+    : { ok: false, kind: "lock_io_error", reason: "lock_io_error", error: lock.error ?? lock.reason };
+  // PK2-W1-fix1 P1-5③：主体收进内层闭包 —— **每个返回路径**都经过外层的释放折叠（旧版忽略
+  //   releasePublishLock 的结果：锁交不还照样 ok，下一次同锁写方全部 busy）。
+  const run = () => {
+    const fresh = loadRegistryStrict(regFile);
+    if (!fresh.ok) return { ok: false, kind: "unreadable", reason: fresh.reason + "：" + fresh.error };
+    const reg = { ...fresh.raw, projects: fresh.projects };
+    const decided = mutate(reg, { root });
+    if (!decided?.ok) return decided ?? { ok: false, kind: "mutate_invalid", reason: "registry_mutate_invalid" };
+    if (decided.skipWrite) return decided;
+    try {
+      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+      const tmp = regFile + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, regFile);
+    } catch (err) {
+      return { ok: false, kind: "write_failed", reason: String(err.message).slice(0, 200) };
+    }
+    return { ...decided, count: reg.projects.length };
+  };
+  let result = null;
+  try {
+    result = run();
+    return result;
+  } finally {
+    let rel;
+    try { rel = releasePublishLock(lockDir); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const unclean = rel.reapUncleared
+      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap" }
+      : rel.absent === true ? { reason: "lock_absent", path: lockDir }
+        : rel.ok !== true ? { reason: String(rel.reason ?? "release_failed"), path: lockDir } : null;
+    if (unclean !== null && result !== null && typeof result === "object") {
+      result.ok = false;
+      result.kind = "release_failed";
+      result.reason = "registry_lock_release_failed";
+      result.why = unclean.reason;
+      result.lockUncleared = unclean;
+    }
   }
 }
 

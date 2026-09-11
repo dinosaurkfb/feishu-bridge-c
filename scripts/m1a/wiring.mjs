@@ -25,8 +25,11 @@ import {
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "../maintenance/journal.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
+import { readSidecarStore, mutateSidecarEntry } from "../m1b/sidecar-store.mjs";
 
 const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
+/** activate 步取回 create_a1 步受验过的 f4（跨步骤传递，不重铸）。 */
+const f4UseOf = (byOp) => byOp.get("__f4Used") ?? null;
 
 /* P1-2 收尾：F4 封闭四项 —— wirePromoteBinding 只**消费**认领校验处受验的 f4，不自铸。 */
 const F4_FIELDS = ["chat_id", "sender", "body", "thread_root"];
@@ -211,6 +214,267 @@ function runWired({ endpointId, env = process.env, legacy, submit, lockOnly = fa
     const rel = acq.release();
     if (result && typeof result === "object") result.release = rel;
   }
+}
+
+/* ── PK2-W1（M1b-W1）：切权威后的会话级绑定 + 认领（authoritative 复合写）──────────
+ *
+ * 背景：`runWired`（上面）对**所有** M1a 双写入口在 cutoverDone / authority_mode≠shadow 时一律拒
+ * `m1a_mode_not_shadow`（影子期契约）—— 切权威后新绑定建不了。W1 只开两条**具名**复合：
+ *   · `wireBindAuthoritative`  会话级绑定（建根话题 → create_b1 → 索引行 → sidecar 条目）
+ *   · `wirePromoteAuthoritative` 认领（create_a1 → activate → 索引更新 → 删 pending-claims 条目）
+ * 其余 wire*（rotate / void / pause / resume / retarget / chatA1 / bindClaim）**仍拒**（清单封闭）。
+ *
+ * 不变量（docs/architecture/m1a-reconciliation.md §4）：account 期 legacy 登记表/mapping 只是**索引**
+ * （root_message_id / chat_id / claude_session_id / 认领后的 session_id、inbound_state）——
+ * binding_target / token / expires_at / policy 这些**已迁事实以账本 + sidecar 为准**，索引里的同名字段
+ * 是创建时快照，只供尚未切换的读方过渡（I2/I3 切完就不再被读），不由这里回写、不参与对账判定。
+ *
+ * 顺序固定（账本先于索引）：账本已验证提交后的索引/sidecar 失败 = `committed_unclean`，
+ * **按同一 request key 确定性幂等续跑**（重跑同一条命令：话题幂等、create_b1/activate 重放命中、
+ * 索引 upsert、sidecar upsert），不新开 WAL。 */
+
+/** 写方判源（拿收据，不拿账本）：never_initialized→legacy，cutoverDone→authoritative，
+ *  其余（init-only）→shadow；收据不可读 → reject（fail-closed，与 runWired 同口径）。 */
+export function m1aWriteRoute({ endpointId, env = process.env }) {
+  const recDir = maintenanceDir(env);
+  const receipt = typeof recDir === "string" && recDir.length > 0
+    ? endpointReceipt(recDir, endpointId)
+    : { ok: false, state: "unreadable", why: "维护目录不可派生（maintenanceDir 返回 null/空）" };
+  if (receipt.ok === true && receipt.state === "never_initialized") return { mode: "legacy", why: "未接入 M1a（无任何账本收据）", receipt };
+  if (receipt.ok !== true) return { mode: "reject", why: receipt.why ?? "M1a 收据不可读，fail-closed", receipt };
+  if (receipt.cutoverDone === true) return { mode: "authoritative", why: "收据已 cutover", receipt };
+  return { mode: "shadow", why: "收据 init-only", receipt };
+}
+
+/** 条目值的规范化（与 sidecar renderer 同一判据：ISO → toISOString）。 */
+const isoOf = (v) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null);
+
+/**
+ * authoritative 复合写的共用骨架：m1a-order outer 锁（与 shadow 写方**同一把**，串行）→
+ * 判源（必须是 authoritative；账本读不出/模式不符 → `m1a_mode_not_shadow`/`m1a_ledger_absent`）
+ * → 逐步骤跑（`steps` 顺序即提交顺序；第一个失败即停）→ 释放。
+ *
+ * 返回 union 与 shadow 写方同形（`ok` / `legacy` / `shadow` / `release`），另加 `commit`：
+ *   `not_committed`（账本未提交）| `committed_clean` | `committed_unclean`（账本已提交而后继失败）。
+ * `buildLegacy(steps)` 由各复合自己给 —— 它决定调用方看到的 "legacy 结果" 是什么。
+ */
+function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy }) {
+  const recDir = maintenanceDir(env);
+  const receipt = typeof recDir === "string" && recDir.length > 0
+    ? endpointReceipt(recDir, endpointId)
+    : { ok: false, state: "unreadable", why: "维护目录不可派生" };
+  if (!(receipt.ok === true && receipt.cutoverDone === true)) {
+    // 封闭清单：非 authoritative 一切照 shadow 契约拒（调用方本应分派到旧路径，走到这里就是不支持）。
+    return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "W1 复合只开 authoritative（收据=" + String(receipt.state ?? "unreadable") + "）", legacy: null, shadow: null, release: null };
+  }
+  const acq = acquireOrderLock(endpointId, env);
+  if (!acq.ok) {
+    return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, lockPath: acq.path ?? null, lockError: acq.error ?? null, legacy: null, shadow: null, release: null };
+  }
+  let result = null;
+  try {
+    const L = loadByEndpoint(endpointId, { env });
+    if (!L.ok) {
+      return { ok: false, commit: "not_committed", reason: "m1a_ledger_absent", why: "账本现场不可读/缺席（" + String(L.reason ?? "unknown") + "）：fail-closed", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+    }
+    if (L.doc.authority_mode !== "authoritative") {
+      return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "账本 authority_mode=" + String(L.doc.authority_mode) + "（W1 复合只开 authoritative）", lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+    }
+    const shadow = [];
+    const byOp = new Map();
+    // PK2-W1-fix1 P1-3：**逐步**记提交进度。一步算「已提交」当且仅当
+    //   · ok:true 且 commit 以 "committed" 开头（committed_clean / committed_with_residue /
+    //     committed_durability_uncertain —— 后两个也是已提交，只是不干净），或
+    //   · ok:false 但显式 committed === true（sidecar 目录屏障失败那类：数据已 rename）。
+    // 任一步失败：前面已有任何提交 → committed_unclean（并带失败点与前序证据）；全无 → not_committed。
+    // 全部成功：所有提交步都 committed_clean → committed_clean；任一不干净 → committed_unclean（证据上折）。
+    let anyCommitted = false;
+    let anyUncleanCommit = false;
+    const commits = {};
+    for (const st of steps) {
+      let r;
+      try { r = st.run({ byOp }); }
+      catch (err) { r = { ok: false, reason: st.op + "_threw", why: String(err?.code ?? err?.message ?? err) }; }
+      // capture 的字段名是 `committed`（值 = 提交态字符串）；sidecar 原语的 `committed` 是布尔。
+      const commit = typeof r?.commit === "string" ? r.commit
+        : typeof r?.committed === "string" ? r.committed
+        : r?.committed === true ? "committed_clean" : null;
+      const stepCommitted = r?.ok === true ? (commit !== null && commit.startsWith("committed")) : r?.committed === true;
+      const step = { op: st.op, ok: r?.ok === true, ...(r ?? {}) };
+      shadow.push(step);
+      byOp.set(st.op, step);
+      if (commit !== null) commits[st.op] = commit;
+      if (stepCommitted) {
+        anyCommitted = true;
+        if (commit !== "committed_clean") anyUncleanCommit = true;
+      }
+      if (step.ok !== true) {
+        result = { ok: true, authoritative: true, commit: anyCommitted ? "committed_unclean" : "not_committed",
+          reason: step.reason ?? (st.op + "_failed"), why: step.why ?? null,
+          ledgerCommitted: anyCommitted ? { ops: { ...commits }, failedOp: st.op } : null, commits: { ...commits },
+          failedStep: st.op,
+          legacy: buildLegacy({ byOp, shadow, failedOp: st.op }), shadow, release: null };
+        return result;
+      }
+    }
+    result = { ok: true, authoritative: true,
+      commit: anyUncleanCommit ? "committed_unclean" : "committed_clean",
+      commits: { ...commits }, legacy: buildLegacy({ byOp, shadow, failedOp: null }), shadow, release: null };
+    return result;
+  } finally {
+    const rel = acq.release();
+    if (result && typeof result === "object") result.release = rel;
+  }
+}
+
+/**
+ * wireBindAuthoritative —— 会话级绑定的 authoritative 复合（顺序固定）：
+ *   ① createTopic（平台幂等键建根话题，与现行同）
+ *   ② 账本 create_b1（rootOm / chatId / lineageId / bindingTarget —— target **必须**带 UUID 会话）
+ *   ③ 索引行 upsert（调用方给 `publishIndex` 闭包：登记表事务入口里锁内重读后局部更新）
+ *   ④ sidecar：`pending-claims[topic_agent_id]={token, claim_expires_at:null}` + `expiry[topic_agent_id]=expiresAt`
+ * 项目级/null target 由**调用方**拒（bind-project 不动）；这里只收会话级。
+ * 幂等续跑：同 `externalRequestId` 下，① 平台幂等（同 om）、② request_key 重放命中、③ upsert、④ upsert。
+ */
+export function wireBindAuthoritative({
+  endpointId, env = process.env, externalRequestId, lineageId, chatId, bindingTarget,
+  pendingToken, expiresAt, createTopic, publishIndex, now = Date.now(), _inject = null,
+}) {
+  return runAuthoritative({ endpointId, env, steps: [
+    { op: "topic", run: () => {
+      const t = createTopic();
+      return t && t.ok === true && en(t.root_message_id) ? { ok: true, root_message_id: t.root_message_id } : { ok: false, reason: t?.reason ?? "topic_failed", why: t?.message ?? t?.why ?? "建根话题失败" };
+    } },
+    { op: "ledger", run: ({ byOp }) => {
+      if (!en(externalRequestId) || !en(lineageId)) return { ok: false, reason: "bad_external_id", why: "externalRequestId/lineageId 必填 1..256 字符串" };
+      // 清单封闭：W1 只开会话级 target（UUID）。项目级/null 仍拒（bind-project 不动）。
+      const sid = bindingTarget?.claude_session_id;
+      if (!(typeof sid === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(sid))) {
+        return { ok: false, reason: "m1a_mode_not_shadow", why: "W1 只开会话级绑定（binding_target.claude_session_id 必须是 UUID）；项目级/null target 仍拒" };
+      }
+      const om = byOp.get("topic")?.root_message_id ?? null;
+      if (!en(om)) return { ok: false, reason: "bad_external_id", why: "根话题 om 缺失" };
+      const k = rk("create_b1", "bind:" + externalRequestId, lineageId);
+      if (!k.ok) return { op: "create_b1", ...k };
+      const r = capture("create_b1", createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env, _inject }));
+      if (r.ok !== true) return r;
+      const id = r.result?.created_id ?? null;
+      return { ...r, root_message_id: om, topic_agent_id: id };
+    } },
+    { op: "index", run: ({ byOp }) => {
+      const om = byOp.get("topic")?.root_message_id ?? null;
+      return publishIndex({ rootMessageId: om, endpointId, env });
+    } },
+    { op: "sidecars", run: ({ byOp }) => {
+      const ta = byOp.get("ledger")?.topic_agent_id ?? null;
+      if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本 create_b1 未返回 topic_agent_id（无法写 sidecar 条目）" };
+      const iso = isoOf(expiresAt);
+      if (iso === null) return { ok: false, reason: "bad_expires_at", why: "expiresAt 不可规范化：" + JSON.stringify(expiresAt ?? null) };
+      if (!en(pendingToken)) return { ok: false, reason: "bad_pending_token", why: "pendingToken 必填（pending-claims 条目的 token）" };
+      const claim = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env,
+        mutate: (cur) => (cur?.token === pendingToken && cur?.claim_expires_at === null ? { ok: true, changed: false } : { ok: true, changed: true, value: { token: pendingToken, claim_expires_at: null } }) });
+      if (claim.ok !== true) return { ok: false, reason: "pending_claims_" + String(claim.reason ?? "failed"), why: claim.why ?? null };
+      const exp = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env,
+        mutate: (cur) => (cur === iso ? { ok: true, changed: false } : { ok: true, changed: true, value: iso }) });
+      if (exp.ok !== true) return { ok: false, reason: "expiry_" + String(exp.reason ?? "failed"), why: exp.why ?? null };
+      return { ok: true, topic_agent_id: ta, pending_claims: claim.changed === true, expiry: exp.changed === true };
+    } },
+  ], buildLegacy: ({ byOp, failedOp }) => {
+    const topic = byOp.get("topic");
+    const om = topic?.root_message_id ?? null;
+    if (failedOp === null) return { ok: true, root_message_id: om, count: byOp.get("index")?.count ?? null, topic_agent_id: byOp.get("ledger")?.topic_agent_id ?? null };
+    // 话题没建成 → 无副作用（与 shadow 路径同形）；话题已建 → 携带 phase 让调用方说清停在哪一步。
+    if (failedOp === "topic") return { ok: false, phase: "send", message: byOp.get("topic")?.why ?? "建话题失败", reason: byOp.get("topic")?.reason ?? "topic_failed" };
+    const phase = failedOp === "ledger" ? "ledger" : failedOp === "index" ? "registry" : "sidecar";
+    return { ok: false, phase, root_message_id: om, reason: byOp.get(failedOp)?.reason ?? failedOp, message: byOp.get(failedOp)?.why ?? "（无 why）" };
+  } });
+}
+
+/**
+ * wirePromoteAuthoritative —— 认领（pending B1 → active）的 authoritative 复合（顺序固定）：
+ *   ① 账本 create_a1 → activate（与 §5.1 同；f4 判别照旧由调用方受验）
+ *   ② 索引更新（调用方给 `publishIndex` 闭包 —— 现行 promoteBinding：session_id / inbound_state …）
+ *   ③ 删 `pending-claims` 里该 B1 的条目（幂等）
+ * **只开 pending B1**：目标是 B3（换会话 rebind）/其它族 → 拒 `m1a_mode_not_shadow`（W2 另单）。
+ */
+export function wirePromoteAuthoritative({
+  endpointId, env = process.env, locator, claimKey, sessionId, authorizedBy, f4 = null, verify = null,
+  publishIndex, now = Date.now(), _inject = null,
+}) {
+  // PK2-W1-fix1 P1-3：create_a1 与 activate 拆成**两个独立步骤**（各自记提交进度）——
+  //   旧版包成一个 "ledger" 步：create_a1 已提交而 activate 失败时外层谎报 not_committed。
+  return runAuthoritative({ endpointId, env, steps: [
+    { op: "create_a1", run: ({ byOp }) => {
+      if (!en(claimKey) || !en(sessionId) || !en(locator)) return { ok: false, reason: "bad_external_id", why: "claimKey/sessionId/locator 必填 1..256 字符串" };
+      if (typeof verify === "function") {
+        const pf = verify();
+        if (!pf || pf.ok !== true) return { ok: false, reason: pf?.reason ?? "preflight_reject", why: pf?.why ?? "锁内重核未通过" };
+        byOp.set("__preflight", { f4: pf.f4 ?? null });
+      }
+      const resolved = resolveLiveId({ endpointId, locator, env });
+      if (!resolved.ok) return { op: "promote", ok: false, reason: resolved.reason, why: resolved.why ?? null };
+      const b1Id = resolved.id;
+      const l = loadByEndpoint(endpointId, { env });
+      if (!l.ok) return { op: "promote", ok: false, reason: "ledger_unreadable", why: l.why ?? null };
+      const target = l.doc.records[b1Id];
+      if (!target || target.kind !== "live") return { op: "promote", ok: false, reason: "target_gone" };
+      // 清单封闭：只有 pending B1 走本复合（B3 rebind / B4 / 已 active 一律拒，W2 另单）。
+      // **例外：同一 request key 的确定性续跑** —— 上一次认领已把 B1 拉成 active、但后继（索引/sidecar）
+      //   失败（committed_unclean），重跑同一条命令必须能补齐。判据不是"已 active"，而是
+      //   "账本里已有这条 activate 请求键"（重放命中）—— 换个 claimKey 再来就是新一笔认领，仍拒。
+      if (target.facts.binding !== "pending") {
+        const kReplay = rk("activate", claimKey, b1Id);
+        const replayed = kReplay.ok && Object.values(l.doc.operations ?? {}).some((op) => op?.request_key === kReplay.request_key);
+        if (!replayed) {
+          return { op: "promote", ok: false, reason: "m1a_mode_not_shadow",
+            why: "认领目标 facts.binding=" + String(target.facts.binding) + "（W1 只开 pending B1 的 create_a1→activate；换会话 rebind 属 W2）" };
+        }
+      }
+      const f4Use = (byOp.get("__preflight")?.f4 ?? null) !== null ? byOp.get("__preflight").f4 : f4;
+      if (!f4Ok(f4Use, locator)) return { op: "create_a1", ok: false, reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭判别联合（matched_om=locator）" };
+      byOp.set("__f4Used", f4Use);
+      const chatId0 = typeof target.chat_id === "string" ? target.chat_id : null;
+      if (!en(chatId0)) return { op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" };
+      const kA1 = rk("create_a1", claimKey, sessionId);
+      if (!kA1.ok) return { op: "create_a1", ...kA1 };
+      const injA1 = typeof _inject === "function" ? _inject("create_a1") : _inject;
+      const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId: chatId0, sessionId, now, env, _inject: injA1 }));
+      if (a1.ok !== true) return a1;
+      return { ...a1, b1Id, topic_agent_id: target.topic_agent_id ?? null, chat_id: chatId0 };
+    } },
+    { op: "activate", run: ({ byOp }) => {
+      const b1Id = byOp.get("create_a1")?.b1Id ?? null;
+      const a1Id = byOp.get("create_a1")?.result?.created_id ?? null;
+      const chatId0 = byOp.get("create_a1")?.chat_id ?? null;
+      if (!en(b1Id) || !en(a1Id)) return { ok: false, reason: "a1_missing", why: "前一步 create_a1 未产出 a1Id（不应到达）" };
+      const kAct = rk("activate", claimKey, b1Id);
+      if (!kAct.ok) return { op: "activate", ...kAct };
+      const injAct = typeof _inject === "function" ? _inject("activate") : _inject;
+      const act = capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id, f4: f4UseOf(byOp), authorizedBy, now, env, _inject: injAct }));
+      if (act.ok !== true) return { ...act, op: "activate" };
+      // topic_agent_id 直接取账本里那条记录自己的 id（权威事实，不重算）。
+      return { ...act, b1Id, a1_id: a1Id, topic_agent_id: byOp.get("create_a1")?.topic_agent_id ?? null, chat_id: chatId0 };
+    } },
+    { op: "sidecars", run: ({ byOp }) => {
+      // PK2-W1-fix1 P1-2：**先删 pending-claims 条目、后更新索引** —— 索引一改，legacy 现场就不是
+      //   pending 了，真实入站的下一次认领在 findPendingBinding 就被挡、到不了复合重放；sidecar 条目
+      //   在、索引未动时，重放照常进得来（幂等续跑的入口不被自己焊死）。
+      const ta = byOp.get("create_a1")?.topic_agent_id ?? null;
+      if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本未给出 topic_agent_id（无法删 pending-claims 条目）" };
+      const del = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env,
+        mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
+      if (del.ok !== true) return { ok: false, reason: "pending_claims_" + String(del.reason ?? "failed"), why: del.why ?? null };
+      return { ok: true, deleted: del.changed === true };
+    } },
+    { op: "index", run: ({ byOp }) => publishIndex({ b1Id: byOp.get("create_a1")?.b1Id ?? null, endpointId, env }) },
+  ], buildLegacy: ({ byOp, failedOp }) => {
+    if (failedOp === null) {
+      const idx = byOp.get("index") ?? {};
+      return { ok: true, root: idx.root ?? null, sessionId, generation: idx.generation ?? null };
+    }
+    const phase = failedOp === "create_a1" || failedOp === "activate" ? "promote" : failedOp === "index" ? "registry" : "sidecar";
+    return { ok: false, phase, reason: byOp.get(failedOp)?.reason ?? failedOp, message: byOp.get(failedOp)?.why ?? "（无 why）" };
+  } });
 }
 
 /* ── per-writer 具名函数（§5.1 每一行一个） ─────────────────── */

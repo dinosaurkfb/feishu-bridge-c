@@ -160,6 +160,27 @@ policy 写方先取 m1a-order.lock）+ doctor policy 对账；双写失败=polic
 
 处置表外字段承担路由语义 → `legacy_field_unmapped` 拒。
 
+### 4.0.1 authoritative 下的登记表/mapping 不变量（M1b-W1，PK2-W1 落地）
+
+切权威后，**账本 + sidecar 是权威事实**；登记表/mapping 保留的是**仍被旧读方需要的当前路由索引**——
+`root_message_id` / `chat_id` / `claude_session_id`，以及认领后的 `session_id` / `inbound_state` **必须正确更新**
+（出站与项目解析不改读法）；只有 token / expires_at / policy 等重复语义字段算**创建时快照**（非权威），
+供尚未切换的读方（I2 expiry / I3 pending-claims）过渡，切换完成后停读、不再回写、不参与对账判定。
+
+由这条不变量派生的两个 authoritative 写方（`m1a/wiring.mjs`，共用 m1a-order 外层锁，清单封闭——
+只有这两支开启，rotate/pause/retarget/B3 rebind 在 authoritative 仍拒 `m1a_mode_not_shadow`，归 W2/W3）：
+
+- **会话级绑定**（`wireBindAuthoritative`，bind-session --apply 分派）：① sendToChat 建根话题（平台幂等键）→
+  ② 账本 `create_b1`（会话级 target：claude_session_id 为 UUID；request_key 与 §5.1 wireBind 同派生）→
+  ③ 登记表索引行（outer 锁内**重读当前文件**再局部 upsert，registry.lock 事务；不许用锁前快照整文件覆盖）→
+  ④ `pending-claims.json[topic_agent_id]={token, claim_expires_at:null}` + `expiry.json[topic_agent_id]=expires_at`
+  （token/expires_at 取自索引行创建时快照）。账本已提交后任一步失败 = `committed_unclean`，按同一 request key
+  确定性幂等续跑（重跑同命令：话题幂等键不重建、create_b1 重放命中、索引 upsert、sidecar upsert）。
+- **认领**（`wirePromoteAuthoritative`，入站 @/引用码认领分派）：只开 **pending B1** 的 `create_a1 → activate`
+  （f4 判别照旧）→ ② 登记表/mapping 索引更新（session_id / inbound_state）→ ③ 删 `pending-claims.json` 条目
+  （幂等）。activate 已提交后任一步失败 = `committed_unclean`，重放同认领幂等补齐（activate 重放命中），
+  不留「账本 active、登记表 pending」卡死态。B3 换会话 rebind 分支不开（W2）。
+
 ### 4.1 复合切换事务（T4；维护 journal step 机制）
 
 1. 每 sidecar 一个 prepared step（`sidecar:expiry:<ep>` 等：before/intended SHA/备份落 journal）；

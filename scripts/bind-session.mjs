@@ -33,7 +33,7 @@ import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { wireBind, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { wireBind, wireBindAuthoritative, isLedgerAuthoritative, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor,
@@ -171,8 +171,40 @@ const canonicalRoot = (() => { try { return fs.realpathSync(root); } catch { ret
 const bindTarget = { runtime: "claude", project_root: canonicalRoot, claude_session_id: me.sessionId };
 // P2-2 wireBind（Frank 裁定）：会话级绑定的 legacy 两步（建根话题 + 登记）收进一个闭包，已启用端点以
 //   m1a-order 锁串行并镜像 shadow create_b1；未启用端点（never_initialized）→ 合法 legacy-only。
-const wired = wireBind({
-  endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
+// PK2-W1：切权威（cutoverDone）后改走 authoritative 复合体 —— 账本先提交（createB1），登记表降为
+//   索引行（outer 锁内重读 upsert），sidecar 条目随后；unclean 幂等续跑。shadow/never 照旧 wireBind。
+const bindEndpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+const bindAuthoritative = isLedgerAuthoritative({ endpointId: bindEndpointId, env: process.env });
+const wired = bindAuthoritative
+  ? wireBindAuthoritative({
+      endpointId: bindEndpointId,
+      env: process.env,
+      externalRequestId: idemKey,
+      lineageId: path.basename(root) + "@project-files",
+      chatId: template.chat_id,
+      bindingTarget: bindTarget,
+      registryFile: regFile,
+      // ① 建根话题（平台幂等键，与现行同一把）：失败 → 无任何副作用。
+      sendRoot: () => {
+        try {
+          const rootMessageId = sendToChat({
+            profile: ident.profile, chatId: template.chat_id, text: rootText,
+            idempotencyKey: idemKey, larkBin: ident.bin, larkHome: ident.configDir,
+            expectedAppId: ident.expectedAppId,
+          });
+          return { ok: true, root_message_id: rootMessageId };
+        } catch (err) {
+          return { ok: false, phase: "send", message: err.message };
+        }
+      },
+      // ③ 索引行（行上 pending_token/expires_at 即 sidecar 两事实的创建时快照来源）。
+      indexEntry: (rootMessageId) => newSessionEntry({
+        root, name, purpose: identity.purpose, token, rootMessageId,
+        claudeSessionId: me.sessionId, sessionName: me.name,
+      }),
+    })
+  : wireBind({
+  endpointId: bindEndpointId,
   env: process.env,
   externalRequestId: idemKey,
   lineageId: path.basename(root) + "@project-files",
@@ -209,19 +241,32 @@ const wired = wireBind({
   },
 });
 if (!wired.ok) {
+  // PK2-W1：authoritative 下账本已提交而索引/sidecar 未补齐 = committed_unclean —— 持久回执 + 指路重跑
+  //  （同命令幂等续跑：话题不重建、账本不多记录），不谎报失败也不谎报干净。
+  if (wired.commit === "committed_unclean") {
+    emitUncleanReceipt("cli_bind_session_authoritative", wired, { root, claudeSessionId: me.sessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
+    die("账本已提交但索引/sidecar 未补齐：" + (wired.why ?? "unclean"),
+      "重跑同一条命令即可幂等补齐（幂等键保证话题不重建、账本不多记录）。");
+  }
   // 已启用端点任一取锁/账本/收据异常 → 整笔拒、不写 legacy、不建话题（fail-closed）。
   die("绑定失败（M1a 一致性锁：" + (wired.reason ?? "unknown") + (wired.why ? "；" + wired.why : "") + "）",
     "没有建话题，也没有写登记表。稍后再试一次。");
 }
 const lr = wired.legacy;
-if (!lr.ok) {
-  if (lr.phase === "send") die("建话题失败，没有写任何文件：" + lr.message);
-  die("话题建好了（" + lr.root_message_id + "）但登记没写成：" + lr.message,
-    "修好权限后重跑同一条命令即可，幂等键保证不会多建一个话题。");
+if (bindAuthoritative) {
+  const rootMessageId = wired.rootMessageId;
+  console.log("\n根话题已建立  " + rootMessageId);
+  console.log("已登记        " + regFile + "  （现在 " + wired.index.count + " 条绑定；账本记录 " + wired.topicAgentId.slice(0, 12) + "…）");
+} else {
+  if (!lr.ok) {
+    if (lr.phase === "send") die("建话题失败，没有写任何文件：" + lr.message);
+    die("话题建好了（" + lr.root_message_id + "）但登记没写成：" + lr.message,
+      "修好权限后重跑同一条命令即可，幂等键保证不会多建一个话题。");
+  }
+  console.log("\n根话题已建立  " + lr.root_message_id);
+  console.log("已登记        " + regFile + "  （现在 " + lr.count + " 条绑定）");
 }
-const rootMessageId = lr.root_message_id;
-console.log("\n根话题已建立  " + rootMessageId);
-console.log("已登记        " + regFile + "  （现在 " + lr.count + " 条绑定）");
+const rootMessageId = bindAuthoritative ? wired.rootMessageId : lr.root_message_id;
 // P1-4：legacy 已提交但 shadow 镜像不干净 → 持久机器回执（不谎报 clean）。
 const bindUnclean = uncleanWired(wired);
 if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_session", wired, { root, claudeSessionId: me.sessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });

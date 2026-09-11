@@ -63,7 +63,7 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1, wirePromoteBinding, wireVoid, uncleanWired } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wirePromoteAuthoritative, wireVoid, isLedgerAuthoritative, uncleanWired } from "./m1a/wiring.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -502,17 +502,43 @@ if (!routed.ok) {
   //   locator=被认领代际根消息 om（matched_om）；claimKey=claim.mjs 64hex；authorizedBy=event.sender_id。
   //   W2（B3 已 active 换会话再认领）只把 aliases.session_id 改到 event.session_id（受验新 Aily 会话 locator）——
   //   认领现场不铸临时 UUID/不碰 binding_target；ledger 侧 claude_session_id 的 retarget 归 Phase 2 配对写方（§5.1）。
-  const wired = wirePromoteBinding({
-    endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
+  // PK2-W1：authoritative 分派 —— 切权威后认领走 authoritative 复合体（账本 create_a1→activate 先提交，
+  //   索引更新与 pending-claims 删除随后，unclean 幂等续跑）；shadow/never_initialized 照旧 wirePromoteBinding。
+  const promoteEndpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+  const promoteAuthoritative = isLedgerAuthoritative({ endpointId: promoteEndpointId, env: process.env });
+  const promoteIndexUpdate = () => promoteBinding({
+    root: promo.root,
+    id: promo.id,
+    source: promo.source,
+    generationId: promo.generationId,
+    operationId: pending.operationId,
+    sessionId: event.session_id,
+  });
+  const wired = promoteAuthoritative
+    ? wirePromoteAuthoritative({
+        endpointId: promoteEndpointId,
+        env: process.env,
+        locator: pending.generation?.root_message_id ?? null,
+        claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
+        sessionId: event.session_id ?? null,
+        authorizedBy: event.sender_id ?? null,
+        f4: promo.f4 ?? null,
+        updateIndex: promoteIndexUpdate,
+        verify: () => {
+          const nowVerify = Date.now();
+          const pendingVerify = findPendingBinding({ content: event.content, now: nowVerify });
+          if (!pendingVerify.ok) return { ok: false, reason: pendingVerify.reason, why: "锁内重核：pending 现场不再可认领（" + (pendingVerify.reason ?? "unknown") + "）" };
+          if (pendingVerify.matchedBy === "only_pending") return { ok: false, reason: "no_token_for_enabled", why: "端点已启用：需绑定码或 root attestation（已启用端点不接受无码认领）" };
+          const promoVerify = evaluatePromotion({ event, template, pending: pendingVerify, now: nowVerify });
+          if (!promoVerify.ok) return { ok: false, reason: promoVerify.reason, why: "锁内重核：认领六件事不再成立（" + (promoVerify.reason ?? "unknown") + "）" };
+          if (promoVerify.f4 != null && promoVerify.f4.matched_om !== (pendingVerify.generation?.root_message_id ?? null)) return { ok: false, reason: "f4_changed", why: "锁内重核：matched_om 与锁内 locator 不符" };
+          return { ok: true, f4: promoVerify.f4 };
+        },
+      })
+    : wirePromoteBinding({
+    endpointId: promoteEndpointId,
     env: process.env,
-    legacy: () => promoteBinding({
-      root: promo.root,
-      id: promo.id,
-      source: promo.source,
-      generationId: promo.generationId,
-      operationId: pending.operationId,
-      sessionId: event.session_id,
-    }),
+    legacy: promoteIndexUpdate,
     locator: pending.generation?.root_message_id ?? null,
     claimKey: claimKey(event.message_id ?? "", promo.id ?? ""),
     sessionId: event.session_id ?? null,
@@ -537,6 +563,17 @@ if (!routed.ok) {
     },
   });
   if (!wired.ok) {
+    // PK2-W1：authoritative 复合体 committed_unclean（账本已 activate、索引/sidecar 未补齐）——
+    //   持久回执 + 指路重放（同认领幂等补齐，不留"账本 active、登记表 pending"卡死态）。
+    if (wired.commit === "committed_unclean") {
+      writeReceipt("m1a-unclean-" + event.message_id, {
+        status: "unclean", authoritative: true, reason: wired.reason, why: wired.why ?? null,
+        ledgerCommitted: wired.ledgerCommitted ?? null, failed: wired.failed ?? null,
+        claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
+      });
+      finish("rejected", { reasonText: "账本已认领但索引未补齐：" + (wired.why ?? "unclean") + "。同一条消息重放会幂等补齐。" },
+        { reason: wired.reason });
+    }
     // 双写强制下锁取不到（busy/maintenance/root_*/dir_*/lock_residue/reap_* 等）：整笔披、不写 legacy、没有绑定。
     writeReceipt("promote-m1a-" + event.message_id, { status: "rejected", reason: wired.reason ?? "m1a_reject", why: wired.why ?? null, lock: wired.lock ?? null, claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow });
     // #守卫①：无码认领被已启用端点拒绝 → 用「需绑定码或 root attestation」文案，而不是通用「锁取不到」。
@@ -547,6 +584,8 @@ if (!routed.ok) {
     finish("rejected", { reasonText }, { reason: finishReason });
   }
 
+  // PK2-W1：authoritative 复合体走到这里必是 committed_clean（unclean 在上方 !wired.ok 支收口）。
+  if (!promoteAuthoritative) {
   const wrote = wired.legacy;
   if (!wrote.ok) {
     writeReceipt("bind-failed-" + event.message_id, {
@@ -563,6 +602,7 @@ if (!routed.ok) {
     status: "unclean", legacy: "ok", ...promoteUnclean,
     claim_acquired: false, handed_off: false, subscription_claim_shadow: subscriptionClaimShadow,
   });
+  }
 
   justBound = true;
   pendingMatchedBy = pending.matchedBy ?? null;

@@ -25,6 +25,8 @@ import {
 import { endpointReceipt } from "../maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "../maintenance/journal.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
+import { acquirePublishLock, loadRegistryStrict, releasePublishLock } from "../registry.mjs";
+import { mutateSidecarDoc } from "../m1b/sidecar-store.mjs";
 
 const en = (v) => typeof v === "string" && v.length > 0 && v.length <= 256;
 
@@ -580,4 +582,241 @@ export function wireSelectRebind({ endpointId, env = process.env, legacy = null,
   if (mode.mode === "authoritative") return selectLedgerOnly(submit()[0]);
   if (typeof legacy !== "function") return selectLegacyMissing();
   return runWired({ endpointId, env, legacy, submit });
+}
+
+/* ─────────────────────────── PK2-W1：authoritative 复合体（M1b-W1） ───────────────────────────
+ * 切权威后的会话级绑定 + 认领写方（设计裁定 2026-09-11 11:22Z + PI-DESIGN M1B-W1）。
+ * 与 runWired 的 shadow 复合体**并列**的两个具名 composite，共用 outer 锁骨架（同一把 m1a-order
+ * 锁串行两代写方），但语义倒置：账本 + sidecar 是权威事实，登记表/mapping 降为**当前路由索引**
+ * （root/chat/session 名与认领后的 session_id/inbound_state 必须正确更新；token/expires_at/policy
+ * 等重复语义字段是创建时快照，供未切换读方过渡）。顺序 = 账本先提交、索引/sidecar 后补；
+ * 账本已提交后的任何失败 = committed_unclean，并按同一 request key **确定性幂等续跑**
+ * （重跑命中幂等键/账本重放/upsert/幂等删除——不建新 WAL，unclean 回执照写）。
+ * 清单封闭：只有 bind（会话级）/ promote（仅 pending B1）开 authoritative 支；rotate/pause/
+ * retarget/B3 rebind 等仍走 runWired 的 m1a_mode_not_shadow 拒（W2/W3 另单）。 */
+
+/** 会话级 target 硬门：claude_session_id 必须是 UUID。项目级/null 仍拒（bind-project 不动）。 */
+const UUID_SHAPE_W1 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/** authoritative 判定（与 R66 同口径的收据侧）：cutoverDone 收据 ok 即视为 authoritative 机器；
+ * 账本 authority_mode 的交叉核由各 composite 在锁内做（runWired 同款）。 */
+export function isLedgerAuthoritative({ endpointId, env = process.env } = {}) {
+  const recDir = maintenanceDir(env);
+  if (typeof recDir !== "string" || recDir.length === 0) return false;
+  const receipt = endpointReceipt(recDir, endpointId);
+  return receipt.ok === true && receipt.cutoverDone === true;
+}
+
+/** authoritative 复合体的外锁骨架：收据/账本必须 authoritative（否则 m1a_mode_not_shadow，清单
+ * 封闭反例正是钉这个），取 m1a-order 外层锁 → run(acq) → 释放（残骸折进结果）。 */
+function runAuthoritative({ endpointId, env, run }) {
+  const recDir = maintenanceDir(env);
+  const receipt = typeof recDir === "string" && recDir.length > 0
+    ? endpointReceipt(recDir, endpointId)
+    : { ok: false, state: "unreadable" };
+  if (!receipt.ok || receipt.state === "never_initialized" || receipt.cutoverDone !== true) {
+    return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "authoritative 复合体只服务切权威后的端点（收据 " + String(receipt.state ?? receipt.why ?? "unreadable") + "）", legacy: null, shadow: null, release: null };
+  }
+  const ledger = loadByEndpoint(endpointId, { env });
+  if (!ledger.ok || ledger.doc.authority_mode !== "authoritative") {
+    return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "账本 " + (ledger.ok ? "authority_mode=" + ledger.doc.authority_mode : "读不出（" + (ledger.reason ?? "?") + "）") + "：authoritative 复合体只服务 authoritative 现场且索引更新以它为前提", legacy: null, shadow: null, release: null };
+  }
+  const acq = acquireOrderLock(endpointId, env);
+  if (!acq.ok) {
+    return { ok: false, commit: "not_committed", reason: acq.reason ?? "binding_busy", why: acq.why ?? null, lock: acq.lock ?? null, lockPath: acq.path ?? null, lockError: acq.error ?? null, legacy: null, shadow: null, release: null };
+  }
+  let result;
+  try {
+    result = run(acq);
+    return result;
+  } finally {
+    const rel = acq.release();
+    if (result && typeof result === "object" && rel && rel.ok !== true) {
+      result.lockUncleared = { path: acq.path ?? null, reason: rel.absent === true ? "absent" : String(rel.reason ?? "release_publish_lock"), ...(rel.error ? { error: String(rel.error) } : {}) };
+    }
+  }
+}
+
+/** 登记表索引 upsert：outer 锁内**重读当前文件**再局部更新（withRegistryTransaction 同款事务纪律：
+ * registry.lock → loadRegistryStrict 全量 → mutate → .prev + tmp+rename 原子写）。并发两笔 bind 被
+ * outer 串行后，后一笔重读必见前一笔的行 —— 不许用锁前快照整文件覆盖。 */
+function upsertRegistryIndex({ registryFile, entry }) {
+  const lockDir = path.join(path.dirname(registryFile), "registry.lock");
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "registry_busy", why: String(lock.reason ?? "publisher_busy"), lock: lockDir };
+  try {
+    const fresh = loadRegistryStrict(registryFile);
+    if (!fresh.ok) return { ok: false, reason: "registry_unreadable", why: (fresh.reason ?? "") + "：" + (fresh.error ?? "") };
+    const reg = { ...fresh.raw, projects: fresh.projects };
+    const idx = reg.projects.findIndex((p) => p.id === entry.id
+      || (p.root === entry.root && (p.claude_session_id ?? null) === (entry.claude_session_id ?? null)));
+    const upserted = idx >= 0 ? "replaced" : "appended";
+    if (idx >= 0) reg.projects[idx] = { ...reg.projects[idx], ...entry };
+    else reg.projects.push(entry);
+    try {
+      fs.mkdirSync(path.dirname(registryFile), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(registryFile)) fs.copyFileSync(registryFile, registryFile + ".prev");
+      const tmp = registryFile + ".tmp." + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(tmp, registryFile);
+    } catch (err) {
+      return { ok: false, reason: "registry_write_failed", why: String(err?.message ?? err) };
+    }
+    return { ok: true, upserted, count: reg.projects.length };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * wireBindAuthoritative —— 切权威后的会话级绑定（M1b-W1 复合体）。
+ * 顺序（outer 锁内）：① sendRoot 建根话题（平台幂等键在调用方闭包，与现行同）→ ② 账本 createB1
+ * （request_key 与 wireBind 同派生：create_b1 | bind:<externalRequestId> | lineageId，重放幂等）→
+ * ③ 登记表索引行（锁内重读 upsert）→ ④ sidecar 条目（pending-claims[token,claim_expires_at:null] +
+ * expiry[expiresAt]，token/expiresAt 取自索引行的创建时快照字段）。
+ * 账本已提交后任一步失败 = committed_unclean（回执点名 + 重跑幂等补齐：话题不重建、账本不多记录）。
+ * 会话级 target 硬门：claude_session_id 必须 UUID；项目级/null → 拒（清单封闭）。
+ * @param sendRoot () => { ok:true, root_message_id } | { ok:false, phase?, message? }
+ * @param indexEntry (rootMessageId) => 登记表索引行（调用方按现行 newSessionEntry 同形构造；行上
+ *   pending_token/expires_at 即 sidecar 两事实的来源）
+ */
+export function wireBindAuthoritative({
+  endpointId, env = process.env, sendRoot, indexEntry, registryFile,
+  externalRequestId, lineageId, chatId, bindingTarget, now = Date.now(), _inject = null,
+}) {
+  if (!bindingTarget || bindingTarget.runtime !== "claude" || !UUID_SHAPE_W1.test(String(bindingTarget.claude_session_id ?? ""))) {
+    return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "authoritative 下只开会话级绑定（claude_session_id 必须是 UUID；项目级/null 归 bind-project，W1 不开）", legacy: null, shadow: null, release: null };
+  }
+  if (typeof sendRoot !== "function" || typeof indexEntry !== "function" || typeof registryFile !== "string" || registryFile.length === 0) {
+    return { ok: false, commit: "not_committed", reason: "bad_input", why: "sendRoot/indexEntry/registryFile 必填", legacy: null, shadow: null, release: null };
+  }
+  return runAuthoritative({ endpointId, env, run: () => {
+    // ① 建根话题（平台幂等键；失败无任何副作用）
+    let sent;
+    try { sent = sendRoot(); }
+    catch (err) { return { ok: false, commit: "not_committed", reason: "send_failed", why: String(err?.message ?? err), legacy: null, shadow: null, release: null }; }
+    if (!sent || sent.ok !== true || !en(sent.root_message_id)) {
+      return { ok: false, commit: "not_committed", reason: "send_failed", why: sent?.message ?? "sendRoot 未返回受验 root_message_id", legacy: null, shadow: null, release: null };
+    }
+    const om = sent.root_message_id;
+    // ② 账本 createB1（同 §5.1 派生；TTL 走锁内 clock）
+    const k = rk("create_b1", "bind:" + externalRequestId, lineageId);
+    if (!k.ok) return { ok: false, commit: "not_committed", reason: "bad_external_id", why: k.why ?? null, legacy: null, shadow: null, release: null };
+    const b1 = createB1({ endpointId, requestKey: k.request_key, chatId, rootOm: om, lineageId, bindingTarget, env, _inject });
+    if (!b1.ok) {
+      return { ok: false, commit: "not_committed", reason: b1.reason ?? "create_b1_failed", why: b1.why ?? null, ...(b1.lockUncleared ? { lockUncleared: b1.lockUncleared } : {}), legacy: null, shadow: null, release: null };
+    }
+    const taId = b1.result?.created_id;
+    // —— 账本已提交：此后任何失败 = committed_unclean（幂等续跑，不回滚账本）——
+    // ③ 登记表索引行（锁内重读 upsert；行上的 pending_token/expires_at 是 sidecar 的来源）
+    // ③ 登记表索引行（顺序纪律：任一步失败后面不做；账本不回滚 → committed_unclean 幂等续跑）
+    let entry;
+    try { entry = indexEntry(om); }
+    catch (err) {
+      return { ok: false, commit: "committed_unclean", reason: "committed_unclean", why: "账本已建 B1 但 indexEntry 抛错：" + String(err?.message ?? err), legacy: null, shadow: null, release: null, ledgerCommitted: { op: "create_b1", topicAgentId: taId, rootOm: om }, failed: [{ step: "index", reason: "index_entry_threw" }] };
+    }
+    if (!entry || typeof entry !== "object") {
+      return { ok: false, commit: "committed_unclean", reason: "committed_unclean", why: "账本已建 B1 但 indexEntry 未产出索引行", legacy: null, shadow: null, release: null, ledgerCommitted: { op: "create_b1", topicAgentId: taId, rootOm: om }, failed: [{ step: "index", reason: "index_entry_missing" }] };
+    }
+    const token = entry.pending_token;
+    const expiresAt = entry.expires_at;
+    const idx = upsertRegistryIndex({ registryFile, entry });
+    if (!idx.ok) {
+      return { ok: false, commit: "committed_unclean", reason: "committed_unclean", why: "账本 B1 已提交，登记表索引未写（" + idx.reason + "：" + (idx.why ?? "") + "）；重跑同命令幂等补齐", legacy: null, shadow: null, release: null, ledgerCommitted: { op: "create_b1", topicAgentId: taId, rootOm: om }, failed: [{ step: "index", reason: idx.reason, why: idx.why ?? null }] };
+    }
+    // ④ sidecar 条目（m1b/sidecar-store：锁内读-改-校验-原子写）
+    const pc = mutateSidecarDoc({ endpointId, name: "pending-claims", env, _inject,
+      mutate: (entries) => ({ ok: true, entries: { ...entries, [taId]: { token, claim_expires_at: null } } }) });
+    if (!pc.ok) {
+      return { ok: false, commit: "committed_unclean", reason: "committed_unclean", why: "账本 B1 已提交、索引已写，pending-claims 未写（" + pc.reason + "）；重跑同命令幂等补齐", legacy: null, shadow: null, release: null, ledgerCommitted: { op: "create_b1", topicAgentId: taId, rootOm: om }, failed: [{ step: "pending-claims", reason: pc.reason, why: pc.why ?? null }] };
+    }
+    const ex = mutateSidecarDoc({ endpointId, name: "expiry", env, _inject,
+      mutate: (entries) => ({ ok: true, entries: { ...entries, [taId]: expiresAt } }) });
+    if (!ex.ok) {
+      return { ok: false, commit: "committed_unclean", reason: "committed_unclean", why: "账本 B1 已提交、索引与 pending-claims 已写，expiry 未写（" + ex.reason + "）；重跑同命令幂等补齐", legacy: null, shadow: null, release: null, ledgerCommitted: { op: "create_b1", topicAgentId: taId, rootOm: om }, failed: [{ step: "expiry", reason: ex.reason, why: ex.why ?? null }] };
+    }
+    return { ok: true, commit: "committed_clean", rootMessageId: om, topicAgentId: taId, index: idx, authoritative: true, legacy: null, shadow: null, release: null };
+  } });
+}
+
+/**
+ * wirePromoteAuthoritative —— 切权威后的认领写方（M1b-W1 复合体）。
+ * 封闭：只开 pending B1 的 create_a1 → activate（f4 判别照旧，只消费受验 f4）；B3 换会话 rebind
+ * 归 W2，仍拒 m1a_mode_not_shadow。顺序：① 账本 create_a1 → activate（与 §5.1 同）→
+ * ② updateIndex（登记表/mapping 索引更新，调用方注入 —— 现行 promoteBinding 即索引更新器）→
+ * ③ 删 pending-claims 条目（幂等）。activate 已提交后任一步失败 = committed_unclean，重跑幂等补齐
+ * （activate 重放命中、索引更新幂等、pending 删除幂等 —— 不留"账本 active、登记表 pending"卡死态）。
+ * verify（可选）在 outer 锁内、账本提交前跑（与 wirePromoteBinding 的锁内重核同职责）。
+ */
+export function wirePromoteAuthoritative({
+  endpointId, env = process.env, locator, claimKey, sessionId, authorizedBy,
+  f4 = null, verify = null, updateIndex, now = Date.now(), _inject = null,
+}) {
+  return runAuthoritative({ endpointId, env, run: () => {
+    if (!en(claimKey) || !en(sessionId) || !en(locator)) {
+      return { ok: false, commit: "not_committed", reason: "bad_external_id", why: "claimKey/sessionId/locator 必填 1..256 字符串", legacy: null, shadow: null, release: null };
+    }
+    let pf = null;
+    if (typeof verify === "function") {
+      pf = verify();
+      if (!pf || pf.ok !== true) {
+        return { ok: false, commit: "not_committed", reason: pf?.reason ?? "preflight_reject", why: pf?.why ?? "锁内重核未通过", legacy: null, shadow: null, release: null };
+      }
+    }
+    const resolved = resolveLiveId({ endpointId, locator, env });
+    if (!resolved.ok) return { ok: false, commit: "not_committed", reason: resolved.reason, why: resolved.why ?? null, legacy: null, shadow: null, release: null };
+    const b1Id = resolved.id;
+    const l = loadByEndpoint(endpointId, { env });
+    if (!l.ok) return { ok: false, commit: "not_committed", reason: "ledger_unreadable", why: l.why ?? null, legacy: null, shadow: null, release: null };
+    const target = l.doc.records[b1Id];
+    if (!target || target.kind !== "live") return { ok: false, commit: "not_committed", reason: "target_gone", legacy: null, shadow: null, release: null };
+    if (target.facts.binding !== "pending") {
+      // 幂等重放：同 claimKey 的 activate 已提交（上一次跑到索引/sidecar 段才失败的 unclean 重跑、
+      // 或同一条消息的重放）→ 放行到账本重放命中（create_a1/activate 按 request_key 幂等），
+      // 再照常走索引/sidecar 幂等步。其它非 pending（不同 claimKey 摸已 active 的 B3 = W2 rebind）
+      // 仍拒 —— 清单封闭。
+      const kActChk = rk("activate", claimKey, b1Id);
+      const replaying = kActChk.ok && Object.values(l.doc.operations ?? {}).some((op) => op.request_key === kActChk.request_key);
+      if (!replaying) {
+        return { ok: false, commit: "not_committed", reason: "m1a_mode_not_shadow", why: "target.facts.binding=" + String(target.facts.binding) + "：authoritative 下只开 pending B1 的认领；B3 换会话 rebind 属 W2", legacy: null, shadow: null, release: null };
+      }
+    }
+    const f4Use = (pf && pf.ok === true && pf.f4 != null) ? pf.f4 : f4;
+    if (!f4Ok(f4Use, locator)) {
+      return { ok: false, commit: "not_committed", reason: "bad_f4", why: "F4 必须是认领校验处受验的封闭判别联合（matched_om=locator 且 token 四项或 no-token 三项）", legacy: null, shadow: null, release: null };
+    }
+    const chatId = typeof target.chat_id === "string" ? target.chat_id : null;
+    if (!en(chatId)) return { ok: false, commit: "not_committed", reason: "bad_input", why: "target.chat_id 缺失", legacy: null, shadow: null, release: null };
+    // ① 账本 create_a1 → activate
+    const kA1 = rk("create_a1", claimKey, sessionId);
+    if (!kA1.ok) return { ok: false, commit: "not_committed", reason: "bad_external_id", why: kA1.why ?? null, legacy: null, shadow: null, release: null };
+    const a1 = createA1({ endpointId, requestKey: kA1.request_key, chatId, sessionId, now, env, _inject });
+    if (!a1.ok) return { ok: false, commit: "not_committed", reason: a1.reason ?? "create_a1_failed", why: a1.why ?? null, ...(a1.lockUncleared ? { lockUncleared: a1.lockUncleared } : {}), legacy: null, shadow: null, release: null };
+    const a1Id = a1.result?.created_id;
+    const kAct = rk("activate", claimKey, b1Id);
+    if (!kAct.ok) return { ok: false, commit: "not_committed", reason: "bad_external_id", why: kAct.why ?? null, legacy: null, shadow: null, release: null };
+    const act = activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id, f4: f4Use, authorizedBy, now, env, _inject });
+    if (!act.ok) {
+      // create_a1 已提交、activate 未成 = 账本半笔 → committed_unclean（重跑：a1 重放命中 + activate 重试）
+      return { ok: false, commit: "committed_unclean", reason: act.reason ?? "activate_failed", why: act.why ?? null, ...(act.lockUncleared ? { lockUncleared: act.lockUncleared } : {}), legacy: null, shadow: null, release: null, ledgerCommitted: { op: "create_a1", a1Id } };
+    }
+    // —— activate 已提交 ——
+    // ② 索引更新（调用方注入：现行 promoteBinding 即登记表/mapping 索引更新器）
+    const idx = typeof updateIndex === "function" ? updateIndex() : { ok: true };
+    // ③ 删 pending-claims 条目（幂等：键不在 → changed:false 零写）
+    const del = mutateSidecarDoc({ endpointId, name: "pending-claims", env, _inject,
+      mutate: (entries) => {
+        const n = { ...entries };
+        const had = Object.prototype.hasOwnProperty.call(n, b1Id);
+        delete n[b1Id];
+        return { ok: true, entries: n, changed: had };
+      } });
+    const failed = [idx.ok ? null : { step: "index", reason: idx.reason ?? "index_failed", why: idx.why ?? idx.error ?? null }, del.ok ? null : { step: "pending-claims", reason: del.reason, why: del.why ?? null }].filter(Boolean);
+    if (failed.length > 0) {
+      return { ok: false, commit: "committed_unclean", reason: "committed_unclean",
+        why: "账本已 activate，索引/sidecar 未补齐（重跑同认领幂等补齐）：" + failed.map((f) => f.step + ":" + f.reason).join("、"),
+        legacy: null, shadow: null, release: null, ledgerCommitted: { op: "activate", b1Id, a1Id }, failed };
+    }
+    return { ok: true, commit: "committed_clean", b1Id, a1Id, index: idx, authoritative: true, legacy: null, shadow: null, release: null };
+  } });
 }

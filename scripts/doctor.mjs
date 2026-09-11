@@ -54,6 +54,7 @@ import {
 import { aggregateEndpointReceipts, preparedLedgerInits } from "./maintenance/ledger-receipt.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/legacy-snapshot.mjs";
 import { reconcileLegacyEndpoint } from "./m1a/reconcile.mjs";
+import { claudeSources } from "./m1a/cutover-reconcile.mjs";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs";
@@ -656,11 +657,11 @@ export function runDoctor({
             }
             // 收据 ok ∧ 账本可读 → 旁路对账（严格只读）。
             const chain = L.doc.chain;
+            // legacy 来源与 cutover 对账、入站用**同一份解析**（PK2-F1）：env 覆盖只影响 template，
+            // registry 与 template 两路径独立（R69 返修二 P1-A）—— 不在这里内联第二套表达式，
+            // 否则同一台机器上体检对账读的模板可能与正在用的那份不是同一份。
             const collectLegacy = chain === "claude"
-              ? () => collectClaudeLegacySnapshot({
-                  registryFile: ctx.registryFile,
-                  templateFile: path.join(ctx.home, ".claude", "feishu-bridge", "chain-config.json"),
-                })
+              ? () => collectClaudeLegacySnapshot(claudeSources(process.env, path.join(ctx.home, ".claude", "feishu-bridge")))
               : () => collectCodexLegacySnapshot({ home: ctx.codexEnv.FEISHU_CODEX_BRIDGE_HOME });
             const r = reconcileLegacyEndpoint({ endpointId: ep, chain, collectLegacy, loadLedgerFn: () => loadByEndpoint(ep) });
             let projectLevelCount = 0;

@@ -37,11 +37,14 @@ const claudeBridgeHome = (env) => {
 /** 非空 env 覆盖，否则默认 —— 与 doctor/chain-template 的 `env.X || 默认` 同语义（空串按没设）。 */
 const envOr = (v, fallback) => (typeof v === "string" && v.length > 0 ? v : fallback);
 
-/** 控制面两份来源：registry 与 chain template **各自独立解析**（与 doctor.machineContext 的 registryFile、
- *  以及 doctor 内联的 `path.join(ctx.home, ".claude", "feishu-bridge", "chain-config.json")` 逐字同源）。
+/** 控制面两份来源：registry 与 chain template **各自独立解析**（与 doctor.machineContext 的 registryFile 同源）。
+ *  **一个出处（PK2-F1）**：doctor ⑭ 与这里的固定适配器调的是**同一个函数**。2026-09-11 之前 doctor 自己内联了
+ *  `path.join(ctx.home, ..., "chain-config.json")` —— 于是 `FEISHU_BRIDGE_CHAIN_TEMPLATE` 覆盖只对 cutover/入站生效，
+ *  同一台机器上体检对账读的模板可能不是正在用的那份（当时注释写的"与 doctor 逐字同源"是句空话）。
+ *  覆盖表达式与 chain-template 的 `env.X || 默认` 同语义（空串按没设，返修一 P1-A 那套判据不变）。
  *  两份文件同属一个 bridge home，但**覆盖一个不等于覆盖另一个**：只设 `FEISHU_BRIDGE_REGISTRY` 时 template
  *  仍走 home 下的默认路径（返修一曾把 template 隐式挪到 registry 同目录 —— 探针一设就露）。 */
-const claudeSources = (env, bridge) => ({
+export const claudeSources = (env, bridge) => ({
   registryFile: envOr(env.FEISHU_BRIDGE_REGISTRY, path.join(bridge, "registry.json")),
   templateFile: envOr(env.FEISHU_BRIDGE_CHAIN_TEMPLATE, path.join(bridge, "chain-config.json")),
 });

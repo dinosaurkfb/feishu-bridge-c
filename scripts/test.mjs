@@ -258,7 +258,7 @@ import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
 import * as SEED_MOD from "./m1a-seed.mjs";
 import { seedShadowEndpoint } from "./m1a-seed.mjs";
-import { collectLegacyForCutover } from "./m1a/cutover-reconcile.mjs"; // R69 返修二 P1-A：registry/template 路径同源断言
+import { collectLegacyForCutover, claudeSources } from "./m1a/cutover-reconcile.mjs"; // R69 返修二 P1-A + PK2-F1：registry/template 路径同源断言
 import * as RECON45 from "./m1a/reconcile.mjs";
 import { commitForInstall, finishInstallReopening, liveBaseline, stageForInstall, stagedChecks, stagedPlanProblem, verifyLiveForInstall, verifyStagedForInstall } from "./maintenance/maintenance-install-core.mjs";
 import { parseMaintenanceInstallArgs, runMaintenanceInstall } from "./maintenance-install.mjs";
@@ -30214,6 +30214,24 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.doesNotMatch(green.detail, new RegExp(proj.replaceAll("/", "\\/"), "u"), "正文无项目路径：" + green.detail);
       assert.doesNotMatch(green.detail, /sess_u1/u, "正文无 session 原文");
       assert.doesNotMatch(green.detail, new RegExp(OM1, "u"), "正文无 root_om 原文");
+      // PK2-F1：⑭ 必须认 FEISHU_BRIDGE_CHAIN_TEMPLATE 覆盖 —— 与 cutover 对账/入站读的是**同一份**模板。
+      // 两份模板都读得出、都合法，**只有 alt 那份的 chat_id 与账本投影一致**（home 那份改过）：
+      // 读错哪一份当场分得清（不是"文件在不在"这种一改就骗过去的判据）。
+      // 刀口：把 doctor 那行改回纯 home 路径 → 覆盖例转红。
+      const altDir = path.join(base, "alt-tpl");
+      fs.mkdirSync(altDir, { recursive: true, mode: 0o700 });
+      const altTpl = path.join(altDir, "chain-config.json");
+      fs.copyFileSync(tpl.file, altTpl); // 合法，chat_id = CHAT1
+      writeTpl(home, { chat_id: "oc_" + "f".repeat(32) });
+      process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = altTpl;
+      const ovD = d14();
+      assert.equal(ovD.ok, true, "⑭ 用 env 覆盖那份（alt）：" + JSON.stringify(ovD));
+      delete process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE;
+      const homeD = d14();
+      assert.equal(homeD.ok, false, "对照：不设覆盖 → 读 home 下那份（chat_id 不同 → 红）：" + JSON.stringify(homeD));
+      assert.match(homeD.detail, /字段不等/u, "点名字段不等（两份模板确实不同）：" + homeD.detail);
+      writeTpl(home); // 还原 home 模板（chat_id 回 CHAT1）
+      process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = tpl.file;
       // 复评 P1-4：账本根里 endpoint 名下的非目录制品（文件/symlink）不算缺席也不算未接入 → inventory 红。
       const EPfile = "endpoint_" + "a".repeat(24);
       fs.writeFileSync(path.join(ledgerRoot, EPfile), "{}\n");
@@ -50450,7 +50468,7 @@ test("R69 返修一 P1-3 T5b 恢复腿：committed_with_residue 之后不得直�
   } finally { f.cleanup(); }
 });
 
-test("R69 返修二 P1-A T14 registry 与 template **各自独立**解析：只覆盖 registry 时 template 仍走 <HOME>/.claude/feishu-bridge/chain-config.json（fs 探针），且与 doctor 的派生逐字同源", () => {
+test("R69 返修二 P1-A T14 registry 与 template **各自独立**解析：只覆盖 registry 时 template 仍走 <HOME>/.claude/feishu-bridge/chain-config.json（fs 探针），且 doctor ⑭ 与 adapter 同用一份共用解析（PK2-F1）", () => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r69-t14-")));
   const home = path.join(base, "home");
   const bridge = path.join(home, ".claude", "feishu-bridge");
@@ -50472,6 +50490,9 @@ test("R69 返修二 P1-A T14 registry 与 template **各自独立**解析：只�
   } finally { fs.openSync = origOpen; fs.readFileSync = origRead; }
   const wantTpl = path.join(home, ".claude", "feishu-bridge", "chain-config.json");
   const movedTpl = path.join(path.dirname(altReg), "chain-config.json");
+  const altTpl14 = path.join(base, "alt", "chain-config.json");
+  const envNoTpl = { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: altReg };
+  delete envNoTpl.FEISHU_BRIDGE_CHAIN_TEMPLATE;
   assert.equal(res.ok, true, "只覆盖 registry 时整份快照仍可读：" + JSON.stringify(res));
   assert.ok(opened.includes(path.resolve(altReg)), "registry 走覆盖路径：" + JSON.stringify(opened.slice(0, 8)));
   assert.ok(opened.includes(path.resolve(wantTpl)), "template 仍走 <HOME> 下的默认路径（不被 registry 覆盖联动）：" + JSON.stringify(opened.slice(0, 8)));
@@ -50485,7 +50506,14 @@ test("R69 返修二 P1-A T14 registry 与 template **各自独立**解析：只�
   }
   assert.equal(mc.registryFile, altReg, "doctor registryFile 与覆盖路径同源：" + mc.registryFile);
   assert.ok(opened.includes(path.resolve(mc.registryFile)), "adapter 打开的 registry == doctor 算出的 registry：" + mc.registryFile);
-  assert.equal(path.join(mc.home, ".claude", "feishu-bridge", "chain-config.json"), wantTpl, "doctor 的 template 派生与 adapter 打开的逐字相等");
+  // PK2-F1：doctor ⑭ 不再内联那条派生 —— 它调的就是上面这个共用解析（覆盖表达式只有一份，改一处即两处一致）。
+  // 从前这里比的是本地重算的一个 path.join，adapter 换成什么都绿："逐字同源"当时是句空话。
+  assert.equal(claudeSources(envNoTpl, path.join(mc.home, ".claude", "feishu-bridge")).templateFile, wantTpl,
+    "共用解析：只设 registry 时 template 仍是 <HOME> 默认路径（== adapter 打开的那份）");
+  assert.equal(claudeSources({ ...envNoTpl, FEISHU_BRIDGE_CHAIN_TEMPLATE: altTpl14 }, path.join(mc.home, ".claude", "feishu-bridge")).templateFile, altTpl14,
+    "共用解析认覆盖（doctor ⑭ 调它 → 体检读的就是替换过的那份模板）");
+  assert.ok(fs.readFileSync(new URL("./doctor.mjs", import.meta.url), "utf-8").includes("claudeSources(process.env"),
+    "doctor ⑭ 引的是这个共用解析，不另立第二套表达式");
   fs.rmSync(base, { recursive: true, force: true });
 });
 

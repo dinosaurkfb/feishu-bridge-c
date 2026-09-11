@@ -28420,8 +28420,12 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
     fs.symlinkSync(JSON.stringify({ reason: "伪造", token: fakeTok, at: new Date(clock).toISOString(), pid: process.pid }), fakeGateFile);
     const fakeRead = readJournal({ dir: fakeMaint, token: fakeTok });
     assert.equal(fakeRead.state, "valid", "F1 伪造现场 journal 本身是合法收据（否则反例无意义）：" + fakeRead.why);
+    // R69 返修一 P1-2：自述路径（maintenanceDir/gateFile）现在连门都进不来 —— capability 键集只许身份三键。
     const f1 = TAL.initializeShadow({ endpointId: EPfake, capability: { maintenanceDir: fakeMaint, gateFile: fakeGateFile, token: fakeTok, kind: "initialize_shadow", endpointId: EPfake }, requestKey: fakeTok, chain: CH, env: { ...process.env, FEISHU_BRIDGE_MAINTENANCE_DIR: emptyMaint, FEISHU_BRIDGE_MAINTENANCE_GATE: emptyGateFile } });
-    assert.equal(f1.ok, false); assert.equal(f1.reason, "maintenance_capability_required"); assert.match(f1.why, /no_active_operation/u, "F1 伪造路径→verifier 用 env 空目录→拒：" + f1.why);
+    assert.equal(f1.ok, false); assert.equal(f1.reason, "maintenance_capability_required"); assert.match(f1.why, /maintenanceDir|gateFile/u, "F1① 自述路径键集拒：" + f1.why);
+    // F1②：只带身份三键时，维护目录/门位置仍只认 env —— env 指向空目录 → no_active_operation（不回退自述路径）
+    const f1b = TAL.initializeShadow({ endpointId: EPfake, capability: { token: fakeTok, kind: "initialize_shadow", endpointId: EPfake }, requestKey: fakeTok, chain: CH, env: { ...process.env, FEISHU_BRIDGE_MAINTENANCE_DIR: emptyMaint, FEISHU_BRIDGE_MAINTENANCE_GATE: emptyGateFile } });
+    assert.equal(f1b.ok, false); assert.equal(f1b.reason, "maintenance_capability_required"); assert.match(f1b.why, /no_active_operation/u, "F1② 伪造路径→verifier 用 env 空目录→拒：" + f1b.why);
     assert.equal(fs.existsSync(path.join(dFake, "ledger.json")), false, "F1 被拒后没写账本");
   } finally {
     if (savedLedgerDir === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedgerDir;
@@ -29484,6 +29488,9 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     //      于是写入锁残骸（账本主锁交不还）在 cutover 侧不可达；真实可达的 cutover 残骸是**回退残骸**：
     //      切权威 fail-closed 后回退，清 active 时 unlink EIO → 退出码 3 + 点名 active（R22 P1-1 同形，但本轮补上、可验证）。──
     {
+      // R69 返修一 P1-3：上一次 --init 的账本主锁残骸会让只向前收口**停门**（新语义：不替锁协议收尾；
+      //   停门本身由返修一的 T5b 覆盖）。这里按人工处置先把残骸清掉，再走 exit。
+      fs.rmSync(path.join(epDir(mkEp("r25_cli_init")), "ledger.lock"), { force: true });
       exitMaintenance(ctx, { apply: true });
       const EP = mkEp("r25_cli_cut"); epDir(EP);
       const outC = [];
@@ -32435,6 +32442,8 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const bridge45 = path.join(home, ".claude", "feishu-bridge");
     // 套件启动时把 FEISHU_BRIDGE_REGISTRY 钉在全局沙箱登记表；本测试的 reconcile 走 ledgerEnter 默认 env=process.env，
     // 必须把登记表指到受控文件，否则快照读的是别人的表（双射空空是碰巧成立，不是受控成立）。
+    // R69 返修一 P1-2：链模板来源同样显式钉住（固定适配器按 env 派生；CLI 面带的是本地 env 快照）。
+    env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge45, "chain-config.json");
     const savedReg45 = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge45, "registry.json");
     fs.writeFileSync(path.join(bridge45, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
     fs.writeFileSync(path.join(bridge45, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 }); // M1a Claude 采集器读链模板（collectFor 默认路径）
@@ -37422,9 +37431,8 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     fx.lease = acquireOperationLease({ dir: fx.maintDir, token: fx.tok });
 
     // 放行冒烟：capability 全过后不再是 capability 拒（§二实现后直接执行成功，同样证明核验放行）。
-    let smoke;
-    try { smoke = TAL.schemaUpgrade(args); }
-    catch (e) { console.error("R51STACK:", String(e.stack).split("\n").slice(0, 6).join(" | ")); throw e; }
+    // 异常原样冒泡（不再吞成调试打印：堆栈由测试执行器的失败报告给出）。
+    const smoke = TAL.schemaUpgrade(args);
     assert.ok(smoke.ok === true, "capability 全过后执行成功（证明核验放行）：" + JSON.stringify(smoke));
   }));
 
@@ -49958,6 +49966,9 @@ const r69Fixture = (tag) => {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
   const bridge = path.join(home, ".claude", "feishu-bridge");
+  // R69 返修一 P1-2：cutover 的对账来源由固定适配器按 env 派生 —— 本地 env 也要把链模板指到本夹具（否则
+  //   只剩全局登记表目录那条回落路径，链模板在别处缺席）。
+  env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(bridge, "chain-config.json");
   const savedReg = process.env.FEISHU_BRIDGE_REGISTRY; process.env.FEISHU_BRIDGE_REGISTRY = path.join(bridge, "registry.json");
   fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ projects: [] }, null, 2) + "\n", { mode: 0o600 });
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TPL, null, 2) + "\n", { mode: 0o600 });
@@ -50048,10 +50059,7 @@ test("R69 T2 崩溃恢复：sidecar 全收敛时崩 → --exit --apply 只向前
     assert.ok(crashed, "崩溃注入生效");
     const token2 = readActive({ dir: f.dir }).token;
     f.takeover(token2);
-    const epDirT2 = path.join(f.ledgerRoot, EP);
-    console.error("T2DIAG pre:", TAL.loadLedger(epDirT2, { endpointId: EP }).doc?.authority_mode, f.journalOf(token2).phase, JSON.stringify(f.journalOf(token2).steps.map((x) => [x.id, x.state])));
     const exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
-    console.error("T2DIAG post:", exit.phase, exit.reason, exit.why ?? "");
     assert.equal(exit.phase, "done", "只向前到 done：" + JSON.stringify({ phase: exit.phase, reason: exit.reason, why: exit.why }));
     const epDir = path.join(f.ledgerRoot, EP);
     const doc = TAL.loadLedger(epDir, { endpointId: EP });
@@ -50118,10 +50126,8 @@ test("R69 T4b 账本 SHA 被旁路改 → 提交点拒（CAS：bind 层先拦或
     f.takeover(token);
     const lease = acquireOperationLease({ dir: f.dir, token });
     assert.ok(lease.ok, "取 operation 租约：" + JSON.stringify(lease));
-    const capability = {
-      token, kind: "authority_cutover", endpointId: EP,
-      reconcile: () => LEDGER_OP.reconcileFor({ ctx: f.ctx, chain: "claude", endpointId: EP, ledgerDir: path.join(f.ledgerRoot, EP), env: f.env }),
-    };
+    // R69 返修一 P1-2：capability 只带身份三键（对账来源由 verifier 从固定适配器构造，不由调用方转手）。
+    const capability = { token, kind: "authority_cutover", endpointId: EP };
     // 账本 SHA 旁路改（同一 doc 换序列化缩进 → 字节变、结构不变）
     const doc = JSON.parse(fs.readFileSync(path.join(f.ledgerRoot, EP, "ledger.json"), "utf-8"));
     fs.writeFileSync(path.join(f.ledgerRoot, EP, "ledger.json"), JSON.stringify(doc, null, 4) + "\n", { mode: 0o600 });
@@ -50146,10 +50152,8 @@ test("R69 T4c sidecar 现场 SHA 被旁路改 → 提交点拒（sidecar_sha_mis
     f.takeover(token);
     const lease = acquireOperationLease({ dir: f.dir, token });
     assert.ok(lease.ok, "取 operation 租约：" + JSON.stringify(lease));
-    const capability = {
-      token, kind: "authority_cutover", endpointId: EP,
-      reconcile: () => LEDGER_OP.reconcileFor({ ctx: f.ctx, chain: "claude", endpointId: EP, ledgerDir: path.join(f.ledgerRoot, EP), env: f.env }),
-    };
+    // R69 返修一 P1-2：capability 只带身份三键（对账来源由 verifier 从固定适配器构造，不由调用方转手）。
+    const capability = { token, kind: "authority_cutover", endpointId: EP };
     fs.writeFileSync(path.join(f.ledgerRoot, EP, "policy.json"), Buffer.from(JSON.stringify({ schema_version: "old-policy", endpoint_id: EP, entries: { tampered: "2026-01-01T00:00:00.000Z" } }, null, 2) + "\n", "utf-8"), { mode: 0o600 });
     const r = TAL.authorityCutover({ endpointId: EP, capability, requestKey: token, chain: "claude", env: f.env });
     assert.equal(r.ok, false, "必须拒：" + JSON.stringify(r));
@@ -50160,10 +50164,10 @@ test("R69 T4c sidecar 现场 SHA 被旁路改 → 提交点拒（sidecar_sha_mis
   } finally { f.cleanup(); }
 });
 
-test("R69 T6 capability 不带 reconcile → maintenance_capability_required；裸注入 reconciler 被拒（不回退占位、不消费 _inject）", () => {
-  const f = r69Fixture("t6");
+test("R69 返修一 P1-2 T8 capability 不得携带对账回调：调用方自造 capability 带 reconcile → 键集拒（不回退占位、不消费 _inject）", () => {
+  const f = r69Fixture("t8");
   try {
-    const EP = f.ep("t6");
+    const EP = f.ep("t8");
     { const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true }); assert.ok(init.phase === "done", "前置 init：" + JSON.stringify(init)); }
     f.crashAt.id = "written:sidecar:policy:" + EP;
     try { LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true }); } catch { /* 崩住 */ }
@@ -50172,11 +50176,16 @@ test("R69 T6 capability 不带 reconcile → maintenance_capability_required；�
     f.takeover(token);
     const lease = acquireOperationLease({ dir: f.dir, token });
     assert.ok(lease.ok, "取 operation 租约：" + JSON.stringify(lease));
-    const bare = { token, kind: "authority_cutover", endpointId: EP };
-    const r = TAL.authorityCutover({ endpointId: EP, capability: bare, requestKey: token, chain: "claude", env: f.env, _inject: { reconcile: () => ({ ok: true, digest: "d".repeat(64) }) } });
-    assert.equal(r.reason, "maintenance_capability_required", "T6 拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
-    assert.match(String(r.why ?? ""), /reconcile/u, "T6 why 点名对账闭包：" + r.why);
-    assert.equal(TAL.loadLedger(path.join(f.ledgerRoot, EP), { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
+    const epDir = path.join(f.ledgerRoot, EP);
+    // 调用方自造的"恒真"对账回调：只核 typeof function 就放行，等于把 cutover 的证据换成谎话。
+    const forged = { token, kind: "authority_cutover", endpointId: EP,
+      reconcile: () => ({ ok: true, digest: "d".repeat(64), ledger: { revision: 1, sha256: "e".repeat(64) }, snapshot_identity: [], sidecars: {} }) };
+    const r = TAL.authorityCutover({ endpointId: EP, capability: forged, requestKey: token, chain: "claude", env: f.env,
+      _inject: { reconcile: () => ({ ok: true, digest: "d".repeat(64) }) } });
+    assert.equal(r.reason, "maintenance_capability_required", "T8 键集拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.match(String(r.why ?? ""), /reconcile/u, "T8 why 点名多余键：" + r.why);
+    assert.equal(r.commit, "not_committed", "未提交");
+    assert.equal(TAL.loadLedger(epDir, { endpointId: EP }).doc.authority_mode, "shadow", "账本未翻转");
     releaseOperationLease(lease);
   } finally { f.cleanup(); }
 });
@@ -50194,7 +50203,7 @@ test("R69 T5 commit_residue：注入 committed_with_residue → 保留门 + acti
     const origRm = fs.rmSync; let fired = false;
     fs.rmSync = (t, ...a) => { if (!fired && path.resolve(String(t)) === path.resolve(lockPath)) { fired = true; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm.call(fs, t, ...a); };
     let exit;
-    try { exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true }); } catch (e69) { console.error("STACK69:", e69?.stack ?? e69); } finally { fs.rmSync = origRm; }
+    try { exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true }); } finally { fs.rmSync = origRm; }
     assert.equal(exit.reason, "commit_residue", "commit_residue：" + JSON.stringify({ reason: exit.reason, commit: exit.commit, why: exit.why }));
     assert.equal(exit.commit, "committed_with_residue", "commit 透传");
     assert.equal(exitCodeFor({ ok: false, reason: "commit_residue", phase: exit.phase }), 3, "退出码 3");
@@ -50261,6 +50270,146 @@ test("R69 T7 入口级（两腿）：cutover 进行中（门已撤、WAL 未完�
     assert.equal(decision.picked.pin, "sess_t7_live", "顺手钉");
   } finally { fB.cleanup(); }
   assert.ok(rejectOk, "拒腿完成");
+});
+
+// ── R69 返修一（Codex #162 一轮 3 P1 + 1 P2）：提交点收官的反例 ──
+
+/** 把 cutover 推到「账本未翻转」的提交前现场并接管（清租约与安装面锁）。
+ *  crashAt 省略 = 崩在 written:sidecar:policy 之后（三条 sidecar 已 done）；传函数 = 自定义崩溃点。 */
+const r69PreCommit = (f, tag, crashAt = null) => {
+  const EP = f.ep(tag);
+  const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true });
+  assert.ok(init.ok && init.phase === "done", "前置 init：" + JSON.stringify(init));
+  f.crashAt.id = crashAt === null ? "written:sidecar:policy:" + EP : crashAt(EP);
+  try { LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true }); } catch { /* 崩在提交前 */ }
+  f.crashAt.id = null;
+  const token = readActive({ dir: f.dir }).token;
+  f.takeover(token);
+  const epDir = path.join(f.ledgerRoot, EP);
+  return {
+    EP, token, epDir,
+    mode: () => TAL.loadLedger(epDir, { endpointId: EP }).doc.authority_mode,
+    lease: () => { const l = acquireOperationLease({ dir: f.dir, token }); assert.ok(l.ok, "取 operation 租约：" + JSON.stringify(l)); return l; },
+  };
+};
+
+test("R69 返修一 P1-2 T9 sidecar step 未全 done 不许提前提交：提前调 authorityCutover → sidecar_steps_incomplete、账本不翻转", () => {
+  const f = r69Fixture("t9");
+  try {
+    const s = r69PreCommit(f, "t9", (EP) => "written:sidecar:expiry:" + EP);
+    const steps = f.journalOf(s.token).steps.filter((x) => x.kind === "sidecar");
+    assert.ok(steps.length === 3 && steps.some((x) => x.state !== "done"), "前置：确有 sidecar 未 done：" + JSON.stringify(steps.map((x) => [x.id, x.state])));
+    const lease = s.lease();
+    const r = TAL.authorityCutover({ endpointId: s.EP, capability: { token: s.token, kind: "authority_cutover", endpointId: s.EP }, requestKey: s.token, chain: "claude", env: f.env });
+    assert.equal(r.reason, "maintenance_capability_required", "T9 拒：" + JSON.stringify({ reason: r.reason, why: r.why }));
+    assert.match(String(r.why ?? ""), /sidecar_steps_incomplete/u, "T9 why 点名 sidecar 未 done：" + r.why);
+    assert.equal(r.commit, "not_committed", "未提交");
+    assert.equal(s.mode(), "shadow", "账本未翻转");
+    releaseOperationLease(lease);
+  } finally { f.cleanup(); }
+});
+
+test("R69 返修一 P1-1 T10 锁内复核覆盖快照身份：提交前 legacy 来源漂移（digest 不变）→ 拒、账本不翻转", () => {
+  const f = r69Fixture("t10");
+  try {
+    const s = r69PreCommit(f, "t10");
+    const tplFile = path.join(f.bridge, "chain-config.json");
+    const tpl = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+    const exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true, _inject: { beforeCommitCheck: () => {
+      // 只改链模板的展示字段：账本双射（空空）与三条 sidecar 现场都不变，变的是 snapshot_identity（模板 sha256）。
+      fs.writeFileSync(tplFile, JSON.stringify({ ...tpl, task_display_name: "drift" }, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(exit.ok, false, "T10 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
+    assert.match(String(exit.reason), /snapshot_identity_mismatch|sidecar_sha_mismatch|bijection/u, "T10 拒因点名快照身份：" + exit.reason);
+    assert.equal(s.mode(), "shadow", "账本未翻转");
+  } finally { f.cleanup(); }
+});
+
+test("R69 返修一 P1-1 T11 锁内复核覆盖 digest：提交前 legacy 投影漂移 → 拒、账本不翻转", () => {
+  const f = r69Fixture("t11");
+  try {
+    const s = r69PreCommit(f, "t11");
+    const regFile = path.join(f.bridge, "registry.json");
+    const proj = path.join(f.base, "p11"); fs.mkdirSync(proj, { recursive: true });
+    const exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true, _inject: { beforeCommitCheck: () => {
+      // 多一条 active project → 投影非空、shadow 空 → 双射 mismatch（digest 漂移）。
+      fs.writeFileSync(regFile, JSON.stringify({ projects: [{ id: "t11", root: proj, name: "T11", root_message_id: "om_t11", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_t11", inbound_state: "bound", status: "active", bound_at: "2026-09-01T00:00:00.000Z" }] }, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(exit.ok, false, "T11 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
+    assert.match(String(exit.reason), /bijection|digest|reconcile|cutover_blocked|snapshot/u, "T11 拒因点名双射/digest：" + exit.reason);
+    assert.equal(s.mode(), "shadow", "账本未翻转");
+  } finally { f.cleanup(); }
+});
+
+test("R69 返修一 P1-1 T12 锁内复核覆盖 blocker：提交前冒出待修项 → 拒、账本不翻转", () => {
+  const f = r69Fixture("t12");
+  try {
+    const s = r69PreCommit(f, "t12");
+    const regFile = path.join(f.bridge, "registry.json");
+    const proj = path.join(f.base, "p12"); fs.mkdirSync(proj, { recursive: true });
+    const exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true, _inject: { beforeCommitCheck: () => {
+      // retired binding（与 #R45 blockers 夹具同形）：投影出待修项 → 硬门。
+      fs.writeFileSync(regFile, JSON.stringify({ projects: [{ root: proj, id: "p1", claude_session_id: "ps_" + "a".repeat(32), root_message_id: "om_" + "b".repeat(20), status: "retired" }] }, null, 2) + "\n", { mode: 0o600 });
+    } } });
+    assert.equal(exit.ok, false, "T12 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
+    assert.match(String(exit.reason), /cutover_blocked|bijection|projection|reconcile/u, "T12 拒因点名待修项：" + exit.reason);
+    assert.equal(s.mode(), "shadow", "账本未翻转");
+  } finally { f.cleanup(); }
+});
+
+test("R69 返修一 P1-3 T13 锁内 pre-SHA 必须是原始字节：提交前账本旁路改（纯字节、结构不变）→ pre_sha_mismatch、账本不翻转", () => {
+  const f = r69Fixture("t13");
+  try {
+    const s = r69PreCommit(f, "t13");
+    const ledgerFile = path.join(s.epDir, "ledger.json");
+    const exit = LEDGER_OP.ledgerExit(f.ctx, { apply: true, _inject: { beforeCommitCheck: () => {
+      // 只加一个尾随空格：JSON 结构不变（serializeLedger 重演算的 SHA 不变），文件原始字节 SHA 变了。
+      fs.writeFileSync(ledgerFile, fs.readFileSync(ledgerFile, "utf-8").replace(/\n$/u, " \n"), { mode: 0o600 });
+    } } });
+    assert.equal(exit.ok, false, "T13 拒：" + JSON.stringify({ ok: exit.ok, reason: exit.reason, why: exit.why }));
+    assert.equal(exit.reason, "pre_sha_mismatch", "T13 拒因：" + JSON.stringify({ reason: exit.reason, why: exit.why }));
+    assert.equal(s.mode(), "shadow", "账本未翻转");
+  } finally { f.cleanup(); }
+});
+
+test("R69 返修一 P1-3 T5b 恢复腿：committed_with_residue 之后不得直接 markStepDone——主锁 / 账本 tmp 残骸 / 持久化屏障三项各自停门，全过才收口", () => {
+  const f = r69Fixture("t5b");
+  try {
+    const s = r69PreCommit(f, "t5b");
+    const lockPath = path.join(s.epDir, "ledger.lock");
+    const ledgerStepState = () => f.journalOf(s.token).steps.find((x) => x.kind === "ledger").state;
+    // 首次：注入 committed_with_residue（主锁删不掉 → release 残骸，主锁留在盘上）——与 T5 同款注入。
+    const origRm = fs.rmSync; let fired = false;
+    fs.rmSync = (t, ...a) => { if (!fired && path.resolve(String(t)) === path.resolve(lockPath)) { fired = true; const e = new Error("EIO"); e.code = "EIO"; throw e; } return origRm.call(fs, t, ...a); };
+    let exit1;
+    try { exit1 = LEDGER_OP.ledgerExit(f.ctx, { apply: true }); } finally { fs.rmSync = origRm; }
+    assert.equal(exit1.reason, "commit_residue", "首次停门：" + JSON.stringify({ reason: exit1.reason, commit: exit1.commit }));
+    assert.equal(exit1.commit, "committed_with_residue", "commit 透传：" + exit1.commit);
+    assert.equal(TAL.loadLedger(s.epDir, { endpointId: s.EP }).doc.authority_mode, "authoritative", "账本已翻转");
+    assert.equal(ledgerStepState(), "prepared", "残骸未清 → ledger step 不得 done");
+    // ① 主锁仍在 → 停门 ledger_lock_residue（不 markStepDone）
+    const exit2 = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
+    assert.equal(exit2.ok, false, "① 主锁残骸不许收口：" + JSON.stringify({ ok: exit2.ok, reason: exit2.reason, why: exit2.why }));
+    assert.equal(exit2.reason, "ledger_lock_residue", "① 拒因：" + JSON.stringify({ reason: exit2.reason, why: exit2.why }));
+    assert.equal(ledgerStepState(), "prepared", "① 不得 markStepDone");
+    // ② 清主锁、种一个账本 tmp 残骸 → 停门 ledger_residue（不自清）
+    fs.rmSync(lockPath, { force: true });
+    const tmpPath = path.join(s.epDir, "ledger.json.4242.11111111-2222-4333-8444-555555555555");
+    fs.writeFileSync(tmpPath, "x", { mode: 0o600 });
+    const exit3 = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
+    assert.equal(exit3.reason, "ledger_residue", "② 拒因：" + JSON.stringify({ reason: exit3.reason, why: exit3.why }));
+    assert.equal(fs.existsSync(tmpPath), true, "② 残骸不得自清");
+    assert.equal(ledgerStepState(), "prepared", "② 不得 markStepDone");
+    // ③ 清 tmp、注入目录 fsync 失败 → 停门 ledger_durability_unconfirmed
+    fs.rmSync(tmpPath, { force: true });
+    const exit4 = LEDGER_OP.ledgerExit(f.ctx, { apply: true, _inject: { failDirFsync: true } });
+    assert.equal(exit4.reason, "ledger_durability_unconfirmed", "③ 拒因：" + JSON.stringify({ reason: exit4.reason, why: exit4.why }));
+    assert.equal(ledgerStepState(), "prepared", "③ 不得 markStepDone");
+    // ④ 三项全过 → 才 markStepDone 并收口 done
+    const exit5 = LEDGER_OP.ledgerExit(f.ctx, { apply: true });
+    assert.equal(exit5.phase, "done", "④ 收口：" + JSON.stringify({ phase: exit5.phase, reason: exit5.reason, why: exit5.why }));
+    assert.equal(ledgerStepState(), "done", "④ ledger step done");
+  } finally { f.cleanup(); }
 });
 
 sealSummary();

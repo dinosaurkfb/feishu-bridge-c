@@ -21,7 +21,7 @@ import path from "node:path";
 import { acquirePublishLock, acquireLockUngated, releasePublishLock, commitWhileHeld, readLockOwner } from "./registry.mjs";
 import { isCanonicalIso, canonicalIso, isCanonicalMs } from "./canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "./claim.mjs";
-import { CUTOVER_JOURNAL_SCHEMA, JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal } from "./maintenance/journal.mjs";
+import { CUTOVER_JOURNAL_SCHEMA, JOURNAL_SCHEMA, OPERATION_KINDS, OWNER_SELECT_JOURNAL_SCHEMA, journalProblem, leaseHolder, leasePath, maintenanceDir, readActive, readJournal, stagedIntendedFile } from "./maintenance/journal.mjs";
 import { campaignIdFor } from "./maintenance/owner-select-derived.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceGatePath, readGate } from "./maintenance-gate-core.mjs";
@@ -31,6 +31,9 @@ export { canonKey, sha256 };
 import { ID_SHAPE, SELECTION_HANDLE_SHAPE, REBIND_HANDLE_SHAPE, REAFFIRM_HANDLE_SHAPE, ENDPOINT_SHAPE, CHAT_SHAPE } from "./shapes.mjs";
 import { SIDECAR_TMP_TAIL_RE } from "./verified-sidecar.mjs";
 import { readSidecarCurrent } from "./maintenance/sidecar-writer.mjs"; // R69：4c-3 与 converge 同一 fd 受验读
+import { readStagedVerified } from "./m1b/staged-plan.mjs"; // R69 返修一 P1-1：锁内复核要 staged plan 的受验字节
+import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs"; // R69 返修一 P1-1：与门内二次重验**同一函数、同一等式**
+import { reconcileForCutover } from "./m1a/cutover-reconcile.mjs"; // R69 返修一 P1-2：对账来源固定在此，不由 capability 携带
 
 export const SCHEMA_VERSION = "1.0";
 export const ARTIFACT_TYPE = "feishu_bridge_topic_agent_ledger";
@@ -1801,7 +1804,9 @@ function writeLedger({ dir, endpointId, gated, requestKey = null, replay = null,
         }
       }
     }
-    const m = mutate(currentDoc);
+    // R69 返修一 P1-3：把**锁内 fd 受验读到的原始字节** SHA 传给 mutate（例如 cutover 的 pre-SHA CAS）——
+    //   serializeLedger(currentDoc) 是重演算的规范化字节，旁路改一个空格它照旧，证不了"账本没被动过"。
+    const m = mutate(currentDoc, { rawSha256: cur.status === "read" ? cur.sha256 : null });
     if (!m.ok) {
       // 重放/冲突判定统一走上面的 request_key 前置（评审七 P1-2：seed 全存在也落空 op，不再有状态式 noop 免写）。
       return finalize({ ok: false, commit: "not_committed", reason: m.reason, why: m.why });
@@ -2425,6 +2430,11 @@ const OSM_KIND_TO_UPGRADE_EDGE = Object.freeze({ owner_select_migration_a: "1.0-
 function _maintenanceVerifier(capability, endpointId, opType, env = process.env) {
   const fail = (reason, why) => ({ ok: false, reason, why });
   if (!capability || typeof capability !== "object") return fail("bad_capability", "capability 缺失");
+  // R69 返修一 P1-2：capability 只携带**身份**（token/kind/endpointId），不得携带"真相回调"。
+  //   旧形 cutover 靠 capability.reconcile 把对账来源递进来，verifier 只核 typeof function —— 持租约的调用方
+  //   传一个恒真 reconciler 就把切权威的证据换成谎话。这里键集封闭：白名单之外的键一律拒。
+  const extraKeys = Object.keys(capability).filter((k) => k !== "token" && k !== "kind" && k !== "endpointId");
+  if (extraKeys.length > 0) return fail("maintenance_capability_required", "capability 只许携带身份三键（endpointId/kind/token），多余键：" + extraKeys.sort().join("、"));
   const isOsm = opType === "schema_upgrade" || opType === "mint_selection_handles";
   const wantKind = isOsm ? null : opType === "initialize_shadow" ? "ledger_init" : "ledger_cutover";
   const wantPhase = isOsm ? null : opType === "initialize_shadow" ? "ledger_initializing" : "ledger_cutting_over";
@@ -2521,6 +2531,21 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
     if (Object.values(sidecarShas).some((v) => typeof v !== "string" || !SHA_SHAPE.test(v))) {
       return fail("sidecar_anchors_missing", "三条 sidecar step 的 intended_after.sha256 缺失或非法");
     }
+    // R69 返修一 P1-2：三条 sidecar 必须都已 done —— 否则提早提交会把复合顺序做坏
+    //   （账本已翻转、sidecar 未收全 → 之后只剩 composite_order_violation 的死局）。
+    for (const st of j.doc.steps) {
+      if (st.kind === "sidecar" && st.state !== "done") return fail("sidecar_steps_incomplete", "sidecar step " + st.id + " 状态 " + st.state + "（提交点要求三条 sidecar 均已 done）");
+    }
+  }
+  // R69 返修一 P1-1：锁内复核要 staged plan 的**受验字节**（journal 的 plan_sha256 是唯一锚）——
+  //   与门内二次重验读的是同一份文件、同一份锚；换个字节就是 plan_anchor_mismatch / 受验读失败。
+  let planBytes = null;
+  if (wantSub === "cutover") {
+    const planSha = ls.intended_after?.plan_sha256;
+    if (typeof planSha !== "string" || !SHA_SHAPE.test(planSha)) return fail("plan_anchor_missing", "ledger step intended_after.plan_sha256 缺失（1.3 八键）");
+    const pb = readStagedVerified(stagedIntendedFile({ dir: maintDir, token, name: "plan" }), { sha256: planSha });
+    if (!pb.ok) return fail("staged_plan_unreadable", "staged plan 受验读失败（" + String(pb.why ?? pb.reason ?? "?") + "）");
+    planBytes = pb.buf;
   }
   const binding = commitWhileHeld(lpath, () => {
     const ld = resolveEndpointDir(endpointId, { env });
@@ -2535,13 +2560,33 @@ function _maintenanceVerifier(capability, endpointId, opType, env = process.env)
   // 评审 P1-3：WAL 所有权转换后 reap 锁残骸没收干净（收成 reapUncleared 挂在 binding 上）→ fail-closed 拒写，不许带着残骸继续落盘。
   if (binding.reapUncleared) return fail("lease_reap_uncleared", "WAL 所有权转换后 reap 残骸未清（" + (binding.reapUncleared.path ?? "?") + "）");
   if (!binding.run.ok) return fail("plan_rebuild", binding.run.reason + (binding.run.why !== undefined ? "：" + binding.run.why : ""));
-  // R69：cutover 的对账来源只经受验 capability 携带（与 prepareFor 同一 adapter 闭包，由维护层构造）——
-  //   不接调用方裸注入、不回退恒拒占位。形状校验在此封闭：非函数 → 拒；其余字段集不变。
-  if (wantSub === "cutover" && typeof capability.reconcile !== "function") {
-    return fail("maintenance_capability_required", "cutover capability 必须携带受验对账闭包 reconcile（R69：对账来源只经受验 capability 携带）");
-  }
+  // R69 返修一 P1-2：对账来源**在这里**构造（固定维护适配器，与 prepareFor 同一份）——
+  //   不再由 capability 携带、也不接调用方裸注入；旧形 reconcileShadow 恒拒占位继续留在生产路径之外。
   return { ok: true, maintenanceDir: maintDir, doc: j.doc, ledgerStep: ls, plan: binding.run.plan,
-    ...(wantSub === "cutover" ? { reconcile: capability.reconcile, sidecarShas } : {}) };
+    ...(wantSub === "cutover" ? { planBytes, reconcile: () => reconcileForCutover({ endpointId, chain: ls.chain, env }), sidecarShas } : {}) };
+}
+
+/**
+ * R69 返修一 P1-3：**已提交（intended_after）收口前置** —— 编排层在 markStepDone 之前必须过这三关：
+ *   ① 账本主锁必须 absent（present / unreadable = 上次提交的归属证明没交还，归人；不替锁协议做决定）；
+ *   ② 持久化屏障必须**重做成功**（账本文件 fsync + endpoint 目录 fsync）—— loadLedger 的"读得到"证明不了耐久；
+ *   ③ 账本 tmp 残骸一律不自清（交显式维护入口；在这里自清等于把"谁留下的"抹掉）。
+ * @returns { ok: true } | { ok: false, reason, why }
+ */
+export function ledgerSettlePrecondition({ dir, _inject = null } = {}) {
+  const lo = readLockOwner(ledgerPaths(dir).lock, { strict: true });
+  if (!lo.absent) {
+    return { ok: false, reason: "ledger_lock_residue",
+      why: "账本主锁未交还（" + (lo.present ? "仍在盘上" : "读不出：" + String(lo.error ?? "?")) + "）：先人工核对再收口" };
+  }
+  const b = barrierLedgerDurability({ dir, claimsDir: null, dirsPendingFsync: [], _inject });
+  if (!b.ok) return { ok: false, reason: "ledger_durability_unconfirmed", why: String(b.why ?? "持久化屏障重做失败") };
+  let names;
+  try { names = fs.readdirSync(dir); }
+  catch (err) { return { ok: false, reason: "ledger_residue", why: "账本目录盘不出：" + String(err?.code ?? err?.message ?? err) }; }
+  const tmp = names.filter((n) => isLedgerTmpName(n));
+  if (tmp.length > 0) return { ok: false, reason: "ledger_residue", why: "账本 tmp 残骸在场（" + tmp.join("、") + "）：不自清，交 repair 入口" };
+  return { ok: true };
 }
 
 /** 由 journal 里已落盘的 ledger step 幂等重建 WAL 蓝图（P1-3：不接受调用方任意 planIn）。 */
@@ -2776,6 +2821,9 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
   // R69：蓝图 result（七键封闭）在重建 plan 内，提交点各核验与重放输入都从它取。
   const cutResult = plan.doc?.operations?.[plan.operationId]?.result ?? null;
   if (!isObj(cutResult)) return { ok: false, commit: "not_committed", reason: "plan_rebuild", why: "蓝图里没有 cutover operation result" };
+  // 只给测试的注入点：在「外层二次重验（convergeSidecars）之后、锁内 mutate 之前」改现场 ——
+  //   四条反例（快照身份漂移 / digest 漂移 / 冒出 blocker / 账本纯字节旁路改）都靠它落在正确的窗口里。
+  if (typeof _inject?.beforeCommitCheck === "function") _inject.beforeCommitCheck();
   const res = writeLedger({
     dir: d.dir, endpointId, gated: false, requestKey, _inject,
     replay: () => [{ opType: "authority_cutover", inputs: {
@@ -2783,29 +2831,40 @@ export function authorityCutover({ endpointId, capability, requestKey, chain, en
       pre_cutover_ledger_sha: cutResult.pre_cutover_ledger_sha, expiry_sha256: cutResult.expiry_sha256,
       pending_claims_sha256: cutResult.pending_claims_sha256, policy_sha256: cutResult.policy_sha256,
     } }],
-    mutate: (currentDoc) => {
+    mutate: (currentDoc, ctxIn = undefined) => {
+      const rawSha256 = ctxIn?.rawSha256 ?? null;
       if (currentDoc === null) return { ok: false, reason: "absent", why: "账本缺席" };
       if (currentDoc.authority_mode !== "shadow") return { ok: false, reason: "mode_not_shadow" };
       if (Object.values(currentDoc.operations).some((op) => op.op_type === "authority_cutover")) return { ok: false, reason: "already_cutover" };
       if (currentDoc.revision !== plan.before.revision) return { ok: false, reason: "state_moved", why: "账本 revision 变过" };
-      // 4c-1：pre SHA CAS（账本字节与蓝图锚逐字）
-      if (sha256(serializeLedger(currentDoc)) !== cutResult.pre_cutover_ledger_sha) return { ok: false, reason: "pre_sha_mismatch", why: "账本 SHA 与蓝图 pre_cutover_ledger_sha 不一致（旁路改动？）" };
-      // 4c-2：重新对账（capability 携带的受验闭包）：ok + blockers 空 + digest 等蓝图
+      // 4c-1：pre SHA CAS —— 用**锁内 fd 受验读到的原始字节**（R69 返修一 P1-3）：规范化重演算的 SHA
+      //   对"旁路改了一个空格"这类纯字节漂移是瞎的，那正是这条 CAS 要抓的东西。
+      if (rawSha256 === null || rawSha256 !== cutResult.pre_cutover_ledger_sha) {
+        return { ok: false, reason: "pre_sha_mismatch", why: "账本原始字节 SHA 与蓝图 pre_cutover_ledger_sha 不一致（旁路改动？）" };
+      }
+      // 4c-2：重新对账 —— 来源是 verifier 构造的**固定维护适配器**（capability 不携带回调）；先过 blockers 硬门。
       const rec = cap.reconcile();
+      if ((rec?.cutover_blockers?.length ?? 0) > 0) return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + rec.cutover_blockers.length + " 条）" };
       if (!rec || !rec.ok) return { ok: false, reason: rec?.reason ?? "reconcile_failed", why: rec?.why ?? "对账器未返回成功" };
-      if ((rec.cutover_blockers?.length ?? 0) > 0) return { ok: false, reason: "cutover_blocked", why: "提交前对账发现待修项（" + rec.cutover_blockers.length + " 条）" };
-      if (rec.digest !== cutResult.bijection_digest) return { ok: false, reason: "bijection_digest_mismatch", why: "提交前对账 digest 与蓝图不一致（staging 后 legacy 变了）" };
-      // 4c-4：蓝图验证（与对账 digest 绑定）
-      const t4 = cutoverPlanVerifier(plan, rec.digest, endpointId);
-      if (!t4.ok) return { ok: false, reason: t4.reason, why: t4.why };
-      // 4c-3：三 sidecar 现场 SHA === 对应 sidecar step 锚（fd 受验读，与 converge 同一读法）
+      // 4c-3（先行短路）：三 sidecar 现场 SHA === 对应 sidecar step 锚（fd 受验读，与 converge 同一读法）
       const sidecarFiles = [["expiry.json", "expiry"], ["pending-claims.json", "pending_claims"], ["policy.json", "policy"]];
       for (const [fname, key] of sidecarFiles) {
-        const cur = readSidecarCurrent(path.join(d.dir, fname));
-        if (!cur.present || cur.problem !== undefined || cur.sha256 !== cap.sidecarShas[key]) {
-          return { ok: false, reason: "sidecar_sha_mismatch", why: fname + " 现场 SHA 与 sidecar step 锚不一致（" + (!cur.present ? "absent" : (cur.problem ?? "sha 不等")) + "）" };
+        const curS = readSidecarCurrent(path.join(d.dir, fname));
+        if (!curS.present || curS.problem !== undefined || curS.sha256 !== cap.sidecarShas[key]) {
+          return { ok: false, reason: "sidecar_sha_mismatch", why: fname + " 现场 SHA 与 sidecar step 锚不一致（" + (!curS.present ? "absent" : (curS.problem ?? "sha 不等")) + "）" };
         }
       }
+      // 4c-4（**最终以它为准**）：与门内二次重验**同一函数、同一等式** —— ①~⑤ + 4f + 快照身份 + 同源渲染字节
+      //   逐条核 plan 锚。上面三段只是先行短路；只有这一核才同时封住"拿旧 sidecar / 旧身份切权威"。
+      const v = verifyCutoverPlan({
+        planBytes: cap.planBytes,
+        doc: cap.doc,
+        ledgerStep: cap.ledgerStep,
+        sidecarSteps: cap.doc.steps.filter((s) => s.kind === "sidecar"),
+        ledgerEndpointId: endpointId,
+        reconcile: { ...rec, ledger: { revision: currentDoc.revision, sha256: rawSha256 } },
+      });
+      if (!v.ok) return { ok: false, reason: v.reason, why: v.why ?? null };
       return { ok: true, next: plan.doc };
     },
   });

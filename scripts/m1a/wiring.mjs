@@ -81,6 +81,14 @@ export function uncleanWired(wired) {
     op: s.op ?? null, commit: s.committed ?? "committed_clean", residue: s.residue ?? null,
     lockUncleared: s.lockUncleared ?? null, path: s.path ?? null, error: s.error ?? null,
   }));
+  // PK2-W1-fix2 P1-3：runAuthoritative 顶层已按 commits[] 算出 commit 联合 —— uncleanWired 必须
+  //   **消费 wired.commit / wired.commits**：ledger 步内部多原语（create_a1 + activate）时，步级
+  //   committed 只剩最后一笔，前面原语的 committed_durability_uncertain / with_residue 只在
+  //   wired.commits 里。任一原语 commit 非 clean → 不谎报 clean（K3 刀命中的缺口）。
+  const commitsUnclean = Array.isArray(wired?.commits)
+    ? wired.commits.filter((c) => c && (c.commit !== "committed_clean" || c.residue || c.lockUncleared || c.path || c.error))
+    : [];
+  const commitUnclean = wired?.commit === "committed_unclean" || commitsUnclean.length > 0;
   const rel = wired?.release;
   const releaseUnclean = rel && rel.ok !== true ? {
     reason: rel.reason ?? null, why: rel.why ?? null, path: rel.path ?? null, error: rel.error ?? null,
@@ -89,11 +97,15 @@ export function uncleanWired(wired) {
     reason: wired.reason ?? null, why: wired.why ?? null,
     path: wired.lockPath ?? wired.lock ?? null, error: wired.lockError ?? null,
   } : null;
-  const durabilityUncertain = uncleanSteps.some((s) => s.commit === "committed_durability_uncertain");
+  const durabilityUncertain = uncleanSteps.some((s) => s.commit === "committed_durability_uncertain")
+    || commitsUnclean.some((c) => c.commit === "committed_durability_uncertain");
   const residue = steps.filter((s) => s && s.residue).map((s) => ({ op: s.op ?? null, residue: s.residue ?? null }));
   return {
-    clean: wired?.ok === true && failedSteps.length === 0 && uncleanSteps.length === 0 && !releaseUnclean,
+    clean: wired?.ok === true && failedSteps.length === 0 && uncleanSteps.length === 0
+      && !releaseUnclean && !commitUnclean && commitsUnclean.length === 0,
     steps, failedSteps, uncleanSteps, residue, releaseUnclean, lockUnclean,
+    commit: wired?.commit ?? null, commits: Array.isArray(wired?.commits) ? wired.commits : [],
+    commitsUnclean, commitUnclean,
     durabilityUncertain,
   };
 }
@@ -394,7 +406,7 @@ export function wireBindAuthoritative({
  */
 export function wirePromoteAuthoritative({
   endpointId, env = process.env, locator, claimKey, sessionId, authorizedBy, f4 = null, verify = null,
-  publishIndex, now = Date.now(),
+  publishIndex, now = Date.now(), _inject = null,
 }) {
   return runAuthoritative({ endpointId, env, steps: [
     { op: "ledger", run: ({ byOp }) => {
@@ -429,7 +441,9 @@ export function wirePromoteAuthoritative({
       if (!en(chatId0)) return { op: "create_a1", ok: false, reason: "bad_input", why: "target.chat_id 缺失" };
       const kA1 = rk("create_a1", claimKey, sessionId);
       if (!kA1.ok) return { op: "create_a1", ...kA1 };
-      const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId: chatId0, sessionId, now, env }));
+      // PK2-W1-fix2 P1-3：_inject（测试缝）按 op 分发 —— create_a1 可注入 committed_durability_uncertain。
+      const injA1 = typeof _inject === "function" ? _inject("create_a1") : _inject;
+      const a1 = capture("create_a1", createA1({ endpointId, requestKey: kA1.request_key, chatId: chatId0, sessionId, now, env, _inject: injA1 }));
       if (a1.ok !== true) return a1;
       // create_a1 的提交证据单独带出（步级 capture 只会留得下 activate 那一笔）—— P1-3。
       const a1Commit = [{ op: "create_a1", commit: a1.committed ?? "committed_clean", idempotent: a1.idempotent === true,
@@ -437,7 +451,8 @@ export function wirePromoteAuthoritative({
         a1_id: a1.result?.created_id ?? null }];
       const kAct = rk("activate", claimKey, b1Id);
       if (!kAct.ok) return { op: "activate", ...kAct, commits: a1Commit };
-      const act = capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: f4Use, authorizedBy, now, env }));
+      const injAct = typeof _inject === "function" ? _inject("activate") : _inject;
+      const act = capture("activate", activate({ endpointId, requestKey: kAct.request_key, b1Id, a1Id: a1.result?.created_id, f4: f4Use, authorizedBy, now, env, _inject: injAct }));
       // 失败也带上 a1 的证据："create_a1 已提交、activate 未成" 是半笔，调用方要能点名。
       if (act.ok !== true) return { ...act, op: "activate", commits: a1Commit };
       // topic_agent_id 直接取账本里那条记录自己的 id（权威事实，不重算）。

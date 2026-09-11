@@ -253,6 +253,7 @@ import { stageCutoverPlan, verifyStagedPlan, removeStagedPlan, planProblem as m1
 import { verifyCutoverPlan } from "./m1b/cutover-plan.mjs";
 import { writeSidecarPrepared } from "./maintenance/sidecar-writer.mjs";
 import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, readSidecarFile, validateSidecarDoc, SIDECAR_SCHEMAS } from "./m1b/sidecar-renderers.mjs";
+import { readSidecarStore, mutateSidecarEntry } from "./m1b/sidecar-store.mjs"; // PK2-W1：sidecar 条目的锁内读-改-写
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
 import { topicAgentIdForLegacy, discriminateGeneration, effectiveBindingStatus, projectLegacySnapshot, projectShadowBFamily, reconcileLegacyEndpoint, isBFamily } from "./m1a/reconcile.mjs";
@@ -11961,17 +11962,21 @@ test("登记表的写入口只有一个 —— 建话题那条路径也走同一
   //
   // 行为上不好造并发，所以这里钉住"文件里没有第二条写回路径"：
   // 整体写回 registry 的语句只许出现在事务函数里。
-  const src = fs.readFileSync(path.resolve("scripts", "bind-project.mjs"), "utf-8");
+  // PK2-W1：事务函数本身搬到了 `topic-generation-store.mjs`（一个实现，bind-project 不再自带第二份）——
+  //   锚点跟着搬家：写回仍然只许有一处，且必须在那一个事务函数里。
+  const txSrc = fs.readFileSync(path.resolve("scripts", "topic-generation-store.mjs"), "utf-8");
   // 用"原子重命名到登记表文件"当锚点 —— 那是真正提交写入的那一步，
   // 比匹配变量名稳（变量可能叫 registry，也可能叫 fresh.registry）。
-  const writes = [...src.matchAll(/renameSync\(tmp, regFile\)/gu)];
+  const writes = [...txSrc.matchAll(/renameSync\(tmp, regFile\)/gu)];
   assert.equal(writes.length, 1, "登记表写回只许有一处（在事务函数里），实际 " + writes.length + " 处");
-  const inTx = src.indexOf("function withRegistryTransaction");
-  const txEnd = src.indexOf("\n}\n", src.indexOf("} finally {", inTx));
+  const inTx = txSrc.indexOf("export function withRegistryTransaction");
+  const txEnd = txSrc.indexOf("\n}\n", txSrc.indexOf("} finally {", inTx));
   assert.ok(writes[0].index > inTx && writes[0].index < txEnd,
     "那唯一一处必须在 withRegistryTransaction 里面");
-  // 两条路径都用它。
-  // 数**调用点**，别把函数定义也数进去（第一版就是这么多算了一处）。
+  // 两条路径都用它 —— 数 bind-project 里的**调用点**（定义已不在这个文件里）。
+  const src = fs.readFileSync(path.resolve("scripts", "bind-project.mjs"), "utf-8");
+  assert.equal((src.match(/function withRegistryTransaction/gu) ?? []).length, 0,
+    "bind-project 里不许再有第二份事务函数（PK2-W1 已搬到 topic-generation-store.mjs）");
   // 三处：补登记、新建绑定、**从暂停恢复**。恢复那条是后加的 ——
   // 它原本直接改项目文件就退出，registry 那一侧根本没修，
   // 于是"恢复成功、出站继续失效"。
@@ -50699,6 +50704,91 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
     assert.equal(ledgerStepState(), "done", "② ledger step done");
   } finally { f.cleanup(); }
 });
+
+// ── PK2-W1：切权威后的会话级绑定 + 认领（M1b-W1）──
+// 设计：m1a-reconciliation.md §4 ③ + PI-DESIGN（M1B-W1）。规范：绑定时建根话题；真机 2026-09-11 已 authoritative。
+{
+  const W1_TA = "ta_" + "a".repeat(32);
+  const W1_TA2 = "ta_" + "b".repeat(32);
+  const w1Root = () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pk2-w1-")));
+    const EP = "endpoint_" + "7".repeat(24);
+    const ledgerRoot = path.join(base, "ledger");
+    const epDir = path.join(ledgerRoot, EP);
+    fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+    return { base, EP, ledgerRoot, epDir };
+  };
+  const w1WithLedger = (root, run) => {
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    try { process.env.FEISHU_BRIDGE_LEDGER_DIR = root; return run(); }
+    finally { if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved; }
+  };
+  const w1WriteDoc = (file, doc) => fs.writeFileSync(file, stableStringify(doc, 2) + "\n", { mode: 0o600 });
+
+  test("PK2-W1 T7 sidecar-store：fsync 失败拒且盘上不变；0644 读拒；锁被占拒；非法条目零写", () => {
+    const r = w1Root();
+    const file = path.join(r.epDir, "expiry.json");
+    const entry = { [W1_TA]: "2099-01-01T00:00:00.000Z" };
+    try {
+      w1WithLedger(r.ledgerRoot, () => {
+        // 缺席 → 如实报 absent（不是错误）；合法 → 读回条目
+        const a0 = readSidecarStore({ endpointId: r.EP, name: "expiry" });
+        assert.deepEqual([a0.ok, a0.absent], [true, true], "缺席 → absent：" + JSON.stringify(a0));
+        w1WriteDoc(file, { schema_version: "expiry-1", endpoint_id: r.EP, entries: entry });
+        const a1 = readSidecarStore({ endpointId: r.EP, name: "expiry" });
+        assert.deepEqual([a1.ok, a1.entries[W1_TA]], [true, "2099-01-01T00:00:00.000Z"], "合法读回：" + JSON.stringify(a1).slice(0, 200));
+        // 加一条 → 原子写 + 读回一致 + 无 tmp 残骸 + 仍 0600
+        const add = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA2,
+          mutate: (cur) => (cur === null ? { ok: true, changed: true, value: "2098-01-01T00:00:00.000Z" } : { ok: false, reason: "already" }) });
+        assert.deepEqual([add.ok, add.changed, add.committed], [true, true, true], "加条目：" + JSON.stringify(add).slice(0, 200));
+        assert.deepEqual(readSidecarStore({ endpointId: r.EP, name: "expiry" }).entries, { ...entry, [W1_TA2]: "2098-01-01T00:00:00.000Z" }, "两条都在");
+        assert.deepEqual(fs.readdirSync(r.epDir).filter((n) => n.endsWith(".tmp")), [], "不留 tmp 残骸");
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600, "写后 0600");
+        // 删条目（value:null）
+        const del = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA,
+          mutate: (cur) => (cur === null ? { ok: false, reason: "absent" } : { ok: true, changed: true, value: null }) });
+        assert.deepEqual([del.ok, del.changed], [true, true], "删条目：" + JSON.stringify(del).slice(0, 160));
+        assert.equal(readSidecarStore({ endpointId: r.EP, name: "expiry" }).entries[W1_TA], undefined, "被删的键不在了");
+        // 0644 → 读拒（受验读要求精确 0600）；写也拒（同一个读取器）
+        fs.chmodSync(file, 0o644);
+        const bad = readSidecarStore({ endpointId: r.EP, name: "expiry" });
+        assert.deepEqual([bad.ok, bad.reason], [false, "sidecar_unreadable"], "0644 读拒：" + JSON.stringify(bad));
+        assert.match(String(bad.why), /0600/u, "why 点名权限：" + bad.why);
+        const badWrite = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA, mutate: () => ({ ok: true, changed: true, value: "2099-01-01T00:00:00.000Z" }) });
+        assert.deepEqual([badWrite.ok, badWrite.reason], [false, "sidecar_unreadable"], "0644 写也拒：" + JSON.stringify(badWrite));
+        fs.chmodSync(file, 0o600);
+        // 非法条目（值域不过）→ 拒且零写
+        const before = fs.readFileSync(file);
+        const invalid = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA, mutate: () => ({ ok: true, changed: true, value: "不是 ISO" }) });
+        assert.deepEqual([invalid.ok, invalid.reason], [false, "sidecar_invalid"], "非法值拒：" + JSON.stringify(invalid));
+        assert.deepEqual(fs.readFileSync(file), before, "非法值零写（字节级）");
+        // fsync 失败（文件那一跳）→ 拒且**盘上不变**（tmp 已删、没 rename）
+        const origFsync = fs.fsyncSync;
+        fs.fsyncSync = () => { const e = new Error("EIO"); e.code = "EIO"; throw e; };
+        let fsyncFail;
+        try { fsyncFail = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA, mutate: () => ({ ok: true, changed: true, value: "2099-01-01T00:00:00.000Z" }) }); }
+        finally { fs.fsyncSync = origFsync; }
+        assert.deepEqual([fsyncFail.ok, fsyncFail.reason], [false, "sidecar_write_failed"], "fsync 失败 → 拒：" + JSON.stringify(fsyncFail));
+        assert.deepEqual(fs.readFileSync(file), before, "fsync 失败 → 盘上不变（字节级）");
+        assert.deepEqual(fs.readdirSync(r.epDir).filter((n) => n.endsWith(".tmp")), [], "fsync 失败也不留 tmp");
+        // 锁被占 → 拒（与 sidecar-writer 同一把 `<file>.lock`）
+        const lockPath = file + ".lock";
+        const held = acquirePublishLock(lockPath);
+        assert.ok(held.ok, "夹具取锁：" + JSON.stringify(held));
+        try {
+          const busy = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA, mutate: () => ({ ok: true, changed: true, value: "2099-01-01T00:00:00.000Z" }) });
+          assert.deepEqual([busy.ok, busy.reason], [false, "sidecar_busy"], "锁被占 → 拒：" + JSON.stringify(busy));
+        } finally { releasePublishLock(lockPath); }
+        assert.deepEqual(fs.readFileSync(file), before, "锁被占时一个字节都没动");
+        // 文件缺席时的写：允许（按同一 schema 新建）—— 行为钉住，不靠猜
+        fs.rmSync(file);
+        const created = mutateSidecarEntry({ endpointId: r.EP, name: "expiry", key: W1_TA, mutate: () => ({ ok: true, changed: true, value: "2099-01-01T00:00:00.000Z" }) });
+        assert.deepEqual([created.ok, created.changed], [true, true], "缺席 → 按同一 schema 新建：" + JSON.stringify(created).slice(0, 200));
+        assert.deepEqual(readSidecarStore({ endpointId: r.EP, name: "expiry" }).entries, entry, "新建后就是那条");
+      });
+    } finally { fs.rmSync(r.base, { recursive: true, force: true }); }
+  });
+}
 
 sealSummary();
 

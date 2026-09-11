@@ -34,7 +34,7 @@ import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
-import { readSidecarStore } from "./m1b/sidecar-store.mjs";
+import { readSidecarStore, mutateSidecarEntry } from "./m1b/sidecar-store.mjs";
 import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
 import { withRegistryTransaction } from "./topic-generation-store.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
@@ -149,26 +149,74 @@ const writeRoute = m1aWriteRoute({ endpointId, env: process.env });
 //     并把 pending-claims 条目复活：一条已认领的工作线被退回待认领。
 //   · pending → 按 sidecar 条目补齐（缺条目 = 上一次半途失败，走同一条幂等复合 upsert；
 //     否则 unclean 只能靠 doctor 点名，绑定永远不完整）。
-const authoritativeComplete = (entry) => {
-  if (writeRoute.mode !== "authoritative" || !entry?.root_message_id) return false;
+// PK2-W1-fix2 P1-4/P1-5①：完整性判断改 **sidecar 精确核对**（键存在不够，值逐字等），
+//   且**完整时也重做零写屏障**（走 mutateSidecarEntry 的 changed:false 路径让目录 fsync 重做；
+//   屏障失败 → 不算完成）。active 分支不再无脑 return true：active 后 expiry 缺失/值漂移
+//   也判不完整，由调用方做**定点修复**（不碰索引、不复活 pending-claims）。
+const normIso = (v) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null);
+const authoritativeState = (entry) => {
+  if (writeRoute.mode !== "authoritative" || !entry?.root_message_id) return null;
   const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
-  if (!resolved.ok) return false;
+  if (!resolved.ok) return { complete: false, active: false };
   const led = loadByEndpoint(endpointId, { env: process.env });
-  if (!led.ok) return false;
+  if (!led.ok) return { complete: false, active: false };
   const rec = led.doc.records[resolved.id];
-  if (!rec || rec.kind !== "live") return false;
-  if (rec.facts?.binding === "active") return true;
+  if (!rec || rec.kind !== "live") return { complete: false, active: false };
   const ta = resolved.id;
+  const iso = normIso(entry.expires_at);
+  if (iso === null) return { complete: false, active: rec.facts?.binding === "active" };
   const pending = readSidecarStore({ endpointId, name: "pending-claims" });
   const expiry = readSidecarStore({ endpointId, name: "expiry" });
-  return pending.ok === true && expiry.ok === true
-    && Object.prototype.hasOwnProperty.call(pending.entries, ta)
-    && Object.prototype.hasOwnProperty.call(expiry.entries, ta);
+  if (!pending.ok || !expiry.ok) return { complete: false, active: rec.facts?.binding === "active" };
+  const expiryValue = Object.prototype.hasOwnProperty.call(expiry.entries, ta) ? expiry.entries[ta] : null;
+  if (rec.facts?.binding === "active") {
+    // 认领后：pending-claims 条目必须**不在**，expiry 值逐字等；都齐 → 重做零写屏障定完成。
+    if (Object.prototype.hasOwnProperty.call(pending.entries, ta) || expiryValue !== iso) {
+      return { complete: false, active: true, drift: expiryValue !== iso ? "expiry" : "pending-claims" };
+    }
+    const bE = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    const bP = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    return { complete: bE.ok === true && bP.ok === true, active: true, barrierFailed: bE.ok !== true || bP.ok !== true };
+  }
+  if (rec.facts?.binding !== "pending") return { complete: false, active: false };
+  const pc = Object.prototype.hasOwnProperty.call(pending.entries, ta) ? pending.entries[ta] : null;
+  if (pc && pc.token === entry.pending_token && pc.claim_expires_at === null && expiryValue === iso) {
+    const bE = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    const bP = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env: process.env, mutate: () => ({ ok: true, changed: false }) });
+    return { complete: bE.ok === true && bP.ok === true, active: false, barrierFailed: bE.ok !== true || bP.ok !== true };
+  }
+  return { complete: false, active: false };
 };
-if (already?.root_message_id && (writeRoute.mode !== "authoritative" || authoritativeComplete(already))) {
+const authoritativeComplete = (entry) => {
+  const st = authoritativeState(entry);
+  return st !== null && st.complete === true;
+};
+const authState = already?.root_message_id && writeRoute.mode === "authoritative"
+  ? authoritativeState(already) : null;
+if (already?.root_message_id && (writeRoute.mode !== "authoritative" || (authState && authState.complete))) {
   console.log("这条会话已经绑过了，没有重复建话题。");
   console.log("  话题  " + already.root_message_id);
   console.log("  入站  " + (already.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));
+  process.exit(0);
+}
+if (authState && authState.active && !authState.complete) {
+  // PK2-W1-fix2 P1-4：已认领（active）但 sidecar 缺失/漂移 → **定点修复**：expiry upsert 回
+  //   创建时快照、pending-claims 条目删除（不该在）；索引一个字节不动、不复活 pending 语义。
+  const resolved = resolveLiveId({ endpointId, locator: already.root_message_id, env: process.env });
+  const ta = resolved.ok ? resolved.id : null;
+  if (ta === null) die("绑定状态说不清（账本里找不到该话题的记录）", "先跑 node scripts/doctor.mjs 看 --status。");
+  const iso = normIso(already.expires_at);
+  if (iso === null) die("索引行 expires_at 不可规范化：" + JSON.stringify(already.expires_at ?? null));
+  const fixE = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env: process.env,
+    mutate: (cur) => (cur === iso ? { ok: true, changed: false } : { ok: true, changed: true, value: iso }) });
+  const fixP = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env: process.env,
+    mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
+  if (!fixE.ok || !fixP.ok) {
+    die("sidecar 修复失败（" + (fixE.ok ? "expiry ok" : "expiry：" + fixE.reason) + (fixE.ok ? "" : "") + (!fixE.ok ? "" : "；") + (!fixP.ok ? "pending-claims：" + fixP.reason : "") + "）",
+      "修好权限后重跑同一条命令即可。");
+  }
+  console.log("绑定已是认领后状态（active）；sidecar 已修复到与索引一致。");
+  console.log("  话题  " + already.root_message_id);
   process.exit(0);
 }
 if (already?.root_message_id) console.log("这条会话的绑定不完整（缺 sidecar 条目）—— 按同一幂等键再跑一次补齐。");

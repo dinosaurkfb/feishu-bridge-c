@@ -51125,6 +51125,53 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
     }
   });
 
+// ─────────── PK2-W1-fix2：P1-4/P1-5① bind-session 真实恢复（精确核对 + 屏障重做 + 定点修复） ───────────
+{
+  const F2B_UUID = "11111111-1111-4111-8111-111111111111";
+  // active 后 expiry 值漂移 → 重跑 bind-session 判不完整并**定点修复**（旧版 active 无脑 return true，
+  //   exit 0「已接入」而漂移留着）；索引一个字节不动（不退化回 pending 快照）。
+  test("PK2-W1-fix2 T13b active 后篡改 expiry → 重跑 bind-session 判不完整并修正；索引零写入（P1-4/P1-5①）", () => {
+    const x = w1Fixture("f2t13b");
+    try {
+      const env = w1SessionEnv(x, { sessionId: F2B_UUID });
+      const r0 = w1Bind(x, env);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const ta0 = rec0.topic_agent_id;
+      const om0 = rec0.aliases.root_om;
+      const claim = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: om0,
+        claimKey: "a".repeat(64), sessionId: "aily_f2b", authorizedBy: "ou_frank",
+        f4: { matched_om: om0, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+        publishIndex: () => {
+          const reg = x.registry();
+          const row = reg.projects.find((p) => p.claude_session_id === F2B_UUID);
+          row.session_id = "aily_f2b"; row.inbound_state = "bound";
+          fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+          return { ok: true, root: x.proj, sessionId: "aily_f2b" };
+        } });
+      assert.deepEqual([claim.ok, claim.commit], [true, "committed_clean"], "前置认领：" + JSON.stringify(claim).slice(0, 250));
+      const row0 = x.registry().projects.find((p) => p.claude_session_id === F2B_UUID);
+      const expiryFile = x.sidecar("expiry");
+      const goodExpiry = JSON.parse(fs.readFileSync(expiryFile, "utf-8"));
+      assert.equal(goodExpiry.entries[ta0], row0.expires_at, "前置：expiry 与索引快照一致");
+      // 篡改 expiry 值（schema 合法的另一时间点 —— 键存在但**值漂移**）
+      const tampered = { ...goodExpiry, entries: { ...goodExpiry.entries, [ta0]: "2098-06-01T00:00:00.000Z" } };
+      fs.writeFileSync(expiryFile, stableStringify(tampered, 2) + "\n", { mode: 0o600 });
+      const regBefore = fs.readFileSync(x.regFile);
+      // 重跑 bind-session（真子进程）→ 判不完整 → 定点修复 expiry → exit 0
+      const r1 = w1Bind(x, env);
+      assert.equal(r1.status, 0, "重跑修复成功：" + r1.stdout + r1.stderr);
+      assert.match(r1.stdout, /sidecar 已修复|已经绑过/u, "点名修复或完成：" + r1.stdout.slice(0, 250));
+      const fixed = JSON.parse(fs.readFileSync(expiryFile, "utf-8"));
+      assert.equal(fixed.entries[ta0], row0.expires_at, "expiry 值已修正回创建时快照");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "索引零写入（active 态不退化回 pending 快照）");
+      assert.equal(row0.inbound_state, "bound", "索引仍 bound");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], undefined, "pending-claims 不复活");
+    } finally { x.f.cleanup(); }
+  });
+}
+
+
   // ────── PK2-W1-fix1：返修单 5 个 P1 + 2 个 P2 的逐条反例 ──────
 
   test("PK2-W1 T8 返修 P1-2 认领后缀顺序：删 pending 条目失败时索引**还没**写（旧序先写索引 → 现场不再 pending、重跑被挡）", () => {

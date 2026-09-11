@@ -32802,13 +32802,11 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       // PK2-F7：R69 之后一次 --apply 直达提交与重开 —— 预览不得再印「停在 authority cutover 提交点之前（等逐次授权）」。
       // 旧文案会让授权者以为还要再点一次（Codex 清单第 4 条：预览不出现「未武装」语义）。
       assert.match(prevD, /提交 authority_cutover → 重开/u, "预览点名一次 --apply 直达提交与重开：" + prevD);
-      // PK2-F10 P2-1：「只向前」必须**限定到进入前向段之后**。原来那条 `/不可回滚、只向前/` 只是子串断言 ——
-      //   旧尾段（…覆盖全程，不可回滚、只向前）和新尾段（…；进入前向段后不可回滚、只向前，此前失败按阶段回退）
-      //   都含这个子串，它区分不了两者（守卫的样子 ≠ 守卫的效果）。改成两条：
-      //   ① 正向钉住限定语；② 否定断言：任何「不可回滚」不得出现在「前向段后」之外的上下文
-      //      （零宽回看定长，含旧尾段「覆盖全程，不可回滚」与任何「全程不可回滚」的说法）。
-      assert.match(prevD, /进入前向段后不可回滚、只向前/u, "预览把「只向前」限定在进入前向段之后：" + prevD);
-      assert.doesNotMatch(prevD, /(?<!前向段后)不可回滚/u, "「不可回滚」只许限定在前向段（旧尾段「覆盖全程，不可回滚」已删）：" + prevD);
+      // PK2-F10-fix1 P1（题面更正）：「不可回滚、只向前」的真实起点 = staged plan / 备份完成后 journal
+      //   原子进入 **ledger_cutting_over** 的那一步（此后 converge/二次重验/复核/提交全只向前）——
+      //   正向断言钉住箭头链里这个**节点**（含限定语），不是尾段。零宽回看那条删掉：它会误杀
+      //   「进入前向段后，不可回滚」这类合法措辞（守卫的样子 ≠ 守卫的效果）。
+      assert.match(prevD, /冻结计划并进入 ledger_cutting_over（自此不可回滚、只向前）/u, "预览标出前向段起点节点（限定语贴在节点上）：" + prevD);
       assert.doesNotMatch(prevD, /全程不可回滚|覆盖全程[，,]\s*不可回滚/u, "预览不得再出现不限定的「全程不可回滚」写法：" + prevD);
       assert.match(prevD, /账本锁内复核/u, "预览点名提交点的锁内复核：" + prevD);
       assert.doesNotMatch(prevD, /提交点之前|等逐次授权|未武装/u, "预览不得再出现「停在提交点之前 / 等逐次授权 / 未武装」：" + prevD);
@@ -32904,7 +32902,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
       assert.equal(cut2.phase, "ledger_cutting_over", "② phase 保留：" + JSON.stringify({ phase: cut2.phase, why: cut2.why }));
       assert.ok(TAL.loadLedger(epDirB, { endpointId: EPb45 }).doc.authority_mode === "shadow", "② 账本仍 shadow");
       assert.equal(readJournal({ dir, token: cut2.token }).doc.steps.find((s) => s.kind === "ledger").state, "prepared", "② ledger step 未翻转");
-      // 调用面③：续跑收敛 —— 待修项还在仍拒；清掉后回到正常停门（authority 未武装）
+      // 调用面③：续跑收敛 —— 待修项还在仍拒；清掉后回到正常停门（authoritative 下由复合体处理，此处为 shadow 契约拒）
       const cut3 = LEDGER_OP.ledgerExit(ctx, { apply: true });
       assert.ok(cut3.ok === false && cut3.reason === "cutover_blocked", "③ 续跑仍拒：" + JSON.stringify(cut3));
       writeRegistry45([]);

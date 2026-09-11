@@ -50788,6 +50788,285 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
       });
     } finally { fs.rmSync(r.base, { recursive: true, force: true }); }
   });
+  // ── W1 夹具：真 cutover（authoritative）的端机器 + 假 lark-cli + 会话登记 —— 全程 tmp ──
+  // 链模板的 agent_uid 决定 endpoint（与入站 / 策略面同源）；lark_cli_bin 指向夹具里的假 binary。
+  const w1Fixture = (tag) => {
+    const f = r69Fixture("w1" + tag);
+    try {
+    const uid = "agent_w1_" + tag;
+    const bin = path.join(f.base, "bin"); fs.mkdirSync(bin, { recursive: true });
+    const larkHome = path.join(f.base, "lark-home"); fs.mkdirSync(larkHome, { recursive: true, mode: 0o700 });
+    // 出站发布会核身份（config.json 里的 appId 必须等于模板的 outbound_app_id）——夹具给它一份合法的。
+    fs.writeFileSync(path.join(larkHome, "config.json"), JSON.stringify({ apps: [{ name: "claude", appId: TPL.outbound_app_id }] }, null, 2) + "\n", { mode: 0o600 });
+    const larkLog = path.join(f.base, "lark-calls.jsonl");
+    // 假 lark-cli：把 argv 记下来；create（发消息）按 idempotency-key 返回**稳定** message id（平台幂等语义）。
+    fs.writeFileSync(path.join(bin, "lark-cli"), [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const crypto = require('node:crypto');",
+      "const argv = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.W1_LARK_LOG, JSON.stringify(argv) + '\\n');",
+      "const keyAt = argv.indexOf('--idempotency-key');",
+      "const key = keyAt >= 0 ? argv[keyAt + 1] : 'none';",
+      "const id = 'om_' + crypto.createHash('sha256').update(key).digest('hex').slice(0, 24);",
+      "process.stdout.write(JSON.stringify({ ok: true, data: { message_id: id } }));",
+    ].join("\n") + "\n", { mode: 0o700 });
+    const tplFile = path.join(f.bridge, "chain-config.json");
+    fs.writeFileSync(tplFile, JSON.stringify({ ...TPL, agent_uid: uid, lark_cli_bin: path.join(bin, "lark-cli"), lark_cli_profile: "claude", lark_cli_home: larkHome }, null, 2) + "\n", { mode: 0o600 });
+    const EP = legacyEndpointId({ runtime: "claude", agentUid: uid });
+    const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true });
+    if (init.phase !== "done") throw new Error("W1 夹具 init：" + JSON.stringify(init));
+    const cut = LEDGER_OP.ledgerEnter(f.ctx, { kind: "cutover", endpointId: EP, chain: "claude", apply: true });
+    if (cut.phase !== "done") throw new Error("W1 夹具 cutover：" + JSON.stringify(cut));
+    const proj = path.join(f.base, "proj"); fs.mkdirSync(proj, { recursive: true });
+    const regFile = path.join(f.bridge, "registry.json");
+    fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [] }, null, 2) + "\n", { mode: 0o600 });
+    const epDir = path.join(f.ledgerRoot, EP);
+    return { f, uid, bin, larkLog, tplFile, EP, proj, regFile, epDir,
+      sidecar: (n) => path.join(epDir, n + ".json"),
+      ledger: () => JSON.parse(fs.readFileSync(path.join(epDir, "ledger.json"), "utf-8")),
+      registry: () => JSON.parse(fs.readFileSync(regFile, "utf-8")),
+      larkCalls: () => (fs.existsSync(larkLog) ? fs.readFileSync(larkLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) };
+    } catch (err) { try { f.cleanup(); } catch { /* 尽力而为 */ } throw err; }
+  };
+  const w1SessionEnv = (x, { sessionId, pid = process.pid + 1, name = "w1-line" }) => {
+    const sessionsDir = path.join(x.f.home, ".claude", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionsDir, pid + ".json"), JSON.stringify({ sessionId, name, pid, kind: "interactive", cwd: x.proj, startedAt: new Date().toISOString() }));
+    return { ...x.f.env, PATH: x.bin + path.delimiter + process.env.PATH, W1_LARK_LOG: x.larkLog,
+      FEISHU_BRIDGE_REGISTRY: x.regFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: x.tplFile,
+      CLAUDE_CODE_SESSION_ID: sessionId, CLAUDE_PID: String(pid) };
+  };
+  const w1Bind = (x, env) => spawnSync(process.execPath, [path.resolve("scripts", "bind-session.mjs"), "--apply"], { encoding: "utf-8", cwd: x.proj, env });
+  const W1_UUID_A = "11111111-1111-4111-8111-111111111111";
+  const W1_UUID_B = "22222222-2222-4222-8222-222222222222";
+
+  test("PK2-W1 T1 authoritative 绑定：话题恰一次 + 账本一条 B1 + 索引行 + pending-claims/expiry 各一条", () => {
+    const x = w1Fixture("t1");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r = w1Bind(x, env);
+      assert.equal(r.status, 0, "bind-session --apply 成功：" + r.stdout + r.stderr);
+      // 假 lark-cli 按幂等键派 om（平台幂等语义）——根话题那条调用的键必须**只出现一次**，
+      // 并发出去的其它 send（状态回复等）另有自己的键，不算“重建话题”。
+      const omOf = (key) => "om_" + createHash("sha256").update(key).digest("hex").slice(0, 24);
+      const doc = x.ledger();
+      const live = Object.values(doc.records).filter((rec) => rec.kind === "live");
+      assert.equal(live.length, 1, "账本恰一条 live B1：" + JSON.stringify(Object.keys(doc.records)));
+      const rec = live[0];
+      assert.equal(rec.facts.binding, "pending", "B1 是 pending（等认领）");
+      assert.equal(rec.binding_target.claude_session_id, W1_UUID_A, "target 带会话 UUID");
+      assert.equal(rec.binding_target.project_root, fs.realpathSync(x.proj), "target 项目根");
+      assert.equal(rec.chat_id, TPL.chat_id, "chat_id 对");
+      const om = rec.aliases.root_om;
+      assert.match(String(om), /^om_[0-9a-f]{24}$/u, "root_om 是平台返回的话题 id：" + String(om));
+      const rootKeyCalls = x.larkCalls().filter((a) => { const i = a.indexOf("--idempotency-key"); return i >= 0 && omOf(a[i + 1]) === om; });
+      assert.equal(rootKeyCalls.length, 1, "建根话题恰一次（同幂等键）：" + JSON.stringify(x.larkCalls()));
+      const row = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      assert.ok(row, "索引行在：" + JSON.stringify(x.registry().projects));
+      assert.deepEqual([row.root_message_id, row.inbound_state, row.status], [om, "pending", "active"], "索引行字段：" + JSON.stringify(row));
+      assert.equal(row.id, path.basename(x.proj) + "@" + W1_UUID_A.slice(0, 8), "会话级 id 形状与 main 同");
+      const ta = rec.topic_agent_id;
+      const pending = readSidecarStore({ endpointId: x.EP, name: "pending-claims" });
+      const expiry = readSidecarStore({ endpointId: x.EP, name: "expiry" });
+      assert.deepEqual([pending.ok, expiry.ok], [true, true], "两份 sidecar 读得出：" + JSON.stringify(pending).slice(0, 120));
+      assert.deepEqual(pending.entries[ta], { token: row.pending_token, claim_expires_at: null }, "pending-claims 条目：" + JSON.stringify(pending.entries));
+      assert.equal(expiry.entries[ta], row.expires_at, "expiry 条目 = 索引行 expires_at");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T2 authoritative 绑定 unclean + 同幂等键重跑补齐：话题不重建、账本不多记", () => {
+    const x = w1Fixture("t2");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      // 注入：sidecar 那把锁被占（`<file>.lock`，与 sidecar-writer 同一把）→ ④ 必失败。
+      const lockPath = x.sidecar("pending-claims") + ".lock";
+      const held = acquirePublishLock(lockPath);
+      assert.ok(held.ok, "夹具取锁：" + JSON.stringify(held));
+      let r1;
+      try { r1 = w1Bind(x, env); } finally { releasePublishLock(lockPath); }
+      assert.notEqual(r1.status, 0, "半途失败 → 非零退出：" + r1.stdout);
+      assert.match(r1.stderr, /绑定没落完|sidecar/u, "点名停在哪一步：" + r1.stderr.slice(0, 200));
+      const receipts = path.join(x.f.home, ".claude", "feishu-bridge", "receipts");
+      const unclean = fs.existsSync(receipts) ? fs.readdirSync(receipts).filter((n) => n.startsWith("m1a-unclean-")) : [];
+      assert.equal(unclean.length, 1, "unclean 机器回执落了：" + JSON.stringify(fs.existsSync(receipts) ? fs.readdirSync(receipts) : []));
+      const doc1 = x.ledger();
+      assert.equal(Object.values(doc1.records).filter((rec) => rec.kind === "live").length, 1, "账本已提交一条（这就是 unclean 的含义）");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[Object.values(doc1.records)[0].topic_agent_id], undefined, "sidecar 确实没写成");
+      if (process.getuid?.() !== 0) {
+        // 重跑（同会话）→ 话题幂等、create_b1 重放命中、索引 upsert、sidecar 补齐
+        const r2 = w1Bind(x, env);
+        assert.equal(r2.status, 0, "重跑补齐：" + r2.stdout + r2.stderr);
+        const doc2 = x.ledger();
+        const live2 = Object.values(doc2.records).filter((rec) => rec.kind === "live");
+        assert.equal(live2.length, 1, "重跑不多记一条：" + JSON.stringify(Object.keys(doc2.records)));
+        assert.equal(Object.values(doc2.records).find((rec) => rec.kind === "live").aliases.root_om, Object.values(doc1.records).find((rec) => rec.kind === "live").aliases.root_om, "话题不重建（同幂等键 → 同 om）");
+        const ta2 = live2[0].topic_agent_id;
+        assert.ok(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta2], "重跑后 pending-claims 条目在");
+        assert.ok(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries[ta2], "重跑后 expiry 条目在");
+        assert.equal(x.registry().projects.filter((p) => p.claude_session_id === W1_UUID_A).length, 1, "索引行只有一条（upsert 而非追加）");
+      }
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T3 authoritative 认领：B1→active + A1 在 + 索引更新 + pending-claims 条目删除（幂等；失败→unclean→重跑补齐）", () => {
+    const x = w1Fixture("t3");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r0 = w1Bind(x, env);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const ta0 = rec0.topic_agent_id;
+      const om = rec0.aliases.root_om;
+      const claimKey0 = "c".repeat(64);
+      const f4 = { matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" };
+      const publishIndex = ({ err }) => (err ? { ok: false, reason: "registry_unwritable", why: "注入：索引写失败" } : ({ ok: true, root: x.proj, sessionId: W1_UUID_A, generation: { channel_generation_id: "g1" } }));
+      const base = { endpointId: x.EP, env: process.env, locator: om, claimKey: claimKey0, sessionId: "aily_claim_1", authorizedBy: "ou_frank", f4,
+        publishIndex: () => publishIndex({ err: true }) };
+      const w1 = WIRE.wirePromoteAuthoritative(base);
+      assert.deepEqual([w1.ok, w1.commit, w1.legacy.ok, w1.legacy.phase], [true, "committed_unclean", false, "registry"],
+        "activate 后索引失败 → committed_unclean：" + JSON.stringify(w1).slice(0, 300));
+      const afterW1 = Object.values(x.ledger().records).find((rec) => rec.kind === "live" && rec.facts.binding === "active");
+      assert.ok(afterW1, "账本已 active（这就是那个必须先被记下的中间态）：" + JSON.stringify(Object.values(x.ledger().records).map((r) => r.facts)));
+      assert.equal(afterW1.topic_agent_id, ta0, "同一条 B1 被激活（不是新建）");
+      assert.ok(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], "索引失败时 sidecar 条目还在（后续步骤没跑）");
+      // 重跑（同 claimKey，索引这次成功）→ 幂等补齐：activate 重放命中、索引更新、pending 条目删
+      const w2 = WIRE.wirePromoteAuthoritative({ ...base, publishIndex: () => publishIndex({ err: false }) });
+      assert.deepEqual([w2.ok, w2.commit, w2.legacy.ok], [true, "committed_clean", true], "重跑补齐：" + JSON.stringify(w2).slice(0, 260));
+      const doc2 = x.ledger();
+      const actives = Object.values(doc2.records).filter((rec) => rec.kind === "live" && rec.facts.binding === "active");
+      assert.equal(actives.length, 1, "active 只有一条（activate 重放命中，不重复）");
+      // activate 会把 A1 并进 B1（A1 记录成墓碑）——“幂等”的证据是 **op 恰一笔**（重放命中），不是记录条数。
+      const a1Ops = Object.values(doc2.operations).filter((op) => op.op_type === "create_a1");
+      const actOps = Object.values(doc2.operations).filter((op) => op.op_type === "activate");
+      assert.deepEqual([a1Ops.length, actOps.length], [1, 1], "create_a1 / activate 各恰一笔（重放命中，不重复）：" + JSON.stringify(Object.values(doc2.operations).map((o) => o.op_type)));
+      assert.equal(Object.values(doc2.records).filter((rec) => rec.kind === "live" && rec.facts?.binding === "none").length, 0, "没有被并进去的第二条 live A1");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta0], undefined, "重跑后 pending-claims 条目被删");
+      assert.equal(fs.existsSync(x.sidecar("pending-claims")), true, "删除是条目级的（文件还在）");
+      // 错 f4 → 拒（复合自己的封闭校验）
+      const bad = WIRE.wirePromoteAuthoritative({ ...base, f4: null, publishIndex: () => publishIndex({ err: false }) });
+      assert.deepEqual([bad.ok, bad.commit, bad.legacy.reason], [true, "not_committed", "bad_f4"], "F4 不合法 → 拒且未提交：" + JSON.stringify(bad).slice(0, 240));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T4 清单封闭：项目级 target / 非 pending 认领 / 其余 wire* 在 authoritative 仍拒", () => {
+    const x = w1Fixture("t4");
+    try {
+      // 项目级（claude_session_id: null）→ 复合自己拒
+      const noSid = WIRE.wireBindAuthoritative({ endpointId: x.EP, env: process.env, externalRequestId: "idem-1", lineageId: "lin@project-files",
+        chatId: TPL.chat_id, bindingTarget: { runtime: "claude", project_root: x.proj, claude_session_id: null },
+        pendingToken: "abcdef", expiresAt: "2099-01-01T00:00:00.000Z",
+        createTopic: () => ({ ok: true, root_message_id: "om_never" }), publishIndex: () => ({ ok: true }) });
+      assert.deepEqual([noSid.ok, noSid.commit, noSid.legacy.reason], [true, "not_committed", "m1a_mode_not_shadow"],
+        "项目级/null target 仍拒：" + JSON.stringify(noSid).slice(0, 260));
+      assert.equal(x.larkCalls().length, 0, "拒的时候连话题都没建");
+      // 其余 wire*：shadow 契约的拒因照旧（cutoverDone → m1a_mode_not_shadow）
+      const rot = WIRE.wireRotate({ endpointId: x.EP, env: process.env, legacy: () => ({ ok: true, root_message_id: "om_rot" }),
+        rotationOpId: "op-rot-1", lineageId: "lin@project-files", chatId: TPL.chat_id,
+        bindingTarget: { runtime: "claude", project_root: x.proj, claude_session_id: W1_UUID_A } });
+      assert.equal(rot.reason, "m1a_mode_not_shadow", "wireRotate 仍拒：" + JSON.stringify(rot).slice(0, 200));
+      const paused = WIRE.wirePauseResume({ endpointId: x.EP, env: process.env, legacy: () => ({ ok: true }) });
+      assert.equal(paused.reason, "m1a_mode_not_shadow", "wirePauseResume 仍拒：" + JSON.stringify(paused).slice(0, 200));
+      const chat = WIRE.wireChatA1({ agentUid: x.uid, chatId: TPL.chat_id, sessionId: "s", messageId: "m", env: process.env, admit: () => ({ ok: true }) });
+      assert.equal(chat.reason, "m1a_mode_not_shadow", "wireChatA1 仍拒：" + JSON.stringify(chat).slice(0, 200));
+      const claim = WIRE.wireBindClaim({ endpointId: x.EP, env: process.env, legacy: () => ({ ok: true }), claimKey: "k", chatId: TPL.chat_id, sessionId: "s", b1Id: "ta_" + "a".repeat(32) });
+      assert.equal(claim.reason, "m1a_mode_not_shadow", "wireBindClaim 仍拒：" + JSON.stringify(claim).slice(0, 200));
+      // 非 pending（已 active）的认领目标 → 复合拒（B3 rebind 属 W2）
+      const envA = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r0 = w1Bind(x, envA);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      const f4 = { matched_om: rec0.aliases.root_om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" };
+      // 先真认领一次（→ active），再拿同一目标认领 → 拒 m1a_mode_not_shadow
+      const ok1 = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "d".repeat(64),
+        sessionId: "aily_a", authorizedBy: "ou_f", f4, publishIndex: () => ({ ok: true }) });
+      assert.equal(ok1.ok && ok1.legacy.ok, true, "第一次认领成功：" + JSON.stringify(ok1).slice(0, 200));
+      const again = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om, claimKey: "e".repeat(64),
+        sessionId: "aily_b", authorizedBy: "ou_f", f4, publishIndex: () => ({ ok: true }) });
+      assert.deepEqual([again.ok, again.legacy.reason], [true, "m1a_mode_not_shadow"], "已 active 的目标再认领 → 拒（B3 rebind 属 W2）：" + JSON.stringify(again).slice(0, 260));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T5 并发两笔 bind：outer 串行 + 锁内重读 → 登记表两行都在", () => {
+    const x = w1Fixture("t5");
+    try {
+      const envA = w1SessionEnv(x, { sessionId: W1_UUID_A, pid: 900001, name: "line-a" });
+      const envB = w1SessionEnv(x, { sessionId: W1_UUID_B, pid: 900002, name: "line-b" });
+      const [ra, rb] = [w1Bind(x, envA), w1Bind(x, envB)];
+      if (ra.status !== 0 || rb.status !== 0) fs.writeFileSync("/tmp/w1-t5.txt", String(ra.status) + "/" + String(rb.status) + "\n=== A out ===\n" + ra.stdout + ra.stderr + "\n=== B out ===\n" + rb.stdout + rb.stderr);
+      assert.deepEqual([ra.status, rb.status], [0, 0], "两笔都成：" + ra.stderr.slice(0, 200) + " || " + rb.stderr.slice(0, 200));
+      const rows = x.registry().projects.filter((p) => p.claude_session_id);
+      assert.deepEqual(rows.map((p) => p.claude_session_id).sort(), [W1_UUID_A, W1_UUID_B].sort(), "两行都在（后一笔不许用陈旧快照盖掉前一笔）：" + JSON.stringify(x.registry().projects));
+      const live = Object.values(x.ledger().records).filter((rec) => rec.kind === "live");
+      assert.equal(live.length, 2, "账本两条 B1：" + JSON.stringify(Object.keys(x.ledger().records)));
+      for (const rec of live) assert.ok(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[rec.topic_agent_id], "每条都有 pending-claims 条目");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W1 T6 shadow / never_initialized：绑定行为与 main 一字不差（登记表照写；不动 sidecar）", () => {
+    // never_initialized：无任何收据 → 合法 legacy-only（不取 outer、不写账本、不建 sidecar）
+    {
+      const f = r69Fixture("w1t6n");
+      try {
+        const bin = path.join(f.base, "bin"); fs.mkdirSync(bin, { recursive: true });
+        const larkLog = path.join(f.base, "lark.jsonl");
+        fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "const fs=require('node:fs');",
+          "fs.appendFileSync(process.env.W1_LARK_LOG, 'x\\n');",
+          "process.stdout.write(JSON.stringify({ ok: true, data: { message_id: 'om_never_init' } }));"].join("\n") + "\n", { mode: 0o700 });
+        const tplFile = path.join(f.bridge, "chain-config.json");
+        const larkHome6n = path.join(f.base, "lark-home"); fs.mkdirSync(larkHome6n, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(larkHome6n, "config.json"), JSON.stringify({ apps: [{ name: "claude", appId: TPL.outbound_app_id }] }, null, 2) + "\n", { mode: 0o600 });
+        fs.writeFileSync(tplFile, JSON.stringify({ ...TPL, agent_uid: "agent_w1_t6n", lark_cli_bin: path.join(bin, "lark-cli"), lark_cli_home: larkHome6n }, null, 2) + "\n", { mode: 0o600 });
+        const proj = path.join(f.base, "proj"); fs.mkdirSync(proj, { recursive: true });
+        const regFile = path.join(f.bridge, "registry.json");
+        fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [] }, null, 2) + "\n", { mode: 0o600 });
+        const sessionsDir = path.join(f.home, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+        const pid = 900101;
+        fs.writeFileSync(path.join(sessionsDir, pid + ".json"), JSON.stringify({ sessionId: W1_UUID_A, name: "n", pid, kind: "interactive", cwd: proj, startedAt: new Date().toISOString() }));
+        const r = w1Bind({ f, bin, larkLog, proj, regFile, tplFile }, { ...f.env, PATH: bin + path.delimiter + process.env.PATH, W1_LARK_LOG: larkLog,
+          FEISHU_BRIDGE_REGISTRY: regFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile, CLAUDE_CODE_SESSION_ID: W1_UUID_A, CLAUDE_PID: String(pid) });
+        assert.equal(r.status, 0, "未接入 → 照旧绑定：" + r.stdout + r.stderr);
+        const row = JSON.parse(fs.readFileSync(regFile, "utf-8")).projects.find((p) => p.claude_session_id === W1_UUID_A);
+        assert.deepEqual([row?.root_message_id, row?.status, row?.inbound_state], ["om_never_init", "active", "pending"], "登记行与 main 同：" + JSON.stringify(row));
+        const EPn = legacyEndpointId({ runtime: "claude", agentUid: "agent_w1_t6n" });
+        assert.equal(fs.existsSync(path.join(f.ledgerRoot, EPn)), false, "未接入不碰账本目录（更不建 sidecar）");
+      } finally { f.cleanup(); }
+    }
+    // shadow：真 init（无 cutover）→ 走原 shadow 双写路径，登记表照写、sidecar 不碰
+    {
+      const f = r69Fixture("w1t6s");
+      try {
+        const uid = "agent_w1_t6s";
+        const bin = path.join(f.base, "bin"); fs.mkdirSync(bin, { recursive: true });
+        const larkLog = path.join(f.base, "lark.jsonl");
+        fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "const fs=require('node:fs');",
+          "fs.appendFileSync(process.env.W1_LARK_LOG, 'x\\n');",
+          "process.stdout.write(JSON.stringify({ ok: true, data: { message_id: 'om_shadow' } }));"].join("\n") + "\n", { mode: 0o700 });
+        const tplFile = path.join(f.bridge, "chain-config.json");
+        const larkHome6s = path.join(f.base, "lark-home"); fs.mkdirSync(larkHome6s, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(larkHome6s, "config.json"), JSON.stringify({ apps: [{ name: "claude", appId: TPL.outbound_app_id }] }, null, 2) + "\n", { mode: 0o600 });
+        fs.writeFileSync(tplFile, JSON.stringify({ ...TPL, agent_uid: uid, lark_cli_bin: path.join(bin, "lark-cli"), lark_cli_home: larkHome6s }, null, 2) + "\n", { mode: 0o600 });
+        const EP = legacyEndpointId({ runtime: "claude", agentUid: uid });
+        const init = LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true });
+        assert.equal(init.phase, "done", "shadow 前置 init：" + JSON.stringify(init));
+        const proj = path.join(f.base, "proj"); fs.mkdirSync(proj, { recursive: true });
+        const regFile = path.join(f.bridge, "registry.json");
+        fs.writeFileSync(regFile, JSON.stringify({ schema_version: "1.0", projects: [] }, null, 2) + "\n", { mode: 0o600 });
+        const sessionsDir = path.join(f.home, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+        const pid = 900102;
+        fs.writeFileSync(path.join(sessionsDir, pid + ".json"), JSON.stringify({ sessionId: W1_UUID_B, name: "n", pid, kind: "interactive", cwd: proj, startedAt: new Date().toISOString() }));
+        const r = w1Bind({ f, bin, larkLog, proj, regFile, tplFile }, { ...f.env, PATH: bin + path.delimiter + process.env.PATH, W1_LARK_LOG: larkLog,
+          FEISHU_BRIDGE_REGISTRY: regFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile, CLAUDE_CODE_SESSION_ID: W1_UUID_B, CLAUDE_PID: String(pid) });
+        assert.equal(r.status, 0, "shadow 绑定成功：" + r.stdout + r.stderr);
+        const row = JSON.parse(fs.readFileSync(regFile, "utf-8")).projects.find((p) => p.claude_session_id === W1_UUID_B);
+        assert.match(String(row?.root_message_id), /^om_shadow$/u, "shadow 登记行照写：" + JSON.stringify(row));
+        const doc = JSON.parse(fs.readFileSync(path.join(f.ledgerRoot, EP, "ledger.json"), "utf-8"));
+        assert.equal(doc.authority_mode, "shadow", "仍 shadow");
+        assert.equal(Object.values(doc.records).filter((rec) => rec.kind === "live").length, 1, "shadow create_b1 镜像照写：" + JSON.stringify(Object.keys(doc.records)));
+        assert.equal(fs.existsSync(path.join(f.ledgerRoot, EP, "pending-claims.json")), false, "shadow 不写 sidecar（cutover 才有）");
+      } finally { f.cleanup(); }
+    }
+  });
 }
 
 sealSummary();

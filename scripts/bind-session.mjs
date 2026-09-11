@@ -33,7 +33,10 @@ import { registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { wireBind, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { readSidecarStore } from "./m1b/sidecar-store.mjs";
+import { resolveLiveId } from "./topic-agent-ledger.mjs";
+import { withRegistryTransaction } from "./topic-generation-store.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor,
@@ -137,12 +140,29 @@ try {
 } catch { /* 没有登记表就新建 */ }
 
 const already = registry.projects.find((p) => p?.claude_session_id === me.sessionId);
-if (already?.root_message_id) {
+const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+// PK2-W1：判源分派。authoritative → 复合写（账本为准，登记表降为索引行）；shadow / 未接入 → 原路径。
+const writeRoute = m1aWriteRoute({ endpointId, env: process.env });
+// authoritative 下的**完整性**判断：索引行在、但 sidecar 条目缺（上一次半途失败）→ 不许早退，
+//   得走同一条幂等复合把 sidecar upsert 补齐（否则 unclean 只能靠 doctor 点名，绑定永远不完整）。
+const authoritativeComplete = (entry) => {
+  if (writeRoute.mode !== "authoritative" || !entry?.root_message_id) return false;
+  const resolved = resolveLiveId({ endpointId, locator: entry.root_message_id, env: process.env });
+  if (!resolved.ok) return false;
+  const ta = resolved.id;
+  const pending = readSidecarStore({ endpointId, name: "pending-claims" });
+  const expiry = readSidecarStore({ endpointId, name: "expiry" });
+  return pending.ok === true && expiry.ok === true
+    && Object.prototype.hasOwnProperty.call(pending.entries, ta)
+    && Object.prototype.hasOwnProperty.call(expiry.entries, ta);
+};
+if (already?.root_message_id && (writeRoute.mode !== "authoritative" || authoritativeComplete(already))) {
   console.log("这条会话已经绑过了，没有重复建话题。");
   console.log("  话题  " + already.root_message_id);
   console.log("  入站  " + (already.session_id ? "已绑定" : "待绑定（去话题里 @ 一下）"));
   process.exit(0);
 }
+if (already?.root_message_id) console.log("这条会话的绑定不完整（缺 sidecar 条目）—— 按同一幂等键再跑一次补齐。");
 
 const identity = readProjectIdentity({ root });
 const name = arg("name") ?? (identity.name + " · " + me.name);
@@ -169,45 +189,79 @@ if (!apply) {
 const ident = resolveLarkIdentity(template);
 const canonicalRoot = (() => { try { return fs.realpathSync(root); } catch { return path.resolve(root); } })();
 const bindTarget = { runtime: "claude", project_root: canonicalRoot, claude_session_id: me.sessionId };
-// P2-2 wireBind（Frank 裁定）：会话级绑定的 legacy 两步（建根话题 + 登记）收进一个闭包，已启用端点以
-//   m1a-order 锁串行并镜像 shadow create_b1；未启用端点（never_initialized）→ 合法 legacy-only。
-const wired = wireBind({
-  endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
-  env: process.env,
-  externalRequestId: idemKey,
-  lineageId: path.basename(root) + "@project-files",
-  chatId: template.chat_id,
-  bindingTarget: bindTarget,
-  legacy: () => {
-    // ① 建根话题（幂等键）。失败 → 无任何副作用，返回 ok:false（wireBind 不跑 shadow）。
-    let rootMessageId;
-    try {
-      rootMessageId = sendToChat({
-        profile: ident.profile, chatId: template.chat_id, text: rootText,
-        idempotencyKey: idemKey, larkBin: ident.bin, larkHome: ident.configDir,
-        expectedAppId: ident.expectedAppId,
-      });
-    } catch (err) {
-      return { ok: false, phase: "send", message: err.message };
-    }
-    // ② 登记（entry push + 原子写）。失败 → 话题已在群里，返回 ok:false（phase=registry，幂等键保重跑不重建）。
-    const entry = newSessionEntry({
-      root, name, purpose: identity.purpose, token, rootMessageId,
-      claudeSessionId: me.sessionId, sessionName: me.name,
-    });
-    registry.projects.push(entry);
-    try {
-      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
-      if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
-      const tmp = regFile + ".tmp." + process.pid;
-      fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
-      fs.renameSync(tmp, regFile);
-    } catch (err) {
-      return { ok: false, phase: "registry", root_message_id: rootMessageId, message: err.message };
-    }
-    return { ok: true, root_message_id: rootMessageId, count: registry.projects.length };
-  },
+// ① 建根话题（幂等键）——两条路径共用一个闭包。失败 → 无任何副作用（不跑后续步骤）。
+const createTopic = () => {
+  try {
+    return { ok: true, root_message_id: sendToChat({
+      profile: ident.profile, chatId: template.chat_id, text: rootText,
+      idempotencyKey: idemKey, larkBin: ident.bin, larkHome: ident.configDir,
+      expectedAppId: ident.expectedAppId,
+    }) };
+  } catch (err) {
+    return { ok: false, reason: "send_failed", message: err.message };
+  }
+};
+const indexEntry = (rootMessageId) => newSessionEntry({
+  root, name, purpose: identity.purpose, token, rootMessageId,
+  claudeSessionId: me.sessionId, sessionName: me.name,
 });
+// authoritative 路径用**同一份**条目模版（同一个 now）：索引行里的 expires_at 必须与写进 expiry sidecar
+// 的那一个逐字相同 —— 两次各自 newSessionEntry 会让两边差几毫秒。
+const indexTemplate = indexEntry("om_placeholder");
+// ③ 索引行 upsert（authoritative 路径）：**锁内重读当前文件再局部更新**（不许拿锁外那份快照写回 ——
+//   两笔并发 bind 被 outer 串行后，后一笔仍会用陈旧快照盖掉前一笔）。同会话已有行 → 就地覆盖（幂等重跑）。
+const publishIndex = ({ rootMessageId }) => {
+  const entry = { ...indexTemplate, root_message_id: rootMessageId };
+  const done = withRegistryTransaction({ regFile, root, mutate: (reg) => {
+    const rows = reg.projects;
+    const at = rows.findIndex((p) => p?.claude_session_id === me.sessionId || (p?.root === entry.root && p?.id === entry.id));
+    if (at >= 0) rows[at] = { ...rows[at], ...entry };
+    else rows.push(entry);
+    return { ok: true, changed: true };
+  } });
+  if (!done.ok) return { ok: false, reason: done.reason ?? "registry_unwritable", why: done.error ?? null };
+  return { ok: true, count: done.count ?? null };
+};
+// PK2-W1：判源分派 —— authoritative 走复合（账本先于索引），shadow / 未接入走原路径（一字未改）。
+const wired = writeRoute.mode === "authoritative"
+  ? wireBindAuthoritative({
+      endpointId, env: process.env, externalRequestId: idemKey,
+      // lineage 取**会话级登记行的 id**（= basename@<sid8>）+ "@registry" —— 与 legacy 快照的
+      //   registry 分支同一算法（entry.id + "@registry"）。用项目级 @project-files 会让同一项目里
+      //   两条工作线撞同一个 lineage（账本一条 lineage 只许一条 live B1）。
+      lineageId: indexTemplate.id + "@registry", chatId: template.chat_id, bindingTarget: bindTarget,
+      pendingToken: token, expiresAt: indexTemplate.expires_at,
+      createTopic, publishIndex,
+    })
+  : wireBind({
+      endpointId,
+      env: process.env,
+      externalRequestId: idemKey,
+      lineageId: path.basename(root) + "@project-files",
+      chatId: template.chat_id,
+      bindingTarget: bindTarget,
+      legacy: () => {
+        // ① 建根话题 → ② 登记（entry push + 原子写）。失败 → 话题已在群里，phase=registry（幂等键保重跑不重建）。
+        const t = createTopic();
+        if (!t.ok) return { ok: false, phase: "send", message: t.message };
+        const entry = indexEntry(t.root_message_id);
+        registry.projects.push(entry);
+        try {
+          fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+          if (fs.existsSync(regFile)) fs.copyFileSync(regFile, regFile + ".prev");
+          const tmp = regFile + ".tmp." + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
+          fs.renameSync(tmp, regFile);
+        } catch (err) {
+          return { ok: false, phase: "registry", root_message_id: t.root_message_id, message: err.message };
+        }
+        return { ok: true, root_message_id: t.root_message_id, count: registry.projects.length };
+      },
+    });
+// PK2-W1：unclean 回执**先写** —— 账本已提交而后继失败时，后面那两条 die 分支会 exit；
+//   回执不能只长在成功路径上（"不能只靠 doctor 点名"）。
+const bindUnclean = uncleanWired(wired);
+if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_session", wired, { root, claudeSessionId: me.sessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
 if (!wired.ok) {
   // 已启用端点任一取锁/账本/收据异常 → 整笔拒、不写 legacy、不建话题（fail-closed）。
   die("绑定失败（M1a 一致性锁：" + (wired.reason ?? "unknown") + (wired.why ? "；" + wired.why : "") + "）",
@@ -216,15 +270,12 @@ if (!wired.ok) {
 const lr = wired.legacy;
 if (!lr.ok) {
   if (lr.phase === "send") die("建话题失败，没有写任何文件：" + lr.message);
-  die("话题建好了（" + lr.root_message_id + "）但登记没写成：" + lr.message,
-    "修好权限后重跑同一条命令即可，幂等键保证不会多建一个话题。");
+  die("话题建好了（" + lr.root_message_id + "）但绑定没落完（停在第 " + String(lr.phase) + " 步：" + lr.message + "）",
+    "按同一幂等键重跑这一条命令即可补齐：话题不会重建、账本也不会多记一条。");
 }
 const rootMessageId = lr.root_message_id;
 console.log("\n根话题已建立  " + rootMessageId);
-console.log("已登记        " + regFile + "  （现在 " + lr.count + " 条绑定）");
-// P1-4：legacy 已提交但 shadow 镜像不干净 → 持久机器回执（不谎报 clean）。
-const bindUnclean = uncleanWired(wired);
-if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_session", wired, { root, claudeSessionId: me.sessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
+console.log("已登记        " + regFile + "  （现在 " + (lr.count ?? "?") + " 条绑定）");
 
 
 try {

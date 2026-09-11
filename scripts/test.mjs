@@ -60,7 +60,7 @@ import {
   recordClaimState, watcherExpectEnv, CLAIM_STATE } from "./claim.mjs";
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
-import { machineContext, runDoctor, firstDanglingSymlinkInChain } from "./doctor.mjs";
+import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { resolveDeliveryTargetFromLedger, decideInboundDeliveryTarget, appendShadowDivergenceNote, classifyLedgerAuthority } from "./m1a/delivery-target.mjs"; // R66：入站投递目标解析/判源/决策
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
@@ -51370,6 +51370,318 @@ test("R69 返修二 P1-B T5c 恢复腿纳入账本锁的 reap 残骸：<lock>.re
     } finally { x.f.cleanup(); }
   });
 }
+
+// ─────────────────── PK2-I6 / fix1：doctor 切后语义（判源 + 降级范围收窄） ────────────────
+// 判源一处 = authoritySource(ctx)（R66 classifyLedgerAuthority 同一函数，绑 runDoctor 的运行上下文）。
+// **降级范围收窄（fix1 P1-1）**：只有「读已被账本/sidecar 接管的冻结 legacy 事实」的项才降；
+// 登记表/路由表/话题登记/chat 认领账本仍是活的路由索引 → 不降（恢复 main 行为，逐字快照断言）；
+// ⑤ 绑定到期改由**权威 expiry.json**接替（读不出/不合法 → 红）。
+// 夹具走真蓝图真收据（initPlan/migrateSeed/cutoverPlan + 真 journal），doctor 走真入口子进程。
+
+const PK2I6_VIEW = "账本视角：live 记录 3 条（项目级（会话未选）2 / 会话级 1 / 待认领（B1）1）";
+const PK2I6_ITEMS = ["registry", "routes", "session_route_missing", "default_route_handler", "binding_expiry", "chat_ledger"];
+// 这六项在 **shadow / reject /（fix1 之后的）authoritative** 下都必须与 main 逐字一致
+// （快照：从 main 的真实入口跑出来抄下的字面，不经任何常量拼）。
+// shadow/reject 下这六项必须与 main 逐字一致（快照；从 main 的真实入口跑出来抄下的，不经任何常量拼）。
+const PK2I6_UNCHANGED = {
+  registry: ["项目登记表", true, "已登记 1 个项目"],
+  routes: ["路由表", true, "0 条启用路由，1 条话题登记"],
+  session_route_missing: ["③ 话题登记指向的路由存在且启用", false, "1 条话题登记指向不存在或已停用的路由：session_… → self"],
+  default_route_handler: ["⑦ 入站默认处理器在 runtime/current 之下", true, "路由表里没有启用的路由，分发器用运行时自带的默认处理器"],
+  binding_expiry: ["⑤ 绑定未到期（阈值 7 天）", true, "1 个项目的绑定都在有效期内"],
+  chat_ledger: ["⑨ chat 账本（两条链）", true, "Claude 正在答 0 条、Codex 正在答 0 条；没有说不清的条目"],
+};
+
+/** PK2-I6 夹具：真机器夹具（doctorMachine）+ 真账本（三条 live：会话级 / 项目级 / 待认领 B1）+ 真收据 journal。
+ *  cutover=true 种 cutover 收据；authoritative=true 必须同时 cutover=true（收据与账本一致才判 authoritative），
+ *  否则得到的就是 T3 的 reject 态（收据已 cutover、账本仍是 shadow）。 */
+function pk2i6Fixture({ cutover = false, authoritative = false, expiryEntries = null, expiryRaw = null,
+  secondEndpointNoLedger = null, secondEndpointFull = null, badReceipt = false, noReceipts = false } = {}) {
+  const m = doctorMachine();
+  const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  m.writeTables({
+    projects: [{ id: "good", root: good, root_message_id: "om_root_good", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }],
+    routes: [], sessions: { session_aaaaaaaaaaaa: "self" }, providers: [],
+  });
+  const EP = "endpoint_" + "a".repeat(24);
+  const epDir = path.join(m.ledgerDir, EP);
+  fs.mkdirSync(epDir, { recursive: true, mode: 0o700 }); fs.chmodSync(epDir, 0o700);
+  const env = { ...process.env, HOME: m.home,
+    FEISHU_BRIDGE_REGISTRY: m.files.registry, FEISHU_BRIDGE_LEDGER_DIR: m.ledgerDir,
+    FEISHU_BRIDGE_MAINTENANCE_DIR: m.maintDir, FEISHU_BRIDGE_MAINTENANCE_GATE: m.gateFile };
+  const write600 = (file, text) => { fs.writeFileSync(file, text, { mode: 0o600 }); fs.chmodSync(file, 0o600); };
+  const initOpId = "00000000-0000-0000-0000-000000000001";
+  const cutOpId = "00000000-0000-0000-0000-000000000002";
+  const at = "2026-09-01T12:00:00.000Z";
+  const sha = "b".repeat(64);
+  const digest = "c".repeat(64);
+  const uuid = "11111111-2222-4333-8444-555555555555";
+  // 端点建造器（PK2-I6-fix2 抽出：第二个完整 Claude 端点同款复用，不另写一份蓝图序列）
+  const buildEndpoint = (epId, tokInit, tokCut) => {
+    fs.mkdirSync(path.join(m.ledgerDir, epId), { recursive: true, mode: 0o700 }); fs.chmodSync(path.join(m.ledgerDir, epId), 0o700);
+    const epLedgerFile = path.join(m.ledgerDir, epId, "ledger.json");
+    const ip = TAL.initPlan({ endpointId: epId, chain: "claude", requestKey: "rk_init_" + epId.slice(-4), operationId: tokInit });
+    assert.equal(ip.ok, true, JSON.stringify(ip));
+    write600(epLedgerFile, JSON.stringify(ip.doc, null, 2) + "\n");
+    // 三条 live 记录：真 migrateSeed（B3 会话级 / B3 项目级 / B1 待认领）——每个 target 各自 lineage（G7）
+    const cand = (id, aliases, facts, target, lin) => ({ topic_agent_id: id, chat_id: "oc_good", aliases, facts, binding_target: target,
+      generation_lineage_id: lin, legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null });
+    const B3 = { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" };
+    const seedE = TAL.migrateSeed({ endpointId: epId, requestKey: "rk_seed_" + epId.slice(-4), authorizedBy: "ou_owner", now: Date.parse(at), env,
+      candidates: [
+        cand("ta_" + "1".repeat(32), { session_id: "sess_one", root_om: "om_A1" }, B3, { runtime: "claude", project_root: good, claude_session_id: uuid }, "lin_one"),
+        cand("ta_" + "2".repeat(32), { session_id: "sess_two", root_om: "om_A2" }, B3, { runtime: "claude", project_root: path.join(m.home, "p2"), claude_session_id: null }, "lin_two"),
+        cand("ta_" + "3".repeat(32), { session_id: null, root_om: "om_A3" }, { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, { runtime: "claude", project_root: path.join(m.home, "p3"), claude_session_id: null }, "lin_three"),
+      ] });
+    assert.equal(seedE.ok, true, JSON.stringify(seedE));
+    // 收据 journal：init 永远有；cutover 按需（token 必须等于账本里那笔 op id，⑬ 要核不可变事务祖先）
+    const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone = (ch, tok) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone = (ch, tok) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone = (tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    const enter = (tok) => [timerDone("claude"), timerDone("codex"), stubDone("claude", tok), stubDone("codex", tok), curDone("claude", tok), curDone("codex", tok)];
+    const initStepE = { id: "ledger:" + epId + ":init", kind: "ledger", target: epId, backup: null, backup_sha256: null, backup_bytes: null,
+      before: { endpoint_id: epId, operation_id: tokInit, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null },
+      intended_after: { endpoint_id: epId, operation_id: tokInit, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha },
+      after: { endpoint_id: epId, operation_id: tokInit, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha }, state: "done", at, chain: "claude" };
+    if (!noReceipts) write600(path.join(m.maintDir, tokInit + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tokInit, reason: "seed 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(tokInit), gateDone(tokInit), initStepE], notes: [] }));
+    const shadowE = TAL.loadByEndpoint(epId, { env });
+    assert.equal(shadowE.ok, true, JSON.stringify(shadowE.ok ? shadowE.doc.authority_mode : shadowE));
+    if (cutover) {
+      const cp = TAL.cutoverPlan({ endpointId: epId, chain: "claude", requestKey: "rk_cut_" + epId.slice(-4), operationId: tokCut, shadowDoc: shadowE.doc, shadowSha: shadowE.sha256, digest, sidecarShas: { expiry: digest, pending_claims: digest, policy: digest } });
+      assert.equal(cp.ok, true, JSON.stringify(cp));
+      const cutStep = { id: "ledger:" + epId + ":cutover", kind: "ledger", target: epId, backup: null, backup_sha256: null, backup_bytes: null,
+        before: { endpoint_id: epId, operation_id: tokCut, fingerprint: sha, authority_mode: "shadow", revision: 1, ledger_sha256: sha, bijection_digest: null },
+        intended_after: { endpoint_id: epId, operation_id: tokCut, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest },
+        after: { endpoint_id: epId, operation_id: tokCut, fingerprint: sha, authority_mode: "authoritative", revision: 2, ledger_sha256: sha, bijection_digest: digest }, state: "done", at, chain: "claude" };
+      write600(path.join(m.maintDir, tokCut + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_cutover", token: tokCut, reason: "cut 收据", started_at: at, updated_at: at, phase: "done", steps: [...enter(tokCut), gateDone(tokCut), cutStep], notes: [] }));
+      // 收据与账本必须一致：authoritative=true 才把账本写成 authoritative；否则（T3）= 收据切了、账本仍 shadow → reject
+      if (authoritative) write600(epLedgerFile, JSON.stringify(cp.doc, null, 2) + "\n");
+    }
+    return epLedgerFile;
+  };
+  const ledgerFile = buildEndpoint(EP, initOpId, cutOpId);
+  // PK2-I6-fix2 P2 反例：第二个 Claude 端点**完整**（init+cutover 收据 + authoritative 账本）→ 视图要汇总它
+  if (secondEndpointFull !== null) buildEndpoint(secondEndpointFull, "00000000-0000-0000-0000-000000000101", "00000000-0000-0000-0000-000000000102");
+  // ⑤ 在 authoritative 下读**权威** expiry.json（readSidecarFile：0600 + 单硬链接 + schema 校验）
+  if (authoritative && expiryEntries !== null) {
+    write600(path.join(epDir, "expiry.json"), expiryRaw ?? JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP, entries: expiryEntries }, null, 2) + "\n");
+  }
+  // P1-2 反例用①：**第二个 Claude 端点有 init 收据、但账本缺席**（旧版会「有可读端点就忽略它」）
+  if (secondEndpointNoLedger !== null) {
+    const tok2 = "00000000-0000-0000-0000-000000000009";
+    const st2 = (over = {}) => ({ endpoint_id: secondEndpointNoLedger, operation_id: tok2, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
+    const initStep2 = { id: "ledger:" + secondEndpointNoLedger + ":init", kind: "ledger", target: secondEndpointNoLedger,
+      backup: null, backup_sha256: null, backup_bytes: null,
+      before: st2(),
+      intended_after: st2({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }),
+      after: st2({ authority_mode: "shadow", revision: 1, ledger_sha256: sha }), state: "done", at, chain: "claude" };
+    const timerDone2 = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
+    const stubDone2 = (ch, tok) => ({ id: "stub:" + ch, kind: "stub", target: "versions/x", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const curDone2 = (ch, tok) => ({ id: "current:" + ch, kind: "current", target: "versions/0123456789abcdef", before: "versions/0123456789abcdef", backup: null, backup_sha256: null, backup_bytes: null, intended_after: "versions/maintenance-" + tok, after: "versions/maintenance-" + tok, state: "done", at, chain: null });
+    const gateDone2 = (tok) => ({ id: "gate", kind: "gate", target: "label", before: null, backup: null, backup_sha256: null, backup_bytes: null, intended_after: { token: tok }, after: { token: tok, txnUncleared: null }, state: "done", at, chain: null });
+    write600(path.join(m.maintDir, tok2 + ".json"), JSON.stringify({ schema_version: "1.2", operation_kind: "ledger_init", token: tok2, reason: "第二端点收据（账本缺席）", started_at: at, updated_at: at, phase: "done", steps: [timerDone2("claude"), timerDone2("codex"), stubDone2("claude", tok2), stubDone2("codex", tok2), curDone2("claude", tok2), curDone2("codex", tok2), gateDone2(tok2), initStep2], notes: [] }));
+  }
+  // P1-2 反例用②：一份读不出的 journal（收据聚合 fail-closed）
+  if (badReceipt) write600(path.join(m.maintDir, "11111111-1111-4111-8111-111111111111.json"), '{"schema_version":"1.2","operation_kind":"ledger_init"}\n');
+  return { m, EP, ledgerFile, maintDir: m.maintDir, epDir };
+}
+
+test("PK2-I6-fix1 T1：authoritative 下**六项都不降级**（逐字等于 main），⑤ 改读权威 expiry.json（真实入口）", () => {
+  const fx = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-06-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const rep = doctorReport(fx.m.run());
+  // P1-1：登记表 / 路由表 / ③ / ⑦ / ⑨ **不降** —— 与 main 逐字一致（判源是 authoritative 也不改它们）
+  for (const id of PK2I6_ITEMS.filter((x) => x !== "binding_expiry")) {
+    const c = checkOf(rep, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 authoritative 下也不许降级（活的路由索引/认领账本）：" + JSON.stringify(c));
+  }
+  // ⑤ 改判据：读**权威** expiry.json（不是 legacy expires_at，也不是账本计数）
+  const c5 = checkOf(rep, "binding_expiry");
+  assert.equal(c5.ok, true, "⑤ 该绿：" + JSON.stringify(c5));
+  assert.match(c5.detail, /权威 expiry\.json：1 个端点、3 条/u, "⑤ 必须说清读的是权威 sidecar 与条数（fix2：恰覆盖 3 条 live B）：" + c5.detail);
+  assert.match(c5.detail, /都在有效期内/u, c5.detail);
+  // 判源行：authoritative + 依据 + 端点 + 账本视角计数
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, true, JSON.stringify(src));
+  assert.match(src.detail, /^authoritative —— 以账本为准/u, src.detail);
+  assert.match(src.detail, /收据与账本一致（authoritative）/u, src.detail);
+  assert.match(src.detail, new RegExp(fx.EP, "u"), src.detail);
+  assert.ok(src.detail.includes(PK2I6_VIEW), "⑳ 也带账本视角：" + src.detail);
+  // 渲染面：没有信息态就不出那一行
+  const text = fx.m.run({}, []).stdout;
+  assert.doesNotMatch(text, /信息态/u, "没有信息态时不该有那一行：" + text.split("\n").filter((l) => l.includes("信息态")).join(" | "));
+});
+
+test("PK2-I6-fix1 T4：authoritative 下 ⑤ 按权威 expiry.json 判到期 —— 过期 → 红；读不出/不合法 → 红（fail-closed）", () => {
+  // ① 有一条已过期（阈值 7 天内的「即将到期」也单独验）
+  const stale = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2020-01-01T00:00:00.000Z" } });
+  const rep1 = doctorReport(stale.m.run());
+  const c1 = checkOf(rep1, "binding_expiry");
+  assert.equal(c1.ok, false, "过期条目必须红：" + JSON.stringify(c1));
+  assert.match(c1.detail, /已过期：/u, c1.detail);
+  assert.match(c1.detail, /权威 expiry\.json：1 个端点、1 条/u, c1.detail);
+  assert.equal(rep1.overall, "blocked", "红要进结论：" + rep1.overall);
+  // ② 即将到期（7 天内）也红（阈值不变）
+  const soon = pk2i6Fixture({ cutover: true, authoritative: true, expiryEntries: { ["ta_" + "2".repeat(32)]: new Date(Date.now() + 3 * 86400000).toISOString() } });
+  const c2 = checkOf(doctorReport(soon.m.run()), "binding_expiry");
+  assert.equal(c2.ok, false, "7 天内到期也算红：" + JSON.stringify(c2));
+  assert.match(c2.detail, /即将到期：/u, c2.detail);
+  // ③ sidecar 缺席 → 红（fail-closed；账本视角的计数不许替代到期判断）
+  const missing = pk2i6Fixture({ cutover: true, authoritative: true, expiryEntries: null });
+  const c3 = checkOf(doctorReport(missing.m.run()), "binding_expiry");
+  assert.equal(c3.ok, false, "expiry.json 缺席 → 红（fail-closed）：" + JSON.stringify(c3));
+  assert.match(c3.detail, /expiry\.json 读不出/u, c3.detail);
+  // ④ sidecar 不合法（schema 不对）→ 红
+  const bad = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: {}, expiryRaw: JSON.stringify({ schema_version: "expiry-9", endpoint_id: "endpoint_" + "a".repeat(24), entries: {} }) + "\n" });
+  const c4 = checkOf(doctorReport(bad.m.run()), "binding_expiry");
+  assert.equal(c4.ok, false, "sidecar schema 不对 → 红：" + JSON.stringify(c4));
+  // ⑤ 条目值不是时间 → 由 sidecar 校验器拦下、整份读不出 → 红（fail-closed；doctor 不自己再判一次时间）
+  const notTime = pk2i6Fixture({ cutover: true, authoritative: true, expiryEntries: { ["ta_" + "3".repeat(32)]: "说不清" } });
+  const c5 = checkOf(doctorReport(notTime.m.run()), "binding_expiry");
+  assert.equal(c5.ok, false, "到期值不是时间 → 红：" + JSON.stringify(c5));
+  assert.match(c5.detail, /expiry\.json 读不出（值不是规范化 ISO/u, c5.detail);
+});
+
+test("PK2-I6-fix1 T5：判源 fail-closed —— 任一端点账本读不出 / 收据坏 → ⑳ 红，且**一项都不降级**", () => {
+  // ① 两个 Claude 端点：一个可读且 authoritative，另一个**有收据但账本缺席**
+  const EP2 = "endpoint_" + "b".repeat(24);
+  const two = pk2i6Fixture({ cutover: true, authoritative: true, secondEndpointNoLedger: EP2,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const rep1 = doctorReport(two.m.run());
+  const s1 = checkOf(rep1, "authority_source");
+  assert.equal(s1.ok, false, "任一端点账本读不出 → 判源必须红（不据部分事实下结论）：" + JSON.stringify(s1));
+  assert.match(s1.detail, /^reject/u, s1.detail);
+  assert.match(s1.detail, new RegExp(EP2, "u"), "红要说清是哪个端点：" + s1.detail);
+  // 不降级任何项：六项仍与 main 逐字一致（⑤ 也回到 legacy 判据 —— reject 态下不看 sidecar）
+  for (const id of PK2I6_ITEMS) {
+    const c = checkOf(rep1, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], "reject 下 " + id + " 不许被降级/改写：" + JSON.stringify(c));
+  }
+  // ② 收据本身读不出（坏 journal）→ 同样 reject
+  const bad = pk2i6Fixture({ cutover: true, authoritative: true, badReceipt: true });
+  const s2 = checkOf(doctorReport(bad.m.run()), "authority_source");
+  assert.equal(s2.ok, false, "收据 fail-closed → 判源红：" + JSON.stringify(s2));
+  assert.match(s2.detail, /^reject.*收据 fail-closed/u, s2.detail);
+});
+
+test("PK2-I6-fix1 T6：判源绑这次体检的 home（home ≠ process.env.HOME 时按 home 派生，不看环境覆盖点）", () => {
+  const fx = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  // 环境覆盖点指向一个**别处**（空维护目录 + 空账本根）：判源若读它 → 会是 legacy（且⑤走 legacy 判据）。
+  const decoy = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pk2i6-decoy-"));
+  fs.mkdirSync(path.join(decoy, "maintenance"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(decoy, "ledger"), { recursive: true, mode: 0o700 });
+  const saved = { HOME: process.env.HOME, M: process.env.FEISHU_BRIDGE_MAINTENANCE_DIR, L: process.env.FEISHU_BRIDGE_LEDGER_DIR };
+  try {
+    process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(decoy, "maintenance");
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(decoy, "ledger");
+    process.env.HOME = decoy;                       // home ≠ process.env.HOME 的字面情形
+    const report = runDoctor({ home: fx.m.home });
+    const src = report.checks.find((c) => c.id === "authority_source");
+    assert.equal(src.ok, true, "判源必须按传入 home 判（那台机器是 authoritative）：" + JSON.stringify(src));
+    assert.match(src.detail, /^authoritative/u, src.detail);
+    assert.match(src.detail, new RegExp(fx.EP, "u"), "端点必须是夹具 home 下那个（不是环境覆盖点里的）：" + src.detail);
+    const c5 = report.checks.find((c) => c.id === "binding_expiry");
+    assert.match(c5.detail, /权威 expiry\.json：1 个端点、1 条/u, "⑤ 也要读夹具 home 下的 sidecar：" + c5.detail);
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME; else process.env.HOME = saved.HOME;
+    if (saved.M === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = saved.M;
+    if (saved.L === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved.L;
+    fs.rmSync(decoy, { recursive: true, force: true });
+  }
+});
+
+test("PK2-I6-fix1 T7：⑳ 无收据 → legacy 且绿；六项与 main 逐字一致（边界常驻）", () => {
+  const fx = pk2i6Fixture({ cutover: false, noReceipts: true });   // 不种任何收据（维护目录里没有任何 journal）
+  const rep = doctorReport(fx.m.run());
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, true, "无收据 → legacy 且绿（未接入 M1a 不是故障）：" + JSON.stringify(src));
+  assert.match(src.detail, /^legacy/u, src.detail);
+  assert.match(src.detail, /没有 Claude 链的账本收据/u, src.detail);
+  for (const id of PK2I6_ITEMS) {
+    const c = checkOf(rep, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], "legacy 下 " + id + " 与 main 逐字一致：" + JSON.stringify(c));
+  }
+});
+
+test("PK2-I6-fix2 P2：ok 三态合同 —— 非布尔一律视为 unknown（不得当 ready）；NOTE 四态已删", () => {
+  assert.equal(summarizeDoctorChecks([{ ok: "note" }]).overall, "incomplete", "非布尔 ok 视为 unknown，不构成 ready");
+  assert.equal(summarizeDoctorChecks([{ ok: undefined }]).overall, "incomplete", "缺 ok 同样视为 unknown");
+  assert.equal(summarizeDoctorChecks([{ ok: "note" }, { ok: false, next: "x" }]).overall, "blocked", "unknown 不遮蔽 red");
+  assert.equal(summarizeDoctorChecks([{ ok: null }]).overall, "incomplete", "null 仍 = unknown");
+  assert.equal(summarizeDoctorChecks([{ ok: true }]).overall, "ready", "全 true → ready");
+  assert.equal(summarizeDoctorChecks([{ ok: true }]).noteCount, undefined, "noteCount 已随四态删除");
+  // 渲染面：非布尔用 ?，red 用 ✗；不再有「信息态」行
+  const text = renderDoctor({ overall: "blocked", checks: [{ id: "a", name: "怪项", ok: "note", detail: "d", next: null }, { id: "b", name: "故障项", ok: false, detail: "d", next: null }], next: [] });
+  assert.match(text, /\? 怪项/u, text);
+  assert.match(text, /✗ 故障项/u, text);
+  assert.match(text, /结论：blocked/u, text);
+  assert.doesNotMatch(text, /信息态/u, "四态已删：渲染面不再有信息态行");
+});
+
+test("PK2-I6-fix2 P1：⑤ 键集覆盖核（§4e）—— live B 缺条目 / 多无主条目都红并点名 id 前缀，恰覆盖才绿", () => {
+  // ① 夹具账本 3 条 live B，expiry.json 只有 2 条 → 红并点名缺的那条（旧版判绿 = 假绿）
+  const miss = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const c1 = checkOf(doctorReport(miss.m.run()), "binding_expiry");
+  assert.equal(c1.ok, false, "缺覆盖必须红：" + JSON.stringify(c1));
+  assert.match(c1.detail, /缺条目/u, c1.detail);
+  assert.ok(c1.detail.includes(("ta_" + "3".repeat(32)).slice(0, 12)), "点名缺项 id 前缀：" + c1.detail);
+  // ② 恰覆盖 + 多一条无主键 → 红
+  const orphan = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "f".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const c2 = checkOf(doctorReport(orphan.m.run()), "binding_expiry");
+  assert.equal(c2.ok, false, "无主条目必须红：" + JSON.stringify(c2));
+  assert.match(c2.detail, /多出无主条目/u, c2.detail);
+  assert.ok(c2.detail.includes(("ta_" + "f".repeat(32)).slice(0, 12)), "点名无主键前缀：" + c2.detail);
+  // ③ 恰好覆盖 → 绿
+  const exact = pk2i6Fixture({ cutover: true, authoritative: true,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const c3 = checkOf(doctorReport(exact.m.run()), "binding_expiry");
+  assert.equal(c3.ok, true, "恰覆盖要绿：" + JSON.stringify(c3));
+});
+
+test("PK2-I6-fix2 P2：多 Claude 端点 authoritative → ⑳ 账本视角**汇总**全部端点（不再只取第一本）", () => {
+  const EP2 = "endpoint_" + "b".repeat(24);
+  const two = pk2i6Fixture({ cutover: true, authoritative: true, secondEndpointFull: EP2,
+    expiryEntries: { ["ta_" + "1".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "2".repeat(32)]: "2099-01-01T00:00:00.000Z", ["ta_" + "3".repeat(32)]: "2099-01-01T00:00:00.000Z" } });
+  const rep = doctorReport(two.m.run());
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, true, JSON.stringify(src));
+  assert.match(src.detail, /endpoint_a{8}/u, "主端点在列：" + src.detail);
+  assert.match(src.detail, /endpoint_b{8}/u, "第二端点也在列：" + src.detail);
+  assert.ok(src.detail.includes("live 记录 6 条"), "两个端点各 3 条 live → 汇总 6 条：" + src.detail);
+  assert.ok(src.detail.includes(EP2), "端点列表要含第二个端点：" + src.detail);
+});
+
+test("PK2-I6 T2：shadow 收据下六项与 main 逐字一致（快照断言），⑳ 判源绿且不打 legacy 后缀", () => {
+  const fx = pk2i6Fixture({ cutover: false });
+  const rep = doctorReport(fx.m.run());
+  for (const id of PK2I6_ITEMS) {
+    const c = checkOf(rep, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 shadow 下必须与 main 逐字一致");
+  }
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, true, JSON.stringify(src));
+  assert.match(src.detail, /^shadow —— 账本只做旁路对账，legacy 仍是判据/u, src.detail);
+  assert.ok(!src.detail.includes(PK2I6_VIEW), "shadow 下不喊账本视角：" + src.detail);
+});
+
+test("PK2-I6 T3：收据已 cutover 而账本仍 shadow → ⑳ 红，其余六项一字不改（真实入口）", () => {
+  const fx = pk2i6Fixture({ cutover: true, authoritative: false });
+  const rep = doctorReport(fx.m.run());
+  const src = checkOf(rep, "authority_source");
+  assert.equal(src.ok, false, "reject 必须红：" + JSON.stringify(src));
+  assert.match(src.detail, /^reject —— 判源不可用，fail-closed/u, src.detail);
+  assert.match(src.detail, /收据已 cutover 但账本 authority_mode=shadow/u, src.detail);
+  for (const id of PK2I6_ITEMS) {
+    const c = checkOf(rep, id);
+    assert.deepEqual([c.name, c.ok, c.detail], PK2I6_UNCHANGED[id], id + " 在 reject 下必须一字不改（reject 不是 legacy，也不许当 authoritative）");
+  }
+});
 
 sealSummary();
 

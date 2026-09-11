@@ -280,7 +280,7 @@ const isoOf = (v) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? ne
  *     "a1 已提交、activate 未成"那半笔误报成 `not_committed`（P1-3）。
  * `buildLegacy(steps)` 由各复合自己给 —— 它决定调用方看到的 "legacy 结果" 是什么。
  */
-function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy }) {
+function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy, prepare = null }) {
   const recDir = maintenanceDir(env);
   const receipt = typeof recDir === "string" && recDir.length > 0
     ? endpointReceipt(recDir, endpointId)
@@ -309,6 +309,22 @@ function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy })
     const shadow = [];
     const byOp = new Map();
     const commits = [];
+    // PK2-W1-fix4 P1-A：**锁内回调** —— 各复合把「读既有现场 → 定冻结值 → 判 repair/reject」这类决定
+    //   放在这里，而不是在取锁之前用一份快照下结论（锁外读到的行可能已被另一路写方改掉）。
+    //   返回 `{ok:false, reason, why}` → 整笔零写中止（不进任何步骤）；返回 `{ok:true, ...}` →
+    //   整份返回值存进 byOp 的 `__prepare`，步骤要用的锁内值从那里取（与 wirePromoteAuthoritative
+    //   的 `__preflight` 同一形）。
+    if (typeof prepare === "function") {
+      let p;
+      try { p = prepare(); }
+      catch (err) { p = { ok: false, reason: "prepare_threw", why: String(err?.code ?? err?.message ?? err) }; }
+      if (!p || p.ok !== true) {
+        result = { ok: false, commit: "not_committed", reason: p?.reason ?? "prepare_reject", why: p?.why ?? null,
+          lock: acq.lock ?? null, legacy: null, shadow: null, release: null };
+        return result;
+      }
+      byOp.set("__prepare", { ...p });
+    }
     for (const st of steps) {
       let r;
       try { r = st.run({ ledgerCommitted: commits.length > 0, byOp }); }
@@ -352,9 +368,9 @@ function runAuthoritative({ endpointId, env = process.env, steps, buildLegacy })
  */
 export function wireBindAuthoritative({
   endpointId, env = process.env, externalRequestId, lineageId, chatId, bindingTarget,
-  pendingToken, expiresAt, createTopic, publishIndex, now = Date.now(),
+  pendingToken, expiresAt, createTopic, publishIndex, now = Date.now(), prepare = null,
 }) {
-  return runAuthoritative({ endpointId, env, steps: [
+  return runAuthoritative({ endpointId, env, prepare, steps: [
     { op: "topic", run: () => {
       const t = createTopic();
       return t && t.ok === true && en(t.root_message_id) ? { ok: true, root_message_id: t.root_message_id } : { ok: false, reason: t?.reason ?? "topic_failed", why: t?.message ?? t?.why ?? "建根话题失败" };
@@ -382,11 +398,15 @@ export function wireBindAuthoritative({
     { op: "sidecars", run: ({ byOp }) => {
       const ta = byOp.get("ledger")?.topic_agent_id ?? null;
       if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本 create_b1 未返回 topic_agent_id（无法写 sidecar 条目）" };
-      const iso = isoOf(expiresAt);
-      if (iso === null) return { ok: false, reason: "bad_expires_at", why: "expiresAt 不可规范化：" + JSON.stringify(expiresAt ?? null) };
-      if (!en(pendingToken)) return { ok: false, reason: "bad_pending_token", why: "pendingToken 必填（pending-claims 条目的 token）" };
+      // PK2-W1-fix4 P1-A：锁内回调（prepare）给的值优先 —— 只有它才是在锁内读到的冻结行/新铸值。
+      const prep = byOp.get("__prepare") ?? null;
+      const pendingTokenUse = prep?.pendingToken ?? pendingToken;
+      const expiresAtUse = prep?.expiresAt ?? expiresAt;
+      const iso = isoOf(expiresAtUse);
+      if (iso === null) return { ok: false, reason: "bad_expires_at", why: "expiresAt 不可规范化：" + JSON.stringify(expiresAtUse ?? null) };
+      if (!en(pendingTokenUse)) return { ok: false, reason: "bad_pending_token", why: "pendingToken 必填（pending-claims 条目的 token）" };
       const claim = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env,
-        mutate: (cur) => (cur?.token === pendingToken && cur?.claim_expires_at === null ? { ok: true, changed: false } : { ok: true, changed: true, value: { token: pendingToken, claim_expires_at: null } }) });
+        mutate: (cur) => (cur?.token === pendingTokenUse && cur?.claim_expires_at === null ? { ok: true, changed: false } : { ok: true, changed: true, value: { token: pendingTokenUse, claim_expires_at: null } }) });
       if (claim.ok !== true) return { ok: false, reason: "pending_claims_" + String(claim.reason ?? "failed"), why: claim.why ?? null };
       const exp = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env,
         mutate: (cur) => (cur === iso ? { ok: true, changed: false } : { ok: true, changed: true, value: iso }) });

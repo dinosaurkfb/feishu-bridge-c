@@ -16,11 +16,13 @@
  * loadStatusProviders、resolveProject、auditOutbox、inventoryRuns、verifyRuntime、loadedPhase）做汇总，
  * Codex 侧那一项以子进程引用 scripts/codex/doctor.mjs 的结论，不另写判断。
  *
- * **三态**：每项 ok ∈ {true, false, null}。null = 本地查不出来，既不是通过也不是故障；
- * 汇总 ready（全 true）/ blocked（任一 false）/ incomplete（无 false、有 null），退出码 0 / 1 / 2。
- *
- * **信息态 note（PK2-I6）**：ok === "note" 是第四种取值，只用于「这项的结论是 legacy 的回声、
- * 切权威后不该再当判据」——不红不绿、不进 next、不计入 overall，退出码语义不变。零外部副作用。
+ * **四态（PK2-I6 / 修于 I6-fix1）**：每项 ok ∈ {true, false, null, "note"}。
+ *   true/false = 通过/故障；null = 本地查不出来（既不是通过也不是故障）；
+ *   **"note" = 信息态**（不红不绿）：只有当某项读的是「已被账本/sidecar 接管的冻结 legacy 事实」时才会出现。
+ * 汇总（唯一判据 `summarizeDoctorChecks`）：任一 false → blocked；无 false 有 null → incomplete；
+ *   **note 既不算 false 也不算 null**（不遮蔽 red/unknown，自己也不构成 incomplete）；全 true（+note）→ ready。
+ * 退出码 0 / 1 / 2 只看 blocked/incomplete，与 note 无关。`--json` 报告另带 `noteCount`（信息态条数）。
+ * 零外部副作用。
  *
  * **doctor 自己的代码不写任何文件、不装、不发飞书、不给"一键修复"**：每条 fail 的 next 只能是既有
  * 显式入口的命令，且是预览形式（不带 --apply）。**只读的边界明说**：登记的状态入口脚本是外部代码，
@@ -52,8 +54,9 @@ import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
 import { spawnSync } from "node:child_process";
 import {
-  familyOf, loadByEndpoint, ENDPOINT_SHAPE, validateLedgerRoot,
+  familyOf, loadByEndpoint, resolveEndpointDir, ENDPOINT_SHAPE, validateLedgerRoot,
 } from "./topic-agent-ledger.mjs";
+import { readSidecarFile } from "./m1b/sidecar-renderers.mjs";
 import { classifyLedgerAuthority } from "./m1a/delivery-target.mjs";
 import { aggregateEndpointReceipts, preparedLedgerInits } from "./maintenance/ledger-receipt.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/legacy-snapshot.mjs";
@@ -115,20 +118,32 @@ export function machineContext({ home = os.homedir() } = {}) {
 /** 默认不执行状态入口脚本时给 collectConnectivity 的替身：统一报"未探测"。 */
 const NOT_PROBED = () => ({ ok: false, reason: "not_probed" });
 
-/* ── PK2-I6：切权威后的判源与「legacy 已冻结」语义 ────────────────────────────────
- * 真机已 authority_cutover：legacy（registry / active-mapping / routes 的话题登记 / chat 认领账本）
- * **冻结**，账本才是准。doctor 里那几个拿 legacy 下结论的项要能一眼看出是「老账的回声」。
- *   · 判源**只有一处**：`authoritySource()` 在 runDoctor 开头算，结果作为上下文传进各项，
+/* ── PK2-I6 / fix1：切权威后的**判源** ──────────────────────────────────────────
+ * 真机已 authority_cutover：账本才是准。但**不是**「凡读 legacy 的项都降级」——只有那些读
+ * 「已被账本/sidecar 接管的冻结事实」的项才降；登记表/路由表/话题登记/chat 认领账本在 R66/I1
+ * 之后仍是**活的路由索引**，读它们做热路径判断的项是真检查（I6-fix1 P1-1 把范围收窄回这里）。
+ *   · 判源**只有一处**：`authoritySource(ctx)` 在 runDoctor 开头算，结果作为上下文传进各项，
  *     各项不再各自读收据（R66 `classifyLedgerAuthority` 同一函数，四态矩阵不重写第二份）。
- *   · 只有 `authoritative` 改写呈现（标题后缀 + 信息态 + 账本视角一句）；`shadow`/`legacy`/`reject`
- *     一个字不改 —— 那些状态下 legacy 仍是判据本身。
+ *   · **绑定运行上下文**（I6-fix1 P1-2）：维护目录与账本根都从 `runDoctor({ home })` 的 home 派生
+ *     （环境覆盖点仍优先 —— 那是既有的隔离契约），不回退 passwd 真实家目录、不另读 process.env。
+ *   · **任一端点收据/账本读不出 → 判源 fail-closed（reject）**：不据部分事实给人下结论。
  */
 
 /** 信息态取值（第四态）：不红不绿、不计入 overall 与退出码。 */
 export const NOTE_STATE = "note";
-/** 「legacy 已冻结」的说明与标题后缀（renderDoctor 的汇总行与各项标题共用一份字）。 */
-export const LEGACY_FROZEN_NOTE = "legacy 已冻结，以账本为准";
-export const LEGACY_FROZEN_SUFFIX = "（" + LEGACY_FROZEN_NOTE + "）";
+
+/**
+ * 判源用的运行上下文：**全部从这次体检的 home 派生**（`<home>/.claude/feishu-bridge/{maintenance,ledger}`）。
+ * 这里**故意不读** `FEISHU_BRIDGE_MAINTENANCE_DIR` / `FEISHU_BRIDGE_LEDGER_DIR` 那两个覆盖点 ——
+ * 判源是报告里唯一一处「哪本书为准」的判定，必须描述 runDoctor 收到的这台机器；那两个覆盖点是给
+ * ⑬/⑭ 之类做隔离用的（见 `machineContext` 的注），读了就会让 ⑳ 描述另一台机器。
+ * 生产上 home 就是真实家目录、覆盖点通常为空，两种派生同一结果。
+ */
+export function authorityRunContext({ home = os.homedir() } = {}) {
+  const bridge = path.join(home, ".claude", "feishu-bridge");
+  return { home, dir: path.join(bridge, "maintenance"),
+    env: { ...process.env, HOME: home, FEISHU_BRIDGE_LEDGER_DIR: path.join(bridge, "ledger") } };
+}
 
 /**
  * 账本视角计数（只数 live；空/坏账本按全零，不臆断）：
@@ -157,35 +172,35 @@ export const ledgerViewText = (view) => "live 记录 " + view.live + " 条（项
 
 /**
  * 判源（唯一一处）：Claude 链 endpoint 的收据 × 账本 authority_mode → 四态。
- * 收据取 ⑬ 同一份聚合（aggregateEndpointReceipts，fail-closed）；端点按账本 chain 过滤到 Claude 链
- *   —— 这份报告里的 legacy 表都是 Claude 链的，Codex 端点的权威态与它们无关。
- * 读不出账本 = 链与模式都不可知：有收据却读不出 → 不能声称 legacy（那正是「老账回声」的反面），
- *   与 ⑬/⑭ 一样交给人工；一个可读的 Claude 端点都没有又不明链时为 reject。
- * 多端点结论不一致 → reject（各读各的 legacy 会得出互相矛盾的报告，不挑一个当准）。
+ * `ctx` 由 `authorityRunContext({ home, env })` 给 —— **运行上下文唯一出处**，本函数不读 process.env。
+ * fail-closed（I6-fix1 P1-2）：聚合收据读不出、或**任一端点**的账本读不出 → `reject`（不据部分事实降级检查）。
+ * 没有任何 Claude 链收据 → `legacy`（未接入 M1a，legacy 仍是判据）。
+ * 多端点判源不一致 → `reject`（不挑一个当准）。
  * @returns {{mode:"legacy"|"shadow"|"authoritative"|"reject", why:string, endpoints:string[], view:object|null}}
  */
-export function authoritySource({ dir = maintenanceDir() } = {}) {
+export function authoritySource({ dir, env } = {}) {
   const empty = { endpoints: [], view: null };
-  if (dir === null) return { mode: "reject", why: "家目录查不出来，维护目录未知", ...empty };
+  if (typeof dir !== "string" || dir.length === 0) return { mode: "reject", why: "运行上下文里没有维护目录", ...empty };
   const agg = aggregateEndpointReceipts({ dir });
   if (!agg.ok) {
     return { mode: "reject", why: "收据 fail-closed（" + (agg.unreadable.length > 0 ? agg.unreadable.length + " 个 journal 读不出" : String(agg.why ?? "说不清")) + "），判源不可用", ...empty };
   }
   const claude = [];
-  const unknownChain = [];
+  const otherChain = [];
   for (const ep of agg.endpoints) {
-    const L = loadByEndpoint(ep.endpointId);
-    // 收据是「已接入」的证据，但链读不出 —— 不猜链，也不拿它当 legacy 的依据。
-    if (L.ok === false) { unknownChain.push(ep.endpointId); continue; }
-    if (L.doc.chain !== "claude") continue;
+    const L = loadByEndpoint(ep.endpointId, { env });
+    // 任一端点账本读不出 → 判源 fail-closed：链与权威态都不可知，绝不能拿别的端点的事实给它下结论。
+    if (L.ok === false) {
+      return { mode: "reject", why: "端点 " + ep.endpointId + " 的账本读不出（" + String(L.reason ?? "unknown") + "），判源 fail-closed（不据部分事实降级检查）", ...empty };
+    }
+    if (L.doc.chain !== "claude") { otherChain.push(ep.endpointId); continue; }
     claude.push({ endpointId: ep.endpointId, doc: L.doc,
       cls: classifyLedgerAuthority({ receipt: { ok: true, state: ep.state, cutoverDone: ep.cutoverDone }, ledgerMode: L.doc.authority_mode }) });
   }
   if (claude.length === 0) {
-    if (unknownChain.length > 0) {
-      return { mode: "reject", why: "有 " + unknownChain.length + " 个 endpoint 的账本读不出，链不可知（⑬/⑭ 点名），判源不可用", ...empty };
-    }
-    return { mode: "legacy", why: "本机没有 Claude 链的账本收据（未接入 M1a，legacy 仍是判据）", ...empty };
+    return { mode: "legacy", why: otherChain.length > 0
+      ? "本机只有非 Claude 链的账本收据（" + otherChain.length + " 个）—— Claude 链未接入 M1a，legacy 仍是判据"
+      : "本机没有 Claude 链的账本收据（未接入 M1a，legacy 仍是判据）", ...empty };
   }
   const modes = [...new Set(claude.map((c) => c.cls.mode))];
   if (modes.length > 1) {
@@ -199,12 +214,17 @@ export function authoritySource({ dir = maintenanceDir() } = {}) {
 }
 
 /**
- * 读 legacy 得结论的项的呈现：authoritative 下标题加后缀、状态降为信息态、正文补账本视角一句；
- * 其余三态返回 null（调用点原样输出，一个字不改）。next 在信息态一律丢弃 —— 信息态没有动作。
+ * 四态汇总（唯一判据，runDoctor 与用例共用一个出处）：note 既不遮 red 也不会被算成 unknown。
+ * @returns {{overall:"ready"|"blocked"|"incomplete", next:string[], noteCount:number}}
  */
-export function legacyFrozenView(authority, { name, detail }) {
-  if (authority?.mode !== "authoritative") return null;
-  return { name: name + LEGACY_FROZEN_SUFFIX, detail: detail + "；账本视角：" + ledgerViewText(authority.view) };
+export function summarizeDoctorChecks(checks = []) {
+  const overall = checks.some((c) => c.ok === false) ? "blocked"
+    : checks.some((c) => c.ok === null) ? "incomplete" : "ready";
+  return {
+    overall,
+    next: [...new Set(checks.filter((c) => c.ok !== true && c.next).map((c) => c.next))],
+    noteCount: checks.filter((c) => c.ok === NOTE_STATE).length,
+  };
 }
 
 /**
@@ -277,17 +297,15 @@ export function runDoctor({
   const checks = [];
   const add = (id, name, ok, detail, next = null) => checks.push({ id, name, ok, detail: displaySafe(detail), next });
 
-  // 判源（PK2-I6）：**只算这一处**，下面读 legacy 得结论的项共用它，不各自读收据。
-  const authority = authoritySource();
-  // 读 legacy 得结论的项统一走这里：authoritative → 标题后缀 + 信息态 + 账本视角；其余三态 = add 原样。
-  // （范围：拿 legacy 表/映射本身当结论的项 —— 登记表、路由表（含话题登记）、
-  //   ③ 话题登记指向的路由、⑦ 默认路由、⑤ 绑定到期、⑨ chat 认领账本。
-  //   ⑥/⑯ 只是用登记表枚举项目根、结论是积压与转发事实，不在此列。）
-  const addLegacy = (id, name, ok, detail, next = null) => {
-    const view = legacyFrozenView(authority, { name, detail });
-    if (view === null) return add(id, name, ok, detail, next);
-    return add(id, view.name, NOTE_STATE, view.detail, null);
-  };
+  // 判源（PK2-I6 / fix1）：**只算这一处**，绑这次体检的运行上下文（同一 home + 既有环境覆盖点）。
+  const authorityCtx = authorityRunContext({ home });
+  const authority = authoritySource({ dir: authorityCtx.dir, env: authorityCtx.env });
+  // PK2-I6-fix1 P1-1：降级范围收窄 —— 只有「读已被账本/sidecar 接管的冻结 legacy 事实」的项才降。
+  //   逐项去留（详见 PR 正文）：
+  //     · `registry`  / `routes` / ③ 话题登记 / ⑦ 默认路由 / ⑨ chat 认领账本：**不降** —— 它们是活的
+  //       路由索引 / 认领账本，读它们做热路径判断仍然是真检查（恢复 main 行为）。
+  //     · ⑤ 绑定到期：legacy `expires_at` 确已冻结 → 改由**权威 expiry.json** 接替（见下面那一段）。
+  //     · ⑥/⑯ 用登记表枚举项目根、结论是积压/转发事实；⑭ 自己带 cutover 分支 —— 都不降。
 
   // ── 运行时
   const runtime = verifyRuntime({ home, chain: "claude" });
@@ -298,11 +316,11 @@ export function runDoctor({
 
   // ── 三张表本身
   const registry = loadRegistryStrict(registryFile);
-  addLegacy("registry", "项目登记表", registry.ok,
+  add("registry", "项目登记表", registry.ok,
     registry.ok ? "已登记 " + (registry.projects ?? []).length + " 个项目" : "读不出来（" + (registry.reason ?? "说不清") + "）",
     registry.ok ? null : PREVIEW.installOutbound);
   const routes = loadRoutes(routesFile);
-  addLegacy("routes", "路由表", routes.ok,
+  add("routes", "路由表", routes.ok,
     routes.ok ? (routes.reason === "no_routes" ? "没有路由表（还没登记过入站路由）" : routes.routes.length + " 条启用路由，" + Object.keys(routes.sessions).length + " 条话题登记")
       : "读不出来（" + (routes.reason ?? "说不清") + (routes.problem ? "：" + routes.problem : "") + "）",
     null);
@@ -348,12 +366,12 @@ export function runDoctor({
   if (routes.ok) {
     const routeIds = new Set(routes.routes.map((r) => r.id));
     const orphans = Object.entries(routes.sessions).filter(([, owner]) => !routeIds.has(owner));
-    addLegacy("session_route_missing", "③ 话题登记指向的路由存在且启用", orphans.length === 0,
+    add("session_route_missing", "③ 话题登记指向的路由存在且启用", orphans.length === 0,
       orphans.length === 0 ? Object.keys(routes.sessions).length + " 条话题登记都指向启用的路由"
         : orphans.length + " 条话题登记指向不存在或已停用的路由：" + list(orphans, ([sid, owner]) => short(sid) + " → " + owner),
       orphans.length > 0 ? PREVIEW.bindProject : null);
   } else {
-    addLegacy("session_route_missing", "③ 话题登记指向的路由存在且启用", null, "路由表读不出来，查不清", null);
+    add("session_route_missing", "③ 话题登记指向的路由存在且启用", null, "路由表读不出来，查不清", null);
   }
 
   // ── ④ 状态入口指向不存在的路由
@@ -372,7 +390,7 @@ export function runDoctor({
   {
     const d = defaultSelf;
     const othersText = d.others?.length ? "；另有 " + d.others.length + " 条非默认路由的处理器在运行时之外（按备注分辨）：" + list(d.others, (o) => o.id + " → " + o.handler) : "";
-    addLegacy("default_route_handler", "⑦ 入站默认处理器在 runtime/current 之下",
+    add("default_route_handler", "⑦ 入站默认处理器在 runtime/current 之下",
       d.status === "runtime" || d.status === "no_routes" ? true : d.status === "unreadable" ? null : false,
       d.status === "runtime" ? "默认路由 " + d.id + " → 装好的运行时" + othersText
         : d.status === "no_routes" ? d.why + "，分发器用运行时自带的默认处理器"
@@ -450,15 +468,51 @@ export function runDoctor({
       if (ledgerNotices.length > 0) backlogWhere.push(name + "（runs 账本已知旧形记录 " + ledgerNotices.length + " 条：" + [...new Set(ledgerNotices.map((x) => x.reason))].join("、") + "，不算问题）");
     }
   }
-  const expiryOk = !registry.ok ? null : (expired.length + expiring.length + pendingExpired.length === 0 ? (unclear.length === 0 ? true : null) : false);
-  addLegacy("binding_expiry", "⑤ 绑定未到期（阈值 7 天）", expiryOk,
-    !registry.ok ? "登记表读不出来，查不清"
-      : [expired.length ? "已过期：" + expired.join("、") : null,
-        expiring.length ? "即将到期：" + expiring.join("、") : null,
-        pendingExpired.length ? "待认领代际已过期：" + pendingExpired.join("、") : null,
-        unclear.length ? "查不清：" + unclear.join("、") : null,
-      ].filter(Boolean).join("；") || (projects.length + " 个项目的绑定都在有效期内"),
-    expired.length + expiring.length ? PREVIEW.bindProject : pendingExpired.length ? PREVIEW.rotate : null);
+  // ⑤ 绑定未到期（阈值 7 天）—— **判据随判源换书**（PK2-I6-fix1 P1-1）：
+  //   · authoritative：legacy `expires_at` 已冻结，改读**权威** `ledger/<ep>/expiry.json`
+  //     （`readSidecarFile` + `validateSidecarDoc("expiry")`，与写侧同一份校验器），按条目判到期；
+  //     读不出 / 不合法 → **红**（fail-closed）。账本视角的计数**不能**替代到期判断。
+  //   · 其余三态（legacy / shadow / reject）：一字不改，照 main 读登记表 + active-mapping 的 expires_at。
+  {
+    const parts = [];
+    const problems = [];
+    const expiredTa = [];
+    const expiringTa = [];
+    let checked = 0;
+    if (authority.mode === "authoritative") {
+      for (const ep of authority.endpoints) {
+        const d = resolveEndpointDir(ep, { env: authorityCtx.env });
+        if (!d.ok) { problems.push(short(ep) + "：账本目录解析不了（" + String(d.reason ?? "unknown") + "）"); continue; }
+        const r = readSidecarFile({ file: path.join(d.dir, "expiry.json"), endpointId: ep, name: "expiry" });
+        if (r.ok !== true) { problems.push(short(ep) + "：expiry.json 读不出（" + String(r.why ?? r.reason ?? "unknown") + "）"); continue; }
+        for (const [ta, v] of Object.entries(r.doc.entries ?? {})) {
+          checked += 1;
+          // 值域由 `readSidecarFile → validateSidecarDoc("expiry")` 保证（规范化 ISO），这里不再二次判时间：
+          // 校验器已经把「不是时间」的条目变成整份 sidecar 读不出 → 上面那条 fail-closed 分支。
+          const at = Date.parse(v);
+          if (at <= now) expiredTa.push(short(ta, 12));
+          else if (at - now <= EXPIRY_WARN_MS) expiringTa.push(short(ta, 12) + "（" + Math.ceil((at - now) / 86400000) + " 天）");
+        }
+      }
+      if (problems.length > 0) parts.push("说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；"));
+      parts.push("权威 expiry.json：" + authority.endpoints.length + " 个端点、" + checked + " 条");
+      if (expiredTa.length) parts.push("已过期：" + expiredTa.join("、"));
+      if (expiringTa.length) parts.push("即将到期：" + expiringTa.join("、"));
+      if (problems.length === 0 && expiredTa.length + expiringTa.length === 0) parts.push("都在有效期内");
+      add("binding_expiry", "⑤ 绑定未到期（阈值 7 天）", problems.length === 0 && expiredTa.length + expiringTa.length === 0,
+        parts.join("；"), expiredTa.length + expiringTa.length ? PREVIEW.bindProject : null);
+    } else {
+      const expiryOk = !registry.ok ? null : (expired.length + expiring.length + pendingExpired.length === 0 ? (unclear.length === 0 ? true : null) : false);
+      add("binding_expiry", "⑤ 绑定未到期（阈值 7 天）", expiryOk,
+        !registry.ok ? "登记表读不出来，查不清"
+          : [expired.length ? "已过期：" + expired.join("、") : null,
+            expiring.length ? "即将到期：" + expiring.join("、") : null,
+            pendingExpired.length ? "待认领代际已过期：" + pendingExpired.join("、") : null,
+            unclear.length ? "查不清：" + unclear.join("、") : null,
+          ].filter(Boolean).join("；") || (projects.length + " 个项目的绑定都在有效期内"),
+        expired.length + expiring.length ? PREVIEW.bindProject : pendingExpired.length ? PREVIEW.rotate : null);
+    }
+  }
 
   // 发布器在不在跑：Claude launchd 兜底（沙箱里不碰真 launchctl，除非显式注入）
   // **隔离态看的是这次体检的 home**（machineContext），不是进程的环境 HOME —— runDoctor({home}) 传隔离目录时
@@ -533,7 +587,7 @@ export function runDoctor({
       for (const note of locks.notes) notes.push(chain + "：" + note);
     }
     const tail = notes.length > 0 ? "；" + notes.join("；") : "";
-    addLegacy("chat_ledger", "⑨ chat 账本（两条链）", problems.length === 0, problems.length === 0 ? parts.join("、") + "；没有说不清的条目" + tail : parts.join("、") + "；说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；") + tail, null);
+    add("chat_ledger", "⑨ chat 账本（两条链）", problems.length === 0, problems.length === 0 ? parts.join("、") + "；没有说不清的条目" + tail : parts.join("、") + "；说不清 " + problems.length + " 处：" + problems.slice(0, 3).join("；") + tail, null);
   }
 
   // ⑩ 维护门（issue #81）：三态 —— 没开 = 正常；开着 = 维护中（点名原因与时长，超过 10 分钟单独点名）；读不出 = 按维护中处理、只人工处置。
@@ -1215,12 +1269,9 @@ export function runDoctor({
       (MODE_TEXT[authority.mode] ?? String(authority.mode)) + "；依据：" + authority.why + where + view, null);
   }
 
-  // ── 汇总：任一 false → blocked；无 false 有 null → incomplete；全 true → ready
-  //   信息态（note）四者都不算 —— 它既不红也不绿、也不构成「本地查不出来」。
-  const overall = checks.some((c) => c.ok === false) ? "blocked"
-    : checks.some((c) => c.ok === null) ? "incomplete" : "ready";
-  const next = [...new Set(checks.filter((c) => c.ok !== true && c.next).map((c) => c.next))];
-  return { overall, checks, next, noteCount: checks.filter((c) => c.ok === NOTE_STATE).length };
+  // ── 汇总：四态唯一判据（`summarizeDoctorChecks`；note 不遮 red/unknown、也不构成 incomplete）
+  const summary = summarizeDoctorChecks(checks);
+  return { overall: summary.overall, checks, next: summary.next, noteCount: summary.noteCount };
 }
 
 export function renderDoctor(report) {
@@ -1230,7 +1281,7 @@ export function renderDoctor(report) {
     lines.push(mark + c.name + "：" + c.detail);
   }
   const notes = report.checks.filter((c) => c.ok === NOTE_STATE).length;
-  if (notes > 0) lines.push("", "信息态 " + notes + " 项：" + LEGACY_FROZEN_NOTE + " —— 不红不绿，不计入结论。");
+  if (notes > 0) lines.push("", "信息态 " + notes + " 项：不红不绿、不计入结论（读的是已冻结的 legacy 事实，以账本为准）。");
   lines.push("");
   lines.push(report.overall === "ready" ? "结论：ready —— 没有发现跨项目说不通的地方。"
     : report.overall === "blocked" ? "结论：blocked —— 上面标 ✗ 的是真故障，需要人处理。"

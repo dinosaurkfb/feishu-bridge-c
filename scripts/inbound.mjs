@@ -64,7 +64,7 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1, wirePromoteBinding, wirePromoteAuthoritative, m1aWriteRoute, uncleanWired, wireVoidAuthoritative } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wirePromoteAuthoritative, m1aWriteRoute, uncleanWired, wireVoid, wireVoidAuthoritative } from "./m1a/wiring.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -406,6 +406,7 @@ const dryRun = process.argv.includes("--dry-run");
 let routed = findBindingForSession({ sessionId: event.session_id });
 let justBound = false;
 let pendingMatchedBy = null;
+let expiredSettledAuthoritative = false;
 let subscriptionClaimShadow = null;
 
 if (!routed.ok) {
@@ -449,7 +450,8 @@ if (!routed.ok) {
       const expireEndpoint = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
       // P1-1：authoritative → 分派到 `wireVoidAuthoritative`（账本 void(expired) 先行 → 条目删 → 索引作废）；
       //   shadow / 未接入 → 原路径一字未改。
-      const wiredExpire = m1aWriteRoute({ endpointId: expireEndpoint, env: process.env }).mode === "authoritative"
+      const expireAuthoritative = m1aWriteRoute({ endpointId: expireEndpoint, env: process.env }).mode === "authoritative";
+      const wiredExpire = expireAuthoritative
         ? wireVoidAuthoritative({
             endpointId: expireEndpoint, env: process.env, operationId: pending.operationId,
             locator: expiredGen?.root_message_id ?? null, reason: "expired",
@@ -476,6 +478,12 @@ if (!routed.ok) {
           message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
         });
       }
+      // 过期作废在 authoritative 下已经在账本里落地了（clean 或 unclean 都意味着 void 已提交）：
+      //   这条消息**不该**再落进 chat 兜底 —— chat 在权威下必拒（W2 清单封闭），进去只会把
+      //   用户与回执引到一句不相干的 `m1a_mode_not_shadow`，而唯一写着「已过期」的 unrouted 回执
+      //   因为 chatTurn 先 exit 而永远写不下。消息仍被拒，只是理由变成真的那一个。
+      //   shadow / 未接入一字未改：那里 legacy chat 能照答（"绑定没成不等于该拒"）。
+      if (expireAuthoritative && wiredExpire.commit !== "not_committed") expiredSettledAuthoritative = true;
       const failedStep = (wiredExpire.shadow ?? []).find((s) => !s.ok);
       const relFail = wiredExpire.release && wiredExpire.release.ok !== true;
       if (failedStep || relFail) {
@@ -495,7 +503,8 @@ if (!routed.ok) {
   });
 
   // 绑定没成不等于该拒：没有 pending / 多份 / 绑定码对不上 / 过期 / 发送者不是 owner → 落进 chat 默认态重新判
-  if (!promo.ok && CHAT_FALLBACK_REASONS.includes(promo.reason)) chatTurn({ chain: "claude", template, event, dryRun, ledgerDir: path.join(UNROUTED_RT, "chat-claims") });
+  //   （例外：authoritative 下刚把过期 pending 作废掉的那一轮 —— 见上面 expiredSettledAuthoritative）。
+  if (!promo.ok && CHAT_FALLBACK_REASONS.includes(promo.reason) && !expiredSettledAuthoritative) chatTurn({ chain: "claude", template, event, dryRun, ledgerDir: path.join(UNROUTED_RT, "chat-claims") });
 
   if (!promo.ok) {
     writeReceipt("unrouted-" + (event.message_id ?? "unknown") + "-" + Date.now(), {

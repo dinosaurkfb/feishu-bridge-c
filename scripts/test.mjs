@@ -256,6 +256,7 @@ import { renderExpirySidecar, renderPendingClaimsSidecar, renderPolicySidecar, r
 import { POLICY_STORE_FILE, POLICY_STORE_LOCK_NAME, readPolicyStore, readPolicyStoreForAudit, livePolicySubjects, resolvePolicySubject, mutatePolicyEntry, policyEntryFor } from "./m1b/policy-store.mjs"; // PK2-I1：authoritative 期策略 store（R31 底座薄壳）
 import { readSidecarStore, mutateSidecarEntry } from "./m1b/sidecar-store.mjs"; // PK2-W1：sidecar 条目的锁内读-改-写
 import { readExpiryEntry, mutateExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）
+import { renewExpiryInLock } from "./binding.mjs"; // PK2-I2-fix3：锁内段函数参数注入（env 注入面已移除）
 import { expiryGate, EXPIRY_SOURCE, evaluateInboundEvidence } from "./selector.mjs"; // PK2-I2：到期闸纯判据
 import * as LEDGER_OP from "./maintenance/ledger-operation.mjs";
 import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot, identitySubset, legacySourceDigest } from "./m1a/legacy-snapshot.mjs";
@@ -53745,25 +53746,20 @@ test("PK2-I2 T9 P1-3 续期覆盖**整条 lineage**：current + 历史 B4 两条
 test("PK2-I2-fix2 P1 确定性并发反例：锁外盘点后、锁内写入前插入 rotate（新 pending B1）与 void —— 写出的条目集合 == 锁内 live 集", () => {
   const fx = i2Fixture({ secondLive: true, voidB1: true, expiryEntries: { [I2_TA]: I2_ISO_FUTURE, [I2_TA2]: I2_ISO_FUTURE } });
   try {
-    // 夹具已预置 pending B1（X，cutover 前种入）：锁外盘点会把它算进 live 集 —— 钩子在「锁已到手、重定位之前」把它 void 掉
-    // 注入钩子（BINDING_RENEW_IN_LOCK_HOOK，binding.mjs 在锁内重定位前 import）：rotate 新建 Y + void X
-    const hookPath = path.join(fx.m.home, "i2fix2-hook.mjs");
-    fs.writeFileSync(hookPath, [
-      "import * as TAL from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "topic-agent-ledger.mjs")).href) + ";",
-      // 先 void X（同 lineage 不许双 pending，rotate 才建得起来）——顺序即 W2 并发两腿
-      "const voidKey = Object.entries(TAL.loadByEndpoint(" + JSON.stringify(fx.EP) + ', { env: process.env }).doc.records).find(([k, r]) => r.kind === "live" && r.aliases.root_om === "om_I2Void");',
-      'if (!voidKey) throw new Error("hook：找不到预置的 pending B1（om_I2Void）");',
-      "const v = TAL.voidPending({ endpointId: " + JSON.stringify(fx.EP) + ', requestKey: "rk_i2fix2_void2", b1Id: voidKey[0], reason: "manual" });',
-      'if (!v.ok) throw new Error("hook void：" + JSON.stringify(v));',
-      "const rot = TAL.createB1({ endpointId: " + JSON.stringify(fx.EP) + ', requestKey: "rk_i2fix2_rotate", chatId: ' + JSON.stringify(TPL.chat_id) +
-        ', rootOm: "om_I2New", lineageId: "lin_i2", bindingTarget: { runtime: "claude", project_root: ' + JSON.stringify(fx.proj) + ', claude_session_id: null } });',
-      'if (!rot.ok) throw new Error("hook rotate：" + JSON.stringify(rot));',
-    ].join("\n"));
-    const ren = spawnSync(process.execPath, [path.resolve("scripts", "binding.mjs"), "--project", fx.proj, "--renew", "1y", "--apply"],
-      { encoding: "utf-8", cwd: fx.proj, env: { ...fx.env, BINDING_RENEW_IN_LOCK_HOOK: hookPath } });
-    assert.equal(ren.status, 0, "续期成功：" + JSON.stringify({ status: ren.status, out: String(ren.stdout).slice(-300), err: String(ren.stderr).slice(0, 400) }));
-    // 判据：写出的条目集合 == **锁内** live 集 —— rotate 的新 B1（Y）必须被覆盖（旧版锁外冻结集合漏掉它）、
-    //   已 void 的 X 不得有条目（旧版会把锁外盘点到的 X 写回）。
+    // 夹具已预置 pending B1（X，cutover 前种入）：锁外盘点会把它算进 live 集 —— hook 在「锁已到手、
+    //   重定位之前」先 void X 再 rotate 新建 pending B1（Y）（同 lineage 不许双 pending，顺序即并发两腿）。
+    //   注入走 CLI 不可触达的函数参数（fix3 P1-①：env 注入面已移除）。
+    const res = renewExpiryInLock({ endpointId: fx.EP, locator: fx.OM, iso: I2_ISO_FUTURE, env: fx.env, hook: () => {
+      const voidKey = Object.entries(TAL.loadByEndpoint(fx.EP, { env: fx.env }).doc.records)
+        .find(([k, r]) => r.kind === "live" && r.aliases.root_om === "om_I2Void");
+      assert.ok(voidKey, "hook：找得到预置的 pending B1（om_I2Void）");
+      const v = TAL.voidPending({ endpointId: fx.EP, requestKey: "rk_i2fix2_void2", b1Id: voidKey[0], reason: "manual", env: fx.env });
+      assert.equal(v.ok, true, "hook void：" + JSON.stringify(v));
+      const rot = TAL.createB1({ endpointId: fx.EP, requestKey: "rk_i2fix2_rotate", chatId: TPL.chat_id, rootOm: "om_I2New",
+        lineageId: "lin_i2", bindingTarget: { runtime: "claude", project_root: fx.proj, claude_session_id: null }, env: fx.env });
+      assert.equal(rot.ok, true, "hook rotate：" + JSON.stringify(rot));
+    } });
+    assert.equal(res.ok, true, "续期成功：" + JSON.stringify(res).slice(0, 300));
     const doc = JSON.parse(fs.readFileSync(path.join(fx.m.ledgerDir, fx.EP, "ledger.json"), "utf-8"));
     const liveIds = Object.entries(doc.records).filter(([, r]) => r.kind === "live").map(([k]) => k).sort();
     const entries = JSON.parse(fs.readFileSync(fx.expiryPath, "utf-8")).entries;
@@ -53772,6 +53768,30 @@ test("PK2-I2-fix2 P1 确定性并发反例：锁外盘点后、锁内写入前�
     assert.equal(entries[fx.voidB1Id], undefined, "void 的 X（" + fx.voidB1Id.slice(0, 10) + "…）不写回：" + JSON.stringify(Object.keys(entries)));
     const taNew = liveIds.find((id) => doc.records[id].aliases.root_om === "om_I2New");
     assert.equal(typeof entries[taNew], "string", "rotate 新 B1（Y）被锁内覆盖：" + JSON.stringify(entries));
+    assert.equal(res.lock_state, "released", "锁已交还：" + JSON.stringify(res));
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2-fix3 P1-② 锁内失败单出口：失败存结果、finally 释放折叠 —— sidecar 零写、outer 锁已交还", () => {
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const before = fx.expiryBytes();
+    // hook 在锁内把账本记录的 root_om 挪走 → 锁内重定位失败（预览期它还好好的）。旧版在 try 里
+    //   process.exit(1)，finally 不执行 → m1a-order.lock 遗留；现单出口：失败存结果、释放折叠后返回。
+    const res = renewExpiryInLock({ endpointId: fx.EP, locator: fx.OM, iso: I2_ISO_FUTURE, env: fx.env, hook: () => {
+      const p = path.join(fx.m.ledgerDir, fx.EP, "ledger.json");
+      const doc = JSON.parse(fs.readFileSync(p, "utf-8"));
+      for (const rec of Object.values(doc.records)) rec.aliases.root_om = "om_Elsewhere";
+      fs.writeFileSync(p, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
+    } });
+    assert.equal(res.ok, false, "锁内失败必须如实返回：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.stage, "relocate", "stage 点名重定位失败：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.lock_state, "released", "释放已折叠（锁交还干净）：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.lockUncleared, undefined, "无残骸：" + JSON.stringify(res).slice(0, 300));
+    assert.deepEqual(fx.expiryBytes(), before, "sidecar 零写");
+    assert.deepEqual(fs.readdirSync(fx.epDir).filter((n) => n.endsWith(".lock")), [],
+      "outer 锁已交还（不得遗留 m1a-order.lock）：" + JSON.stringify(fs.readdirSync(fx.epDir)));
+    // 非零退出由 CLI 对 ok:false 的统一映射兜住（与 T4/T6/T8 同一条 !ok → exit(1) 路径）。
   } finally { fx.cleanup(); }
 });
 

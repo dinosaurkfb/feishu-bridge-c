@@ -23,7 +23,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url"; // PK2-I2-fix2 P1：锁内注入点用（测试并发反例）
 
 import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mjs";
 import { liveLineageIds, mutateExpiryEntries, readExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）
@@ -84,6 +83,66 @@ export function validateNote(v) {
 }
 
 // ---------- CLI ----------
+
+/**
+ * 续期的**锁内段**（PK2-I2-fix2 P1 + fix3 P1，可导入、CLI 只传生产实现）：
+ * 取 outer m1a-order 锁 → 锁内重定位（resolveExpiryTarget）→ 重读现值 → 重读账本 → 派生 lineage
+ * 与全部 live id → 一次 sidecar 事务写入 → **finally 释放并折叠释放状态**（I4-fix3 同款单出口工艺：
+ * 任何失败都存成结果对象返回，绝不 process.exit 绕过 finally 留锁）。
+ * `hook` 仅测试注入（CLI 不可触达；生产恒缺省 = 空操作）：在「锁已到手、重定位之前」调用，
+ *   钉「锁外盘点」与「锁内重读」之间的并发窗口（W2 新建/作废 pending B1）。
+ * 返回 {ok:true, lineageId, ids, changed} 或 {ok:false, stage, reason, why?, lock_state, lockUncleared?}。
+ */
+export function renewExpiryInLock({ endpointId, locator, iso, env = process.env, hook = null } = {}) {
+  const acq = acquireOrderLock(endpointId, env);
+  if (!acq.ok) {
+    return { ok: false, stage: "lock", reason: acq.reason ?? "lock_failed",
+      why: "取 m1a-order 锁失败（" + String(acq.reason ?? "unknown") + "）：不写（与 W1/W2 同一把锁串行）", lock_state: null };
+  }
+  let rel = null;
+  let result = null;
+  try {
+    if (typeof hook === "function") hook();
+    const targetNow = resolveExpiryTarget({ endpointId, locator, env });
+    if (targetNow?.ok !== true) {
+      result = { ok: false, stage: "relocate", reason: targetNow?.reason ?? "unknown",
+        why: "锁内重定位不到账本里的这条记录（" + String(targetNow?.reason ?? "unknown") + "）：不写" };
+    } else {
+      const curNow = readExpiryEntry({ endpointId, topicAgentId: targetNow.topicAgentId, env });
+      if (curNow.ok !== true) {
+        result = { ok: false, stage: "reread", reason: curNow.reason ?? "unknown",
+          why: "锁内重读权威到期现值读不出（" + String(curNow.reason ?? "unknown") + (curNow.why ? "：" + curNow.why : "") + "）：不写" };
+      } else {
+        const led = loadByEndpoint(endpointId, { env });
+        if (!led.ok) {
+          result = { ok: false, stage: "ledger", reason: led.reason ?? "unknown", why: "锁内重读账本读不出（" + String(led.reason ?? "unknown") + "）：不写" };
+        } else {
+          const lineageId = led.doc?.records?.[targetNow.topicAgentId]?.generation_lineage_id ?? null;
+          const lin = typeof lineageId === "string"
+            ? liveLineageIds({ endpointId, lineageId, loadLedger: loadByEndpoint, env })
+            : { ok: false, reason: "no_lineage", why: "这条记录没有 generation_lineage_id" };
+          if (!lin.ok) {
+            result = { ok: false, stage: "lineage", reason: lin.reason ?? "unknown",
+              why: "续期的覆盖范围说不清（" + String(lin.reason ?? "unknown") + (lin.why ? "：" + lin.why : "") + "）：不写" };
+          } else {
+            const values = Object.fromEntries(lin.ids.map((id) => [id, iso]));
+            const w = mutateExpiryEntries({ endpointId, values, env });
+            result = w.ok === true
+              ? { ok: true, lineageId, ids: lin.ids, changed: w.changed === true }
+              : { ok: false, stage: "write", reason: w.reason ?? "unknown",
+                  why: "权威到期没写成（" + String(w.reason ?? "unknown") + (w.why ? "：" + w.why : "") + "）" + (w.committed === true ? " —— 已落盘但不干净，先 doctor" : ""),
+                  committed: w.committed === true };
+          }
+        }
+      }
+    }
+  } finally {
+    try { rel = acq.release(); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+  }
+  const lockState = foldLockReleaseState(rel);
+  return { ...result, lock_state: lockState,
+    ...(lockState !== "released" ? { lockUncleared: { lock_state: lockState, path: rel?.path ?? null, reason: rel?.reason ?? null, why: rel?.why ?? null } } : {}) };
+}
 
 if (!isDirectRun(import.meta.url)) {
   // 被 import 时只提供上面那个纯函数，不碰任何文件。
@@ -272,65 +331,20 @@ if (AUTHORITATIVE) {
     process.exit(1);
   }
   // P1-3：续期覆盖**整条 lineage**（current + 历史 B4 …）——一次 sidecar 事务、经 outer m1a-order 锁串行。
-  // PK2-I2-fix2 P1：**写集合在锁内重新派生** —— 旧版在锁外冻结 lineageIds，W2 可在「锁外盘点」与
-  //   「取锁」之间新建 pending B1（漏掉它）或作废 pending B1（给已 void 的 id 写回条目）。改：取得
-  //   outer 锁**之后**重定位目标、重读账本、重派生 lineage 与全部 live id，再构造 values 写入；
-  //   上面锁外的读数只做预览/文案。确定性反例用 BINDING_RENEW_IN_LOCK_HOOK 钉死（见锁内注入点）。
-  const acqAuth = acquireOrderLock(endpointForLedger, process.env);
-  if (!acqAuth.ok) {
-    console.error("取 m1a-order 锁失败（" + String(acqAuth.reason ?? "unknown") + "）：**不写**（与 W1/W2 同一把锁串行）。");
+  // PK2-I2-fix2 P1：**写集合在锁内重新派生** —— 锁外读数只做预览/文案。锁内段抽成可导入的
+  //   `renewExpiryInLock`（PK2-I2-fix3 P1-①：env 注入面已移除，测试走 CLI 不可触达的函数参数 hook）。
+  const res = renewExpiryInLock({ endpointId: endpointForLedger, locator: expiryLocator, iso, env: process.env });
+  if (res.lockUncleared) {
+    console.error("outer 锁没交还干净（" + res.lockUncleared.lock_state + "）：先 doctor 再重跑（写已提交的话是幂等的）。");
     process.exit(1);
   }
-  let w;
-  let relAuth = null;
-  let linNow = null;        // 锁内派生的覆盖范围（lineageId + 全部 live id），成功路径的文案也以它为准
-  try {
-    // 【PK2-I2-fix2 反例注入点】锁已到手、重定位之前 —— 「锁外盘点」与「锁内重读」之间的并发窗口。
-    //   测试用它插入 rotate / void；生产不设该变量，恒为空操作。
-    const hookFile = process.env.BINDING_RENEW_IN_LOCK_HOOK;
-    if (typeof hookFile === "string" && hookFile.length > 0) await import(pathToFileURL(hookFile).href);
-    const targetNow = resolveExpiryTarget({ endpointId: endpointForLedger, locator: expiryLocator, env: process.env });
-    if (targetNow?.ok !== true) {
-      console.error("锁内重定位不到账本里的这条记录（" + String(targetNow?.reason ?? "unknown") + "）：**不写**。");
-      process.exit(1);
-    }
-    const curNow = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: targetNow.topicAgentId, env: process.env });
-    if (curNow.ok !== true) {
-      console.error("锁内重读权威到期现值读不出（" + String(curNow.reason ?? "unknown") + (curNow.why ? "：" + curNow.why : "") + "）：**不写**。");
-      process.exit(1);
-    }
-    const targetLed = loadByEndpoint(endpointForLedger, { env: process.env });
-    if (targetLed.ok !== true) {
-      console.error("锁内重读账本读不出（" + String(targetLed.reason ?? "unknown") + "）：**不写**。");
-      process.exit(1);
-    }
-    const lineageId = targetLed.doc?.records?.[targetNow.topicAgentId]?.generation_lineage_id ?? null;
-    const lineageIds = typeof lineageId === "string"
-      ? liveLineageIds({ endpointId: endpointForLedger, lineageId, loadLedger: loadByEndpoint, env: process.env })
-      : { ok: false, reason: "no_lineage", why: "这条记录没有 generation_lineage_id" };
-    if (lineageIds.ok !== true) {
-      console.error("续期的覆盖范围说不清（" + String(lineageIds.reason ?? "unknown") + (lineageIds.why ? "：" + lineageIds.why : "") + "）：**不写**。");
-      process.exit(1);
-    }
-    linNow = { lineageId, ids: lineageIds.ids };
-    const values = Object.fromEntries(lineageIds.ids.map((id) => [id, iso]));
-    w = mutateExpiryEntries({ endpointId: endpointForLedger, values, env: process.env });
-  } finally {
-    try { relAuth = acqAuth.release(); } catch (err) { relAuth = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
-  }
-  const relState = foldLockReleaseState(relAuth);
-  if (relState !== "released") {
-    console.error("outer 锁没交还干净（" + relState + "）：先 doctor 再重跑（写已提交的话是幂等的）。");
-    process.exit(1);
-  }
-  if (w.ok !== true) {
-    console.error("权威到期没写成（" + String(w.reason ?? "unknown") + (w.why ? "：" + w.why : "") + "）" +
-      (w.committed === true ? " —— 已落盘但不干净，先 doctor" : ""));
+  if (res.ok !== true) {
+    console.error(res.why ?? "权威到期没写成（" + String(res.reason ?? "unknown") + "）。");
     process.exit(1);
   }
   const afterAuth = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env });
-  console.log("\n已写入 ledger/<endpoint>/expiry.json（lineage " + String(linNow.lineageId) + " 共 " + linNow.ids.length + " 条 live B：" +
-    linNow.ids.map((id) => id.slice(0, 12) + "…").join("、") + "，" + (w.changed ? "已更新" : "本就是这个值") + "）");
+  console.log("\n已写入 ledger/<endpoint>/expiry.json（lineage " + String(res.lineageId) + " 共 " + res.ids.length + " 条 live B：" +
+    res.ids.map((id) => id.slice(0, 12) + "…").join("、") + "，" + (res.changed ? "已更新" : "本就是这个值") + "）");
   console.log("现在权威到期：" + (afterAuth.ok === true ? String(afterAuth.iso) : "读回失败"));
   console.log("legacy 的 expires_at 一个字没动（切权威后它已冻结；入站按权威这份判）。");
   process.exit(0);

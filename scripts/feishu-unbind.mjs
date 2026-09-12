@@ -21,7 +21,7 @@ import {
 } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { activeGeneration } from "./topic-generation.mjs";
-import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 
 const arg = (n) => {
@@ -53,7 +53,9 @@ console.log("暂停之后：");
 console.log("  · 出站停发，进展**留在本地**（现有 " + st.pending + " 条），恢复后一并发出");
 console.log("  · 入站一律拒绝，话题里发指令会收到明确的拒绝回执");
 console.log("  · 话题、历史、登记、回执**全部保留**，不删任何东西，也不往飞书发消息");
-console.log("  · 恢复：node scripts/bind-project.mjs --apply（复用原话题，不新建）");
+console.log("  · 恢复：" + (st.level === "session"
+  ? "在**这条工作线的会话里**跑 node scripts/bind-session.mjs --apply（复用原话题，不新建）"
+  : "node scripts/bind-project.mjs --apply（复用原话题，不新建）"));
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没做。加 --apply 才真的暂停。");
@@ -87,15 +89,20 @@ if (agentUid) {
       console.error("暂停中止（M1a 权威写方拒：" + (wiredAuth.reason ?? "m1a_reject") + (wiredAuth.why ? "；" + wiredAuth.why : "") + "）");
       process.exit(1);
     }
+    // P1-4（W3-fix4）：**统一 unclean 投影**（与 W1 同一份）。账本与索引都 clean、而 `runAuthoritative.release`
+    //   不净时，`commit` 仍是 committed_clean —— 旧写法（只在 commit!==clean / legacy 非 ok 时调）
+    //   会一个回执都不留（成功退出且无痕迹）。prepare 就拒的那一支已经 exit（什么都没写，不算 unclean）。
+    const pauseUnclean = uncleanWired(wiredAuth);
+    if (!pauseUnclean.clean) emitUncleanReceipt("cli_unbind_pause", wiredAuth, { root, claudeSessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
     if (wiredAuth.legacy?.ok !== true) {
-      emitUncleanReceipt("cli_unbind_pause", wiredAuth, { root, claudeSessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
       console.error("暂停没落完（停在第 " + String(wiredAuth.legacy?.phase ?? "?") + " 步：" + String(wiredAuth.legacy?.message ?? wiredAuth.legacy?.reason ?? "")
-        + "）。账本可能已提交：**同一条命令重跑**会按同一 request key 续做索引（不重复记）。");
+        + "）。账本可能已提交：**按当前 origin op 证明已提交后补索引**（同一条命令重跑，不重复记）。");
       process.exit(1);
     }
     if (wiredAuth.commit !== "committed_clean") {
-      emitUncleanReceipt("cli_unbind_pause", wiredAuth, { root, claudeSessionId, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
       console.error("注意      这一步有提交不干净（commit=" + String(wiredAuth.commit) + "）：已落机器回执，先 doctor 核对（暂停本身已完成）。");
+    } else if (!pauseUnclean.clean) {
+      console.error("注意      排序锁没交还干净：已落机器回执，先 doctor 核对（暂停本身已完成）。");
     }
     console.log("\n已暂停（账本 unbind 先行，再改索引）。");
     console.log(describeStatus(currentBinding({ root, claudeSessionId }), bindingsForRoot({ root })));

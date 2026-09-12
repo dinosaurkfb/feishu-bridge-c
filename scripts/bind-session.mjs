@@ -33,11 +33,12 @@ import { loadRegistryStrict, registryPath } from "./registry.mjs";
 import { publishDraft, sendToChat } from "./outbound.mjs";
 import { isDirectRun } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
-import { wireBind, wireBindAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { wireBind, wireBindAuthoritative, wirePauseResume, wirePauseResumeAuthoritative, m1aWriteRoute, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { setBindingStatus } from "./feishu-control.mjs";
 import { mutateSidecarEntry, readSidecarStore } from "./m1b/sidecar-store.mjs";
 import { canonKey, loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
-import { validateTopicGenerationState } from "./topic-generation.mjs";
-import { withRegistryTransaction } from "./topic-generation-store.mjs";
+import { validateTopicGenerationState, activeGeneration } from "./topic-generation.mjs";
+import { withRegistryTransaction, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
 import { stableStringify } from "./policy-store/canonical.mjs"; // 值比对用键序无关的规范序列化（同一份，不另写）
 import { legacyEndpointId } from "./subscription.mjs";
@@ -150,6 +151,51 @@ const already = registry.projects.find((p) => p?.claude_session_id === me.sessio
 const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
 // PK2-W1：判源分派。authoritative → 复合写（账本为准，登记表降为索引行）；shadow / 未接入 → 原路径。
 const writeRoute = m1aWriteRoute({ endpointId, env: process.env });
+
+/** PK2-W3-fix4 P1-1：**会话级恢复入口** —— 在这条会话里跑本命令时，若本会话那一行是暂停态，恢复它。
+ *
+ * 为什么落在这里：feishu-unbind 按 `CLAUDE_CODE_SESSION_ID` 暂停的是**这条工作线的行**；而 bind-project
+ * 的“恢复已暂停”支只看 `currentBinding({ root })` / `loadClaudeTopicBinding({ root })`（**项目级**行），
+ * 会话级的行在它那里根本选不中 —— 会话级绑定因此只有“暂停”没有“恢复”。恢复是「在那条会话里跑一次」
+ * 这件事，入口只能在本文件。判据只看本会话那一行自己的 `topic_generation_state.binding_status`
+ * （`paused` = feishu-unbind 写进去的那个值），不猜别的行。 */
+const selfSuspended = already?.root_message_id
+  ? loadClaudeTopicBinding({ root, claudeSessionId: me.sessionId })
+  : { ok: false, reason: "not_bound" };
+if (selfSuspended?.ok === true && selfSuspended.state?.binding_status === "paused") {
+  console.log("这条工作线的接入此前被暂停，将恢复原话题（不新建）。");
+  if (!apply) {
+    console.log("\n[dry-run] 什么都没做。加 --apply 才真的恢复。");
+    process.exit(0);
+  }
+  const locator = activeGeneration(selfSuspended.state)?.root_message_id ?? already.root_message_id;
+  const runResume = () => setBindingStatus({ root, claudeSessionId: me.sessionId, status: "active" });
+  const receiptDir = path.join(os.homedir(), ".claude", "feishu-bridge", "receipts");
+  // 与 feishu-unbind 同一分派：authoritative → 账本 restore 先行（再索引）；shadow / 未接入 → 原路径。
+  const wiredR = writeRoute.mode === "authoritative"
+    ? wirePauseResumeAuthoritative({ endpointId, env: process.env, action: "resume", locator, publishIndex: runResume })
+    : wirePauseResume({ endpointId, env: process.env, legacy: runResume });
+  if (wiredR.ok !== true) {
+    die("恢复中止（M1a 一致性锁：" + (wiredR.reason ?? "unknown") + (wiredR.why ? "；" + wiredR.why : "") + "）",
+      "账本与索引都没改写。");
+  }
+  // P1-4（W3-fix4）：统一 unclean 投影（与 W1 同一份）—— release 不净也要留机器回执；
+  //   prepare 就拒的那一支已经 die（什么都没写，不算 unclean）。
+  const resumeUnclean = uncleanWired(wiredR);
+  if (!resumeUnclean.clean) emitUncleanReceipt("cli_bind_session_resume", wiredR, { root, claudeSessionId: me.sessionId, receiptDir });
+  if (wiredR.legacy?.ok !== true) {
+    die("恢复没落完（停在第 " + String(wiredR.legacy?.phase ?? "?") + " 步：" + String(wiredR.legacy?.message ?? wiredR.legacy?.reason ?? "")
+      + "）。账本可能已提交：**按当前 origin op 证明已提交后补索引**（同一条命令重跑，不重复记）。");
+  }
+  if (typeof wiredR.commit === "string" && wiredR.commit !== "committed_clean") {
+    console.error("注意      这一步有提交不干净（commit=" + wiredR.commit + "）：已落机器回执，先 doctor 核对（恢复本身已完成）。");
+  } else if (!resumeUnclean.clean) {
+    console.error("注意      排序锁没交还干净：已落机器回执，先 doctor 核对（恢复本身已完成）。");
+  }
+  console.log("\n已恢复（" + (writeRoute.mode === "authoritative" ? "账本 restore 先行，再改索引" : "原路径") + "）。");
+  process.exit(0);
+}
+
 /** sidecar 值的**归一 + 键序无关**比对：时间串与写侧的 `isoOf` 同一判据（规范化成 ISO），
  *  对象逐值归一（`{"claim_expires_at":null,"token":…}` 与 `{token, claim_expires_at}` 是同一份现场）。 */
 const normSidecarValue = (v) => {

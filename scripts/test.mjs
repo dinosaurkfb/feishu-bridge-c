@@ -53700,7 +53700,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { x.f.cleanup(); }
   });
 
-  test("PK2-W3 T4 幂等 / 前态：已暂停再暂停 → 幂等零写；没暂停就恢复 → 拒 not_paused 零写", () => {
+  test("PK2-W3 T4 幂等 / 前态：已暂停再暂停 → 幂等零写；已恢复再恢复 → 幂等零写；从没暂停过就恢复 → 拒 not_paused 零写", () => {
     const { x, ta, om } = w3Fixture("w3t4");
     try {
       assert.equal(w3Pause(x, { om }).ok, true, "前置暂停");
@@ -53712,14 +53712,27 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore, "幂等路径账本零写");
       assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "幂等路径索引零写");
       assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "unbind").length, 1, "unbind 不多记");
-      // 恢复之后再恢复 → not_paused 拒零写
+      // 已恢复再恢复 → **同样幂等**（W3-fix4 P1-2 的判据是「按记录现状：当前 origin op 就是本笔的 restore
+      //   ⇒ 已落地 → 只补索引」，与"已暂停再暂停"对称；这条与"从没暂停过"是两件事，见下一个夹具）
       assert.equal(w3Resume(x, { om }).ok, true, "先恢复");
       const ledBefore2 = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const regBefore2 = fs.readFileSync(x.regFile);
       const r = w3Resume(x, { om });
-      assert.deepEqual([r.ok, r.reason], [false, "not_paused"], "没暂停过 → 拒：" + JSON.stringify(r).slice(0, 240));
-      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore2, "拒时零写");
+      assert.deepEqual([r.ok, r.commit], [true, "committed_clean"], "已恢复再恢复 = 幂等成功：" + JSON.stringify(r).slice(0, 240));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore2, "幂等路径账本零写");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore2, "幂等路径索引零写");
       assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "restore").length, 1, "restore 恰一笔");
     } finally { x.f.cleanup(); }
+    // 从没暂停过就恢复 → 拒 not_paused 零写（origin op 是 activate，不是本单的 restore）
+    const y = w3Fixture("w3t4b");
+    try {
+      const led = fs.readFileSync(path.join(y.x.epDir, "ledger.json"));
+      const reg = fs.readFileSync(y.x.regFile);
+      const r2 = w3Resume(y.x, { om: y.om });
+      assert.deepEqual([r2.ok, r2.commit, r2.reason], [false, "not_committed", "not_paused"], "没暂停过 → 拒：" + JSON.stringify(r2).slice(0, 240));
+      assert.deepEqual(fs.readFileSync(path.join(y.x.epDir, "ledger.json")), led, "拒时账本零写");
+      assert.deepEqual(fs.readFileSync(y.x.regFile), reg, "拒时索引零写");
+    } finally { y.x.f.cleanup(); }
   });
 
   test("PK2-W3 T5 失败面：目标状态不符（还没认领的 pending 记录）→ 拒 not_pausable 且零写", () => {
@@ -53737,11 +53750,146 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.deepEqual([r.ok, r.commit, r.reason], [false, "not_committed", "not_pausable"], "状态不符 → 拒：" + JSON.stringify(r).slice(0, 260));
       assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore, "拒时账本零写");
       assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "拒时索引零写");
-      // 参数形状的封闭（action 只收 pause / resume）
-      assert.deepEqual(WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) }).reason,
-        "m1a_mode_not_shadow" === "x" ? "x" : WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) }).reason,
-        "（对照）同一夹具下 action 非法也拒：" + JSON.stringify(WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) }).reason));
+      // 参数形状的封闭（action 只收 pause / resume）—— PK2-W3-fix4 P2①：这里旧版是**结果与自身比较**的恒真断言，
+      //   改真断言：点名 bad_action + 零写（这一支连请求 key 都派不出来，不许任何写入）
+      const ledBeforeBad = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const regBeforeBad = fs.readFileSync(x.regFile);
+      const bad = WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) });
+      assert.deepEqual([bad.ok, bad.commit, bad.reason], [false, "not_committed", "bad_action"],
+        "action 非法 → 拒 bad_action：" + JSON.stringify(bad).slice(0, 240));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBeforeBad, "action 非法 → 账本零写");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBeforeBad, "action 非法 → 索引零写");
     } finally { x.f.cleanup(); }
+  });
+
+  // ── PK2-W3-fix4：Codex #207 一轮 4 P1 + 2 P2 的常驻反例 ───────────────────────
+  const w3Spawn = (x, env, script, extra = []) => spawnSync(process.execPath,
+    [path.resolve("scripts", script), "--project", x.proj, "--apply", ...extra], { encoding: "utf-8", cwd: x.proj, env });
+  const w3SpawnSession = (x, env) => spawnSync(process.execPath, [path.resolve("scripts", "bind-session.mjs"), "--apply"],
+    { encoding: "utf-8", cwd: x.proj, env });
+  const w3ReceiptDir = (x) => path.join(x.f.home, ".claude", "feishu-bridge", "receipts");
+  const w3UncleanReceipts = (x) => { const d = w3ReceiptDir(x); return fs.existsSync(d) ? fs.readdirSync(d).filter((n) => n.startsWith("m1a-unclean-")).sort() : []; };
+  test("PK2-W3-fix4 P1-1 会话级恢复真入口：feishu-unbind 暂停这条工作线（打印的恢复命令指向 bind-session）→ 同会话 bind-session --apply → 账本 +restore / 索引 active", () => {
+    const { x, env, ta } = w3Fixture("w3f4a");
+    try {
+      const rp = w3Spawn(x, env, "feishu-unbind.mjs");
+      assert.equal(rp.status, 0, "前置暂停：" + JSON.stringify({ out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-300) }));
+      assert.equal(w3Rec(x, ta).facts.binding, "dormant", "前置：账本 dormant：" + JSON.stringify(w3Rec(x, ta).facts));
+      assert.equal(w3Status(x), "paused", "前置：索引 paused：" + String(w3Status(x)));
+      assert.match(String(rp.stdout), /bind-session\.mjs/u, "会话级暂停打印的恢复命令指向 bind-session（旧版一律写 bind-project）：" + String(rp.stdout).slice(-400));
+      const rr = w3SpawnSession(x, env);
+      assert.equal(rr.status, 0, "会话级恢复真入口退出码 0：" + JSON.stringify({ status: rr.status, out: String(rr.stdout).slice(-400), err: String(rr.stderr).slice(-400) }));
+      assert.match(String(rr.stdout), /恢复/u, "stdout 说清恢复了：" + String(rr.stdout).slice(-300));
+      assert.equal(w3Rec(x, ta).facts.binding, "active", "账本翻回 active：" + JSON.stringify(w3Rec(x, ta).facts));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "restore").length, 1, "账本恰一笔 restore：" + JSON.stringify(Object.values(x.ledger().operations).map((o) => o.op_type)));
+      assert.equal(w3Status(x), "active", "索引复原：" + String(w3Status(x)));
+      assert.equal(x.registry().projects.filter((p) => p.claude_session_id === W1_UUID_A).length, 1, "恢复不是新建：没有多出第二行：" + JSON.stringify(x.registry().projects.map((p) => [p.id, p.claude_session_id])));
+    } finally { x.f.cleanup(); }
+  });
+
+  /** 建一条 A3（用产品原语：create_a1 → attach_a3）：A3 有根 om（anchor present）——是能被"暂停"这条命令
+   *  按 locator 定位到的非 B3 族。A2 **没有**根 om（anchor absent ⇒ aliases.root_om 必为 null），
+   *  prepare 按 locator 根本定位不到它 —— 族闸门在它前面就到不了（所以这一族的"拒"由外层给）。 */
+  const w3MakeA3 = (x, { om, sessionId = "aily_w3f4a3", target = W1_UUID_B } = {}) => {
+    const a1 = TAL.createA1({ endpointId: x.EP, requestKey: "w3f4_a1", chatId: TPL.chat_id, sessionId, env: process.env });
+    if (a1.ok !== true) return { ok: false, why: "夹具 create_a1：" + JSON.stringify(a1).slice(0, 200) };
+    const att = TAL.attachF4({ endpointId: x.EP, requestKey: "w3f4_a3", id: a1.result.created_id,
+      bindingTarget: { runtime: "claude", project_root: x.proj, claude_session_id: target },
+      claimKey: "d".repeat(64), authorizedBy: TPL.frank_sender_id,
+      f4: { root_om: om, matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" },
+      env: process.env });
+    if (att.ok !== true) return { ok: false, why: "夹具 attachF4：" + JSON.stringify(att).slice(0, 200) };
+    return { ok: true, id: a1.result.created_id, family: TAL.familyOf(x.ledger().records[a1.result.created_id].facts) };
+  };
+
+  test("PK2-W3-fix4 P1-3 pause 只允许 B3↔B3′：B4（轮转+认领后的旧代际）与 A3（attach_a3）→ 拒 not_pausable 且零写", () => {
+    // ① B4：真流程——轮转一代并认领它 ⇒ 旧 current 被降成 historical（facts.binding 仍 active）= 合法 B4
+    const { x, env, ta, om } = w3Fixture("w3f4b1");
+    try {
+      const r1 = w2RotateCli(x, env, ["--apply"]);
+      assert.equal(r1.status, 0, "夹具：轮转一代：" + JSON.stringify({ err: String(r1.stderr).slice(-300) }).slice(0, 500));
+      // 认领新代际（in-process，与 W2 T3 同一个复合；不用 W2 后段才声明的真入口助手）
+      const pOm = w2PendingGen(x).root_message_id;
+      const claim = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: pOm, claimKey: "d".repeat(64),
+        sessionId: "aily_w3f4b1", authorizedBy: TPL.frank_sender_id, f4: w1F4Of(pOm), publishIndex: w1ClaimIndex(x, "aily_w3f4b1") });
+      assert.equal(claim.ok === true && claim.legacy?.ok === true, true, "夹具：认领新代际：" + JSON.stringify(claim).slice(0, 300));
+      assert.deepEqual([TAL.familyOf(w3Rec(x, ta).facts), w3Rec(x, ta).aliases.root_om], ["B4", om],
+        "夹具：旧 current 已是 B4（且 locator 仍指向它）：" + JSON.stringify(w3Rec(x, ta).facts));
+      const ledBefore = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const regBefore = fs.readFileSync(x.regFile);
+      const r = w3Pause(x, { om });
+      assert.deepEqual([r.ok, r.commit, r.reason], [false, "not_committed", "not_pausable"],
+        "B4 → 拒 not_pausable（旧版 A2/A3/B3/B4 全放行，落一个没有反向路径的 dormant）：" + JSON.stringify(r).slice(0, 300));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore, "B4：拒时账本零写");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "B4：拒时索引零写");
+    } finally { x.f.cleanup(); }
+    // ② A3（产品原语建出来的，不是手改字段）→ 同样拒
+    const y = w3Fixture("w3f4b2");
+    try {
+      const a3om = "om_" + "7".repeat(24);
+      const made = w3MakeA3(y.x, { om: a3om });
+      assert.deepEqual([made.ok, made.family], [true, "A3"], "夹具：建出 A3：" + JSON.stringify(made));
+      const ledBefore = fs.readFileSync(path.join(y.x.epDir, "ledger.json"));
+      const regBefore = fs.readFileSync(y.x.regFile);
+      const r = w3Pause(y.x, { om: a3om });
+      assert.deepEqual([r.ok, r.commit, r.reason], [false, "not_committed", "not_pausable"],
+        "A3 → 拒 not_pausable（账本 restore() 只接受 B3′）：" + JSON.stringify(r).slice(0, 300));
+      assert.deepEqual(fs.readFileSync(path.join(y.x.epDir, "ledger.json")), ledBefore, "A3：拒时账本零写");
+      assert.deepEqual(fs.readFileSync(y.x.regFile), regBefore, "A3：拒时索引零写");
+    } finally { y.x.f.cleanup(); }
+  });
+
+  test("PK2-W3-fix4 P1-2 restore 半笔续跑：账本已 restore、索引失败 → committed_unclean；重跑按当前 origin op 认已提交、只补索引、账本零新 op", () => {
+    const { x, ta, om } = w3Fixture("w3f4c");
+    try {
+      assert.equal(w3Pause(x, { om }).ok, true, "前置暂停");
+      const bad = w3Resume(x, { om, publishIndex: () => ({ ok: false, reason: "registry_unwritable", why: "注入：索引写失败" }) });
+      assert.deepEqual([bad.ok, bad.commit, bad.legacy.phase, bad.legacy.reason], [true, "committed_unclean", "registry", "registry_unwritable"],
+        "恢复半笔点名停在哪一步：" + JSON.stringify(bad).slice(0, 300));
+      assert.equal(w3Rec(x, ta).facts.binding, "active", "账本已恢复（这就是 unclean 的含义）：" + JSON.stringify(w3Rec(x, ta).facts));
+      assert.equal(w3Status(x), "paused", "索引还没改：" + String(w3Status(x)));
+      const opsBefore = Object.keys(x.ledger().operations).length;
+      const again = w3Resume(x, { om });
+      assert.deepEqual([again.ok, again.commit], [true, "committed_clean"],
+        "重跑只补索引（旧版在这里先撞 not_paused，永远补不齐）：" + JSON.stringify(again).slice(0, 300));
+      assert.equal(Object.keys(x.ledger().operations).length, opsBefore, "重跑账本零新 op：" + String(opsBefore));
+      assert.equal(w3Status(x), "active", "索引补齐：" + String(w3Status(x)));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "restore").length, 1, "restore 仍恰一笔");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W3-fix4 P1-4 release 不净也要留机器回执：feishu-unbind（暂停）与 bind-session（会话级恢复）各一条（账本/索引都 clean 时旧版一个字节都不留）", () => {
+    // 归属转换锁 .reap 拿在手里 → outer release 必 release_busy（主锁交不还，这正是"提交都干净"的 release 不净）
+    const reapLockOf = (x) => path.join(x.epDir, "m1a-order.lock.reap");
+    const a = w3Fixture("w3f4d1");
+    try {
+      const reap = reapLockOf(a.x);
+      const held = acquirePublishLock(reap);
+      assert.ok(held.ok, "夹具取 .reap 锁：" + JSON.stringify(held));
+      let rp;
+      try { rp = w3Spawn(a.x, a.env, "feishu-unbind.mjs"); } finally { releasePublishLock(reap); }
+      assert.equal(w3Rec(a.x, a.ta).facts.binding, "dormant", "暂停本身已完成（账本）：" + String(rp.status));
+      assert.equal(w3Status(a.x), "paused", "索引也已完成：" + String(w3Status(a.x)));
+      const recs = w3UncleanReceipts(a.x);
+      assert.equal(recs.length, 1, "release 不净也留下机器回执：" + JSON.stringify({ status: rp.status, out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-300), receipts: recs }));
+      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(a.x), recs[0]), "utf-8"));
+      assert.equal(body.releaseUnclean?.reason, "release_busy", "回执点名 release 不净：" + JSON.stringify(body.releaseUnclean));
+      assert.equal(body.clean, false, "投影自报不干净：" + String(body.clean));
+    } finally { a.x.f.cleanup(); }
+    const b = w3Fixture("w3f4d2");
+    try {
+      assert.equal(w3Pause(b.x, { om: b.om }).ok, true, "前置暂停（in-process）");
+      const reap = reapLockOf(b.x);
+      const held = acquirePublishLock(reap);
+      assert.ok(held.ok, "夹具再取 .reap 锁：" + JSON.stringify(held));
+      let rr;
+      try { rr = w3SpawnSession(b.x, b.env); } finally { releasePublishLock(reap); }
+      assert.equal(w3Rec(b.x, b.ta).facts.binding, "active", "恢复本身已完成（账本）：" + JSON.stringify({ status: rr.status, out: String(rr.stdout).slice(-300), err: String(rr.stderr).slice(-300) }));
+      const recs = w3UncleanReceipts(b.x);
+      assert.equal(recs.length, 1, "bind-session 的恢复分支也留回执：" + JSON.stringify(recs));
+      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(b.x), recs[0]), "utf-8"));
+      assert.equal(body.releaseUnclean?.reason, "release_busy", "回执点名 release 不净：" + JSON.stringify(body.releaseUnclean));
+    } finally { b.x.f.cleanup(); }
   });
 
   test("PK2-W2 T1 手动轮转真入口：新话题恰一次 + 账本多一条 live pending B1（target 继承）+ 索引新代际 pending + 两份 sidecar 各多一条", () => {

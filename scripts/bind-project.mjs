@@ -26,7 +26,7 @@ import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding, withRegistryTransaction } from "./topic-generation-store.mjs";
 import { activeGeneration } from "./topic-generation.mjs";
-import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
@@ -203,15 +203,19 @@ if (suspended.ok && suspended.suspended) {
         console.error("恢复中止（M1a 权威写方拒：" + (wiredAuthR.reason ?? "m1a_reject") + (wiredAuthR.why ? "；" + wiredAuthR.why : "") + "）");
         process.exit(1);
       }
+      // P1-4（W3-fix4）：**统一 unclean 投影**（与 W1 同一份）—— 账本与索引都 clean、而 outer release
+      //   不净时 commit 仍 committed_clean，旧写法会一个回执都不留。prepare 就拒的那一支已 exit。
+      const resumeUnclean = uncleanWired(wiredAuthR);
+      if (!resumeUnclean.clean) emitUncleanReceipt("cli_bind_project_resume", wiredAuthR, { root, claudeSessionId: null, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
       if (wiredAuthR.legacy?.ok !== true) {
-        emitUncleanReceipt("cli_bind_project_resume", wiredAuthR, { root, claudeSessionId: null, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
         console.error("恢复没落完（停在第 " + String(wiredAuthR.legacy?.phase ?? "?") + " 步：" + String(wiredAuthR.legacy?.message ?? wiredAuthR.legacy?.reason ?? "")
-          + "）。账本可能已提交：**同一条命令重跑**会按同一 request key 续做索引（不重复记）。");
+          + "）。账本可能已提交：**按当前 origin op 证明已提交后补索引**（同一条命令重跑，不重复记）。");
         process.exit(1);
       }
       if (wiredAuthR.commit !== "committed_clean") {
-        emitUncleanReceipt("cli_bind_project_resume", wiredAuthR, { root, claudeSessionId: null, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
         console.error("注意      这一步有提交不干净（commit=" + String(wiredAuthR.commit) + "）：已落机器回执，先 doctor 核对（恢复本身已完成）。");
+      } else if (!resumeUnclean.clean) {
+        console.error("注意      排序锁没交还干净：已落机器回执，先 doctor 核对（恢复本身已完成）。");
       }
       const rr = wiredAuthR.legacy;
       if (rr?.__fixedKind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");

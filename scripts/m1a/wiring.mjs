@@ -875,7 +875,10 @@ export function wireVoidAuthoritative({
  *   · 索引后缀**复用现有状态助手**（feishu-unbind / bind-project 的现行写法：嵌套 binding_status + 恢复时的
  *     routability / enabled），锁内重读再局部更新（W1 口径）。
  *   · request key **不加 WAL**：由「目标 id + pause/resume + 当前不可变 `origin_operation_id`」派生；
- *     账本提交后重跑从新的 origin op 识别重放 → 只补索引（committed_unclean 续跑，W1 口径）。
+ *     账本提交后重跑**按记录现状**（当前 origin op 是本单类型 + 影响的就是这条）识别重放 → 只补索引
+ *     （committed_unclean 续跑，W1 口径；不扫历史同类型 op）。
+ *   · **族收口（W3-fix4 P1-3）**：本单只开 **B3 ↔ B3′** —— 账本 `restore()` 只接受 B3′，
+ *     暂停 A2/A3/B4 会落一个没有反向路径的 dormant 态，一律拒 `not_pausable`。
  *   · sidecar 不动；rotate/void 归 W2；其余 wire* 在 authoritative 仍拒。
  */
 export function wirePauseResumeAuthoritative({
@@ -895,28 +898,37 @@ export function wirePauseResumeAuthoritative({
     if (!en(originOperationId)) return { ok: false, reason: "no_origin_operation", why: "这条记录没有 origin_operation_id，派不出确定的 request key（不加 WAL）" };
     const k = rk(opType, action + ":" + resolved.id, originOperationId);
     if (!k.ok) return { ok: false, reason: k.reason ?? "bad_external_id", why: k.why ?? null };
-    // 裁定 4：**先**识别「同 request key 已提交态」——已经提交过这一笔就不再受前态检查挡（只补索引）。
-    const committed = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === k.request_key);
     const fam = familyOf(rec.facts);
     const dormant = rec.facts?.binding === "dormant";
-    // 「这一笔已经落地了吗」：账本提交后 `origin_operation_id` 会被这一笔改写（unbind → 新的 op），
-    //   所以重跑派出的 key 与首跑不同 —— 重放识别**按记录的现状 + 已有那笔 op**看（裁定 4：先识别已提交态）。
-    const opDoneFor = (type) => Object.values(L.doc.operations ?? {}).some((op) => op?.op_type === type
-      && (op?.result?.affected_id === resolved.id || op?.result?.voided_id === resolved.id));
-    const ledgerDone = action === "pause" ? opDoneFor("unbind") : opDoneFor("restore");
+    // P1-2（W3-fix4）：**已提交态按记录现状判** —— 直查当前 `origin_operation_id` 指向的**那一条** op。
+    //   账本提交后 origin_operation_id 会被这一笔改写（unbind/restore 都写），重跑派出的 request key 也就随之不同，
+    //   所以“这一笔落地了吗”不能靠 key，只能看记录现状：那条 op ① 是本单的目标类型（pause→unbind /
+    //   resume→restore）② 影响的 id 就是这条记录（与账本自己的 G13 同一判据：旧形给 affected_id、
+    //   新形给 affected_live_ids_after_commit）。两个都对 ⇒ 已落地 → 只补索引（**在**前态拒绝之前判）。
+    //   不扫历史同类型 op（旧实现 `opDoneFor` 会把**别人的**那一笔也算成本笔已提交）。
+    const originOp = L.doc.operations?.[originOperationId] ?? null;
+    const originCommitted = originOp !== null && originOp.op_type === opType
+      && (originOp.result?.affected_id === resolved.id || originOp.result?.affected_live_ids_after_commit?.includes(resolved.id));
+    // 同 request key 已提交（首跑崩在“提交后、记录里的 origin 已改”之间那个窗口才可能命中）。
+    const committed = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === k.request_key);
     if (action === "pause") {
-      // 已经 dormant（暂停那一笔已提交）→ **只补索引**（幂等：索引侧状态助手自己会 changed:false）。
-      if (dormant && ledgerDone) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, ledgerDone: true };
-      if (dormant && !committed) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, alreadyDone: true };
-      if (!dormant && !["A2", "A3", "B3", "B4"].includes(fam)) {
-        return { ok: false, reason: "not_pausable", why: "目标当前不是可暂停的族（facts.binding=" + String(rec.facts?.binding) + " / family=" + fam + "）" };
+      // P1-3（W3-fix4）：本单只允许 **B3 ↔ B3′**（账本 `restore()` 只接受 B3′）。
+      //   暂停 A2/A3/B4 会落一个**没有反向路径**的 dormant 态，一律拒 not_pausable —— 不为 A 族另扩恢复设计。
+      if (fam !== "B3" && fam !== "B3'") {
+        return { ok: false, reason: "not_pausable",
+          why: "目标不是可暂停的族（family=" + String(fam) + "）：本单只开 B3 ↔ B3′（暂停别的族没有反向恢复路径）" };
       }
+      // 已经 dormant（暂停那一笔已落地）→ **只补索引**（幂等：索引侧状态助手自己会 changed:false）。
+      if (dormant && originCommitted) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, ledgerDone: true };
+      if (dormant) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, alreadyDone: true };
     } else {
+      // 恢复那一笔已落地（记录已 active 回来）→ 只补索引。这条判定必须在下面的“前态拒绝”**之前**：
+      //   首跑已提交、索引写失败时记录已经是 active B3，重跑的 key 又因 origin 已变而不同 ——
+      //   先撞 not_paused 就永远补不了索引（旧版的形状）。
+      if (!dormant && originCommitted) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, ledgerDone: true };
       if (!dormant && fam !== "B3'" && !committed) {
-        return { ok: false, reason: "not_paused", why: "这条绑定没有暂停过（facts.binding=" + String(rec.facts?.binding) + "）—— 没什么可恢复的，零写" };
+        return { ok: false, reason: "not_paused", why: "这条绑定没有暂停过（facts.binding=" + String(rec.facts?.binding) + " / family=" + String(fam) + "）—— 没什么可恢复的，零写" };
       }
-      // 恢复那一笔已提交（记录已 active 回来）→ 只补索引
-      if (!dormant && ledgerDone) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, ledgerDone: true };
     }
     const regProblem = strictRegistryProblem(env);
     if (regProblem !== null) return regProblem;

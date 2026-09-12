@@ -54914,92 +54914,81 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { inj.cleanup(); }
   });
 
-  // ── PK2-W2-fix3（T7）/ PK2-W3（T5）：shadow / never_initialized 下与 origin/main 一字不差 ─────────
-  // 做法：用本分支把现场建**一次** → 整份 base 拷贝成两份（A 用 `git archive origin/main scripts` 解出来的
-  //   scripts，B 用本分支的 scripts）→ 两边跑同一序列 → 归一化后逐字节比。
-  // 归一化只有三类**本来就跑不出同一个值**的东西：夹具根路径、ISO 时间戳、随机身份（uuid / m1a 摘要 / ta_、handle）。
-  const w2Fix3Normalize = (text, bases) => {
-    let s = String(text);
-    for (const b of bases) s = s.split(b).join("<BASE>");
-    return s
-      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu, "<UUID>")
-      .replace(/m1a_[0-9a-f]{40}/gu, "<RK>")
-      .replace(/\b[0-9a-f]{64}\b/gu, "<SHA256>")      // 指纹/摘要：输入里含随机 op id，本来就不可能相同
-      .replace(/ta_[0-9a-f]{32}/gu, "<TA>")
-      .replace(/(?:osh|orh|rfh)_[0-9a-f]{32}/gu, "<HANDLE>")
-      .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/gu, "<TS>")
-      .replace(/\b\d{13}\b/gu, "<MS>")
-      .replace(/"pid":\s*\d+/gu, '"pid":<PID>')      // 子进程 pid：本来就不可能相同
-      .replace(/-\d{2,7}\.json/gu, "-<PID>.json");     // 回执文件名里的 <ts>-<pid>.json
+  // ── PK2-W2-fix3（T7）/ PK2-W3（T5）：shadow / never_initialized 下与**固定基线**逐字节一致 ─────────
+  // 基线是**固定提交**（不是移动的 origin/main —— 合并后 main 会包含这些改造，对照就退化成"自己跟自己比"）。
+  // 做法：用本分支把现场建**一次** → 存一份 pristine → 基线脚本跑一遍、**原地恢复现场**再跑本分支一遍
+  //   （两个拷贝跑在**同一组路径**上，所以"路径"这一类不需要归一化）→ 归一化后逐字节比。
+  // 归一化**只**替换"本次运行新生成"的随机值（新话题 om / 新 op id / 新 request key / 新 ta_ 与 handle /
+  //   新指纹 / 子进程 pid / 本次写入的时间戳）；夹具事实（固定 UUID、稳定摘要、预置业务时间）**逐字比**。
+  const W2FIX3_BASELINE = "b9ff7e8";   // 改造前基线（W2/W3 的分叉点；W2 与 main 的 merge-base 就是它）
+  const W2FIX3_PAST = "2020-01-01T00:00:00.000Z";   // 过期兜底写入的业务时间预置值（两侧逐字比）
+  const W2FIX3_ID_PATTERNS = [
+    [/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu, "<UUID>"],   // 新 op id / origin op id
+    [/m1a_[0-9a-f]{40}/gu, "<RK>"],                                                  // 新 request key
+    [/om_[0-9a-f]{24}/gu, "<OM>"],                                                   // 新话题 om
+    [/ta_[0-9a-f]{32}/gu, "<TA>"],                                                   // 新 B1 的 topic_agent_id
+    [/(?:osh|orh|rfh)_[0-9a-f]{32}/gu, "<HANDLE>"],                                  // 新 handle
+    [/\b[0-9a-f]{64}\b/gu, "<SHA256>"],                                              // 新指纹（输入含新 op id）
+    [/\b\d{13}\b/gu, "<MS>"],                                                        // 本次写入的毫秒时间戳（回执名等）
+  ];
+  const W2FIX3_ISO_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/gu;
+  /** pre-run 现场里**已经存在**的身份/时间值 = 夹具事实（固定 UUID W1_UUID_*、夹具摘要、预置业务时间）。 */
+  const w2Fix3Stable = (text) => {
+    const out = new Set();
+    for (const [re] of W2FIX3_ID_PATTERNS) for (const m of String(text).matchAll(re)) out.add(m[0]);
+    for (const m of String(text).matchAll(W2FIX3_ISO_RE)) out.add(m[0]);
+    return out;
   };
-  /** main 的 scripts 解到临时目录（只解 scripts/，不带 .git）—— 返回 { dir, cleanup }。 */
-  const w2Fix3MainScripts = () => {
-    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "w2fix3-main-"));
-    const r = spawnSync("bash", ["-c", "git archive origin/main scripts | tar -x -C " + JSON.stringify(dir)],
+  /** 收窄版归一化：只把**本次运行新生成**的值换成占位符；夹具值逐字比（业务时间预置值也因此逐字比）。 */
+  const w2Fix3Normalize = (text, stable) => {
+    let s = String(text);
+    for (const [re, ph] of W2FIX3_ID_PATTERNS) s = s.replace(re, (m) => (stable.has(m) ? m : ph));
+    s = s.replace(W2FIX3_ISO_RE, (m) => (stable.has(m) ? m : "<TS>"));
+    s = s.replace(/"pid":\s*\d+/gu, '"pid":<PID>');            // 子进程 pid：本来就不同
+    s = s.replace(/-\d{1,7}\.json/gu, "-<PID>.json");           // 回执文件名里的 <ts>-<pid>.json
+    return s;
+  };
+  /** 基线（`b9ff7e8`）的 scripts 解到临时目录（只解 scripts/，不带 .git）—— 返回 { dir, cleanup }。 */
+  const w2Fix3BaselineScripts = () => {
+    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "w2fix6-base-"));
+    const r = spawnSync("bash", ["-c", "git archive " + W2FIX3_BASELINE + " scripts | tar -x -C " + JSON.stringify(dir)],
       { cwd: path.resolve("."), encoding: "utf-8" });
     if (r.status !== 0 || !fs.existsSync(path.join(dir, "scripts", "feishu-rotate.mjs"))) {
       fs.rmSync(dir, { recursive: true, force: true });
-      throw new Error("夹具：解 origin/main 的 scripts 失败：" + r.status + r.stdout + r.stderr);
+      throw new Error("夹具：解基线 " + W2FIX3_BASELINE + " 的 scripts 失败：" + r.status + r.stdout + r.stderr);
     }
     return { dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   };
-  /** 把拷贝里所有文本文件里的旧根路径换成新根路径（模板 / 登记表 / 账本 / sessions 里都存着绝对路径）。 */
-  const w2Fix3RebaseTree = (dir, from, to) => {
-    const walk = (d) => {
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, e.name);
-        if (e.isDirectory()) { walk(p); continue; }
-        if (!e.isFile()) continue;
-        let st; try { st = fs.statSync(p); } catch { continue; }
-        if (st.size > 4 * 1024 * 1024) continue;
-        let txt; try { txt = fs.readFileSync(p, "utf-8"); } catch { continue; }
-        if (txt.includes(from)) fs.writeFileSync(p, txt.split(from).join(to), { mode: st.mode & 0o777 });
-      }
-    };
-    walk(dir);
-  };
-  /** 拷贝的句柄：路径 + 环境（环境里的绝对路径也换根）。 */
-  const w2Fix3Copy = (x, env, root, scriptsRoot, ledgerRoot) => {
-    const base = x.f.base;
-    const rebase = (v) => (typeof v === "string" ? v.split(x.f.ledgerRoot).join(ledgerRoot).split(base).join(root) : v);
-    const env2 = Object.fromEntries(Object.entries(env).map(([k, v]) => [k, rebase(v)]));
-    // 路径一律**从环境里取**（登记表 / 账本根 / HOME 都由夹具 env 显式钉）——不手拼目录名。
-    return { x, base: root, scriptsDir: path.join(scriptsRoot, "scripts"), proj: path.join(root, "proj"),
-      regFile: env2.FEISHU_BRIDGE_REGISTRY, ledgerRoot: env2.FEISHU_BRIDGE_LEDGER_DIR, home: env2.HOME,
-      epDir: path.join(env2.FEISHU_BRIDGE_LEDGER_DIR, x.EP), uid: x.uid, env: env2 };
-  };
-  /** 把一次「建好的现场」拷成两份（A=main / B=本分支）并返回两个拷贝。 */
-  const w2Fix3Split = (x, env, mainRoot) => {
-    const baseB = x.f.base + "-copy";
-    // 账本根**在 base 之外**（r69Fixture 用独立 tmp）→ 两份都要拷，否则两个拷贝共享同一份账本（对照就废了）
-    const ledgerB = x.f.ledgerRoot + "-copy";
-    for (const d of [baseB, ledgerB]) fs.rmSync(d, { recursive: true, force: true });
-    // 影子期 rotate 的 lineage 取自**索引行**的 binding_id；夹具的账本记录来自 authoritative 绑定（lineage=完整会话 uuid）。
-    // 两边对齐（对两个拷贝同样生效）——否则影子镜像会以另一条 lineage 建 B1（would_corrupt），对照就退化成"两边都不动账本"。
-    const live = (() => { try { return Object.entries(x.ledger().records).find(([, r]) => r.kind === "live" && r.facts?.generation === "current") ?? null; } catch { return null; } })();   // never_initialized：没有账本
-    if (live !== null) {
-      const reg0 = JSON.parse(fs.readFileSync(x.regFile, "utf-8"));
-      const row0 = reg0.projects.find((p) => p.root_message_id);
-      row0.topic_generation_state.binding_id = live[1].generation_lineage_id;
-      fs.writeFileSync(x.regFile, JSON.stringify(reg0, null, 2) + "\n", { mode: 0o600 });
+  /** 账本树权限复原（root_perms / dir_perms 是真实判据，cpSync 建目录的 mode 受 umask 影响）。 */
+  const w2Fix3FixMode = (d) => {
+    fs.chmodSync(d, 0o700);
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const q = path.join(d, e.name);
+      if (e.isDirectory()) w2Fix3FixMode(q);
+      else if (e.isFile()) fs.chmodSync(q, 0o600);
     }
-    fs.cpSync(x.f.base, baseB, { recursive: true });
-    fs.cpSync(x.f.ledgerRoot, ledgerB, { recursive: true });
-    // 账本树的权限是**真实判据**（root_perms / dir_perms）——cpSync 建目录的 mode 受 umask 影响，这里显式复原
-    const fixMode = (d) => {
-      fs.chmodSync(d, 0o700);
-      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        const q = path.join(d, e.name);
-        if (e.isDirectory()) fixMode(q);
-        else if (e.isFile()) fs.chmodSync(q, 0o600);
+  };
+  /** 原地双跑夹具：存 pristine → run A → `restore()` → run B（同一组路径）。 */
+  const w2Fix3FixtureSplit = (x) => {
+    const dirs = [[x.f.base + "-pristine", x.f.base]];
+    if (fs.existsSync(x.f.ledgerRoot)) dirs.push([x.f.ledgerRoot + "-pristine", x.f.ledgerRoot]);
+    const restore = () => {
+      for (const [from, to] of dirs) {
+        fs.rmSync(to, { recursive: true, force: true });
+        fs.cpSync(from, to, { recursive: true });
+        if (to === x.f.ledgerRoot) w2Fix3FixMode(to);
       }
     };
-    fixMode(ledgerB);
-    // 两个拷贝树里都要换**两类**根路径：base（proj / home / 登记表里写的 root）与账本根（在 base 之外）
-    for (const [tree, from, to] of [[baseB, x.f.base, baseB], [baseB, x.f.ledgerRoot, ledgerB],
-      [ledgerB, x.f.base, baseB], [ledgerB, x.f.ledgerRoot, ledgerB]]) w2Fix3RebaseTree(tree, from, to);
-    return { a: w2Fix3Copy(x, env, x.f.base, mainRoot, x.f.ledgerRoot), b: w2Fix3Copy(x, env, baseB, path.resolve("."), ledgerB) };
+    for (const [from, to] of dirs) {
+      fs.rmSync(from, { recursive: true, force: true });
+      fs.cpSync(to, from, { recursive: true });
+      if (from === x.f.ledgerRoot + "-pristine") w2Fix3FixMode(from);
+    }
+    return { restore, cleanup: () => { for (const [from] of dirs) fs.rmSync(from, { recursive: true, force: true }); } };
   };
+  /** 一侧的句柄：**同一组路径**，只有 scripts 根不同（A = 基线，B = 本分支）。 */
+  const w2Fix3Side = (x, env, scriptsRoot) => ({ x, scriptsDir: path.join(scriptsRoot, "scripts"), proj: x.proj,
+    regFile: x.regFile, ledgerRoot: x.f.ledgerRoot, home: x.f.home, env, uid: x.uid });
   const w2Fix3Spawn = (c, script, args = [], envExtra = {}) => spawnSync(process.execPath,
     [path.join(c.scriptsDir, script), ...args], { encoding: "utf-8", cwd: c.proj, env: { ...c.env, ...envExtra } });
   const w2Fix3Rotate = (c, extra) => w2Fix3Spawn(c, "feishu-rotate.mjs", ["--project", c.proj, "--claude-session-id", W1_UUID_A, ...extra]);
@@ -55027,16 +55016,14 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       inboundReceipts: w2Fix3List(path.join(c.home, ".claude", "feishu-bridge", "inbound", "receipts")),
     },
   });
-  const w2Fix3NormState = (c) => {
-    const st = w2Fix3State(c);
-    const bases = [c.base];
-    return { files: Object.fromEntries(Object.entries(st.files).map(([k, v]) => [k, w2Fix3Normalize(v, bases)])),
-      names: Object.fromEntries(Object.entries(st.names).map(([k, v]) => [k, v.map((n) => w2Fix3Normalize(n, bases))])) };
-  };
+  const w2Fix3NormState = (raw, stable) => ({
+    files: Object.fromEntries(Object.entries(raw.files).map(([k, v]) => [k, w2Fix3Normalize(v, stable)])),
+    names: Object.fromEntries(Object.entries(raw.names).map(([k, v]) => [k, v.map((n) => w2Fix3Normalize(n, stable))])),
+  });
   const w2Fix3UncleanNames = (c) => w2Fix3List(path.join(c.home, ".claude", "feishu-bridge", "receipts")).filter((n) => n.startsWith("m1a-unclean-"));
-  /** 自动轮转：driver 子进程调**本拷贝**的 automatic-topic-rotation（同源码、只换 import 根）。 */
+  /** 自动轮转：driver 子进程调**本侧**的 automatic-topic-rotation（同源码、只换 import 根）。 */
   const w2Fix3Auto = (c, cfg) => {
-    const file = path.join(c.base, "auto-driver.mjs");
+    const file = path.join(c.home, "auto-driver.mjs");
     fs.writeFileSync(file, [
       'import { spawnSync } from "node:child_process";',
       "import { recordClaudeActivityAndMaybeRotate } from " + JSON.stringify(path.join(c.scriptsDir, "automatic-topic-rotation.mjs")) + ";",
@@ -55048,25 +55035,21 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     ].join("\n") + "\n");
     return spawnSync(process.execPath, [file, JSON.stringify(cfg)], { encoding: "utf-8", cwd: c.proj, env: c.env });
   };
-  /** 让索引里那条待认领代际**真的过期**（登记表 + pending-claims 条目），两个拷贝用**同一个**过去时刻。 */
+  /** 让索引里那条待认领代际**真的过期**（登记表 + pending-claims 条目），两侧用**同一个**业务时间预置值。 */
   const w2Fix3Expire = (c, generationId, token) => {
-    const past = "2020-01-01T00:00:00.000Z";
     const reg = JSON.parse(fs.readFileSync(c.regFile, "utf-8"));
     const row = reg.projects.find((p) => p.root_message_id);
     const gen = (row.topic_generation_state.generations ?? []).find((g) => g.channel_generation_id === generationId);
-    gen.claim_expires_at = past;
+    gen.claim_expires_at = W2FIX3_PAST;
     fs.writeFileSync(c.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
-    const ta = row.topic_generation_state.rotation?.pending_generation_id === generationId
-      ? null : null; // pending-claims 的键是账本 ta —— 从 sidecar 现值里找 token 相同的那条
     const pcPath = path.join(c.ledgerRoot, c.x.EP, "pending-claims.json");
     if (fs.existsSync(pcPath)) {
       const pc = JSON.parse(fs.readFileSync(pcPath, "utf-8"));
-      for (const k of Object.keys(pc.entries ?? {})) if (pc.entries[k]?.token === token) pc.entries[k] = { token, claim_expires_at: past };
+      for (const k of Object.keys(pc.entries ?? {})) if (pc.entries[k]?.token === token) pc.entries[k] = { token, claim_expires_at: W2FIX3_PAST };
       fs.writeFileSync(pcPath, JSON.stringify(pc, null, 2) + "\n", { mode: 0o600 });
     }
-    void ta;
   };
-  /** W2 三入口 + 过期兜底的同一序列（两个拷贝各跑一遍）。 */
+  /** W2 三入口的同一序列（两侧各跑一遍）。 */
   const w2Fix3W2Sequence = (c, { genId }) => {
     const steps = [];
     const push = (label, r) => { steps.push({ label, status: r.status, out: String(r.stdout ?? ""), err: String(r.stderr ?? "") }); return r; };
@@ -55075,7 +55058,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     push("auto", w2Fix3Auto(c, { root: c.proj, claudeSessionId: W1_UUID_A, generationId: genId, registryFile: c.regFile }));
     return steps;
   };
-  /** 过期兜底那一条**单独跑**（它把索引退休掉，会污染逐字节对照）：把当前 pending 设成已过期，再发一条过期话题里的 @。 */
+  /** 过期兜底那一条**单独跑**（它把索引退休掉，会污染逐字节对照）。 */
   const w2Fix3ExpiredEntry = (c) => {
     const reg = JSON.parse(fs.readFileSync(c.regFile, "utf-8"));
     const row = reg.projects.find((p) => p.root_message_id);
@@ -55085,44 +55068,75 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     const r = w2Fix3Inbound(c, { messageId: "msg_w2fix3_expired", content: w2Quote(pend.pending_token), senderId: "ou_not_owner_" + "0".repeat(8) });
     return { status: r.status, out: String(r.stdout ?? ""), err: String(r.stderr ?? "") };
   };
-  /** 逐字段找第一处不同（断言消息用）：给「哪一份文件、第几个字符、两侧各是什么」。 */
+  /** 逐字段找第一处不同（断言消息用）。 */
   const w2Fix3FirstDiff = (na, nb) => {
     const out = [];
     const cmp = (label, x, y) => {
       if (x === y) return;
       let i = 0; while (i < Math.min(x.length, y.length) && x[i] === y[i]) i += 1;
-      out.push(label + "：第 " + i + " 字符起 main=" + JSON.stringify(x.slice(i, i + 200)) + " branch=" + JSON.stringify(y.slice(i, i + 200)));
+      out.push(label + "：第 " + i + " 字符起 baseline=" + JSON.stringify(x.slice(i, i + 200)) + " branch=" + JSON.stringify(y.slice(i, i + 200)));
     };
     for (const k of Object.keys(na.files)) cmp("files." + k, na.files[k], nb.files[k]);
     for (const k of Object.keys(na.names)) cmp("names." + k, JSON.stringify(na.names[k]), JSON.stringify(nb.names[k]));
     return out.join(" || ") || "（无差异？）";
   };
-  const w2Fix3Compare = (mode, a, b, stepsA, stepsB) => {
+  const w2Fix3Compare = (mode, sides, rawA, rawB, stepsA, stepsB, stable) => {
     assert.deepEqual(stepsB.map((s) => [s.label, s.status]), stepsA.map((s) => [s.label, s.status]),
-      "每一步的退出码不一致（列出两侧每步的退出码与 stderr 尾巴）：main=" + JSON.stringify(stepsA.map((x) => [x.label, x.status, String(x.err).slice(-260)])) + " branch=" + JSON.stringify(stepsB.map((x) => [x.label, x.status, String(x.err).slice(-260)])) + " || " +
-      mode + "：每一步退出码一致：" + JSON.stringify(stepsA.map((s) => [s.label, s.status])) + " vs " + JSON.stringify(stepsB.map((s) => [s.label, s.status])));
+      mode + "：每一步退出码一致（列出两侧每步的退出码与 stderr 尾巴）：baseline=" + JSON.stringify(stepsA.map((x) => [x.label, x.status, String(x.err).slice(-260)])) +
+      " branch=" + JSON.stringify(stepsB.map((x) => [x.label, x.status, String(x.err).slice(-260)])));
     for (let i = 0; i < stepsA.length; i += 1) {
-      const oa = w2Fix3Normalize(stepsA[i].out, [a.base]);
-      const ob = w2Fix3Normalize(stepsB[i].out, [b.base]);
-      assert.equal(ob, oa, mode + " " + stepsA[i].label + "：stdout 归一化后一致 || main=" + oa + " || branch=" + ob);
-      const ea = w2Fix3Normalize(stepsA[i].err, [a.base]);
-      const eb = w2Fix3Normalize(stepsB[i].err, [b.base]);
-      assert.equal(eb, ea, mode + " " + stepsA[i].label + "：stderr 归一化后一致 || main=" + ea + " || branch=" + eb);
+      const oa = w2Fix3Normalize(stepsA[i].out, stable);
+      const ob = w2Fix3Normalize(stepsB[i].out, stable);
+      assert.equal(ob, oa, mode + " " + stepsA[i].label + "：stdout 归一化后一致 || baseline=" + oa + " || branch=" + ob);
+      const ea = w2Fix3Normalize(stepsA[i].err, stable);
+      const eb = w2Fix3Normalize(stepsB[i].err, stable);
+      assert.equal(eb, ea, mode + " " + stepsA[i].label + "：stderr 归一化后一致 || baseline=" + ea + " || branch=" + eb);
     }
-    for (const [who, c] of [["main", a], ["branch", b]]) {
+    for (const [who, c] of [["baseline", sides.a], ["branch", sides.b]]) {
       assert.deepEqual(w2Fix3UncleanNames(c), [], mode + " / " + who + "：非权威下不得产生任何 m1a-unclean-* 回执：" + JSON.stringify(w2Fix3State(c).names.receipts));
     }
-    const na = w2Fix3NormState(a), nb = w2Fix3NormState(b);
-    assert.deepEqual(nb, na,
-      mode + "：分支与 origin/main 的落盘状态（账本 / 登记表 / 两份 sidecar / mapping / lark 调用 / 回执目录）归一化后必须逐字节一致：" + w2Fix3FirstDiff(na, nb));
+    const na = w2Fix3NormState(rawA, stable), nb = w2Fix3NormState(rawB, stable);
+    assert.deepEqual(nb, na, mode + "：分支与基线 " + W2FIX3_BASELINE + " 的落盘状态（账本 / 登记表 / 两份 sidecar / mapping / lark 调用 / 回执目录）归一化后必须逐字节一致：" + w2Fix3FirstDiff(na, nb));
+    return w2Fix3SelfCheck(mode, na, nb, stable, rawB);
+  };
+  /** 反向自检（防"归一化把差异洗掉"）：把某个**夹具事实**改一处 → 归一化后必须仍不等。
+   *  只对"现场里真有"的项跑，并如实返回跑过哪些（缺项的由调用方断言覆盖来源）。 */
+  const w2Fix3SelfCheck = (mode, na, nb, stable, rawB) => {
+    const ran = { time: false, uuid: false, digest: false };
+    const present = (v) => Object.values(nb.files).some((t) => String(t).includes(v));
+    // ① 业务时间预置值（登记行的 expires_at）：改成另一个时间必须被逐字比出来
+    const biz = (() => { try { return JSON.parse(rawB.files.registry).projects?.[0]?.expires_at ?? null; } catch { return null; } })();
+    if (typeof biz === "string") {
+      ran.time = true;
+      assert.notDeepEqual({ ...nb, files: { ...nb.files, registry: nb.files.registry.split(biz).join("2030-01-01T00:00:00.000Z") } }, na,
+        mode + "：自检 —— 业务时间预置值（expires_at）改了必须被逐字比出来（没被归一化洗掉）");
+    }
+    // ② 固定夹具 UUID（W1_UUID_* 等）：改掉必须被逐字比出来
+    const uuid = [...stable].find((v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(v) && present(v)) ?? null;
+    if (uuid !== null) {
+      ran.uuid = true;
+      const other = (uuid[0] === "1" ? "2" : "1") + uuid.slice(1);
+      assert.notDeepEqual({ ...nb, files: Object.fromEntries(Object.entries(nb.files).map(([k, v]) => [k, String(v).split(uuid).join(other)])) }, na,
+        mode + "：自检 —— 固定夹具 UUID（" + uuid + "）改了必须被逐字比出来");
+    }
+    // ③ 稳定摘要（夹具自带的长 hex，不在"本次新生成"集合里）：改掉必须被逐字比出来
+    const dig = [...stable].find((v) => /^[0-9a-f]{32,64}$/u.test(v) && present(v)) ?? null;
+    if (dig !== null) {
+      ran.digest = true;
+      const zeroed = "0".repeat(dig.length);
+      assert.notDeepEqual({ ...nb, files: Object.fromEntries(Object.entries(nb.files).map(([k, v]) => [k, String(v).split(dig).join(zeroed)])) }, na,
+        mode + "：自检 —— 稳定摘要改了必须被逐字比出来（旧版把 64-hex / request key 全抹了）");
+    }
+    return ran;
   };
 
-  test("PK2-W2 T7 shadow / never_initialized 下三入口（手动轮转 / cancel / 自动轮转）与 origin/main 落盘字节一致；过期兜底单钉\"分支侧不崩 + 两侧都不产生 m1a-unclean-*\"（main 那条本身是崩的）", () => {
-    const main = w2Fix3MainScripts();
+  test("PK2-W2 T7 shadow / never_initialized 下三入口（手动轮转 / cancel / 自动轮转）与**固定基线 " + W2FIX3_BASELINE + "**（改造前）落盘字节一致；过期兜底单钉\"分支侧不崩 + 不产生 m1a-unclean-*\"（基线那条本身是崩的）", () => {
+    const base = w2Fix3BaselineScripts();
     try {
+      let ran = { time: false, uuid: false, digest: false };
       for (const mode of ["shadow", "never_initialized"]) {
         const x = w1Fixture("w2t7" + (mode === "shadow" ? "s" : "n"), { cutover: false, init: mode === "shadow" });
-        let b = null;
+        let split = null;
         try {
           const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
           const r0 = w1Bind(x, env);
@@ -55130,35 +55144,42 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
           const rc = w2Inbound(x, env, { messageId: "msg_w2t7_claim", content: w2Quote(w2Row(x).pending_token), sessionId: "aily_w2t7" });
           assert.equal(rc.status, 0, mode + "：夹具认领：" + rc.stdout + rc.stderr);
           const genId = (w2Row(x).topic_generation_state.generations ?? []).find((g) => g.status === "active").channel_generation_id;
-          const split = w2Fix3Split(x, env, main.dir);
-          b = split.b;
-          const stepsA = w2Fix3W2Sequence(split.a, { genId });
-          const stepsB = w2Fix3W2Sequence(split.b, { genId });
-          w2Fix3Compare(mode, split.a, split.b, stepsA, stepsB);
-          // 过期兜底**不进逐字节对照**：origin/main 在这条上是崩的（inbound 调 `wireVoid` 却没 import ——
-          //   W2-fix6 已修，Codex 已闭合清单里就列着这一条），所以两边本来就该不同。这里只钉两件事：
-          //   ① 分支侧不崩（没有"入站处理异常终止"）；② **两侧都不产生任何 m1a-unclean-***（P1-a 的靶心）。
-          const expA = w2Fix3ExpiredEntry(split.a);
-          const expB = w2Fix3ExpiredEntry(split.b);
+          const sides = { a: w2Fix3Side(x, env, base.dir), b: w2Fix3Side(x, env, path.resolve(".")) };
+          // 夹具事实（固定 UUID / 稳定摘要 / 预置业务时间）在**本侧跑之前**采集 —— 归一化只替换不在这个集合里的值
+          const stable = w2Fix3Stable(JSON.stringify(w2Fix3State(sides.a)));
+          split = w2Fix3FixtureSplit(x);
+          const stepsA = w2Fix3W2Sequence(sides.a, { genId });
+          const rawA = w2Fix3State(sides.a);
+          split.restore();
+          const stepsB = w2Fix3W2Sequence(sides.b, { genId });
+          const rawB = w2Fix3State(sides.b);
+          const ranNow = w2Fix3Compare(mode, sides, rawA, rawB, stepsA, stepsB, stable);
+          ran = { time: ran.time || ranNow.time, uuid: ran.uuid || ranNow.uuid, digest: ran.digest || ranNow.digest };
+          // 过期兜底**不进逐字节对照**：固定基线的 b9ff7e8 在这条上是崩的（inbound 调 `wireVoid` 却没 import ——
+          //   那正是 W2-fix6 修掉、Codex 已闭合清单里列着的一条），所以两边本来就该不同。
+          //   这里只钉分支侧：不崩（没有"入站处理异常终止"）+ **不产生任何 m1a-unclean-***（P1-a 的靶心）。
+          const expB = w2Fix3ExpiredEntry(sides.b);
           assert.equal(expB.status, 0, mode + "：分支侧过期兜底正常收口（不崩）：" + JSON.stringify(expB).slice(0, 400));
           assert.equal(String(expB.out).includes("入站处理异常终止"), false, mode + "：分支侧不是崩溃回执：" + String(expB.out).slice(0, 300));
-          for (const [who, c] of [["main", split.a], ["branch", split.b]]) {
-            assert.deepEqual(w2Fix3UncleanNames(c), [], mode + " / " + who + "：过期兜底也不得产生任何 m1a-unclean-* 回执：" + JSON.stringify(expA.status) + "/" + JSON.stringify(expB.status));
-          }
+          assert.deepEqual(w2Fix3UncleanNames(sides.b), [], mode + " / branch：过期兜底也不得产生任何 m1a-unclean-* 回执");
         } finally {
-          if (b !== null) { fs.rmSync(b.base, { recursive: true, force: true }); fs.rmSync(b.ledgerRoot, { recursive: true, force: true }); }
+          if (split !== null) split.cleanup();
           x.f.cleanup();
         }
       }
-    } finally { main.cleanup(); }
+      // 三项自检都要在**至少一个模式**里真跑过（shadow 有账本 → 固定 UUID / 稳定摘要都在现场）
+      assert.deepEqual(ran, { time: true, uuid: true, digest: true },
+        "自检覆盖：业务时间 / 固定夹具 UUID / 稳定摘要都必须真跑过：" + JSON.stringify(ran));
+    } finally { base.cleanup(); }
   });
 
-  test("PK2-W3 T5 shadow / never_initialized 下两入口（feishu-unbind 暂停 / bind-project 恢复）与 origin/main 落盘字节一致 + 不产生 m1a-unclean-*", () => {
-    const main = w2Fix3MainScripts();
+  test("PK2-W3 T5 shadow / never_initialized 下两入口（feishu-unbind 暂停 / bind-project 恢复）与**固定基线 " + W2FIX3_BASELINE + "**（改造前）落盘字节一致 + 不产生 m1a-unclean-*", () => {
+    const base = w2Fix3BaselineScripts();
     try {
+      let ran = { time: false, uuid: false, digest: false };
       for (const mode of ["shadow", "never_initialized"]) {
         const x = w1Fixture("w3t5" + (mode === "shadow" ? "s" : "n"), { cutover: false, init: mode === "shadow" });
-        let b = null;
+        let split = null;
         try {
           const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
           // 项目级绑定只能在 never_initialized 端点上建：只把**维护目录**指到空目录（账本/登记表仍用夹具的）
@@ -55166,8 +55187,8 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
           fs.mkdirSync(emptyMaint, { recursive: true, mode: 0o700 });
           const r0 = w3Spawn(x, { ...env, FEISHU_BRIDGE_MAINTENANCE_DIR: emptyMaint }, "bind-project.mjs");
           assert.equal(r0.status, 0, mode + "：夹具建项目级绑定：" + r0.stdout + r0.stderr);
-          const split = w2Fix3Split(x, env, main.dir);
-          b = split.b;
+          const sides = { a: w2Fix3Side(x, env, base.dir), b: w2Fix3Side(x, env, path.resolve(".")) };
+          const stable = w2Fix3Stable(JSON.stringify(w2Fix3State(sides.a)));
           const run = (c) => {
             const steps = [];
             const push = (label, r) => { steps.push({ label, status: r.status, out: String(r.stdout ?? ""), err: String(r.stderr ?? "") }); return r; };
@@ -55175,20 +55196,27 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
             push("resume", w2Fix3Spawn(c, "bind-project.mjs", ["--project", c.proj, "--apply"]));
             return steps;
           };
-          const stepsA = run(split.a);
-          const stepsB = run(split.b);
-          // 恢复真的生效（两侧都是）：登记行不再 suspended
-          const rowA = JSON.parse(fs.readFileSync(split.a.regFile, "utf-8")).projects.find((p) => p.root_message_id);
-          const rowB = JSON.parse(fs.readFileSync(split.b.regFile, "utf-8")).projects.find((p) => p.root_message_id);
-          assert.equal(rowA.status, "active", mode + "：main 侧恢复后登记行是 active：" + JSON.stringify(rowA.status));
+          split = w2Fix3FixtureSplit(x);
+          const stepsA = run(sides.a);
+          const rawA = w2Fix3State(sides.a);
+          const rowA = JSON.parse(fs.readFileSync(sides.a.regFile, "utf-8")).projects.find((p) => p.root_message_id);
+          assert.equal(rowA.status, "active", mode + "：基线侧恢复后登记行是 active：" + JSON.stringify(rowA.status));
+          split.restore();
+          const stepsB = run(sides.b);
+          const rawB = w2Fix3State(sides.b);
+          const rowB = JSON.parse(fs.readFileSync(sides.b.regFile, "utf-8")).projects.find((p) => p.root_message_id);
           assert.equal(rowB.status, "active", mode + "：分支侧恢复后登记行是 active：" + JSON.stringify(rowB.status));
-          w2Fix3Compare(mode, split.a, split.b, stepsA, stepsB);
+          const ranNow = w2Fix3Compare(mode, sides, rawA, rawB, stepsA, stepsB, stable);
+          ran = { time: ran.time || ranNow.time, uuid: ran.uuid || ranNow.uuid, digest: ran.digest || ranNow.digest };
         } finally {
-          if (b !== null) { fs.rmSync(b.base, { recursive: true, force: true }); fs.rmSync(b.ledgerRoot, { recursive: true, force: true }); }
+          if (split !== null) split.cleanup();
           x.f.cleanup();
         }
       }
-    } finally { main.cleanup(); }
+      // 项目级夹具里账本是空的（绑定先于 init）→ 固定 UUID / 稳定摘要两项没有现场，由 T7 的 shadow 面覆盖；
+      //   这里只要求业务时间那一项真跑过。
+      assert.equal(ran.time, true, "自检覆盖：业务时间预置值那一项必须真跑过：" + JSON.stringify(ran));
+    } finally { base.cleanup(); }
   });
 
 }

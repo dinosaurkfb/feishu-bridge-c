@@ -53217,6 +53217,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       const r = w1Bind(x, env);
       assert.equal(r.status, 0, "ENOENT = 空表 → 首跑照常成功：" + r.stdout + r.stderr);
       const reg = x.registry();
+      assert.equal(reg.schema_version, "1.0", "首次写出的登记表保留默认形状（schema_version 1.0，不得漂移成 {projects:[...]}）：" + JSON.stringify({ sv: reg.schema_version, n: reg.projects.length }));
       assert.equal(reg.projects.length, 1, "首跑建了一行：" + JSON.stringify(reg.projects.map((p) => [p.id, p.claude_session_id])));
       assert.equal(reg.projects[0].claude_session_id, W1_UUID_A, "就是这条会话：" + JSON.stringify(reg.projects[0].id));
       const live = Object.values(x.ledger().records).filter((rec) => rec.kind === "live");

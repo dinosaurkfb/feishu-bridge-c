@@ -21,7 +21,6 @@
  * 汇总（唯一判据 `summarizeDoctorChecks`）：任一 false → blocked；无 false 有非布尔（含 null）→
  *   incomplete —— **非布尔 ok 一律视为 unknown，不得当 ready**；全 true → ready。
  * 退出码 0 / 1 / 2 只看 blocked/incomplete。零外部副作用。
- * 零外部副作用。
  *
  * **doctor 自己的代码不写任何文件、不装、不发飞书、不给"一键修复"**：每条 fail 的 next 只能是既有
  * 显式入口的命令，且是预览形式（不带 --apply）。**只读的边界明说**：登记的状态入口脚本是外部代码，

@@ -75,7 +75,10 @@ export function loadRegistryStrict(file = registryPath()) {
   let raw;
   try { raw = fs.readFileSync(file, "utf-8"); }
   catch (err) {
-    if (err.code === "ENOENT") return { ok: true, file, projects: [], missing: true };
+    // PK2-P2-cleanup-fix1（#206 P2）：ENOENT 也要带出**默认形状的 raw** —— 否则首次写出的登记表会
+    //   丢 schema_version:"1.0"（漂移成 {projects:[...]}）。同时盖住 bind-session 的 legacy 写方与
+    //   withRegistryTransaction 的 authoritative 首次创建（唯一根因修在这里，不在调用方各自补）。
+    if (err.code === "ENOENT") return { ok: true, file, raw: { schema_version: "1.0", projects: [] }, projects: [], missing: true };
     return { ok: false, reason: "unreadable", file, error: err.code + ": " + err.message };
   }
   let parsed;

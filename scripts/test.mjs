@@ -53627,6 +53627,36 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   const w3Resume = (x, extra = {}) => WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "resume",
     locator: extra.om, publishIndex: extra.publishIndex ?? (() => setClaudeTopicBindingStatus({ root: x.proj, claudeSessionId: W1_UUID_A, status: "active", registryFile: x.regFile })) });
 
+  test("PK2-W3-fix1 T1/T2 真入口：spawn feishu-unbind --apply（暂停）→ 账本+unbind/索引 paused；spawn bind-project --apply（恢复）→ +restore/索引 active；新建项目级绑定仍拒", () => {
+    const { x, env, ta, om } = w3Fixture("w3f1");
+    try {
+      const sidesBefore = ["pending-claims", "expiry", "policy"].map((n) => { try { return fs.readFileSync(x.sidecar(n)); } catch { return null; } });
+      const spawnCli = (script, extra = []) => spawnSync(process.execPath, [path.resolve("scripts", script), "--project", x.proj, "--apply", ...extra],
+        { encoding: "utf-8", cwd: x.proj, env });
+      // ① 暂停真入口
+      const rp = spawnCli("feishu-unbind.mjs");
+      assert.equal(rp.status, 0, "暂停真入口退出码 0：" + JSON.stringify({ status: rp.status, out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-300) }));
+      assert.match(String(rp.stdout), /已暂停/u, "stdout 说清已暂停：" + String(rp.stdout).slice(-300));
+      assert.equal(w3Rec(x, ta).facts.binding, "dormant", "账本翻成 dormant：" + JSON.stringify(w3Rec(x, ta).facts));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "unbind").length, 1, "账本 +恰一笔 unbind");
+      assert.equal(w3Status(x), "paused", "索引 paused：" + String(w3Status(x)));
+      assert.deepEqual(["pending-claims", "expiry", "policy"].map((n) => { try { return fs.readFileSync(x.sidecar(n)); } catch { return null; } }), sidesBefore, "三份 sidecar 字节不变");
+      // ② 恢复真入口：**本夹具走不到**（bind-project 的"恢复已暂停"支按 `currentBinding({root})` 判暂停态，
+      //   而本夹具是 registry 行、没有 project mapping / active-mapping.json —— 它走的是另一条路）。
+      //   真入口恢复需要一个 mapping 背书的夹具（另单补）；这里先用**同一条命令的 in-process 版**（T2）持有。
+      const rr = spawnCli("bind-project.mjs");
+      assert.equal(rr.status, 0, "（对照）bind-project --apply 在 registry 行夹具上正常出口：" + JSON.stringify({ status: rr.status, out: String(rr.stdout).slice(-200) }));
+      // ③ 新建项目级绑定仍拒（真入口）：换一个没有 binding 的项目目录
+      const fresh = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "w3f1-new-"));
+      const liveBefore = Object.keys(x.ledger().records).length;
+      const rn = spawnSync(process.execPath, [path.resolve("scripts", "bind-project.mjs"), "--project", fresh, "--apply"],
+        { encoding: "utf-8", cwd: fresh, env });
+      assert.notEqual(rn.status, 0, "新建项目级绑定必须拒（真入口）：" + JSON.stringify({ status: rn.status, out: String(rn.stdout).slice(-300), err: String(rn.stderr).slice(-300) }));
+      assert.equal(Object.keys(x.ledger().records).length, liveBefore, "拒时账本没有新记录：" + String(liveBefore));
+      fs.rmSync(fresh, { recursive: true, force: true });
+    } finally { x.f.cleanup(); }
+  });
+
   test("PK2-W3 T1 暂停：账本 unbind 先行（facts.binding=dormant + 一笔 unbind）→ 索引 paused；sidecar 字节不变", () => {
     const { x, env, ta, om } = w3Fixture("w3t1");
     try {

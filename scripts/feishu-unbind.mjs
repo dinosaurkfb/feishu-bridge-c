@@ -20,6 +20,7 @@ import {
   SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
 } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
+import { activeGeneration } from "./topic-generation.mjs";
 import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 
@@ -69,7 +70,10 @@ if (agentUid) {
   // PK2-W3：authoritative → 走 `wirePauseResumeAuthoritative`（账本 unbind 先行 → 索引 paused）；
   //   shadow / 未接入 → 原路径一字未改。
   if (m1aWriteRoute({ endpointId: pauseEndpoint, env: process.env }).mode === "authoritative") {
-    const om = currentBinding({ root, claudeSessionId })?.mapping?.feishu_root_message_id_reference
+    // locator：优先取**活跃代际的根消息**（与 rotate 同口径），否则退回 mapping / 登记行里的引用
+    const stBind = loadClaudeTopicBinding({ root, claudeSessionId });
+    const om = activeGeneration(stBind?.state)?.root_message_id
+      ?? currentBinding({ root, claudeSessionId })?.mapping?.feishu_root_message_id_reference
       ?? currentBinding({ root, claudeSessionId })?.entry?.root_message_id ?? null;
     if (typeof om !== "string" || om.length === 0) {
       console.error("这条绑定没有根消息 locator（定位不到账本记录）：**不写**（先人工核对）。");
@@ -77,7 +81,7 @@ if (agentUid) {
     }
     const wiredAuth = wirePauseResumeAuthoritative({
       endpointId: pauseEndpoint, env: process.env, action: "pause", locator: om,
-      publishIndex: () => setClaudeTopicBindingStatus({ root, claudeSessionId, status: "paused" }),
+      publishIndex: () => setBindingStatus({ root, claudeSessionId, status: SUSPENDED }),
     });
     if (!wiredAuth.ok) {
       console.error("暂停中止（M1a 权威写方拒：" + (wiredAuth.reason ?? "m1a_reject") + (wiredAuth.why ? "；" + wiredAuth.why : "") + "）");

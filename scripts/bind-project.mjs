@@ -25,6 +25,7 @@ import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding, withRegistryTransaction } from "./topic-generation-store.mjs";
+import { activeGeneration } from "./topic-generation.mjs";
 import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
@@ -187,7 +188,9 @@ if (suspended.ok && suspended.suspended) {
     //   **只放开"恢复已暂停的既有 binding"这一支**：新建项目级绑定根本不走这里（runResume 只在既有行上跑）。
     if (m1aWriteRoute({ endpointId: resumeEndpoint, env: process.env }).mode === "authoritative") {
       const cur = currentBinding({ root, claudeSessionId: null });
-      const om = cur?.mapping?.feishu_root_message_id_reference ?? cur?.entry?.root_message_id ?? null;
+      const stR = loadClaudeTopicBinding({ root });
+      const om = activeGeneration(stR?.state)?.root_message_id
+        ?? cur?.mapping?.feishu_root_message_id_reference ?? cur?.entry?.root_message_id ?? null;
       if (typeof om !== "string" || om.length === 0) {
         console.error("这条 binding 没有根消息 locator（定位不到账本记录）：**不写**（先人工核对）。");
         process.exit(1);

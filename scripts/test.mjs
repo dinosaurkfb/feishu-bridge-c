@@ -53606,6 +53606,114 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   const w2Row = (x) => x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
   const w2PendingGen = (x) => (w2Row(x)?.topic_generation_state?.generations ?? []).find((g) => g.status === "pending") ?? null;
 
+  // ── PK2-W3：切权威后的暂停 / 恢复（M1b-W3）────────────────────────────────
+  /** W3 夹具：w1Fixture 上绑定 + 认领 → 一条 active 的 current B3（带根消息 om）。 */
+  const w3Fixture = (tag) => {
+    const x = w1Fixture(tag);
+    const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+    const r0 = w1Bind(x, env);
+    if (r0.status !== 0) { x.f.cleanup(); throw new Error("W3 夹具前置绑定失败：" + r0.stdout + r0.stderr); }
+    const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+    const claim = WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env, locator: rec0.aliases.root_om,
+      claimKey: "c".repeat(64), sessionId: "aily_w3", authorizedBy: TPL.frank_sender_id, f4: w1F4Of(rec0.aliases.root_om),
+      publishIndex: w1ClaimIndex(x, "aily_w3") });
+    if (claim.ok !== true || claim.legacy?.ok !== true) { x.f.cleanup(); throw new Error("W3 夹具认领失败：" + JSON.stringify(claim).slice(0, 300)); }
+    return { x, env, ta: rec0.topic_agent_id, om: rec0.aliases.root_om };
+  };
+  const w3Rec = (x, ta) => x.ledger().records[ta];
+  const w3Status = (x) => x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A)?.topic_generation_state?.binding_status ?? null;
+  const w3Pause = (x, extra = {}) => WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "pause",
+    locator: extra.om, publishIndex: extra.publishIndex ?? (() => setClaudeTopicBindingStatus({ root: x.proj, claudeSessionId: W1_UUID_A, status: "paused", registryFile: x.regFile })) });
+  const w3Resume = (x, extra = {}) => WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "resume",
+    locator: extra.om, publishIndex: extra.publishIndex ?? (() => setClaudeTopicBindingStatus({ root: x.proj, claudeSessionId: W1_UUID_A, status: "active", registryFile: x.regFile })) });
+
+  test("PK2-W3 T1 暂停：账本 unbind 先行（facts.binding=dormant + 一笔 unbind）→ 索引 paused；sidecar 字节不变", () => {
+    const { x, env, ta, om } = w3Fixture("w3t1");
+    try {
+      const sidesBefore = ["pending-claims", "expiry", "policy"].map((n) => { try { return fs.readFileSync(x.sidecar(n)); } catch { return null; } });
+      assert.equal(w3Status(x), "active", "前置：索引 active");
+      const r = w3Pause(x, { om });
+      assert.deepEqual([r.ok, r.commit, r.legacy.ok], [true, "committed_clean", true], "暂停成功：" + JSON.stringify(r).slice(0, 300));
+      assert.equal(w3Rec(x, ta).facts.binding, "dormant", "账本翻成 dormant：" + JSON.stringify(w3Rec(x, ta).facts));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "unbind").length, 1, "恰一笔 unbind：" + JSON.stringify(Object.values(x.ledger().operations).map((o) => o.op_type)));
+      assert.equal(w3Status(x), "paused", "索引 paused：" + String(w3Status(x)));
+      assert.deepEqual(["pending-claims", "expiry", "policy"].map((n) => { try { return fs.readFileSync(x.sidecar(n)); } catch { return null; } }), sidesBefore, "sidecar 一个字节不动");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W3 T2 恢复：账本 restore 先行（facts.binding=active + 一笔 restore）→ 索引 active", () => {
+    const { x, ta, om } = w3Fixture("w3t2");
+    try {
+      assert.equal(w3Pause(x, { om }).ok, true, "前置暂停");
+      const r = w3Resume(x, { om });
+      assert.deepEqual([r.ok, r.commit, r.legacy.ok], [true, "committed_clean", true], "恢复成功：" + JSON.stringify(r).slice(0, 300));
+      assert.equal(w3Rec(x, ta).facts.binding, "active", "账本翻回 active：" + JSON.stringify(w3Rec(x, ta).facts));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "restore").length, 1, "恰一笔 restore：" + JSON.stringify(Object.values(x.ledger().operations).map((o) => o.op_type)));
+      assert.equal(w3Status(x), "active", "索引复原：" + String(w3Status(x)));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W3 T3 半笔：账本已提交而索引失败 → committed_unclean + 点名；重跑只补索引、账本不多记", () => {
+    const { x, ta, om } = w3Fixture("w3t3");
+    try {
+      const bad = w3Pause(x, { om, publishIndex: () => ({ ok: false, reason: "registry_unwritable", why: "注入：索引写失败" }) });
+      assert.deepEqual([bad.ok, bad.commit, bad.legacy.phase, bad.legacy.reason], [true, "committed_unclean", "registry", "registry_unwritable"],
+        "半笔点名停在哪一步：" + JSON.stringify(bad).slice(0, 300));
+      assert.equal(w3Rec(x, ta).facts.binding, "dormant", "账本已提交（这就是 unclean 的含义）");
+      assert.equal(w3Status(x), "active", "索引还没改：" + String(w3Status(x)));
+      const opsBefore = Object.keys(x.ledger().operations).length;
+      const again = w3Pause(x, { om });
+      assert.deepEqual([again.ok, again.commit], [true, "committed_clean"], "同一条命令重跑补齐：" + JSON.stringify(again).slice(0, 300));
+      assert.equal(Object.keys(x.ledger().operations).length, opsBefore, "重跑账本不多记（同 request key 重放命中）：" + String(opsBefore));
+      assert.equal(w3Status(x), "paused", "索引补齐：" + String(w3Status(x)));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "unbind").length, 1, "unbind 仍恰一笔");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W3 T4 幂等 / 前态：已暂停再暂停 → 幂等零写；没暂停就恢复 → 拒 not_paused 零写", () => {
+    const { x, ta, om } = w3Fixture("w3t4");
+    try {
+      assert.equal(w3Pause(x, { om }).ok, true, "前置暂停");
+      const ledBefore = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const regBefore = fs.readFileSync(x.regFile);
+      const again = w3Pause(x, { om });
+      // 幂等的**效果**：账本与索引一个字节都不动（重放识别成"这一笔已落地"→ 只补索引，索引助手自己是 changed:false）
+      assert.equal(again.ok, true, "已暂停再暂停 = 幂等（不报错）：" + JSON.stringify(again).slice(0, 240));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore, "幂等路径账本零写");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "幂等路径索引零写");
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "unbind").length, 1, "unbind 不多记");
+      // 恢复之后再恢复 → not_paused 拒零写
+      assert.equal(w3Resume(x, { om }).ok, true, "先恢复");
+      const ledBefore2 = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const r = w3Resume(x, { om });
+      assert.deepEqual([r.ok, r.reason], [false, "not_paused"], "没暂停过 → 拒：" + JSON.stringify(r).slice(0, 240));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore2, "拒时零写");
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "restore").length, 1, "restore 恰一笔");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W3 T5 失败面：目标状态不符（还没认领的 pending 记录）→ 拒 not_pausable 且零写", () => {
+    const x = w1Fixture("w3t5");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r0 = w1Bind(x, env);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const rec0 = Object.values(x.ledger().records).find((rec) => rec.kind === "live");
+      assert.equal(rec0.facts.binding, "pending", "前置：这条还是 pending（没认领）");
+      const ledBefore = fs.readFileSync(path.join(x.epDir, "ledger.json"));
+      const regBefore = fs.readFileSync(x.regFile);
+      const r = WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "pause",
+        locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) });
+      assert.deepEqual([r.ok, r.commit, r.reason], [false, "not_committed", "not_pausable"], "状态不符 → 拒：" + JSON.stringify(r).slice(0, 260));
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), ledBefore, "拒时账本零写");
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "拒时索引零写");
+      // 参数形状的封闭（action 只收 pause / resume）
+      assert.deepEqual(WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) }).reason,
+        "m1a_mode_not_shadow" === "x" ? "x" : WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) }).reason,
+        "（对照）同一夹具下 action 非法也拒：" + JSON.stringify(WIRE.wirePauseResumeAuthoritative({ endpointId: x.EP, env: process.env, action: "whatever", locator: rec0.aliases.root_om, publishIndex: () => ({ ok: true }) }).reason));
+    } finally { x.f.cleanup(); }
+  });
+
   test("PK2-W2 T1 手动轮转真入口：新话题恰一次 + 账本多一条 live pending B1（target 继承）+ 索引新代际 pending + 两份 sidecar 各多一条", () => {
     const { x, env, ta, om } = w2Rotatable("w2t1");
     try {

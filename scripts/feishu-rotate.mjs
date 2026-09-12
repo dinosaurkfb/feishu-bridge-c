@@ -237,7 +237,27 @@ const wired = writeRoute.mode === "authoritative"
         if (phase === "inspect") {
           // 只读：这里只回答"那条过期 pending 能不能在本笔里退休"（未过期 / 别人的 pending → null，交给账本侧判）
           const blk = pendingRotationBlocker(st.state);
-          const sup = blk.kind === "expired" ? { opId: rot?.operation_id ?? null, rootOm: blk.pending?.root_message_id ?? null, generation: blk.pending?.generation ?? null } : null;
+          let sup = blk.kind === "expired" ? { opId: rot?.operation_id ?? null, rootOm: blk.pending?.root_message_id ?? null, generation: blk.pending?.generation ?? null } : null;
+          // P1-3 崩溃窗（W2-fix5）：上一轮可能"索引侧已退休（PREPARING 也写了）而账本 void 还没提交"就崩了。
+          //   那种现场索引里已经没有 pending（blocker=none），账本却还有一条 pending —— 重跑会被
+          //   `rotation_pending_exists` **永久卡住**。这里把"账本有 pending、索引里**根本没有这一代**"
+          //   识别成"可退休的孤儿 pending"：把它交给账本侧按 expired 作废（指数退休已经在上一轮做过了）。
+          if (sup === null && blk.kind === "none") {
+            const ledPeek = loadByEndpoint(legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid }), { env: process.env });
+            if (ledPeek.ok === true) {
+              const lin = ledPeek.doc.records?.[Object.keys(ledPeek.doc.records).find((k) => ledPeek.doc.records[k]?.kind === "live"
+                && ledPeek.doc.records[k]?.aliases?.root_om === active.root_message_id)]?.generation_lineage_id ?? null;
+              const orphan = lin === null ? null : Object.entries(ledPeek.doc.records).find(([, r]) => r?.kind === "live"
+                && r.facts?.generation === "pending" && r.generation_lineage_id === lin) ?? null;
+              // "索引还认它吗"：只算**未退休**的代际（closePending 把它标 retired 但留在列表里 ——
+              //   留在列表 ≠ 索引仍认它是待认领代际）。
+              const known = new Set((st.state.generations ?? [])
+                .filter((g) => g.status !== "retired").map((g) => g.root_message_id));
+              if (orphan !== null && !known.has(orphan[1].aliases?.root_om)) {
+                sup = { opId: rot?.operation_id ?? null, rootOm: orphan[1].aliases?.root_om ?? null, generation: null, orphan: true };
+              }
+            }
+          }
           return { ok: true, superseded: sup, nextNumber: mine ? nextOf(st.state) : null };
         }
         if (mine) {

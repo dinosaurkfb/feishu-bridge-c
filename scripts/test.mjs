@@ -312,6 +312,7 @@ import {
   setClaudeTopicBindingStatus, reserveClaudeClaimReminder,
   topicGenerationLockDir, withRegistryTransaction,
 } from "./topic-generation-store.mjs";
+import * as TGS from "./topic-generation-store.mjs"; // PK2-W2-fix5：夹具用 closeClaudeTopicRotation 造"索引已退休"的崩溃现场
 import {
   finalizeClaudeDialogueTurn, loadClaudeInteractionPolicy, loadClaudeInteractionPolicyRouted, reserveClaudeDialogueTurn,
   setClaudeInteractionMode,
@@ -53937,6 +53938,32 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
         "归属三项核不过（那笔 create_b1 的 created_id 不是这条 pending）→ 拒、不续跑：" + JSON.stringify(res).slice(0, 280));
       assert.deepEqual(w2LedgerBytes(x), ledgerBefore, "拒时账本零写");
       assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "拒时索引零写");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W2-fix5（一）崩溃窗：索引已退休、账本仍有 pending（freeze→void 之间崩）→ 重跑不被 rotation_pending_exists 卡住、最终一致", () => {
+    const { x, env, ta, om } = w2Rotatable("w2f5a");
+    try {
+      const r1 = w2RotateCli(x, env, ["--apply"]);
+      assert.equal(r1.status, 0, "前置轮转：" + JSON.stringify({ err: String(r1.stderr).slice(-300) }).slice(0, 400));
+      const oldPending = w2Live(x).find((r) => r.id !== ta);
+      assert.deepEqual([oldPending.facts.generation, oldPending.facts.binding], ["pending", "pending"], "前置：账本有一条 pending");
+      const gen = w2PendingGen(x);
+      // 造崩溃现场：**只**退休索引侧那一代 + 关掉 rotation（等价于 supersedeExpired… 写完 PREPARING 后就崩，
+      //   账本 void 从没提交）—— 账本里那条 pending 于是成了"索引不认识的孤儿"。
+      const closed = TGS.closeClaudeTopicRotation({ root: x.proj, claudeSessionId: W1_UUID_A,
+        operationId: w2Row(x).topic_generation_state.rotation.operation_id, reason: "cancelled" });
+      assert.equal(closed.ok, true, "夹具：索引侧退休：" + JSON.stringify(closed).slice(0, 240));
+      assert.equal(w2PendingGen(x), null, "索引里已经没有 pending 代际");
+      assert.equal(w2Live(x).find((r) => r.id === oldPending.id).facts.binding, "pending", "账本里那条仍是 pending（孤儿）");
+      // 重跑：不被卡住，且把孤儿按 expired 作废掉、再建新的一代
+      const r2 = w2RotateCli(x, env, ["--apply"]);
+      assert.equal(r2.status, 0, "重跑不被 rotation_pending_exists 卡住：" + JSON.stringify({ status: r2.status, err: String(r2.stderr).slice(-400) }).slice(0, 600));
+      assert.equal(x.ledger().records[oldPending.id].kind, "voided_audit", "孤儿被作废（账本 void）：" + String(x.ledger().records[oldPending.id].kind));
+      assert.equal(Object.values(x.ledger().operations).filter((op) => op.op_type === "void").length, 1, "恰一笔 void(expired)");
+      const fresh = w2PendingGen(x);
+      assert.ok(fresh, "重跑建出了新的 pending 代际：" + JSON.stringify((w2Row(x).topic_generation_state.generations ?? []).map((g) => [g.generation, g.status])));
+      assert.equal(w2Live(x).filter((r) => r.facts.binding === "pending").length, 1, "账本恰一条 pending：" + JSON.stringify(w2Live(x).map((r) => [r.facts.generation, r.facts.binding])));
     } finally { x.f.cleanup(); }
   });
 

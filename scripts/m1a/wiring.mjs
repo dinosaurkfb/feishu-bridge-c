@@ -670,7 +670,8 @@ export function wireRotateAuthoritative({
         const kSv = rk("void", prep.supersededVoid.opId ?? operationId, prep.supersededVoid.b1Id);
         if (!kSv.ok) return { op: "void", ok: false, reason: kSv.reason ?? "bad_external_id", why: kSv.why ?? null };
         // P1-1：1.1+ 账本的 void(expired) 要**双键 CAS** —— 双键从锁内那条 pending 记录逐字取。
-        const svRec = L.doc.records?.[prep.supersededVoid.b1Id] ?? null;
+        // 锁内重读（`L` 只在 prepare 作用域里，这里取同一时刻的记录拿双键）
+        const svRec = (loadByEndpoint(endpointId, { env }).doc?.records ?? {})[prep.supersededVoid.b1Id] ?? null;
         const sv = capture("void", voidPending({ endpointId, requestKey: kSv.request_key, b1Id: prep.supersededVoid.b1Id, reason: "expired",
           expectedHandle: svRec?.selection_handle ?? null, expectedExpiresAt: svRec?.handle_expires_at ?? null, env }));
         if (sv.ok !== true) return { ...sv, op: "void" };

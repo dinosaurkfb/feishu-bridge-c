@@ -52,7 +52,7 @@ import { loadChainTemplate } from "./chain-template.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
-import { decideInboundDeliveryTarget, appendShadowDivergenceNote } from "./m1a/delivery-target.mjs";
+import { decideInboundDeliveryTarget, decideLedgerRoute, appendShadowDivergenceNote } from "./m1a/delivery-target.mjs";
 import { readExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）读侧
 import { appendChannelSample, channelDisposition } from "./channel-samples.mjs";
 import {
@@ -662,23 +662,36 @@ const endpointForLedger = legacyEndpointId({ runtime: "claude", agentUid: bootTp
 //   让 R66 投递层统一拒收（与 policy 读点「延后拒」同一裁定）。
 // store 读不出 → **fail-closed 拒收**（reason 与投递层同码），绝不回退冻结的 legacy 值。
 let expiryInput = null;
-const expiryRouteMode = m1aWriteRoute({ endpointId: endpointForLedger, env: process.env }).mode;
+// P1-2：判源与 I1/R66 **同一份矩阵**（收据 × 账本 authority_mode）—— 只看收据会把"收据说 cutover、
+//   账本其实还是 shadow"这类交叉不符当成 authoritative 放过去。
+const expiryReceiptForRoute = (() => {
+  const dir = maintenanceDir(process.env);
+  return (typeof dir === "string" && dir.length > 0)
+    ? endpointReceipt(dir, endpointForLedger) : { ok: false, state: "unreadable", why: "维护目录不可派生" };
+})();
+const expiryRouteMode = decideLedgerRoute({ receipt: expiryReceiptForRoute, endpointId: endpointForLedger, env: process.env }).mode;
+const expiryReject = (why) => {
+  writeReceipt("expiry-store-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
+    status: "error", reason: "ledger_route_unavailable", why,
+    message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
+  });
+  finish("error", { detail: "到期判据不可用（" + why + "），这条消息拒收（不回退 legacy）" }, { reason: "ledger_route_unavailable" });
+};
 if (expiryRouteMode === "reject") {
-  // 判源不明：按上面那条裁定延后拒（不回退 legacy、也不读 sidecar）。
+  // 判源不可用（收据坏 / cutover 与账本模式交叉不符）：**不在到期层下结论** —— 不回落 legacy、也不按 sidecar 判，
+  //   交 R66 投递层统一按 `ledger_route_unavailable` 拒收（PK2-I1 T7 的裁定：延后拒的形状，claim 走 .failed 终态）。
+  //   P1-2 改的是**判源**（收据 × 账本矩阵，不是只看收据），不是这一层的处置。
   expiryInput = { source: EXPIRY_SOURCE.SIDECAR, iso: null };
 } else if (expiryRouteMode === "authoritative") {
   const target = resolveExpiryTarget({ endpointId: endpointForLedger, locator: rootOmForLedger, env: process.env });
   if (target.ok !== true) {
-    // 记录定位不了：不是到期问题，交给 R66 投递层按 ledger_route_unavailable 拒（那里有完整判据）。
-    expiryInput = { source: EXPIRY_SOURCE.SIDECAR, iso: null };
+    // P1-1：定位不到这条绑定的 live B = **缺失的授权事实**，不是"没设到期" → 拒。
+    expiryReject("按根消息定位不到这条绑定的 live B（" + String(target.reason ?? "unknown") + "）");
   } else {
     const entry = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: target.topicAgentId, env: process.env });
     if (entry.ok !== true) {
-      writeReceipt("expiry-store-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
-        status: "error", reason: "ledger_route_unavailable", why: entry.why ?? null,
-        message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
-      });
-      finish("error", { detail: "权威到期账本读不出，这条消息拒收（不回退 legacy）" }, { reason: "ledger_route_unavailable" });
+      // P1-1：store 读不出 / 文件缺席 / 缺条目 —— 都拒（缺条目不许当"永不过期"）。
+      expiryReject(String(entry.why ?? entry.reason ?? "权威到期读不出"));
     }
     expiryInput = { source: EXPIRY_SOURCE.SIDECAR, iso: entry.iso };
   }

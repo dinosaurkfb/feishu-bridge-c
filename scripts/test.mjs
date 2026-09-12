@@ -47052,6 +47052,10 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => Date.parse("2026-09-20T00:00:00.000Z") });
     if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
     assert.ok(b1.ok, "B1 夹具：" + JSON.stringify(b1));
+    // PK2-I2-fix1 P1-1：cutover 之后 expiry.json 必须在场、且覆盖每条 live B —— 这份夹具少了它，
+    //   到期层会先按「缺失授权事实」拒收，T7–T11 想测的投递路径就走不到。补上权威条目。
+    fs.writeFileSync(path.join(epDir, "expiry.json"), JSON.stringify({
+      schema_version: "expiry-1", endpoint_id: endpoint, entries: { [b1.result.created_id]: "2099-01-01T00:00:00.000Z" } }, null, 2) + "\n", { mode: 0o600 });
     // 收据夹具：init journal（终态）→ 恰好 init-only；surgeryCutoverJournal 造 cutover 终态
     const initTok = "00000000-0000-4000-8000-0000000006e1";
     const ats = "2026-09-20T00:00:00.000Z"; const sha = "b".repeat(64);
@@ -53386,9 +53390,10 @@ test("PK2-I4-fix3 P2：失败格式化输出 lockUncleared 一行（lock_state /
 const I2_ISO_FUTURE = "2099-01-01T00:00:00.000Z";
 const I2_ISO_PAST = "2020-01-01T00:00:00.000Z";
 const I2_TA = "ta_" + "9".repeat(32);
+const I2_TA2 = "ta_" + "8".repeat(32);   // 同 lineage 的历史 B4（P1-3 续期覆盖范围的反例用）
 
 /** 极简账本夹具：真蓝图（initPlan → migrateSeed → cutoverPlan）+ 真收据 journal + 一条**项目级** live 记录。 */
-function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = true, noReceipts = false, expiryEntries = null } = {}) {
+function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = true, noReceipts = false, expiryEntries = null, secondLive = false } = {}) {
   const m = doctorMachine();
   const proj = m.project("good", { expiresAt: I2_ISO_FUTURE });
   const OM = "om_I2Root";                       // registry 行的 root_message_id 必须与账本记录的 aliases.root_om 同一个
@@ -53414,11 +53419,13 @@ function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = t
   const ip = TAL.initPlan({ endpointId: EP, chain: "claude", requestKey: "rk_init", operationId: initOpId });
   assert.equal(ip.ok, true, JSON.stringify(ip));
   write600(ledgerFile, JSON.stringify(ip.doc, null, 2) + "\n");
+  const i2Cand = (id, om, session, generation) => ({ topic_agent_id: id, chat_id: TPL.chat_id, aliases: { session_id: session, root_om: om },
+    facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation },
+    binding_target: { runtime: "claude", project_root: proj, claude_session_id: null },
+    generation_lineage_id: "lin_i2", legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null });
   const seed = TAL.migrateSeed({ endpointId: EP, requestKey: "rk_seed", authorizedBy: TPL.frank_sender_id, now: Date.parse(at), env,
-    candidates: [{ topic_agent_id: I2_TA, chat_id: TPL.chat_id, aliases: { session_id: "sess_i2", root_om: OM },
-      facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
-      binding_target: { runtime: "claude", project_root: proj, claude_session_id: null },
-      generation_lineage_id: "lin_i2", legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null }] });
+    candidates: [i2Cand(I2_TA, OM, "sess_i2", "current"),
+      ...(secondLive ? [i2Cand(I2_TA2, "om_I2Hist", "sess_i2_hist", "historical")] : [])] });
   assert.equal(seed.ok, true, JSON.stringify(seed));
   // 收据 journal（suffix 必须与 operation_kind 一致；token 必须等于账本里那笔 op id —— ⑬ 要核不可变事务祖先）
   const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
@@ -53474,7 +53481,7 @@ function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = t
   };
 }
 
-test("PK2-I2 T1 store 薄壳：非法 iso 拒（盘上不变）；null 删条目；缺席=没设到期；0644 读不出", () => {
+test("PK2-I2 T1 store 薄壳：非法 iso 拒（盘上不变）；null 删条目；**缺席/缺条目 = 缺失事实（ok:false）**；0644 读不出", () => {
   const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i2-store-"));
   const ledgerRoot = path.join(base, "ledger");
   const EP = "endpoint_" + "c".repeat(24);
@@ -53484,8 +53491,10 @@ test("PK2-I2 T1 store 薄壳：非法 iso 拒（盘上不变）；null 删条目
   const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
   try {
     process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
-    // ① 缺席不是故障：没设到期
-    assert.deepEqual(readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env }), { ok: true, present: false, iso: null }, "缺席 = 没设到期");
+    // ① P1-1：**缺席 ≠ 没设到期** —— 薄壳如实报「缺」（ok:false + 点名缺席），由调用方 fail-closed 拒。
+    const abs1 = readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env });
+    assert.deepEqual([abs1.ok, abs1.absent, abs1.reason], [false, true, "expiry_store_absent"], "文件缺席 → ok:false：" + JSON.stringify(abs1));
+    assert.match(String(abs1.why), /缺席/u, "why 说清是缺席：" + String(abs1.why));
     // ② 合法写入 + 读回
     const w1 = mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: I2_ISO_FUTURE }) });
     assert.deepEqual([w1.ok, w1.changed, w1.iso], [true, true, I2_ISO_FUTURE], "写入：" + JSON.stringify(w1));
@@ -53500,7 +53509,8 @@ test("PK2-I2 T1 store 薄壳：非法 iso 拒（盘上不变）；null 删条目
     // ④ null → 删条目
     const w3 = mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: null }) });
     assert.deepEqual([w3.ok, w3.changed], [true, true], "删条目：" + JSON.stringify(w3));
-    assert.equal(readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env }).present, false, "删完读回是缺席");
+    const afterDel = readExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env });
+    assert.deepEqual([afterDel.ok, afterDel.reason], [false, "expiry_entry_absent"], "删完读回 = 缺条目（ok:false，不是「没设到期」）：" + JSON.stringify(afterDel));
     // ⑤ 0644 → 读不出（fail-closed 的那一半）
     mutateExpiryEntry({ endpointId: EP, topicAgentId: I2_TA, env, mutate: () => ({ ok: true, changed: true, value: I2_ISO_FUTURE }) });
     fs.chmodSync(file, 0o644);
@@ -53517,13 +53527,13 @@ test("PK2-I2 T1 store 薄壳：非法 iso 拒（盘上不变）；null 删条目
   }
 });
 
-test("PK2-I2 T2 authoritative：续期写 expiry.json（registry 字节不变）；入站按它判（条目过期→拒，缺条目→放行）", () => {
+test("PK2-I2 T2 authoritative：续期写 expiry.json（registry 字节不变）；入站按它判（条目过期→拒，**缺条目→也拒**〔P1-1 反例〕）", () => {
   const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
   try {
     const regBefore = fs.readFileSync(fx.m.files.registry);
     // ① 续期：真入口 → 写权威 expiry.json
     const ren = fx.runRenew();
-    assert.equal(ren.status, 0, "续期成功：" + ren.stdout + ren.stderr);
+    assert.equal(ren.status, 0, "续期成功：" + JSON.stringify({ status: ren.status, out: String(ren.stdout).slice(-400), err: String(ren.stderr).slice(0, 800) }));
     assert.match(ren.stdout, /ledger\/<endpoint>\/expiry\.json/u, "文案要说清写到了哪份文件：" + ren.stdout);
     const entry = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env });
     assert.equal(entry.ok, true, "读回权威条目：" + JSON.stringify(entry));
@@ -53539,11 +53549,22 @@ test("PK2-I2 T2 authoritative：续期写 expiry.json（registry 字节不变）
     // ③ 入站：**删掉条目**（= 没设到期）→ 不再因到期被拒（legacy 的 expires_at 是多少都不看）
     const del = mutateExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env, mutate: () => ({ ok: true, changed: true, value: null }) });
     assert.equal(del.ok, true, "夹具：删条目：" + JSON.stringify(del));
+    const claimsBefore2 = [path.join(fx.m.home, ".claude", "feishu-bridge", "inbound", "delivery-claims"),
+      path.join(fs.realpathSync(fx.proj), ".runtime-data", "inbound", "delivery-claims")]
+      .map((d) => (fs.existsSync(d) ? fs.readdirSync(d).length : 0));
     const r2 = fx.runInbound("msg_i2_b");
-    // 这一条的**到期闸**必须放行：不许出现 mapping_expired（它后面被投递层按别的原因拒是另一回事）
+    // P1-1 反例：**缺条目 ≠ 永不过期** —— 拒，且是 fail-closed 那条码（不是靠 legacy 判过期）
     assert.deepEqual(fx.rejectReasonsFor("msg_i2_b").filter((x) => x === "mapping_expired"), [],
-      "缺条目 = 没设到期 → 不许按过期拒：" + JSON.stringify(fx.rejectReasonsFor("msg_i2_b")) + " || " + r2.stdout.slice(0, 300));
-    assert.doesNotMatch(String(r2.stdout) + String(r2.stderr), /绑定关系已过期/u, "回执/输出里不许出现过期措辞：" + r2.stdout.slice(0, 300));
+      "缺条目不按 legacy 的过期拒（那不是判据）：" + JSON.stringify(fx.rejectReasonsFor("msg_i2_b")) + " || " + r2.stdout.slice(0, 300));
+    const storeRej = fx.receiptsOf("expiry-store-").filter((d) => d.message_id === "msg_i2_b");
+    assert.equal(storeRej.length, 1, "缺条目 → 到期层直接拒（落回执）：" + JSON.stringify(fx.receiptsOf("")) + " || " + r2.stdout.slice(0, 300));
+    assert.equal(storeRej[0].reason, "ledger_route_unavailable", "拒因与 store 读不出同码：" + JSON.stringify(storeRej[0]).slice(0, 240));
+    assert.deepEqual([storeRej[0].claim_acquired, storeRej[0].handed_off], [false, false], "回执如实说没 claim 没投递：");
+    assert.equal(r2.status, 1, "入口受控 error 出口（非零）：" + JSON.stringify({ status: r2.status, out: String(r2.stdout).slice(0, 200) }));
+    const claimsAfter2 = [path.join(fx.m.home, ".claude", "feishu-bridge", "inbound", "delivery-claims"),
+      path.join(fs.realpathSync(fx.proj), ".runtime-data", "inbound", "delivery-claims")]
+      .map((d) => (fs.existsSync(d) ? fs.readdirSync(d).length : 0));
+    assert.deepEqual(claimsAfter2, claimsBefore2, "缺条目被拒时**不新增 claim**（不是放过去）：");
   } finally { fx.cleanup(); }
 });
 
@@ -53575,11 +53596,28 @@ test("PK2-I2 T4 authoritative + expiry.json 读不出 → 入站拒 ledger_route
     fs.chmodSync(fx.expiryPath, 0o644);              // 受验读拒 0644（父目录 0700 + mode 0600 是合同）
     const before = fx.expiryBytes();
     // ① 入站：store 读不出 → fail-closed 拒（不回退 —— registry 的 expires_at 其实还在有效期内）
+    // claim 目录（两处：机器级 / 项目级，看路由）在跑之前先记数 —— 拒绝必须**不新增 claim**。
+    const claimDirs = [path.join(fx.m.home, ".claude", "feishu-bridge", "inbound", "delivery-claims"),
+      path.join(fs.realpathSync(fx.proj), ".runtime-data", "inbound", "delivery-claims")];
+    const claimCount = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).length : 0);
+    const claimsBefore = claimDirs.map(claimCount);
     const r1 = fx.runInbound("msg_i2_d");
     const receipts = fx.receiptsOf("expiry-store-");
     assert.equal(receipts.length, 1, "store 读不出要落一条回执：" + JSON.stringify(fx.receiptsOf("")) + " || " + r1.stdout.slice(0, 300));
     assert.equal(receipts[0].reason, "ledger_route_unavailable", "拒因与投递层同码：" + JSON.stringify(receipts[0]).slice(0, 300));
     assert.deepEqual(fx.rejectReasons(), [], "不是 verdict 层的过期拒（这一条根本没让对方按 legacy 判）");
+    // **真效果**（K2 刀）：只落一条回执不算拒绝 —— 这条消息必须**没被受理**：
+    //   入口受控 error 出口退出码 1、输出说清拒收、回执如实 claim_acquired/handed_off=false、
+    //   而且**没有 claim 文件**、没有任何受理/投递痕迹。删掉那条 finish 后 entry.iso 是 undefined
+    //   → 到期闸把它当"没设到期"放行 → 这里会看到退出码 0 + claim 文件（实测过）。
+    assert.equal(r1.status, 1, "入口受控 error 出口（退出码 1；放开这条 finish 就会变 0）："
+      + JSON.stringify({ status: r1.status, out: String(r1.stdout).slice(0, 200), err: String(r1.stderr).slice(0, 200) }));
+    assert.match(String(r1.stdout), /拒收|系统错误/u, "输出说清这条消息被拒：" + String(r1.stdout).slice(0, 300));
+    assert.deepEqual([receipts[0].claim_acquired, receipts[0].handed_off], [false, false], "回执如实说没 claim、没投递：" + JSON.stringify(receipts[0]).slice(0, 240));
+    assert.deepEqual(claimDirs.map(claimCount), claimsBefore, "这次入站没有新增任何 claim 文件（两处 delivery-claims 计数不变）");
+    const allReceipts = fs.existsSync(fx.projectReceipts) ? fs.readdirSync(fx.projectReceipts) : [];
+    assert.deepEqual(allReceipts.filter((n) => n.includes("msg_i2_d") && !n.startsWith("expiry-store-")), [],
+      "除那条 expiry-store 回执外没有任何受理/投递痕迹：" + JSON.stringify(allReceipts));
     // ② 续期：写拒（不许把 0644 改回、也不许拿 legacy 兜底）
     const regBefore = fs.readFileSync(fx.m.files.registry);
     const ren = fx.runRenew();
@@ -53590,7 +53628,7 @@ test("PK2-I2 T4 authoritative + expiry.json 读不出 → 入站拒 ledger_route
   } finally { fx.cleanup(); }
 });
 
-test("PK2-I2 T5 判源不明（收据读不出）：到期闸不在这一层下结论 —— 不回退 legacy、不按 sidecar 判，交 R66 延后拒", () => {
+test("PK2-I2 T5 判源不明（收据读不出）：按矩阵拒 —— 不回退 legacy、不按 sidecar 判、不 claim 不投递", () => {
   // 两条路都会判过期（registry 的 expires_at 与 sidecar 条目都设成过去）——只要出现 mapping_expired
   // 就说明我们在判源不明时**回退**了某一份冻结事实。期望：延后到 R66，回执码 ledger_route_unavailable。
   const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_PAST } });
@@ -53604,9 +53642,11 @@ test("PK2-I2 T5 判源不明（收据读不出）：到期闸不在这一层下�
     const r = fx.runInbound("msg_i2_e");
     assert.deepEqual(fx.rejectReasonsFor("msg_i2_e").filter((x) => x === "mapping_expired"), [],
       "判源不明时不许按过期拒（那等于回退某一份冻结事实）：" + JSON.stringify(fx.rejectReasonsFor("msg_i2_e")) + " || " + r.stdout.slice(0, 300));
-    const routed = fx.receiptsOf("ledger-route-").filter((d) => d.message_id === "msg_i2_e");
-    assert.equal(routed.length, 1, "必须由 R66 投递层延后拒（ledger-route 回执）：" + JSON.stringify(fx.receiptsOf("")) + " || " + r.stdout.slice(0, 300));
-    assert.equal(routed[0].reason, "ledger_route_unavailable", "拒因与投递层同码：" + JSON.stringify(routed[0]).slice(0, 300));
+    // P1-2：判源不可用 → 本层直接拒（也可以由 R66 层拒）——**效果**是同一条码、零写、未 claim/未投递。
+    const rej = [...fx.receiptsOf("expiry-store-"), ...fx.receiptsOf("ledger-route-")].filter((d) => d.message_id === "msg_i2_e");
+    assert.equal(rej.length, 1, "恰一条拒回执（判源不明 → 交 R66 投递层延后拒）：" + JSON.stringify(fx.receiptsOf("")) + " || " + r.stdout.slice(0, 300));
+    assert.equal(rej[0].reason, "ledger_route_unavailable", "拒因与投递层同码：" + JSON.stringify(rej[0]).slice(0, 300));
+    assert.equal(r.status, 0, "受控拒收（I1 T7 的延后拒形状：走到投递层才拒）：" + JSON.stringify({ status: r.status, out: String(r.stdout).slice(0, 200) }));
   } finally { fx.cleanup(); }
 });
 
@@ -53637,6 +53677,77 @@ test("PK2-I2 T6 authoritative 但账本里定位不到这条记录：续期拒�
   } finally { fx.cleanup(); }
 });
 
+
+test("PK2-I2 T8 P1-2 交叉不符（收据 cutover 但账本仍 shadow）→ 续期**零写拒**、入站拒（不落回 legacy）", () => {
+  const fx = i2Fixture({ cutover: true, authoritative: false, expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const regBefore = fs.readFileSync(fx.m.files.registry);
+    const expBefore = fx.expiryBytes();
+    const ren = fx.runRenew();
+    assert.equal(ren.status, 1, "交叉不符 → 续期非零退出：" + JSON.stringify({ out: String(ren.stdout).slice(-200), err: String(ren.stderr).slice(0, 300) }));
+    assert.match(String(ren.stderr), /判源不可用|交叉核不过/u, "说清拒因：" + String(ren.stderr).slice(0, 300));
+    assert.deepEqual(fs.readFileSync(fx.m.files.registry), regBefore, "**不落回 legacy**：registry 字节不变（这就是 P1-2 要收的那条）");
+    assert.deepEqual(fx.expiryBytes(), expBefore, "sidecar 也不动（零写）");
+    // 入站同样拒（同码 + 未 claim 未投递）
+    const claimsBefore = [path.join(fx.m.home, ".claude", "feishu-bridge", "inbound", "delivery-claims"),
+      path.join(fs.realpathSync(fx.proj), ".runtime-data", "inbound", "delivery-claims")].map((d) => (fs.existsSync(d) ? fs.readdirSync(d).length : 0));
+    const r = fx.runInbound("msg_i2_t8");
+    const rej = [...fx.receiptsOf("expiry-store-"), ...fx.receiptsOf("ledger-route-")].filter((d) => d.message_id === "msg_i2_t8");
+    assert.equal(rej.length, 1, "入站拒（一条回执）：" + JSON.stringify(fx.receiptsOf("")) + " || " + r.stdout.slice(0, 300));
+    assert.equal(rej[0].reason, "ledger_route_unavailable", "拒因：" + JSON.stringify(rej[0]).slice(0, 200));
+    assert.equal(r.status, 0, "受控拒收：" + JSON.stringify({ status: r.status, out: String(r.stdout).slice(0, 200) }));
+    assert.deepEqual(fs.readFileSync(fx.m.files.registry), regBefore, "入站这一路也没回退去写 legacy（registry 仍逐字不变）");
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2 T9 P1-3 续期覆盖**整条 lineage**：current + 历史 B4 两条条目都更新；别的 lineage 字节不变；经 outer 锁串行", () => {
+  const fx = i2Fixture({ secondLive: true, expiryEntries: { [I2_TA]: I2_ISO_FUTURE, [I2_TA2]: I2_ISO_FUTURE } });
+  try {
+    const before = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA2, env: fx.env });
+    assert.deepEqual([before.ok, before.iso], [true, I2_ISO_FUTURE], "夹具：历史 B4 也有条目：" + JSON.stringify(before));
+    const ren = fx.runRenew();
+    assert.equal(ren.status, 0, "续期成功：" + JSON.stringify({ status: ren.status, err: String(ren.stderr).slice(0, 400) }));
+    const a = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env });
+    const b = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA2, env: fx.env });
+    assert.equal(a.ok && b.ok, true, "两条都读得回：" + JSON.stringify([a, b]));
+    assert.equal(a.iso, b.iso, "current 与历史 B4 的条目**同一次事务**里都换成新值：" + JSON.stringify([a.iso, b.iso]));
+    assert.notEqual(a.iso, I2_ISO_FUTURE, "确实换了新值：" + String(a.iso));
+    const days = (Date.parse(a.iso) - Date.now()) / 86400000;
+    assert.ok(days > 360 && days < 370, "新值 ≈ 一年后：" + String(a.iso) + "（" + days.toFixed(1) + " 天）");
+    // 别的 lineage 不受影响 + 文案说清覆盖了几条
+    assert.match(String(ren.stdout), /共 2 条 live B/u, "文案说清覆盖范围：" + String(ren.stdout).slice(-200));
+    assert.equal(fs.readdirSync(fx.epDir).filter((n) => n.endsWith(".lock")).length, 0, "outer 锁（m1a-order）已交还，无残骸：" + JSON.stringify(fs.readdirSync(fx.epDir)));
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2 T7 expiryGate 纯判据逐支（纵深支直调）：sidecar 非法 iso → 拒、null → 放行、未知 source → 拒；legacy 口径一字不改", () => {
+  const NOW = Date.parse("2026-09-01T00:00:00.000Z");
+  // ① sidecar：iso 不是时间 → 拒（纵深支；真入口到不了这里 —— expiry-store 薄壳先拒非法 iso）
+  const bad = expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: "not-a-date" }, now: NOW });
+  assert.deepEqual([bad.ok, bad.source, bad.at], [false, EXPIRY_SOURCE.SIDECAR, null], "非法 iso → 拒：" + JSON.stringify(bad));
+  assert.match(String(bad.why), /不是时间/u, "why 要点名「不是时间」：" + String(bad.why));
+  // ② sidecar：null / 缺省 = 没设到期 → 放行（2026-08-28 的决定）
+  assert.deepEqual(expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: null }, now: NOW }), { ok: true, source: EXPIRY_SOURCE.SIDECAR, at: null },
+    "null = 没设到期：");
+  assert.equal(expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR }, now: NOW }).ok, true, "iso 缺省同 null：");
+  // ③ 未知 source → 拒（fail-closed：既不当 legacy，也不当「没设到期」）
+  const unknown = expiryGate({ expiry: { source: "somewhere", iso: "2099-01-01T00:00:00.000Z" }, mapping: { expires_at: "2099-01-01T00:00:00.000Z" }, now: NOW });
+  assert.deepEqual([unknown.ok, unknown.source, unknown.at], [false, "somewhere", null], "未知 source → 拒：" + JSON.stringify(unknown));
+  assert.match(String(unknown.why), /来源不认识/u, "why 点名来源：" + String(unknown.why));
+  // ④ sidecar 的两个时点
+  const fut = expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: "2099-01-01T00:00:00.000Z" }, now: NOW });
+  assert.deepEqual([fut.ok, fut.at], [true, Date.parse("2099-01-01T00:00:00.000Z")], "未来 → 放行并给 at：" + JSON.stringify(fut));
+  assert.equal(expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: "2020-01-01T00:00:00.000Z" }, now: NOW }).ok, false, "过去 → 拒：");
+  // ⑤ legacy 口径（main 行为一字不改）
+  const legBad = expiryGate({ mapping: { expires_at: "nope" }, now: NOW });
+  assert.deepEqual([legBad.ok, legBad.source], [false, EXPIRY_SOURCE.LEGACY], "legacy 非法 → 拒：" + JSON.stringify(legBad));
+  assert.equal(expiryGate({ mapping: {}, now: NOW }).ok, false, "legacy 缺 expires_at → 拒（配错不是过期）：");
+  assert.equal(expiryGate({ mapping: { expires_at: "2099-01-01T00:00:00.000Z" }, now: NOW }).ok, true, "legacy 未来 → 放行：");
+  assert.equal(expiryGate({ mapping: { expires_at: "2020-01-01T00:00:00.000Z" }, now: NOW }).ok, false, "legacy 过去 → 拒：");
+  // ⑥ 两条判据互不串：sidecar 判据在场时**完全不看** mapping.expires_at
+  assert.equal(expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: null }, mapping: { expires_at: "2020-01-01T00:00:00.000Z" }, now: NOW }).ok, true,
+    "sidecar 判据在场时不看 legacy 的 expires_at：");
+});
 
 sealSummary();
 

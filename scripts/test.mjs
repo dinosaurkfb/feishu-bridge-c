@@ -54922,31 +54922,69 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   //   新指纹 / 子进程 pid / 本次写入的时间戳）；夹具事实（固定 UUID、稳定摘要、预置业务时间）**逐字比**。
   const W2FIX3_BASELINE = "b9ff7e8";   // 改造前基线（W2/W3 的分叉点；W2 与 main 的 merge-base 就是它）
   const W2FIX3_PAST = "2020-01-01T00:00:00.000Z";   // 过期兜底写入的业务时间预置值（两侧逐字比）
-  const W2FIX3_ID_PATTERNS = [
-    [/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu, "<UUID>"],   // 新 op id / origin op id
-    [/m1a_[0-9a-f]{40}/gu, "<RK>"],                                                  // 新 request key
-    [/om_[0-9a-f]{24}/gu, "<OM>"],                                                   // 新话题 om
-    [/ta_[0-9a-f]{32}/gu, "<TA>"],                                                   // 新 B1 的 topic_agent_id
-    [/(?:osh|orh|rfh)_[0-9a-f]{32}/gu, "<HANDLE>"],                                  // 新 handle
-    [/\b[0-9a-f]{64}\b/gu, "<SHA256>"],                                              // 新指纹（输入含新 op id）
-    [/\b\d{13}\b/gu, "<MS>"],                                                        // 本次写入的毫秒时间戳（回执名等）
+  const W2FIX3_NUMBERED_PATTERNS = [
+    [/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu, "UUID"],   // 新 op id / origin op id
+    [/m1a_[0-9a-f]{40}/gu, "RK"],                                                  // 新 request key
+    [/om_[0-9a-f]{24}/gu, "OM"],                                                   // 新话题 om
+    [/ta_[0-9a-f]{32}/gu, "TA"],                                                   // 新 B1 的 topic_agent_id
+    [/(?:osh|orh|rfh)_[0-9a-f]{32}/gu, "HANDLE"],                                  // 新 handle
+    [/\b[0-9a-f]{64}\b/gu, "SHA256"],                                              // 新指纹（输入含新 op id）
+    [/\b\d{13}\b/gu, "MS"],                                                        // 本次写入的毫秒时间戳（回执名等）
   ];
   const W2FIX3_ISO_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/gu;
   /** pre-run 现场里**已经存在**的身份/时间值 = 夹具事实（固定 UUID W1_UUID_*、夹具摘要、预置业务时间）。 */
   const w2Fix3Stable = (text) => {
     const out = new Set();
-    for (const [re] of W2FIX3_ID_PATTERNS) for (const m of String(text).matchAll(re)) out.add(m[0]);
+    for (const [re] of W2FIX3_NUMBERED_PATTERNS) for (const m of String(text).matchAll(re)) out.add(m[0]);
     for (const m of String(text).matchAll(W2FIX3_ISO_RE)) out.add(m[0]);
     return out;
   };
-  /** 收窄版归一化：只把**本次运行新生成**的值换成占位符；夹具值逐字比（业务时间预置值也因此逐字比）。 */
-  const w2Fix3Normalize = (text, stable) => {
-    let s = String(text);
-    for (const [re, ph] of W2FIX3_ID_PATTERNS) s = s.replace(re, (m) => (stable.has(m) ? m : ph));
-    s = s.replace(W2FIX3_ISO_RE, (m) => (stable.has(m) ? m : "<TS>"));
-    s = s.replace(/"pid":\s*\d+/gu, '"pid":<PID>');            // 子进程 pid：本来就不同
-    s = s.replace(/-\d{1,7}\.json/gu, "-<PID>.json");           // 回执文件名里的 <ts>-<pid>.json
-    return s;
+  /** 每一侧的编号归一化器：按首次出现顺序给每个不同的新生成实值编号（<UUID#1>、<RK#1> …），该侧所有 stdout / stderr / 文件共用同一映射。 */
+  const w2Fix3MakeSideNormalizer = (stable) => {
+    const valToPlaceholder = new Map();
+    const counts = Object.create(null);
+    const getPh = (val, type) => {
+      if (stable.has(val)) return val;
+      let ph = valToPlaceholder.get(val);
+      if (!ph) {
+        counts[type] = (counts[type] || 0) + 1;
+        ph = "<" + type + "#" + counts[type] + ">";
+        valToPlaceholder.set(val, ph);
+      }
+      return ph;
+    };
+    const normalize = (text) => {
+      let s = String(text);
+      for (const [re, type] of W2FIX3_NUMBERED_PATTERNS) {
+        s = s.replace(re, (m) => getPh(m, type));
+      }
+      s = s.replace(W2FIX3_ISO_RE, (m) => getPh(m, "TS"));
+      s = s.replace(/"pid":\s*\d+/gu, '"pid":<PID>');            // 子进程 pid：本来就不同
+      s = s.replace(/-\d{1,7}\.json/gu, "-<PID>.json");           // 回执文件名里的 <ts>-<pid>.json
+      return s;
+    };
+    return { normalize, valToPlaceholder, counts };
+  };
+  /** 单侧状态与步骤归一化：按确定性顺序（先 steps 的 out/err，再 sorted files，再 sorted names）消费同一归一化器映射。 */
+  const w2Fix3NormSide = (steps, raw, stable) => {
+    const norm = w2Fix3MakeSideNormalizer(stable);
+    const normSteps = (steps ?? []).map((s) => ({
+      label: s.label,
+      status: s.status,
+      out: norm.normalize(s.out),
+      err: norm.normalize(s.err),
+    }));
+    const normFiles = Object.fromEntries(
+      Object.keys(raw.files).sort().map((k) => [k, norm.normalize(raw.files[k])])
+    );
+    const normNames = Object.fromEntries(
+      Object.keys(raw.names).sort().map((k) => [k, raw.names[k].map((n) => norm.normalize(n))])
+    );
+    return {
+      steps: normSteps,
+      state: { files: normFiles, names: normNames },
+      norm,
+    };
   };
   /** 基线（`b9ff7e8`）的 scripts 解到临时目录（只解 scripts/，不带 .git）—— 返回 { dir, cleanup }。 */
   const w2Fix3BaselineScripts = () => {
@@ -55016,10 +55054,6 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       inboundReceipts: w2Fix3List(path.join(c.home, ".claude", "feishu-bridge", "inbound", "receipts")),
     },
   });
-  const w2Fix3NormState = (raw, stable) => ({
-    files: Object.fromEntries(Object.entries(raw.files).map(([k, v]) => [k, w2Fix3Normalize(v, stable)])),
-    names: Object.fromEntries(Object.entries(raw.names).map(([k, v]) => [k, v.map((n) => w2Fix3Normalize(n, stable))])),
-  });
   const w2Fix3UncleanNames = (c) => w2Fix3List(path.join(c.home, ".claude", "feishu-bridge", "receipts")).filter((n) => n.startsWith("m1a-unclean-"));
   /** 自动轮转：driver 子进程调**本侧**的 automatic-topic-rotation（同源码、只换 import 根）。 */
   const w2Fix3Auto = (c, cfg) => {
@@ -55084,25 +55118,30 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     assert.deepEqual(stepsB.map((s) => [s.label, s.status]), stepsA.map((s) => [s.label, s.status]),
       mode + "：每一步退出码一致（列出两侧每步的退出码与 stderr 尾巴）：baseline=" + JSON.stringify(stepsA.map((x) => [x.label, x.status, String(x.err).slice(-260)])) +
       " branch=" + JSON.stringify(stepsB.map((x) => [x.label, x.status, String(x.err).slice(-260)])));
+
+    // 两侧各自建立编号归一化映射，该侧所有 stdout / stderr / 文件共用同一映射
+    const sideA = w2Fix3NormSide(stepsA, rawA, stable);
+    const sideB = w2Fix3NormSide(stepsB, rawB, stable);
+
     for (let i = 0; i < stepsA.length; i += 1) {
-      const oa = w2Fix3Normalize(stepsA[i].out, stable);
-      const ob = w2Fix3Normalize(stepsB[i].out, stable);
+      const oa = sideA.steps[i].out;
+      const ob = sideB.steps[i].out;
       assert.equal(ob, oa, mode + " " + stepsA[i].label + "：stdout 归一化后一致 || baseline=" + oa + " || branch=" + ob);
-      const ea = w2Fix3Normalize(stepsA[i].err, stable);
-      const eb = w2Fix3Normalize(stepsB[i].err, stable);
+      const ea = sideA.steps[i].err;
+      const eb = sideB.steps[i].err;
       assert.equal(eb, ea, mode + " " + stepsA[i].label + "：stderr 归一化后一致 || baseline=" + ea + " || branch=" + eb);
     }
     for (const [who, c] of [["baseline", sides.a], ["branch", sides.b]]) {
       assert.deepEqual(w2Fix3UncleanNames(c), [], mode + " / " + who + "：非权威下不得产生任何 m1a-unclean-* 回执：" + JSON.stringify(w2Fix3State(c).names.receipts));
     }
-    const na = w2Fix3NormState(rawA, stable), nb = w2Fix3NormState(rawB, stable);
+    const na = sideA.state, nb = sideB.state;
     assert.deepEqual(nb, na, mode + "：分支与基线 " + W2FIX3_BASELINE + " 的落盘状态（账本 / 登记表 / 两份 sidecar / mapping / lark 调用 / 回执目录）归一化后必须逐字节一致：" + w2Fix3FirstDiff(na, nb));
-    return w2Fix3SelfCheck(mode, na, nb, stable, rawB);
+    return w2Fix3SelfCheck(mode, na, nb, stable, rawB, stepsB, sideB.norm);
   };
   /** 反向自检（防"归一化把差异洗掉"）：把某个**夹具事实**改一处 → 归一化后必须仍不等。
    *  只对"现场里真有"的项跑，并如实返回跑过哪些（缺项的由调用方断言覆盖来源）。 */
-  const w2Fix3SelfCheck = (mode, na, nb, stable, rawB) => {
-    const ran = { time: false, uuid: false, digest: false };
+  const w2Fix3SelfCheck = (mode, na, nb, stable, rawB, stepsB, normB) => {
+    const ran = { time: false, uuid: false, digest: false, crossId: false };
     const present = (v) => Object.values(nb.files).some((t) => String(t).includes(v));
     // ① 业务时间预置值（登记行的 expires_at）：改成另一个时间必须被逐字比出来
     const biz = (() => { try { return JSON.parse(rawB.files.registry).projects?.[0]?.expires_at ?? null; } catch { return null; } })();
@@ -55127,13 +55166,39 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.notDeepEqual({ ...nb, files: Object.fromEntries(Object.entries(nb.files).map(([k, v]) => [k, String(v).split(dig).join(zeroed)])) }, na,
         mode + "：自检 —— 稳定摘要改了必须被逐字比出来（旧版把 64-hex / request key 全抹了）");
     }
+    // ④ 跨文件新 ID 同一性（Codex #207 五轮 P2-2）：把某个新 ID 的第二处引用换成另一个同形新 ID → 对照必须不相等（防同一性关系被洗掉）
+    if (normB && stepsB) {
+      const newValues = [...normB.valToPlaceholder.keys()];
+      const crossVal = newValues.find((u) => {
+        const filesWithU = Object.keys(rawB.files).filter((k) => String(rawB.files[k]).includes(u));
+        return filesWithU.length >= 2;
+      }) ?? null;
+
+      if (crossVal !== null) {
+        ran.crossId = true;
+        const filesWithU = Object.keys(rawB.files).sort().filter((k) => String(rawB.files[k]).includes(crossVal));
+        const secondFileKey = filesWithU[1];
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(crossVal);
+        const fakeVal = isUuid
+          ? "99999999-9999-4999-8999-999999999999"
+          : (crossVal.slice(0, 4) + "9".repeat(crossVal.length - 4));
+        const tamperedFiles = {
+          ...rawB.files,
+          [secondFileKey]: String(rawB.files[secondFileKey]).split(crossVal).join(fakeVal),
+        };
+        const tamperedRawB = { ...rawB, files: tamperedFiles };
+        const tamperedSideB = w2Fix3NormSide(stepsB, tamperedRawB, stable);
+        assert.notDeepEqual(tamperedSideB.state, na,
+          mode + "：自检 —— 跨文件新 ID（" + crossVal + "）在 " + secondFileKey + " 的第二处引用换成另一个同形新 ID，归一化后必须不相等（防同一性关系被洗掉）");
+      }
+    }
     return ran;
   };
 
   test("PK2-W2 T7 shadow / never_initialized 下三入口（手动轮转 / cancel / 自动轮转）与**固定基线 " + W2FIX3_BASELINE + "**（改造前）落盘字节一致；过期兜底单钉\"分支侧不崩 + 不产生 m1a-unclean-*\"（基线那条本身是崩的）", () => {
     const base = w2Fix3BaselineScripts();
     try {
-      let ran = { time: false, uuid: false, digest: false };
+      let ran = { time: false, uuid: false, digest: false, crossId: false };
       for (const mode of ["shadow", "never_initialized"]) {
         const x = w1Fixture("w2t7" + (mode === "shadow" ? "s" : "n"), { cutover: false, init: mode === "shadow" });
         let split = null;
@@ -55147,14 +55212,21 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
           const sides = { a: w2Fix3Side(x, env, base.dir), b: w2Fix3Side(x, env, path.resolve(".")) };
           // 夹具事实（固定 UUID / 稳定摘要 / 预置业务时间）在**本侧跑之前**采集 —— 归一化只替换不在这个集合里的值
           const stable = w2Fix3Stable(JSON.stringify(w2Fix3State(sides.a)));
+
+          // 1. 基线（b9ff7e8）跑三步
           split = w2Fix3FixtureSplit(x);
           const stepsA = w2Fix3W2Sequence(sides.a, { genId });
           const rawA = w2Fix3State(sides.a);
+
+          // 2. 原地恢复现场 → 本分支跑同样的序列
           split.restore();
           const stepsB = w2Fix3W2Sequence(sides.b, { genId });
           const rawB = w2Fix3State(sides.b);
+
+          // 3. 落盘 + 退出码 + stderr/stdout 归一化后逐字节一致
           const ranNow = w2Fix3Compare(mode, sides, rawA, rawB, stepsA, stepsB, stable);
-          ran = { time: ran.time || ranNow.time, uuid: ran.uuid || ranNow.uuid, digest: ran.digest || ranNow.digest };
+          ran = { time: ran.time || ranNow.time, uuid: ran.uuid || ranNow.uuid, digest: ran.digest || ranNow.digest, crossId: ran.crossId || ranNow.crossId };
+
           // 过期兜底**不进逐字节对照**：固定基线的 b9ff7e8 在这条上是崩的（inbound 调 `wireVoid` 却没 import ——
           //   那正是 W2-fix6 修掉、Codex 已闭合清单里列着的一条），所以两边本来就该不同。
           //   这里只钉分支侧：不崩（没有"入站处理异常终止"）+ **不产生任何 m1a-unclean-***（P1-a 的靶心）。
@@ -55167,16 +55239,16 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
           x.f.cleanup();
         }
       }
-      // 三项自检都要在**至少一个模式**里真跑过（shadow 有账本 → 固定 UUID / 稳定摘要都在现场）
-      assert.deepEqual(ran, { time: true, uuid: true, digest: true },
-        "自检覆盖：业务时间 / 固定夹具 UUID / 稳定摘要都必须真跑过：" + JSON.stringify(ran));
+      // 四项自检都要在**至少一个模式**里真跑过（shadow 有账本 → 固定 UUID / 稳定摘要 / 跨文件新 ID 都在现场）
+      assert.deepEqual(ran, { time: true, uuid: true, digest: true, crossId: true },
+        "自检覆盖：业务时间 / 固定夹具 UUID / 稳定摘要 / 跨文件新 ID 同一性都必须真跑过：" + JSON.stringify(ran));
     } finally { base.cleanup(); }
   });
 
   test("PK2-W3 T5 shadow / never_initialized 下两入口（feishu-unbind 暂停 / bind-project 恢复）与**固定基线 " + W2FIX3_BASELINE + "**（改造前）落盘字节一致 + 不产生 m1a-unclean-*", () => {
     const base = w2Fix3BaselineScripts();
     try {
-      let ran = { time: false, uuid: false, digest: false };
+      let ran = { time: false, uuid: false, digest: false, crossId: false };
       for (const mode of ["shadow", "never_initialized"]) {
         const x = w1Fixture("w3t5" + (mode === "shadow" ? "s" : "n"), { cutover: false, init: mode === "shadow" });
         let split = null;
@@ -55207,7 +55279,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
           const rowB = JSON.parse(fs.readFileSync(sides.b.regFile, "utf-8")).projects.find((p) => p.root_message_id);
           assert.equal(rowB.status, "active", mode + "：分支侧恢复后登记行是 active：" + JSON.stringify(rowB.status));
           const ranNow = w2Fix3Compare(mode, sides, rawA, rawB, stepsA, stepsB, stable);
-          ran = { time: ran.time || ranNow.time, uuid: ran.uuid || ranNow.uuid, digest: ran.digest || ranNow.digest };
+          ran = { time: ran.time || ranNow.time, uuid: ran.uuid || ranNow.uuid, digest: ran.digest || ranNow.digest, crossId: ran.crossId || ranNow.crossId };
         } finally {
           if (split !== null) split.cleanup();
           x.f.cleanup();

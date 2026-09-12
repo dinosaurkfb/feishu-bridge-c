@@ -50249,7 +50249,7 @@ fs.lstatSync = function(p, ...rest) {
 // ─────────── R69：武装唯一 authority_cutover 提交点（M1b 收官） ───────────
 
 /** R69 夹具：与 #R45 C+D 复合提交同构（真安装器进夹具 home + 空 legacy fixture「双射空空成立」+ 真编排 ctx）。 */
-const r69Fixture = (tag) => {
+const r69Fixture = (tag, { inHome = false } = {}) => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r69-" + tag + "-")));
   const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
@@ -50283,11 +50283,14 @@ const r69Fixture = (tag) => {
     return { ok: false, detail: "unknown" };
   };
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
-  const gateFile = path.join(base, "maintenance.gate"); const dir = path.join(base, "maintenance");
+  // PK2-I3-fix1：inHome=true 时维护目录/账本根都放 home 的 bridge 下（与 I6 authorityRunContext 的
+  //   home 派生口径一致）—— ⑲/⑳ 的判源才见得到 authoritative；默认布局不变（老用例零扰动）。
+  const gateFile = path.join(base, "maintenance.gate");
+  const dir = inHome ? path.join(bridge, "maintenance") : path.join(base, "maintenance");
   let clock = Date.parse("2026-09-01T12:00:00.000Z");
   const crashAt = { id: null };
   const ledgerTmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r69-ledger-")));
-  const ledgerRoot = path.join(ledgerTmp, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 });
+  const ledgerRoot = inHome ? path.join(bridge, "ledger") : path.join(ledgerTmp, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 });
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
   env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot; env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile; env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
   const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
@@ -52047,8 +52050,8 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   });
   // ── W1 夹具：真 cutover（authoritative）的端机器 + 假 lark-cli + 会话登记 —— 全程 tmp ──
   // 链模板的 agent_uid 决定 endpoint（与入站 / 策略面同源）；lark_cli_bin 指向夹具里的假 binary。
-  const w1Fixture = (tag) => {
-    const f = r69Fixture("w1" + tag);
+  const w1Fixture = (tag, opts = {}) => {
+    const f = r69Fixture("w1" + tag, opts);
     try {
     const uid = "agent_w1_" + tag;
     const bin = path.join(f.base, "bin"); fs.mkdirSync(bin, { recursive: true });
@@ -53419,7 +53422,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   });
 
   test("PK2-I3 T5 doctor ⑲ pending-claims store：一致 → 绿；与账本 pending 对不上 → 红并计数；正文不含 token 明文", () => {
-    const x = w1Fixture("i3t5");
+    const x = w1Fixture("i3t5", { inHome: true });   // fix1：⑲ 消费 I6 判源，夹具布局须与 home 派生口径一致
     try {
       const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
       const r0 = w1Bind(x, env);
@@ -53448,6 +53451,61 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.equal(back.ok, true, "修回：" + JSON.stringify(back).slice(0, 180));
       assert.equal(row().ok, true, "修回后 → 绿：" + JSON.stringify(row()));
     } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-I3-fix1 P2 K4 直接反例：登记表两行映射到同一 root/id → TOKEN_DUPLICATED、零写", () => {
+    const x = w1Fixture("i3f2", { inHome: true });
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      const r0 = w1Bind(x, env);
+      assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      const row = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      // 刀：塞进第二行 —— 同 root、同 id（两行映射到同一个 binding），换个会话号。
+      //   findByToken 只保证 store 里 id 唯一；登记面重复映射时 hits.length > 1 必须继续拒。
+      const reg = x.registry();
+      reg.projects.push({ ...row, claude_session_id: W1_UUID_B });
+      fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      const ta = Object.values(x.ledger().records).find((rec) => rec.kind === "live").topic_agent_id;
+      const token = readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta].token;
+      const regBefore = fs.readFileSync(x.regFile);
+      const storeBefore = fs.readFileSync(x.sidecar("pending-claims"));
+      const res = findPendingBinding({ content: w1Quoted(token), registryFile: x.regFile, templateFile: x.tplFile, env });
+      assert.deepEqual([res.ok, res.reason], [false, PROMOTE_REJECT.TOKEN_DUPLICATED],
+        "重复映射必须拒（不许挑一行放行）：" + JSON.stringify(res).slice(0, 240));
+      assert.equal(res.ids?.length, 2, "点名两条：" + JSON.stringify(res).slice(0, 240));
+      assert.deepEqual(fs.readFileSync(x.regFile), regBefore, "零写：登记表不变");
+      assert.deepEqual(fs.readFileSync(x.sidecar("pending-claims")), storeBefore, "零写：凭证库不变");
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-I3-fix1 P1 双 home 行为钉：目标 home 的 store 漂移而进程 HOME 那份健康 → runDoctor({home:目标}) 的 ⑲ 必须红（不得读别处健康 store 报绿）", () => {
+    // 两套**真夹具**（journal 与绝对路径绑定，复制目录会被形状校验拒，故不拷贝）：A 是判定对象，B 是
+    // 进程级环境覆盖指向的「健康」家 —— 判源（I6 纪律）只认 runDoctor({home}) 派生的上下文，⑲/⑳ 同理。
+    const x = w1Fixture("i3f1", { inHome: true });
+    const y = w1Fixture("i3f1b", { inHome: true });
+    try {
+      for (const [f, sid] of [[x, W1_UUID_A], [y, W1_UUID_A]]) {
+        const r0 = w1Bind(f, w1SessionEnv(f, { sessionId: sid }));
+        assert.equal(r0.status, 0, "前置绑定：" + r0.stdout + r0.stderr);
+      }
+      // 目标 home（x）漂移：凭证库里那条被删（账本还是 pending）；y 全程健康
+      const ta = Object.values(x.ledger().records).find((rec) => rec.kind === "live").topic_agent_id;
+      const del = mutateSidecarEntry({ endpointId: x.EP, name: "pending-claims", key: ta, env: x.f.env,
+        mutate: () => ({ ok: true, changed: true, value: null }) });
+      assert.deepEqual([del.ok, del.changed], [true, true], "夹具：目标 home（x）的凭证库条目删除：" + JSON.stringify(del).slice(0, 160));
+      const saved = { M: process.env.FEISHU_BRIDGE_MAINTENANCE_DIR, L: process.env.FEISHU_BRIDGE_LEDGER_DIR };
+      process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(y.f.home, ".claude", "feishu-bridge", "maintenance");
+      process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(y.f.home, ".claude", "feishu-bridge", "ledger");
+      try {
+        const c = runDoctor({ home: x.f.home }).checks.find((k) => k.id === "pending_claims_store");
+        assert.equal(c.ok, false, "目标 home 的 store 漂移 → ⑲ 必须红（改前读进程 HOME 指向的健康 store 会报绿 = fail-open）："
+          + JSON.stringify(c));
+        assert.match(c.detail, /少 1/u, "点名方向与计数：" + c.detail);
+      } finally {
+        if (saved.M === undefined) delete process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; else process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = saved.M;
+        if (saved.L === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved.L;
+      }
+    } finally { y.f.cleanup(); x.f.cleanup(); }   // 逆序还原（y 的 saved 是 x 的覆盖值）
   });
 }
 // ─────────────────── PK2-I4-fix1：P1-1 权威判源 / P1-2 确定性 operation 身份 / P2 探测口径 ───────────────────

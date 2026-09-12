@@ -3917,11 +3917,13 @@ test("两个真实 OS 进程同时清同一个 reap 残骸：最多一个 remove
     //   ② **无事可做**（reason 为 null）—— 产品的**自己的**入场盘点发现没有陈旧残骸可清：残骸已被别人清掉、
     //   或新实例已挂上、或它恰落在「隔离」与「重挂」之间（`.reap` 那一刻不在）。②正是老断言一律判红的
     //   那种晚到结局（2026-09-11 的全量偶发红；本单跑第 2 次全量的第 3 轮就自然出现过一次）。
-    //   封闭集合之外的 reason（io_error / quarantine_unremoved / …）仍一律判红（unrecognized_artifact 见下：并发 torn read，合法）。
+    //   封闭集合之外的 reason（io_error / quarantine_unremoved / …）仍一律判红（unrecognized_artifact 见下：TOCTOU 混合快照，合法）。
     for (const g of got.filter((x) => !x.removed)) {
       // 合法的非 remover 结局：三个封闭 reason、`null`（无事可做），以及 `unrecognized_artifact` ——
-      //   最后这个是**并发窗口里的 torn read**：赢家把 .reap rename 走 / 重挂新实例的那一瞬，输家的
-      //   inspect 可能读到一个说不清现场的 symlink（lstat 是 symlink、readlink 的内容过不了形状校验）。
+      //   最后这个是**并发窗口里的 TOCTOU 混合快照**（措辞更正：symlink target 本身的 rename 是原子的，
+      //   "内容 torn" 说法不准）—— inspect() 首次 lstat 认定它是 .reap 残骸之后、readLockOwner() 再次
+      //   lstat/readlink 之前，赢家已把 .reap rename 走 / 重挂新实例，输家两次看的是不同对象，拼出
+      //   一个过不了形状校验的现场。
       //   产品在那里是 **fail-closed**（一个字节不写、reason 明确），且下面两条不变式仍然成立
       //   （恰好一个 removed + 新实例还在 + 无残骸）—— 所以它算合法结局，不算故障。
       //   （2026-09-11 实测：未放宽前 10 轮跑 5 次红；放宽后见本单回报。）
@@ -53188,8 +53190,12 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       if (process.getuid?.() !== 0) {
         fs.chmodSync(x.regFile, 0o000);
         try {
+          // PK2-P2-cleanup ②（Codex #200 P2-②）：零写快照必须在**运行前**取 —— 旧写法在命令跑完后
+          //   才取 w7Snap(x)，before/after 是同一份对象，deepEqual(x,x) 恒真，零写比较形同虚设
+          //   （EISDIR 分支本来就先取，不动）。
+          const before = w7Snap(x);
           const r = w1Bind(x, env);
-          w7ExpectZeroWriteReject(x, w7Snap(x), r, "权限 0000");
+          w7ExpectZeroWriteReject(x, before, r, "权限 0000");
         } finally { fs.chmodSync(x.regFile, 0o600); }
       }
       // ② 读错（路径被换成目录 → EISDIR）：与 uid 无关，root 下也成立 —— 根因是「非 ENOENT 的读错」
@@ -53558,6 +53564,18 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
         if (saved.L === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved.L;
       }
     } finally { y.f.cleanup(); x.f.cleanup(); }   // 逆序还原（y 的 saved 是 x 的覆盖值）
+  });
+  test("PK2-P2-cleanup ① 启动快照：合法 JSON 但 projects 非数组（{projects:{}}）→ fail-closed 点名拒、零写（不得裸抛 TypeError）", () => {
+    const x = w1Fixture("p2c1");
+    try {
+      const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+      fs.writeFileSync(x.regFile, JSON.stringify({ schema_version: "1.0", projects: {} }) + "\n", { mode: 0o600 });
+      const before = w7Snap(x);
+      const r = w1Bind(x, env);
+      w7ExpectZeroWriteReject(x, before, r, "{projects:{}}");
+      assert.doesNotMatch(String(r.stderr), /TypeError|is not a function/u,
+        "不得裸抛（旧版在启动快照的 .find() 处抛 TypeError）：" + String(r.stderr).slice(0, 300));
+    } finally { x.f.cleanup(); }
   });
 }
 // ─────────────────── PK2-I4-fix1：P1-1 权威判源 / P1-2 确定性 operation 身份 / P2 探测口径 ───────────────────

@@ -136,12 +136,16 @@ if (!tpl.ok) {
 const template = tpl.template;
 
 const regFile = registryPath();
-let registry = { schema_version: "1.0", projects: [] };
-try {
-  registry = JSON.parse(fs.readFileSync(regFile, "utf-8"));
-  registry.projects ??= [];
-} catch { /* 没有登记表就新建 */ }
-
+// PK2-P2-cleanup ①（Codex #200 P2-①）：启动快照不再裸 JSON.parse —— 复用 loadRegistryStrict
+// （与锁内 readRowsNow 同一份判据）：只有 ENOENT 算空表；坏 JSON / 权限错 / 合法 JSON 但形状非法
+//（如 projects 非数组）→ fail-closed 点名拒，不得在下面 .find() 处裸抛 TypeError。
+const reg0 = loadRegistryStrict(regFile);
+if (reg0.ok !== true) {
+  die("[bind-session] 登记表读不出（registry_unreadable / " + String(reg0.reason ?? "unknown") + "）："
+    + String(reg0.error ?? ""),
+    "修好或移走 " + regFile + " 后重跑（登记表坏了不许当空表新建）");
+}
+const registry = { ...reg0.raw, projects: reg0.projects };   // 沿用旧名（legacy 写路径会 push 进 projects）
 const already = registry.projects.find((p) => p?.claude_session_id === me.sessionId);
 const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
 // PK2-W1：判源分派。authoritative → 复合写（账本为准，登记表降为索引行）；shadow / 未接入 → 原路径。

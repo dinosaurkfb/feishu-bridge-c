@@ -25,6 +25,15 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { NO_PREFIX, UNLIMITED, isValidPrefix, isValidQuota } from "./selector.mjs";
+import { liveLineageIds, mutateExpiryEntries, readExpiryEntry, resolveExpiryTarget } from "./m1b/expiry-store.mjs"; // PK2-I2：权威到期（expiry.json）
+import { decideLedgerRoute } from "./m1a/delivery-target.mjs"; // PK2-I2-fix1 P1-2：与 I1 同一份「收据 × 账本 authority_mode」矩阵
+import { acquireOrderLock } from "./m1a/dual-write.mjs";
+import { foldLockReleaseState } from "./maintenance/reaffirm-intents.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+import { maintenanceDir } from "./maintenance/journal.mjs";
+import { loadByEndpoint } from "./topic-agent-ledger.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
+import { legacyEndpointId } from "./subscription.mjs";
 import { checkBinding, WARN_DAYS } from "./binding-health.mjs";
 import { projectMappingPath, resolveProject } from "./project-resolve.mjs";
 import { registryPath } from "./registry.mjs";
@@ -75,6 +84,71 @@ export function validateNote(v) {
 
 // ---------- CLI ----------
 
+/**
+ * 续期的**锁内段**（PK2-I2-fix2 P1 + fix3 P1，可导入、CLI 只传生产实现）：
+ * 取 outer m1a-order 锁 → 锁内重定位（resolveExpiryTarget）→ 重读现值 → 重读账本 → 派生 lineage
+ * 与全部 live id → 一次 sidecar 事务写入 → **finally 释放并折叠释放状态**（I4-fix3 同款单出口工艺：
+ * 任何失败都存成结果对象返回，绝不 process.exit 绕过 finally 留锁）。
+ * `hook` 仅测试注入（CLI 不可触达；生产恒缺省 = 空操作）：在「锁已到手、重定位之前」调用，
+ *   钉「锁外盘点」与「锁内重读」之间的并发窗口（W2 新建/作废 pending B1）。
+ * 返回 {ok:true, lineageId, ids, changed} 或 {ok:false, stage, reason, why?, lock_state, lockUncleared?}。
+ */
+export function renewExpiryInLock({ endpointId, locator, iso, env = process.env, hook = null } = {}) {
+  const acq = acquireOrderLock(endpointId, env);
+  if (!acq.ok) {
+    return { ok: false, stage: "lock", reason: acq.reason ?? "lock_failed",
+      why: "取 m1a-order 锁失败（" + String(acq.reason ?? "unknown") + "）：不写（与 W1/W2 同一把锁串行）", lock_state: null };
+  }
+  let rel = null;
+  let result = null;
+  try {
+    if (typeof hook === "function") hook();
+    const targetNow = resolveExpiryTarget({ endpointId, locator, env });
+    if (targetNow?.ok !== true) {
+      result = { ok: false, stage: "relocate", reason: targetNow?.reason ?? "unknown",
+        why: "锁内重定位不到账本里的这条记录（" + String(targetNow?.reason ?? "unknown") + "）：不写" };
+    } else {
+      const curNow = readExpiryEntry({ endpointId, topicAgentId: targetNow.topicAgentId, env });
+      if (curNow.ok !== true) {
+        result = { ok: false, stage: "reread", reason: curNow.reason ?? "unknown",
+          why: "锁内重读权威到期现值读不出（" + String(curNow.reason ?? "unknown") + (curNow.why ? "：" + curNow.why : "") + "）：不写" };
+      } else {
+        const led = loadByEndpoint(endpointId, { env });
+        if (!led.ok) {
+          result = { ok: false, stage: "ledger", reason: led.reason ?? "unknown", why: "锁内重读账本读不出（" + String(led.reason ?? "unknown") + "）：不写" };
+        } else {
+          const lineageId = led.doc?.records?.[targetNow.topicAgentId]?.generation_lineage_id ?? null;
+          const lin = typeof lineageId === "string"
+            ? liveLineageIds({ endpointId, lineageId, loadLedger: loadByEndpoint, env })
+            : { ok: false, reason: "no_lineage", why: "这条记录没有 generation_lineage_id" };
+          if (!lin.ok) {
+            result = { ok: false, stage: "lineage", reason: lin.reason ?? "unknown",
+              why: "续期的覆盖范围说不清（" + String(lin.reason ?? "unknown") + (lin.why ? "：" + lin.why : "") + "）：不写" };
+          } else {
+            const values = Object.fromEntries(lin.ids.map((id) => [id, iso]));
+            const w = mutateExpiryEntries({ endpointId, values, env });
+            result = w.ok === true
+              ? { ok: true, lineageId, ids: lin.ids, changed: w.changed === true }
+              : { ok: false, stage: "write", reason: w.reason ?? "unknown",
+                  why: "权威到期没写成（" + String(w.reason ?? "unknown") + (w.why ? "：" + w.why : "") + "）" + (w.committed === true ? " —— 已落盘但不干净，先 doctor" : ""),
+                  committed: w.committed === true };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // PK2-I2-fix4 P1：hook / 锁内调用抛异常 → 结构化 renew_expiry_threw，统一经 finally →
+    //   foldLockReleaseState → return；不许原异常裸穿把 lockUncleared 证据遮掉。
+    result = { ok: false, stage: "threw", reason: "renew_expiry_threw",
+      why: "锁内段抛异常（" + String(err?.code ?? err?.message ?? err) + "）：不写；锁已按 finally 释放折叠" };
+  } finally {
+    try { rel = acq.release(); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+  }
+  const lockState = foldLockReleaseState(rel);
+  return { ...result, lock_state: lockState,
+    ...(lockState !== "released" ? { lockUncleared: { lock_state: lockState, path: rel?.path ?? null, reason: rel?.reason ?? null, why: rel?.why ?? null } } : {}) };
+}
+
 if (!isDirectRun(import.meta.url)) {
   // 被 import 时只提供上面那个纯函数，不碰任何文件。
 } else {
@@ -99,8 +173,43 @@ const mapping = resolved.mapping;
 const FROM_REGISTRY = resolved.source === "registry";
 const STORE = FROM_REGISTRY ? registryPath() : projectMappingPath(ROOT);
 
+// PK2-I2：**续期的落点随判源换书**。authoritative → 权威 `ledger/<ep>/expiry.json`（不再碰 registry/mapping）；
+//   其余（legacy / shadow / 未接入）→ 原逻辑（registry 那一行或项目 mapping 文件）。
+//   判源不明（收据坏 / 维护目录读不出）→ 未知态：**不写**（fail-closed），下面按错误报。
+const tplForLedger = loadChainTemplate();
+const endpointForLedger = tplForLedger.ok && tplForLedger.template?.agent_uid
+  ? legacyEndpointId({ runtime: "claude", agentUid: tplForLedger.template.agent_uid }) : null;
+// P1-2：判源与 I1/R66 **同一份矩阵**（收据 × 账本 authority_mode）——只看收据会把"收据说 cutover、
+//   账本其实还是 shadow"这类交叉不符放过去，而那条路上 legacy 已经不该再被写。
+const routeReceipt = (() => {
+  const dir = maintenanceDir(process.env);
+  return (typeof dir === "string" && dir.length > 0 && endpointForLedger !== null)
+    ? endpointReceipt(dir, endpointForLedger) : { ok: false, state: "unreadable", why: "维护目录不可派生 / 端点未知" };
+})();
+const routeMode = endpointForLedger === null ? "reject"
+  : decideLedgerRoute({ receipt: routeReceipt, endpointId: endpointForLedger, env: process.env }).mode;
+const AUTHORITATIVE = routeMode === "authoritative";
+// reject / unknown：**零写退出**，绝不落回 legacy（切后写 legacy 就是把事实写进已被冻结的那本书）。
+if (routeMode === "reject") {
+  console.error("到期判源不可用（收据 × 账本 authority_mode 交叉核不过）：**不写任何东西**，先核对维护收据与账本。");
+  console.error("  （PK2-I2-fix1 P1-2：切权威后不再回退 legacy —— 那是把事实写进已被冻结的那本书。）");
+  process.exit(1);
+}
+// 权威落点：按这条绑定的根消息（代际优先）定位账本 live 记录 → topic_agent_id。
+const expiryLocator = typeof mapping.feishu_root_message_id_reference === "string" && mapping.feishu_root_message_id_reference.length > 0
+  ? mapping.feishu_root_message_id_reference : null;
+const expiryTarget = (() => {
+  if (!AUTHORITATIVE) return null;
+  if (expiryLocator === null) return { ok: false, reason: "no_locator", why: "这条绑定没有根消息 locator，定位不到账本记录" };
+  return resolveExpiryTarget({ endpointId: endpointForLedger, locator: expiryLocator, env: process.env });
+})();
+
 const now = Date.now();
 const health = checkBinding({ root: ROOT, now });
+// 权威现值（只读）：authoritative 下这条命令改的就是它，报告要显示它而不是冻结的 legacy 值。
+const authoritativeEntry = AUTHORITATIVE && expiryTarget?.ok === true
+  ? readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env })
+  : null;
 
 // ---------- 算改动 ----------
 
@@ -167,7 +276,15 @@ console.log("项目    " + ROOT);
 console.log("绑定    " + (mapping.binding_id ?? "(无 id)") + "   存放在 " + (FROM_REGISTRY ? "登记表" : "项目目录"));
 console.log("状态    " + (mapping.status ?? "?") + " / " + (STATE_TEXT[health.state] ?? health.state));
 console.log("有效期  " + (mapping.expires_at ?? "(缺)") +
-  (daysLeft === null ? "" : "   还有 " + daysLeft + " 天"));
+  (daysLeft === null ? "" : "   还有 " + daysLeft + " 天") +
+  (AUTHORITATIVE ? "   （legacy 值已冻结，仅供参考）" : ""));
+if (AUTHORITATIVE) {
+  const iso = authoritativeEntry?.ok === true ? authoritativeEntry.iso : null;
+  const days = iso === null ? null : Math.floor((Date.parse(iso) - now) / DAY_MS);
+  console.log("权威到期  " + (authoritativeEntry?.ok === true ? (iso ?? "(未设 —— 不过期)") : "读不出（" + String(authoritativeEntry?.why ?? "unknown") + "）") +
+    (days === null || iso === null ? "" : "   还有 " + days + " 天") +
+    "   存放在 ledger/<endpoint>/expiry.json");
+}
 console.log("配额    " + (quotaNow === UNLIMITED ? "不限" : quotaNow) + "   已用 " + consumed + " 条");
 console.log("话题    " + (mapping.session_id ?? "?"));
 console.log("根消息  " + (mapping.feishu_root_message_id_reference ?? "?"));
@@ -195,6 +312,48 @@ if (!apply) {
 }
 
 // ---------- 写 ----------
+
+// PK2-I2：authoritative 下**只写权威 expiry.json** —— 冻结的 legacy（登记表 / 项目 mapping）一个字节都不碰，
+//   也就不留 .prev（它是 legacy 文件的备份，这里没有可回退的那一份）。除 expires_at 之外的字段在
+//   authoritative 下**没有权威落点**（quota / prefix / note 仍是 legacy 面）：明说拒，不悄悄写冻结文件。
+if (AUTHORITATIVE) {
+  const unsupported = changes.filter(([f]) => f !== "expires_at").map(([f]) => f);
+  if (unsupported.length > 0) {
+    console.error("权威（authoritative）下这些字段没有权威落点：" + unsupported.join(", "));
+    console.error("本命令在权威期只改 expires_at（写 ledger/<endpoint>/expiry.json）；其余字段仍只在 legacy 面。");
+    process.exit(1);
+  }
+  if (expiryTarget?.ok !== true) {
+    console.error("定位不到账本里的这条记录（" + String(expiryTarget?.reason ?? "unknown") + "）：不写，先核对账本");
+    process.exit(1);
+  }
+  const iso = changes.find(([f]) => f === "expires_at")[2];
+  // P1-1：**缺条目 ≠ 没设到期** —— 续期遇缺条目（或文件缺席/读不出）一律拒零写，不凭缺席建事实。
+  const curAuth = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env });
+  if (curAuth.ok !== true) {
+    console.error("权威到期现值读不出（" + String(curAuth.reason ?? "unknown") + (curAuth.why ? "：" + curAuth.why : "") + "）：**不写**。");
+    console.error("  （PK2-I2-fix1 P1-1：缺席 / 缺条目不是「没设到期」，是缺失的授权事实 —— 先核对现场。）");
+    process.exit(1);
+  }
+  // P1-3：续期覆盖**整条 lineage**（current + 历史 B4 …）——一次 sidecar 事务、经 outer m1a-order 锁串行。
+  // PK2-I2-fix2 P1：**写集合在锁内重新派生** —— 锁外读数只做预览/文案。锁内段抽成可导入的
+  //   `renewExpiryInLock`（PK2-I2-fix3 P1-①：env 注入面已移除，测试走 CLI 不可触达的函数参数 hook）。
+  const res = renewExpiryInLock({ endpointId: endpointForLedger, locator: expiryLocator, iso, env: process.env });
+  if (res.lockUncleared) {
+    console.error("outer 锁没交还干净（" + res.lockUncleared.lock_state + "）：先 doctor 再重跑（写已提交的话是幂等的）。");
+    process.exit(1);
+  }
+  if (res.ok !== true) {
+    console.error(res.why ?? "权威到期没写成（" + String(res.reason ?? "unknown") + "）。");
+    process.exit(1);
+  }
+  const afterAuth = readExpiryEntry({ endpointId: endpointForLedger, topicAgentId: expiryTarget.topicAgentId, env: process.env });
+  console.log("\n已写入 ledger/<endpoint>/expiry.json（lineage " + String(res.lineageId) + " 共 " + res.ids.length + " 条 live B：" +
+    res.ids.map((id) => id.slice(0, 12) + "…").join("、") + "，" + (res.changed ? "已更新" : "本就是这个值") + "）");
+  console.log("现在权威到期：" + (afterAuth.ok === true ? String(afterAuth.iso) : "读回失败"));
+  console.log("legacy 的 expires_at 一个字没动（切权威后它已冻结；入站按权威这份判）。");
+  process.exit(0);
+}
 
 // 留一份上一版：改错了能立刻退回去，不用去翻别的地方。
 fs.copyFileSync(STORE, STORE + ".prev");

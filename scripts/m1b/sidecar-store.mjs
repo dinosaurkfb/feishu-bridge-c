@@ -118,6 +118,78 @@ function writeSidecarAtomic(file, content) {
 }
 
 /**
+ * 锁内读-改-校验-原子写**多条目**（PK2-I2-fix1 P1-3：续期一次事务覆盖整条 lineage）。
+ * 与单条目版**同一把锁**（`<file>.lock`）、同一份 schema、同一份原子写与释放折叠 —— 不新建第二套。
+ * `values`：`{key: 新值 | null}`（null = 删该条目）。整份文档先过 `validateSidecarDoc` 再落盘；
+ * 写后受验读回逐字比对。返回形状与单条目版同族：`{ok:false, reason, …}` 或
+ * `{ok:true, changed, entries, committed, persistence, file, …}`。
+ */
+export function mutateSidecarEntries({ endpointId, name, values, env = process.env, lockRetries = 0 } = {}) {
+  if (values === null || typeof values !== "object" || Array.isArray(values)) return { ok: false, reason: "sidecar_bad_values", why: "values 必须是 {key: value|null} 对象" };
+  const keys = Object.keys(values);
+  if (keys.length === 0) return { ok: false, reason: "sidecar_bad_values", why: "values 不能为空（没有要改的条目）" };
+  if (keys.some((k) => typeof k !== "string" || k.length === 0)) return { ok: false, reason: "sidecar_bad_key", why: "key 必须是非空字符串" };
+  const p = sidecarPath({ endpointId, name, env, mustExistRoot: true });
+  if (!p.ok) return { ok: false, reason: "sidecar_unreadable", why: "账本目录解析失败：" + String(p.why ?? p.reason) };
+  const lockDir = p.file + ".lock";
+  const lock = acquireSidecarLock(lockDir, lockRetries, env);
+  if (!lock.ok) {
+    return { ok: false, reason: lock.reason === "maintenance" ? "maintenance" : "sidecar_busy", why: String(lock.reason ?? "lock_unavailable") };
+  }
+  let result = null;
+  try {
+    const cur = readSidecarStore({ endpointId, name, env });
+    if (!cur.ok) { result = { ok: false, reason: cur.reason, why: cur.why }; return result; }
+    const nextEntries = { ...(cur.entries ?? {}) };
+    let changed = false;
+    for (const k of keys) {
+      const curValue = Object.prototype.hasOwnProperty.call(nextEntries, k) ? nextEntries[k] : null;
+      const want = values[k];
+      if (curValue === want) continue;   // 逐字相同 → 不改这一条
+      changed = true;
+      if (want === null || want === undefined) delete nextEntries[k];
+      else nextEntries[k] = want;
+    }
+    if (!changed) {
+      const dirErr = fsyncDir(path.dirname(p.file));
+      result = dirErr !== null
+        ? { ok: false, changed: false, reason: "sidecar_durability_unconfirmed", why: dirErr, committed: true, entries: cur.entries ?? {}, file: p.file }
+        : { ok: true, changed: false, entries: cur.entries ?? {}, file: p.file, committed: false, persistence: "fsynced" };
+      return result;
+    }
+    const nextDoc = { schema_version: (cur.doc?.schema_version ?? SIDECAR_SCHEMAS[name]), endpoint_id: endpointId, entries: nextEntries };
+    const invalid = validateSidecarDoc(nextDoc, name, { endpointId });
+    if (invalid !== null) { result = { ok: false, reason: "sidecar_invalid", why: invalid }; return result; }
+    const w = writeSidecarAtomic(p.file, stableStringify(nextDoc, 2) + "\n");
+    if (!w.ok) { result = { ok: false, reason: w.reason, why: w.why, committed: w.committed === true, entries: w.committed === true ? nextEntries : cur.entries }; return result; }
+    const back = readSidecarStore({ endpointId, name, env });
+    if (!back.ok) { result = { ok: false, reason: "sidecar_readback_failed", why: back.why ?? back.reason, committed: true, entries: nextEntries, file: p.file }; return result; }
+    if (stableStringify(back.entries, 2) !== stableStringify(nextEntries, 2)) {
+      result = { ok: false, reason: "sidecar_readback_mismatch", why: "读回条目与本次意图不一致（盘上被别的写方动过？）", committed: true, entries: nextEntries, file: p.file };
+      return result;
+    }
+    result = { ok: true, changed: true, entries: nextEntries, doc: nextDoc, file: p.file, committed: true, persistence: "fsynced" };
+    return result;
+  } finally {
+    let rel;
+    try { rel = releasePublishLock(lockDir); }
+    catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
+    const unclean = rel.reapUncleared
+      ? { reason: "reap_residue_uncleared", path: rel.reapUncleared.path ?? lockDir + ".reap", detail: rel.reapUncleared.error != null ? String(rel.reapUncleared.error) : null }
+      : rel.absent === true ? { reason: "lock_absent", path: lockDir, detail: null }
+        : rel.ok !== true
+          ? { reason: String(rel.reason ?? "release_failed"), path: lockDir, detail: rel.error != null ? String(rel.error) : (rel.why != null ? String(rel.why) : null) }
+          : null;
+    if (unclean !== null && result !== null && typeof result === "object" && result.lockUncleared === undefined) {
+      result.ok = false;
+      result.reason = "sidecar_lock_release_failed";
+      result.why = unclean.reason;
+      result.lockUncleared = unclean;
+    }
+  }
+}
+
+/**
  * 锁内读-改-校验-原子写**单条目**。
  *
  * `mutate(current, meta)` 契约：`current` = 该 key 现值（缺 → null）；

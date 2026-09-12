@@ -62,9 +62,9 @@ const compareAdmission = (legacy, candidate) => {
  * Canonical Event 是正式路径；legacy event 只为直接运行旧 handler 的诊断/回滚路径保留。
  * 一旦显式传入了坏的 canonical event 就 fail-closed，不能悄悄回落到另一份事实。
  */
-export function evaluateMappingAdmission({ canonicalEvent, event, mapping, config, now } = {}) {
+export function evaluateMappingAdmission({ canonicalEvent, event, mapping, config, now, expiry = null } = {}) {
   if (canonicalEvent !== undefined && canonicalEvent !== null) {
-    const legacy = evaluateInbound({ event, mapping, config, now });
+    const legacy = evaluateInbound({ event, mapping, config, now, expiry });
     if (!validateCanonicalEvent(canonicalEvent).ok) {
       const candidate = {
         decision: "invalid",
@@ -90,6 +90,7 @@ export function evaluateMappingAdmission({ canonicalEvent, event, mapping, confi
       mapping,
       config,
       now,
+      expiry,
     });
     // INV-12：候选结果先影子比较，旧 selector 在真实样本验收前仍是唯一权威。
     return {
@@ -100,7 +101,7 @@ export function evaluateMappingAdmission({ canonicalEvent, event, mapping, confi
       admission_shadow: compareAdmission(legacy, candidate),
     };
   }
-  const verdict = evaluateInbound({ event, mapping, config, now });
+  const verdict = evaluateInbound({ event, mapping, config, now, expiry });
   return { ...baseResult(), ...verdict, evaluation_path: "legacy_event_v2" };
 }
 

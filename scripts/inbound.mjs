@@ -657,7 +657,8 @@ const sessionGenForLedger = generationForSession(mapping?.topic_generation_state
 const rootOmForLedger = sessionGenForLedger?.root_message_id
   ?? (typeof mapping?.feishu_root_message_id_reference === "string" ? mapping.feishu_root_message_id_reference : null);
 const endpointForLedger = legacyEndpointId({ runtime: "claude", agentUid: bootTpl.template.agent_uid });
-// authoritative → 按投递记录的 topic_agent_id 取权威 expiry.json 条目（缺条目 = 没设到期，不拒）；
+// authoritative → 按投递记录的 topic_agent_id 取权威 expiry.json 条目（PK2-I2-fix2 P2-2 口径校准：
+//   **缺条目/缺席/读不出都是缺失的授权事实，一律 fail-closed 拒** —— 不存在「缺条目 = 没设到期，不拒」）；
 // shadow / legacy / 未接入 → 照 main 读 mapping.expires_at；判源不明（reject）→ 不在这里下结论，
 //   让 R66 投递层统一拒收（与 policy 读点「延后拒」同一裁定）。
 // store 读不出 → **fail-closed 拒收**（reason 与投递层同码），绝不回退冻结的 legacy 值。

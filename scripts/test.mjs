@@ -53391,9 +53391,10 @@ const I2_ISO_FUTURE = "2099-01-01T00:00:00.000Z";
 const I2_ISO_PAST = "2020-01-01T00:00:00.000Z";
 const I2_TA = "ta_" + "9".repeat(32);
 const I2_TA2 = "ta_" + "8".repeat(32);   // 同 lineage 的历史 B4（P1-3 续期覆盖范围的反例用）
+const I2_TA_OTHER = "ta_" + "7".repeat(32); // fix2 P2-1：无关 lineage 的条目（逐字不变钉）
 
 /** 极简账本夹具：真蓝图（initPlan → migrateSeed → cutoverPlan）+ 真收据 journal + 一条**项目级** live 记录。 */
-function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = true, noReceipts = false, expiryEntries = null, secondLive = false } = {}) {
+function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = true, noReceipts = false, expiryEntries = null, secondLive = false, otherLive = false, voidB1 = false } = {}) {
   const m = doctorMachine();
   const proj = m.project("good", { expiresAt: I2_ISO_FUTURE });
   const OM = "om_I2Root";                       // registry 行的 root_message_id 必须与账本记录的 aliases.root_om 同一个
@@ -53425,7 +53426,21 @@ function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = t
     generation_lineage_id: "lin_i2", legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null });
   const seed = TAL.migrateSeed({ endpointId: EP, requestKey: "rk_seed", authorizedBy: TPL.frank_sender_id, now: Date.parse(at), env,
     candidates: [i2Cand(I2_TA, OM, "sess_i2", "current"),
-      ...(secondLive ? [i2Cand(I2_TA2, "om_I2Hist", "sess_i2_hist", "historical")] : [])] });
+      ...(secondLive ? [i2Cand(I2_TA2, "om_I2Hist", "sess_i2_hist", "historical")] : []),
+      // fix2 P2-1：无关 lineage（G7：target 须异于主 lineage 的）
+      ...(otherLive ? [{ topic_agent_id: I2_TA_OTHER, chat_id: TPL.chat_id, aliases: { session_id: "sess_i2_other", root_om: "om_I2Other" },
+        facts: { binding: "active", session: "present", anchor: "present", locator_link_proof: "present", generation: "current" },
+        binding_target: { runtime: "claude", project_root: proj + "-other", claude_session_id: null },
+        generation_lineage_id: "lin_i2_other", legacy_source_digest: "a".repeat(64), kind: "live", anchor_candidate: null }] : [])] });
+  // fix2 P1：预置一条 pending B1（X，shadow 期 create_b1 正路创建）—— 锁外盘点会把它算进 live 集，
+  //   钩子在锁内把它 void 掉（cutover 之后它已在场）。
+  if (voidB1) {
+    const bx = TAL.createB1({ endpointId: EP, requestKey: "rk_i2fix2_preb1", chatId: TPL.chat_id, rootOm: "om_I2Void",
+      lineageId: "lin_i2", bindingTarget: { runtime: "claude", project_root: proj, claude_session_id: null }, env });
+    assert.equal(bx.ok, true, JSON.stringify(bx));
+    assert.match(String(bx.result?.created_id), /^ta_[0-9a-f]{32}$/u, "预置的 X 已创建：" + JSON.stringify(bx.result));
+    var voidB1Id = bx.result.created_id;
+  }
   assert.equal(seed.ok, true, JSON.stringify(seed));
   // 收据 journal（suffix 必须与 operation_kind 一致；token 必须等于账本里那笔 op id —— ⑬ 要核不可变事务祖先）
   const timerDone = (ch) => ({ id: "timer:" + ch, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at, chain: null });
@@ -53458,7 +53473,7 @@ function i2Fixture({ agentUid = "agent_i2_fx", cutover = true, authoritative = t
   if (expiryEntries !== null) write600(expiryPath, JSON.stringify({ schema_version: "expiry-1", endpoint_id: EP, entries: expiryEntries }, null, 2) + "\n");
   const projectReceipts = path.join(fs.realpathSync(proj), ".runtime-data", "inbound", "receipts");
   return {
-    m, proj, EP, epDir, env, OM, tplFile, agentUid, expiryPath, projectReceipts,
+    m, proj, EP, epDir, env, OM, tplFile, agentUid, expiryPath, projectReceipts, voidB1Id,
     registry: () => JSON.parse(fs.readFileSync(m.files.registry, "utf-8")),
     expiryBytes: () => { try { return fs.readFileSync(expiryPath); } catch { return null; } },
     rejectReasons: () => (fs.existsSync(projectReceipts) ? fs.readdirSync(projectReceipts).filter((n) => n.startsWith("reject-")).sort()
@@ -53701,10 +53716,12 @@ test("PK2-I2 T8 P1-2 交叉不符（收据 cutover 但账本仍 shadow）→ 续
 });
 
 test("PK2-I2 T9 P1-3 续期覆盖**整条 lineage**：current + 历史 B4 两条条目都更新；别的 lineage 字节不变；经 outer 锁串行", () => {
-  const fx = i2Fixture({ secondLive: true, expiryEntries: { [I2_TA]: I2_ISO_FUTURE, [I2_TA2]: I2_ISO_FUTURE } });
+  const fx = i2Fixture({ secondLive: true, otherLive: true, expiryEntries: { [I2_TA]: I2_ISO_FUTURE, [I2_TA2]: I2_ISO_FUTURE, [I2_TA_OTHER]: I2_ISO_FUTURE } });
   try {
     const before = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA2, env: fx.env });
     assert.deepEqual([before.ok, before.iso], [true, I2_ISO_FUTURE], "夹具：历史 B4 也有条目：" + JSON.stringify(before));
+    const otherBefore = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA_OTHER, env: fx.env });
+    assert.deepEqual([otherBefore.ok, otherBefore.iso], [true, I2_ISO_FUTURE], "夹具：无关 lineage 也有条目：" + JSON.stringify(otherBefore));
     const ren = fx.runRenew();
     assert.equal(ren.status, 0, "续期成功：" + JSON.stringify({ status: ren.status, err: String(ren.stderr).slice(0, 400) }));
     const a = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env });
@@ -53716,7 +53733,45 @@ test("PK2-I2 T9 P1-3 续期覆盖**整条 lineage**：current + 历史 B4 两条
     assert.ok(days > 360 && days < 370, "新值 ≈ 一年后：" + String(a.iso) + "（" + days.toFixed(1) + " 天）");
     // 别的 lineage 不受影响 + 文案说清覆盖了几条
     assert.match(String(ren.stdout), /共 2 条 live B/u, "文案说清覆盖范围：" + String(ren.stdout).slice(-200));
+    // fix2 P2-1：无关 lineage 的条目**逐字不变**（iso 值原样；也确没被顺手续期）
+    const otherAfter = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA_OTHER, env: fx.env });
+    assert.deepEqual([otherAfter.ok, otherAfter.iso], [otherBefore.ok, otherBefore.iso],
+      "别的 lineage 的条目逐字不变：" + JSON.stringify([otherBefore, otherAfter]));
+    assert.notEqual(otherAfter.iso, a.iso, "无关 lineage 确实没被顺手续期：" + JSON.stringify([a.iso, otherAfter.iso]));
     assert.equal(fs.readdirSync(fx.epDir).filter((n) => n.endsWith(".lock")).length, 0, "outer 锁（m1a-order）已交还，无残骸：" + JSON.stringify(fs.readdirSync(fx.epDir)));
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2-fix2 P1 确定性并发反例：锁外盘点后、锁内写入前插入 rotate（新 pending B1）与 void —— 写出的条目集合 == 锁内 live 集", () => {
+  const fx = i2Fixture({ secondLive: true, voidB1: true, expiryEntries: { [I2_TA]: I2_ISO_FUTURE, [I2_TA2]: I2_ISO_FUTURE } });
+  try {
+    // 夹具已预置 pending B1（X，cutover 前种入）：锁外盘点会把它算进 live 集 —— 钩子在「锁已到手、重定位之前」把它 void 掉
+    // 注入钩子（BINDING_RENEW_IN_LOCK_HOOK，binding.mjs 在锁内重定位前 import）：rotate 新建 Y + void X
+    const hookPath = path.join(fx.m.home, "i2fix2-hook.mjs");
+    fs.writeFileSync(hookPath, [
+      "import * as TAL from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "topic-agent-ledger.mjs")).href) + ";",
+      // 先 void X（同 lineage 不许双 pending，rotate 才建得起来）——顺序即 W2 并发两腿
+      "const voidKey = Object.entries(TAL.loadByEndpoint(" + JSON.stringify(fx.EP) + ', { env: process.env }).doc.records).find(([k, r]) => r.kind === "live" && r.aliases.root_om === "om_I2Void");',
+      'if (!voidKey) throw new Error("hook：找不到预置的 pending B1（om_I2Void）");',
+      "const v = TAL.voidPending({ endpointId: " + JSON.stringify(fx.EP) + ', requestKey: "rk_i2fix2_void2", b1Id: voidKey[0], reason: "manual" });',
+      'if (!v.ok) throw new Error("hook void：" + JSON.stringify(v));',
+      "const rot = TAL.createB1({ endpointId: " + JSON.stringify(fx.EP) + ', requestKey: "rk_i2fix2_rotate", chatId: ' + JSON.stringify(TPL.chat_id) +
+        ', rootOm: "om_I2New", lineageId: "lin_i2", bindingTarget: { runtime: "claude", project_root: ' + JSON.stringify(fx.proj) + ', claude_session_id: null } });',
+      'if (!rot.ok) throw new Error("hook rotate：" + JSON.stringify(rot));',
+    ].join("\n"));
+    const ren = spawnSync(process.execPath, [path.resolve("scripts", "binding.mjs"), "--project", fx.proj, "--renew", "1y", "--apply"],
+      { encoding: "utf-8", cwd: fx.proj, env: { ...fx.env, BINDING_RENEW_IN_LOCK_HOOK: hookPath } });
+    assert.equal(ren.status, 0, "续期成功：" + JSON.stringify({ status: ren.status, out: String(ren.stdout).slice(-300), err: String(ren.stderr).slice(0, 400) }));
+    // 判据：写出的条目集合 == **锁内** live 集 —— rotate 的新 B1（Y）必须被覆盖（旧版锁外冻结集合漏掉它）、
+    //   已 void 的 X 不得有条目（旧版会把锁外盘点到的 X 写回）。
+    const doc = JSON.parse(fs.readFileSync(path.join(fx.m.ledgerDir, fx.EP, "ledger.json"), "utf-8"));
+    const liveIds = Object.entries(doc.records).filter(([, r]) => r.kind === "live").map(([k]) => k).sort();
+    const entries = JSON.parse(fs.readFileSync(fx.expiryPath, "utf-8")).entries;
+    assert.deepEqual(Object.keys(entries).sort(), liveIds,
+      "条目集合 == 锁内 live 集：" + JSON.stringify({ entries: Object.keys(entries).sort(), liveIds }));
+    assert.equal(entries[fx.voidB1Id], undefined, "void 的 X（" + fx.voidB1Id.slice(0, 10) + "…）不写回：" + JSON.stringify(Object.keys(entries)));
+    const taNew = liveIds.find((id) => doc.records[id].aliases.root_om === "om_I2New");
+    assert.equal(typeof entries[taNew], "string", "rotate 新 B1（Y）被锁内覆盖：" + JSON.stringify(entries));
   } finally { fx.cleanup(); }
 });
 

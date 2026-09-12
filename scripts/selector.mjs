@@ -51,7 +51,9 @@ export const EXPIRY_SOURCE = Object.freeze({ LEGACY: "legacy", SIDECAR: "sidecar
 /**
  * 绑定到期闸的**唯一判据**（PK2-I2）。`expiry` 由调用方按判源给：
  *   · `null`/缺省 → legacy：读 `mapping.expires_at`；缺失或非法 = 配错 → **拒**（main 行为，一字不改）。
- *   · `{source:"sidecar", iso}` → authoritative：iso=null = **没设到期**（不拒）；iso 非法 → 拒（fail-closed）。
+ *   · `{source:"sidecar", iso}` → authoritative：iso 非法 → 拒（fail-closed）。`iso:null` **不是**正常的
+ *     「没设到期」—— 受验的 expiry store 不可能产出 null（缺席/缺条目在上游就已 fail-closed 拒）；
+ *     它只是 reject 延后处理路径的内部哨兵，别把它当成对外合同。
  * 纯函数、零 IO：sidecar 的读取（含「读不出 → 调用方拒收」）在 `m1b/expiry-store.mjs` + 调用点完成。
  * @returns {{ok:boolean, source:string, at:number|null, why?:string}}
  */

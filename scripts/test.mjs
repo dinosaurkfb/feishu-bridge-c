@@ -53749,6 +53749,57 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { x.f.cleanup(); }
   });
 
+  test("PK2-W2-fix2 P1-1②：1.1-transition 账本上 void(expired) 的**双键 CAS** —— 传错任一键拒、正确双键通过（零写 / 真作废）", () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "w2f2-")));
+    const ledgerRoot = path.join(base, "ledger");
+    const EP = "endpoint_" + "5".repeat(24);
+    const epDir = path.join(ledgerRoot, EP);
+    fs.mkdirSync(epDir, { recursive: true, mode: 0o700 });
+    const saved = process.env.FEISHU_BRIDGE_LEDGER_DIR;
+    process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
+    try {
+      const sha = "b".repeat(64);
+      const doc0 = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP, chain: "claude",
+        authority_mode: "shadow", revision: 2, operations: {
+          "00000000-0000-4000-8000-0000000006d1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "f2_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
+          "00000000-0000-4000-8000-0000000006d2": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "f2_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "f2_up", endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP, from_schema: "1.0", to_schema: "1.1-transition" } },
+        }, records: {} };
+      fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc0, null, 2) + "\n", { mode: 0o600 });
+      const b1 = TAL.createB1({ endpointId: EP, requestKey: "f2_b1", chatId: TPL.chat_id, rootOm: "om_f2", lineageId: "lin_f2",
+        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => Date.parse("2026-09-20T00:00:00.000Z") });
+      assert.equal(b1.ok, true, "1.1-transition 下 create_b1（签 handle）：" + JSON.stringify(b1).slice(0, 240));
+      const id = b1.result.created_id;
+      const handle = b1.result.selection_handle;
+      const expires = b1.result.handle_expires_at;
+      assert.equal(typeof handle, "string", "签出了 selection_handle：" + String(handle));
+      assert.equal(typeof expires, "string", "签出了 handle_expires_at：" + String(expires));
+      const bytesBefore = fs.readFileSync(path.join(epDir, "ledger.json"));
+      // clock 推到 handle 到期之后（否则先撞 not_expired，不是 CAS 那一条）
+      const afterExpiry = () => Date.parse(expires) + 86400000;
+      // ① 传错 handle → 拒（CAS 不符），盘上不变
+      const bad1 = TAL.voidPending({ endpointId: EP, requestKey: "f2_void_wrong_handle", b1Id: id, reason: "expired", clock: afterExpiry,
+        expectedHandle: "osh_" + "0".repeat(32), expectedExpiresAt: expires, clock: afterExpiry, env: process.env });
+      assert.notEqual(bad1.ok, true, "错 handle 必须拒：" + JSON.stringify(bad1).slice(0, 240));
+      assert.match(String(bad1.reason), /cas_mismatch|bad_input/u, "拒因点名 CAS：" + String(bad1.reason));
+      // ② 传错 expiry → 拒
+      const bad2 = TAL.voidPending({ endpointId: EP, requestKey: "f2_void_wrong_exp", b1Id: id, reason: "expired", clock: afterExpiry,
+        expectedHandle: handle, expectedExpiresAt: "2000-01-01T00:00:00.000Z", clock: afterExpiry, env: process.env });
+      assert.notEqual(bad2.ok, true, "错 expiry 必须拒：" + JSON.stringify(bad2).slice(0, 240));
+      // ③ 双键都不给 → 拒（1.1+ 的 expired 必须带双键）
+      const bad3 = TAL.voidPending({ endpointId: EP, requestKey: "f2_void_no_keys", b1Id: id, reason: "expired", clock: afterExpiry, env: process.env });
+      assert.deepEqual([bad3.ok, bad3.reason], [false, "bad_input"], "expired 缺双键 → 拒：" + JSON.stringify(bad3).slice(0, 200));
+      assert.deepEqual(fs.readFileSync(path.join(epDir, "ledger.json")), bytesBefore, "三次拒都零写（字节不变）");
+      // ④ 正确双键 → 通过
+      const ok = TAL.voidPending({ endpointId: EP, requestKey: "f2_void_ok", b1Id: id, reason: "expired",
+        expectedHandle: handle, expectedExpiresAt: expires, clock: afterExpiry, env: process.env });
+      assert.equal(ok.ok, true, "正确双键 → 作废成功：" + JSON.stringify(ok).slice(0, 240));
+      assert.equal(JSON.parse(fs.readFileSync(path.join(epDir, "ledger.json"), "utf-8")).records[id].kind, "voided_audit", "记录变成 voided_audit");
+    } finally {
+      if (saved === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = saved;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test("PK2-W2-fix1 P2-1/P2-2：暂停中的 current 不得轮转（rotation_no_current 零写）；非 pending 目标必须在 prepare 阶段以 void_not_pending 拒", () => {
     const { x, ta, om } = w2Rotatable("w2f1d");
     try {

@@ -312,14 +312,13 @@ const pickPendingFromStore = ({ pending, tokens, endpointId, env, now = Date.now
     const res = resumeCandidate({ pending, claims, endpointId, env });
     if (res !== null) return { ok: true, one: res.binding, matchedBy: "consumed_credential_resume", storeBacked: true, deadline: claimDeadline(res.entry) };
 
-    // PK2-W2-fix9：码不在库里，但索引里这条 pending 代际按自己的 claim_expires_at 已过期
-    // （例如首次过期作废已删掉 store 条目/账本已 voided_audit，重跑补索引半笔）。
-    // "索引里这条 pending 代际已过期" 优先于 "码对不上"：
+    // PK2-W2-fix10：重跑补后缀只认「索引仍 pending 且已过期 + 账本同 root 已是 voided_audit」（AND，不是 OR）；
+    // store 条目缺失但账本仍 live pending，无论索引时间如何，都继续拒 TOKEN_UNKNOWN（Codex #205 六轮 P1）。
     const tokenHits = claims.filter((c) => sameToken(c.binding.generation?.pending_token, tokens[0]));
     if (tokenHits.length === 1) {
       const hit = tokenHits[0];
       if (isPendingGenerationExpired(hit.binding, now)) {
-        if (hit.entry === null || isRecordVoidedAudit(endpointId, hit.binding.generation?.root_message_id, env)) {
+        if (isRecordVoidedAudit(endpointId, hit.binding.generation?.root_message_id, env)) {
           return makeExpiredResult(hit.binding);
         }
       }
@@ -333,7 +332,7 @@ const pickPendingFromStore = ({ pending, tokens, endpointId, env, now = Date.now
   if (pending.length > 1) return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
   const only = claims[0];
   if (isPendingGenerationExpired(only.binding, now)) {
-    if (only.entry === null || isRecordVoidedAudit(endpointId, only.binding.generation?.root_message_id, env)) {
+    if (isRecordVoidedAudit(endpointId, only.binding.generation?.root_message_id, env)) {
       return makeExpiredResult(only.binding);
     }
   }

@@ -136,6 +136,11 @@ export function renewExpiryInLock({ endpointId, locator, iso, env = process.env,
         }
       }
     }
+  } catch (err) {
+    // PK2-I2-fix4 P1：hook / 锁内调用抛异常 → 结构化 renew_expiry_threw，统一经 finally →
+    //   foldLockReleaseState → return；不许原异常裸穿把 lockUncleared 证据遮掉。
+    result = { ok: false, stage: "threw", reason: "renew_expiry_threw",
+      why: "锁内段抛异常（" + String(err?.code ?? err?.message ?? err) + "）：不写；锁已按 finally 释放折叠" };
   } finally {
     try { rel = acq.release(); } catch (err) { rel = { ok: false, reason: "release_threw", error: String(err?.code ?? err?.message ?? err) }; }
   }

@@ -53795,6 +53795,38 @@ test("PK2-I2-fix3 P1-② 锁内失败单出口：失败存结果、finally 释�
   } finally { fx.cleanup(); }
 });
 
+test("PK2-I2-fix4 P1：hook 抛异常 → 结构化 renew_expiry_threw（不裸穿、锁照交还、sidecar 零写）", () => {
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const before = fx.expiryBytes();
+    const res = renewExpiryInLock({ endpointId: fx.EP, locator: fx.OM, iso: I2_ISO_FUTURE, env: fx.env, hook: () => {
+      throw Object.assign(new Error("注入：hook 抛异常"), { code: "EINJECT" });
+    } });
+    assert.equal(res.ok, false, "必须结构化失败（改前原异常裸穿、foldLockReleaseState 被遮）：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.reason, "renew_expiry_threw", JSON.stringify(res).slice(0, 300));
+    assert.match(String(res.why), /EINJECT|抛异常/u, "why 带异常原文：" + res.why);
+    assert.equal(res.lock_state, "released", "锁照交还：" + JSON.stringify(res).slice(0, 300));
+    assert.equal(res.lockUncleared, undefined, "释放干净就无残骸字段：" + JSON.stringify(res).slice(0, 300));
+    assert.deepEqual(fx.expiryBytes(), before, "sidecar 零写");
+    // CLI 面上该结果形状走 !ok → exit(1) 的统一映射（与 T4/T6/T8 同路），非零退出由它兜住。
+  } finally { fx.cleanup(); }
+});
+
+test("PK2-I2-fix4 P2 短钉：旧环境变量 BINDING_RENEW_IN_LOCK_HOOK 是死字母（指向写标记文件的模块也不执行），续期照常", () => {
+  const fx = i2Fixture({ expiryEntries: { [I2_TA]: I2_ISO_FUTURE } });
+  try {
+    const marker = path.join(fx.m.home, "hook-ran.marker");
+    const hookPath = path.join(fx.m.home, "hook.mjs");
+    fs.writeFileSync(hookPath, 'import fs from "node:fs";\nfs.writeFileSync(' + JSON.stringify(marker) + ', "ran");\n');
+    const ren = spawnSync(process.execPath, [path.resolve("scripts", "binding.mjs"), "--project", fx.proj, "--renew", "1y", "--apply"],
+      { encoding: "utf-8", cwd: fx.proj, env: { ...fx.env, BINDING_RENEW_IN_LOCK_HOOK: hookPath } });
+    assert.equal(ren.status, 0, "续期照常成功：" + ren.stdout + ren.stderr);
+    assert.equal(fs.existsSync(marker), false, "标记文件不出现（旧环境变量是死字母）");
+    const entry = readExpiryEntry({ endpointId: fx.EP, topicAgentId: I2_TA, env: fx.env });
+    assert.notEqual(entry.iso, I2_ISO_FUTURE, "续期照常生效");
+  } finally { fx.cleanup(); }
+});
+
 test("PK2-I2 T7 expiryGate 纯判据逐支（纵深支直调）：sidecar 非法 iso → 拒、null → 放行、未知 source → 拒；legacy 口径一字不改", () => {
   const NOW = Date.parse("2026-09-01T00:00:00.000Z");
   // ① sidecar：iso 不是时间 → 拒（纵深支；真入口到不了这里 —— expiry-store 薄壳先拒非法 iso）

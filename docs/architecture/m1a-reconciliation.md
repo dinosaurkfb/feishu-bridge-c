@@ -441,3 +441,6 @@ sidecars:{expiry:{sha256},pending_claims:{sha256},policy:{sha256}} }` |
 - **新前置块 = v2 policy store 抽取**（§4；T3 之后、M1b 之前；含读写方迁移与 cutover step 接线）；
 - cutover 复合事务（§4.1）已接 R45/R69 编排（提交点已武装）；
 - T3a（§1/§2/§3 投影/§6/§7）已开 #R19 实现；T3b（§3.1/§5）与 T4（§4.1）以本 v14 为合同。
+- **W3（暂停 / 恢复）**：账本 `unbind` / `restore` **先行**，再改索引（嵌套 `binding_status` 与恢复时的 routability / enabled）；
+  request key 由「目标 + pause/resume + 当前不可变 `origin_operation_id`」派生（不新增 WAL）；
+  半笔按同 request key 找回已提交那一笔**只补索引**；`sidecar` 不动。

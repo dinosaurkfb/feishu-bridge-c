@@ -221,25 +221,28 @@ const wired = writeRoute.mode === "authoritative"
       operationId: w2ResumeIntent ? w2ResumeIntent.opId : effOpId,
       locator: w2ResumeIntent ? w2ResumeIntent.rootOm : active.root_message_id,
       chatId: current.config.chat_id,
-      // 先问一句「过期的那条能不能退休」（锁内新鲜读 index）：它同时完成 PREPARING 冻结（发话题之前），
-      //   并把被退休的那条（若有）告诉账本侧，让同一笔把它的 B1 按 expired 作废。
-      supersede: ({ operationId: opId }) => {
-        // 半笔续跑：意图已经在索引里（pending 已登记）——直接沿用它，**不写索引**（零写），只补后缀。
+      // P1-3：supersede / freeze 收成**一份**两相实现 —— `phase:"inspect"` 只读（零写，回报过期那条能不能退休），
+      //   `phase:"freeze"` 才持久化 PREPARING。判据（账本 pending / 登记表严格读）在调用方过完之后才走到 freeze 相。
+      supersede: ({ operationId: opId, phase }) => {
+        const st = loadClaudeTopicBinding({ root, claudeSessionId });
+        if (!st.ok) return { ok: false, reason: "state_unreadable", why: "锁内读不到话题状态：" + String(st.reason ?? "unknown") };
+        const rot = st.state?.rotation ?? null;
+        const nextOf = (state) => Math.max(...state.generations.map((g) => g.generation)) + 1;
         if (w2ResumeIntent && opId === w2ResumeIntent.opId) {
           return { ok: true, nextNumber: w2ResumeIntent.generation, token: w2ResumeIntent.token,
             claimExpiresAt: w2ResumeIntent.claimExpiresAt, reused: true, superseded: null };
         }
-        const st = loadClaudeTopicBinding({ root, claudeSessionId });
-        if (!st.ok) return { ok: false, reason: "state_unreadable", why: "锁内读不到话题状态：" + String(st.reason ?? "unknown") };
-        const rot = st.state?.rotation ?? null;
-        const pend = pendingGeneration(st.state);
         const mine = rot && rot.operation_id === opId && (rot.status === ROTATION_STATUS.PREPARING || rot.status === ROTATION_STATUS.FAILED);
-        if (mine) {
-          const n = Math.max(...st.state.generations.map((g) => g.generation)) + 1;
-          return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: true,
-            superseded: null };
+        if (phase === "inspect") {
+          // 只读：这里只回答"那条过期 pending 能不能在本笔里退休"（未过期 / 别人的 pending → null，交给账本侧判）
+          const blk = pendingRotationBlocker(st.state);
+          const sup = blk.kind === "expired" ? { opId: rot?.operation_id ?? null, rootOm: blk.pending?.root_message_id ?? null, generation: blk.pending?.generation ?? null } : null;
+          return { ok: true, superseded: sup, nextNumber: mine ? nextOf(st.state) : null };
         }
-        // 只有**已过期**的 pending 才能在同一笔里退休（未过期仍挡路 —— 与现行 supersedeExpiredAndPrepareTopicRotation 同判据）
+        if (mine) {
+          const n = nextOf(st.state);
+          return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: true, superseded: null };
+        }
         const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId: opId, supersedeExpired: true });
         if (!prepared.ok) {
           return { ok: false, why: "锁内冻结 PREPARING 失败（" + String(prepared.reason) + "）",
@@ -250,26 +253,6 @@ const wired = writeRoute.mode === "authoritative"
         return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: false,
           superseded: prepared.superseded === null || prepared.superseded === undefined ? null
             : { opId: rot?.operation_id ?? null, rootOm: prepared.superseded.root_message_id ?? null, generation: prepared.superseded.generation ?? null } };
-      },
-      freeze: ({ replay }) => {
-        // 锁内新鲜读（CAS 基准）；绝不拿锁外那份快照下结论。
-        const st = loadClaudeTopicBinding({ root, claudeSessionId });
-        if (!st.ok) return { ok: false, reason: "state_unreadable", why: "锁内读不到话题状态：" + String(st.reason ?? "unknown") };
-        const rot = st.state?.rotation ?? null;
-        const mine = rot && rot.operation_id === effOpId && (rot.status === ROTATION_STATUS.PREPARING || rot.status === ROTATION_STATUS.FAILED);
-        if (mine) {
-          // 自己的意图：沿用（代数在锁内派生 —— 尚未登记 pending generation，故代数与首跑一致）
-          const n = Math.max(...st.state.generations.map((generation) => generation.generation)) + 1;
-          return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: true };
-        }
-        const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId: effOpId, supersedeExpired: true });
-        if (!prepared.ok) {
-          return { ok: false, why: "锁内冻结 PREPARING 失败（" + String(prepared.reason) + "）",
-            reason: prepared.reason === "rotation_already_pending" ? "rotation_pending_exists" : prepared.reason };
-        }
-        if (prepared.superseded) console.log("已作废    第 " + prepared.superseded.generation + " 代（过期的待认领代际）");
-        const n = prepared.nextGeneration;
-        return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: false };
       },
       createTopic: ({ nextNumber }) => {
         const { rootText } = plan(nextNumber);

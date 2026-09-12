@@ -572,7 +572,11 @@ export function wireRotateAuthoritative({
     if (cur && cur.kind === "live" && cur.facts?.generation === "pending") {
       const linP = cur.generation_lineage_id;
       const kP = rk("create_b1", operationId, linP);
-      const ownP = kP.ok && Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === kP.request_key);
+      // P1-4：归属要核**三项**（op_type / result.created_id / lineage），不能只看 request key ——
+      //   索引里的 operation id 漂移或被篡改时，光有同 key 会把另一笔 pending 当成本次续跑。
+      const ownP = kP.ok && Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === kP.request_key
+        && op?.op_type === "create_b1" && op?.result?.created_id === resolved.id
+        && op?.result?.lineage_id === undefined ? true : (op?.result?.lineage_id ?? linP) === linP);
       if (!ownP) return { ok: false, reason: "rotation_pending_exists", why: "同 lineage 已有别人那条 live pending 代际（" + resolved.id + "）—— 不能重复创建" };
       const curOfLineage = liveOfLineage(L.doc, linP).find(([, r]) => r.facts?.generation === "current");
       if (!curOfLineage) return { ok: false, reason: "rotation_no_current", why: "pending 那一代没有 active 的 current 可继承" };
@@ -599,16 +603,22 @@ export function wireRotateAuthoritative({
     // 过期代际的退休：index 侧的 `supersedeExpired:true` 语义只对**已过期**的 pending 生效。
     //   先问调用方（锁内新鲜读 index）那一句 —— 它同时把 PREPARING 冻结了；返回的 superseded 若是
     //   **账本里那条** pending（同 root_om），本笔就允许把它按 expired 作废（在同一把 outer 锁内）。
-    let superseded = null;
-    let frozen = null;
+    // P1-3：**先**跑只读预检（phase:"inspect"，零写），把 superseded 的那条 pending 问出来；
+    //   只有全部判据过了才 phase:"freeze" 去持久化 PREPARING（否则一次本应零写拒绝的请求会留下持久 intent）。
+    let inspected = null;
     if (typeof supersede === "function") {
-      try { frozen = supersede({ operationId, pendingEntry }); }
+      try { inspected = supersede({ operationId, pendingEntry, phase: "inspect" }); }
       catch (err) { return { ok: false, reason: "rotation_prepare_threw", why: String(err?.code ?? err?.message ?? err) }; }
-      if (!frozen || frozen.ok !== true) return { ok: false, reason: frozen?.reason ?? "rotation_prepare_failed", why: frozen?.why ?? null };
-      superseded = frozen.superseded ?? null;
+      if (!inspected || inspected.ok !== true) return { ok: false, reason: inspected?.reason ?? "rotation_prepare_failed", why: inspected?.why ?? null };
     }
+    const superseded = inspected?.superseded ?? null;
+    let frozen = null;
     // 裁定 2：**先**看同 request key 是否已提交 —— 已提交 = 这是同一轮转的续跑，不被"已有 pending"挡住。
-    const ownCommitted = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === kOwn.request_key);
+    // P1-4：同 request key 命中还不够 —— 必须同时是 create_b1、且它的结果是**这条** pending 记录、lineage 对得上。
+    const ownCommitted = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === kOwn.request_key
+      && op?.op_type === "create_b1"
+      && op?.result?.created_id === (pendingEntry === undefined ? op?.result?.created_id : pendingEntry[0])
+      && (op?.result?.lineage_id ?? lineageId) === lineageId);
     // 「已过期的那条」= 调用方退休的那条 pending（同 root_om）—— 它可以在本笔里被作废，不算"重复创建"。
     const supersededIsPending = superseded !== null && pendingEntry !== undefined
       && superseded.rootOm === (pendingEntry[1]?.aliases?.root_om ?? null);
@@ -618,9 +628,13 @@ export function wireRotateAuthoritative({
     }
     const regProblem = strictRegistryProblem(env);
     if (regProblem !== null) return regProblem;
+    // 判据全过 → 现在才持久化 intent（freeze / supersede(phase:"freeze") 是同一份实现）
     if (frozen === null) {
-      try { frozen = freeze({ operationId, currentTa: current[0], currentRecord: current[1], replay: ownCommitted }); }
-      catch (err) { return { ok: false, reason: "rotation_prepare_threw", why: String(err?.code ?? err?.message ?? err) }; }
+      try {
+        frozen = typeof supersede === "function"
+          ? supersede({ operationId, currentTa: current[0], currentRecord: current[1], replay: ownCommitted, pendingEntry, phase: "freeze" })
+          : freeze({ operationId, currentTa: current[0], currentRecord: current[1], replay: ownCommitted });
+      } catch (err) { return { ok: false, reason: "rotation_prepare_threw", why: String(err?.code ?? err?.message ?? err) }; }
       if (!frozen || frozen.ok !== true) return { ok: false, reason: frozen?.reason ?? "rotation_prepare_failed", why: frozen?.why ?? null };
     }
     if (!en(frozen.token)) return { ok: false, reason: "rotation_prepare_failed", why: "锁内冻结没有给出 pending token" };
@@ -649,7 +663,10 @@ export function wireRotateAuthoritative({
       if (prep.supersededVoid !== null && prep.supersededVoid !== undefined) {
         const kSv = rk("void", prep.supersededVoid.opId ?? operationId, prep.supersededVoid.b1Id);
         if (!kSv.ok) return { op: "void", ok: false, reason: kSv.reason ?? "bad_external_id", why: kSv.why ?? null };
-        const sv = capture("void", voidPending({ endpointId, requestKey: kSv.request_key, b1Id: prep.supersededVoid.b1Id, reason: "expired", env }));
+        // P1-1：1.1+ 账本的 void(expired) 要**双键 CAS** —— 双键从锁内那条 pending 记录逐字取。
+        const svRec = L.doc.records?.[prep.supersededVoid.b1Id] ?? null;
+        const sv = capture("void", voidPending({ endpointId, requestKey: kSv.request_key, b1Id: prep.supersededVoid.b1Id, reason: "expired",
+          expectedHandle: svRec?.selection_handle ?? null, expectedExpiresAt: svRec?.handle_expires_at ?? null, env }));
         if (sv.ok !== true) return { ...sv, op: "void" };
         commits.push({ op: "void", commit: sv.committed ?? "committed_clean", idempotent: sv.idempotent === true,
           residue: sv.residue ?? null, lockUncleared: sv.lockUncleared ?? null, path: sv.path ?? null, error: sv.error ?? null });
@@ -717,37 +734,48 @@ export function wireVoidAuthoritative({
 }) {
   return runAuthoritative({ endpointId, env, prepare: () => {
     if (!en(operationId) || !en(locator)) return { ok: false, reason: "bad_external_id", why: "operationId/locator 必填 1..256 字符串" };
-    const resolved = resolveLiveId({ endpointId, locator, env });
-    if (!resolved.ok) {
-      return { ok: false, reason: resolved.reason === "ledger_absent" || resolved.reason === "ledger_unreadable" ? "ledger_route_unavailable" : resolved.reason,
-        why: "定位不到账本里的这条记录（" + String(resolved.reason) + "）：fail-closed" };
-    }
-    const b1Id = resolved.id;
     const L = loadByEndpoint(endpointId, { env });
     if (!L.ok) return { ok: false, reason: "ledger_route_unavailable", why: "账本读不出（" + String(L.reason ?? "unknown") + "）" };
-    const rec = L.doc.records?.[b1Id];
-    if (!rec || rec.kind !== "live") return { ok: false, reason: "void_target_not_live", why: "这条记录不是 live（" + b1Id + "）" };
+    const resolved = resolveLiveId({ endpointId, locator, env });
+    // P1-2：void 提交后 B1 已经是 `voided_audit`（不再是 live）——`resolveLiveId` 只认 live，重跑会 `locator_absent`，
+    //   永远到不了 replay 分支。所以定位要**同时**看 live 与 voided_audit（后者按 root_om 命中）。
+    let b1Id = resolved.ok === true ? resolved.id : null;
+    let rec = b1Id === null ? null : (L.doc.records?.[b1Id] ?? null);
+    if (b1Id === null) {
+      const vHit = Object.entries(L.doc.records ?? {}).find(([, r]) => r?.kind === "voided_audit" && r?.root_om === locator) ?? null;
+      if (vHit === null) {
+        return { ok: false, reason: resolved.reason === "ledger_absent" || resolved.reason === "ledger_unreadable" ? "ledger_route_unavailable" : resolved.reason,
+          why: "定位不到账本里的这条记录（live 与 voided_audit 都没有这个 root_om）：fail-closed" };
+      }
+      b1Id = vHit[0]; rec = vHit[1];
+    }
     const k = rk("void", operationId, b1Id);
     if (!k.ok) return { ok: false, reason: k.reason ?? "bad_external_id", why: k.why ?? null };
-    // 裁定 2：**先**识别同 request key 已提交态 —— 已 void 且是本笔 → 续跑后缀（不因"已不是 pending"被挡）
-    const replayed = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === k.request_key);
+    // 裁定 2 / P1-2：**先**按同一 request key 精确找已提交的 void op —— 找到 = 本笔已落地 → 只补后缀。
+    const committedVoid = Object.values(L.doc.operations ?? {}).find((op) => op?.request_key === k.request_key && op?.op_type === "void");
+    if (rec.kind === "voided_audit") {
+      if (committedVoid !== undefined) return { ok: true, b1Id, replay: true, ledgerDone: true };
+      return { ok: true, b1Id, alreadyVoid: true, ledgerDone: true, skipped: true };
+    }
     if (rec.facts?.binding !== "pending") {
-      if (replayed) return { ok: true, b1Id, replay: true, indexOnly: true };
-      if (rec.facts?.binding === "void") return { ok: true, b1Id, alreadyVoid: true, indexOnly: true, skipped: true };
       return { ok: false, reason: "void_not_pending", why: "目标不是待认领记录（facts.binding=" + String(rec.facts?.binding) + "）：只能作废 pending 代际" };
     }
     const regProblem = strictRegistryProblem(env);
     if (regProblem !== null) return regProblem;
-    return { ok: true, b1Id, replay: replayed, indexOnly: false };
+    return { ok: true, b1Id, replay: false, ledgerDone: false };
   }, steps: [
     { op: "ledger", run: ({ byOp }) => {
       const prep = byOp.get("__prepare") ?? {};
-      if (prep.indexOnly === true || prep.alreadyVoid === true) return { ok: true, skipped: true, b1Id: prep.b1Id ?? null };
+      if (prep.indexOnly === true || prep.alreadyVoid === true || prep.ledgerDone === true) return { ok: true, skipped: true, b1Id: prep.b1Id ?? null };
       const b1Id = prep.b1Id ?? null;
       if (!en(b1Id)) return { ok: false, reason: "bad_external_id", why: "prepare 没给出目标 id" };
       const k = rk("void", operationId, b1Id);
       if (!k.ok) return { op: "void", ...k };
-      return capture("void", voidPending({ endpointId, requestKey: k.request_key, b1Id, reason, env }));
+      // P1-1：expired 在 1.1+ 要**双键 CAS** —— 双键从**锁内**那条 pending 记录逐字取。
+      const curRec = (loadByEndpoint(endpointId, { env }).doc?.records ?? {})[b1Id] ?? null;
+      return capture("void", voidPending({ endpointId, requestKey: k.request_key, b1Id, reason,
+        expectedHandle: reason === "expired" ? (curRec?.selection_handle ?? null) : null,
+        expectedExpiresAt: reason === "expired" ? (curRec?.handle_expires_at ?? null) : null, env }));
     } },
     { op: "sidecars", run: ({ byOp }) => {
       const prep = byOp.get("__prepare") ?? {};

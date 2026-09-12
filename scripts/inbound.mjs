@@ -64,7 +64,7 @@ import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeo
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "./chat-ledger.mjs";
 import { closeClaudeTopicRotation, loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { recordClaudeActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
-import { wireChatA1, wirePromoteBinding, wirePromoteAuthoritative, m1aWriteRoute, uncleanWired } from "./m1a/wiring.mjs";
+import { wireChatA1, wirePromoteBinding, wirePromoteAuthoritative, m1aWriteRoute, uncleanWired, wireVoidAuthoritative } from "./m1a/wiring.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
 } from "./dialogue-binding-authorization.mjs";
@@ -446,14 +446,23 @@ if (!routed.ok) {
     if (template?.agent_uid) {
       const bound = loadClaudeTopicBinding({ root: pending.root, claudeSessionId: pending.claudeSessionId });
       const expiredGen = bound.ok ? pendingGeneration(bound.state) : null;
-      const wiredExpire = wireVoid({
-        endpointId: legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid }),
-        env: process.env,
-        rotationOpId: pending.operationId,
-        locator: expiredGen?.root_message_id ?? null,
-        reason: "expired",
-        legacy: wireExpireLegacy,
-      });
+      const expireEndpoint = legacyEndpointId({ runtime: "claude", agentUid: template.agent_uid });
+      // P1-1：authoritative → 分派到 `wireVoidAuthoritative`（账本 void(expired) 先行 → 条目删 → 索引作废）；
+      //   shadow / 未接入 → 原路径一字未改。
+      const wiredExpire = m1aWriteRoute({ endpointId: expireEndpoint, env: process.env }).mode === "authoritative"
+        ? wireVoidAuthoritative({
+            endpointId: expireEndpoint, env: process.env, operationId: pending.operationId,
+            locator: expiredGen?.root_message_id ?? null, reason: "expired",
+            publishIndex: () => wireExpireLegacy(),
+          })
+        : wireVoid({
+            endpointId: expireEndpoint,
+            env: process.env,
+            rotationOpId: pending.operationId,
+            locator: expiredGen?.root_message_id ?? null,
+            reason: "expired",
+            legacy: wireExpireLegacy,
+          });
       const failedStep = (wiredExpire.shadow ?? []).find((s) => !s.ok);
       const relFail = wiredExpire.release && wiredExpire.release.ok !== true;
       if (failedStep || relFail) {

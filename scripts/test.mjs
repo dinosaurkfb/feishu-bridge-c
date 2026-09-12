@@ -52100,6 +52100,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   const w1Bind = (x, env) => spawnSync(process.execPath, [path.resolve("scripts", "bind-session.mjs"), "--apply"], { encoding: "utf-8", cwd: x.proj, env });
   const W1_UUID_A = "11111111-1111-4111-8111-111111111111";
   const W1_UUID_B = "22222222-2222-4222-8222-222222222222";
+  const W1_UUID_C = "33333333-3333-4333-8333-333333333333";
 
   test("PK2-W1 T1 authoritative 绑定：话题恰一次 + 账本一条 B1 + 索引行 + pending-claims/expiry 各一条", () => {
     const x = w1Fixture("t1");
@@ -53369,17 +53370,15 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
         "凭证在场（只是对不上）→ 不给续跑：" + JSON.stringify(findPendingBinding({ content: w1Quoted(code), registryFile: x.regFile, templateFile: x.tplFile, env }).reason));
       const del = mutateSidecarEntry({ endpointId: x.EP, name: "pending-claims", key: ta, mutate: () => ({ ok: true, changed: true, value: null }) });
       assert.equal(del.ok, true, "夹具：再删掉（回到半笔现场）");
-      // 反例②：两条待认领且其中一条是半笔（凭证已被消费）→ 码无从消歧，宁可拒也不挑一个
+      // fix2（翻转原反例②）：另一条**正常** pending（B）不该卡死 A 的续跑 —— resumeCandidate 看的是
+      //   「符合四项恢复证据的候选数」，不是全机 pending 数（原「两条待认领 → TOKEN_UNKNOWN」已废）。
       const envB = w1SessionEnv(x, { sessionId: W1_UUID_B, pid: 900301, name: "line-b" });
       const rb = w1Bind(x, envB);
-      assert.equal(rb.status, 0, "第二条（另一个会话）绑上，于是有两条待认领：" + rb.stdout + rb.stderr);
+      assert.equal(rb.status, 0, "第二条（另一个会话）正常绑上：" + rb.stdout + rb.stderr);
       const two = findPendingBinding({ content: w1Quoted(code), registryFile: x.regFile, templateFile: x.tplFile, env });
-      assert.deepEqual([two.ok, two.reason], [false, PROMOTE_REJECT.TOKEN_UNKNOWN],
-        "两条待认领时不给续跑（码已被消费、无从消歧，绝不挑一个）：" + JSON.stringify(two).slice(0, 200));
-      // 真入口：把第二条撤掉，回到唯一半笔 → 同一条消息重跑补齐（激活重放命中 + 索引写 + 条目删）
-      const reg = x.registry();
-      reg.projects = reg.projects.filter((p) => p.claude_session_id !== W1_UUID_B);
-      fs.writeFileSync(x.regFile, JSON.stringify(reg, null, 2) + "\n", { mode: 0o600 });
+      assert.deepEqual([two.ok, two.matchedBy], [true, "consumed_credential_resume"],
+        "仅一条半笔 + 一条正常 pending → 仍续跑：" + JSON.stringify(two).slice(0, 200));
+      // 真入口：同一条消息重跑补齐（激活重放命中 + 索引写 + 条目删）——B 在场也不影响
       const r = w1InboundRun(x, env, { messageId: msgId, content: w1Quoted(code) });
       assert.equal(r.status, 0, "真入口重跑：" + r.stdout + r.stderr);
       const rowAfter = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
@@ -53388,6 +53387,59 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.equal(actives.length, 1, "active 仍恰一条（activate 重放命中，不重建）");
       assert.deepEqual(Object.values(x.ledger().operations).map((o) => o.op_type).filter((t) => t === "activate").length, 1, "activate 恰一笔");
     } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-I3-fix2 P1 真入口反例：仅一条 consumed half-state → A 重放能续跑、B 不受影响；两条都 half-state → 拒（歧义）", () => {
+    const f = w1ClaimableFixture("i3f2");
+    const { x, om, ta, env } = f;
+    try {
+      const code = readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[ta].token;
+      const rowIdA = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A).id;
+      const msgId = "msg_i3f2_1";
+      const half = (msgTag, locator, rowId, sessionId) => WIRE.wirePromoteAuthoritative({ endpointId: x.EP, env: process.env,
+        locator, claimKey: claimKey(msgTag, rowId), sessionId, authorizedBy: TPL.frank_sender_id, f4: w1F4Of(locator),
+        publishIndex: () => ({ ok: false, reason: "registry_unwritable", why: "注入：索引写失败" }) });
+      // A 造成半笔（账本 active、凭证条目已删、索引仍 pending）
+      const failA = half(msgId, om, rowIdA, "aily_i3");
+      assert.equal(failA.commit, "committed_unclean", "A 半笔：" + JSON.stringify(failA).slice(0, 200));
+      // B：另一条 lineage 的**正常** pending（bind 全套）
+      const envB = w1SessionEnv(x, { sessionId: W1_UUID_B, pid: 900401, name: "line-b-fix2" });
+      const rb = w1Bind(x, envB);
+      assert.equal(rb.status, 0, "B 正常绑上：" + rb.stdout + rb.stderr);
+      // 仅一条 half-state → A 的重放能续跑（改前 pending.length===2 直接拒 = fail-open 的反面：卡死合法续跑）
+      const pend = findPendingBinding({ content: w1Quoted(code), registryFile: x.regFile, templateFile: x.tplFile, env });
+      assert.deepEqual([pend.ok, pend.matchedBy], [true, "consumed_credential_resume"],
+        "仅一条半笔 → 续跑：" + JSON.stringify(pend).slice(0, 240));
+      const r = w1InboundRun(x, env, { messageId: msgId, content: w1Quoted(code) });
+      assert.equal(r.status, 0, "真入口 A 续跑：" + r.stdout + r.stderr);
+      const rowA = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_A);
+      assert.deepEqual([rowA.inbound_state, rowA.session_id], ["bound", "aily_i3"], "A 索引补齐：" + JSON.stringify(rowA).slice(0, 160));
+      const rowB = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_B);
+      assert.equal(rowB.inbound_state, "pending", "B 不受影响：" + JSON.stringify(rowB).slice(0, 160));
+      const recB = Object.values(x.ledger().records).find((rec) => rec.kind === "live" && rec.facts.binding === "pending");
+      assert.equal(recB.aliases.root_om !== om, true, "B 是另一条 lineage：" + String(recB.aliases.root_om));
+      assert.ok(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[recB.topic_agent_id], "B 的凭证条目还在");
+      // 两条都 half-state → 拒（歧义）：B 也造成半笔，再造 C 半笔 —— pending 里两条同时满足恢复证据
+      const halfB = half("msg_i3f2_b", recB.aliases.root_om, rowB.id, "aily_b");
+      assert.equal(halfB.commit, "committed_unclean", "B 半笔：" + JSON.stringify(halfB).slice(0, 200));
+      const envC = w1SessionEnv(x, { sessionId: W1_UUID_C, pid: 900402, name: "line-c-fix2" });
+      const rc = w1Bind(x, envC);
+      assert.equal(rc.status, 0, "C 绑上：" + rc.stdout + rc.stderr);
+      const rowC = x.registry().projects.find((p) => p.claude_session_id === W1_UUID_C);
+      const recC = Object.values(x.ledger().records).find((rec) => rec.kind === "live" && rec.facts.binding === "pending" && rec.aliases.root_om !== recB.aliases.root_om);
+      const halfC = half("msg_i3f2_c", recC.aliases.root_om, rowC.id, "aily_c");
+      assert.equal(halfC.commit, "committed_unclean", "C 半笔：" + JSON.stringify(halfC).slice(0, 200));
+      const two = findPendingBinding({ content: w1Quoted(code), registryFile: x.regFile, templateFile: x.tplFile, env });
+      assert.deepEqual([two.ok, two.reason], [false, PROMOTE_REJECT.TOKEN_UNKNOWN],
+        "两条真半笔 → 拒（歧义，绝不挑一个）：" + JSON.stringify(two).slice(0, 200));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-I3-fix2 P2：⑳ reject 时 ⑲ 文案 = 「判源不可用，⑲ 不作对账；见 ⑳ 故障」，不再断言旧登记面为准", () => {
+    const x = pk2i6Fixture({ cutover: true, authoritative: false });   // 收据切了、账本还是 shadow → reject
+    const c = checkOf(doctorReport(x.m.run()), "pending_claims_store");
+    assert.match(c.detail, /判源不可用，⑲ 不作对账；见 ⑳ 故障/u, c.detail);
+    assert.doesNotMatch(c.detail, /旧登记面/u, "reject 不能断言旧登记面为准：" + c.detail);
   });
 
   test("PK2-I3 T4 authoritative + 凭证库读不出 → 拒 ledger_route_unavailable（真入口，零写、不回落旧登记表 token）", () => {

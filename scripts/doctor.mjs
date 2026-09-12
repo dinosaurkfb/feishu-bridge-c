@@ -1295,9 +1295,11 @@ export function runDoctor({
     const parts19 = [];
     const problems19 = [];
     if (authority.mode !== "authoritative") {
-      add("pending_claims_store", "⑲ pending-claims store", true,
-        authority.mode === "legacy" ? "没有已切权威的 endpoint（authoritative 之后才出现）"
-          : "判源非 authoritative（" + authority.mode + "：" + authority.why + "）—— 待认领仍在旧登记面，不作对账", null);
+      // PK2-I3-fix2 P2：reject 只能说明判源不可用，**不能断言旧登记面为准**（那是 legacy/shadow 才有的含义）。
+      const text19 = authority.mode === "legacy" ? "没有已切权威的 endpoint（authoritative 之后才出现）"
+        : authority.mode === "reject" ? "判源不可用，⑲ 不作对账；见 ⑳ 故障"
+        : "待认领仍在旧登记面，不作对账";
+      add("pending_claims_store", "⑲ pending-claims store", true, text19, null);
     } else {
       for (const ep19 of authority.endpoints) {
         const short19 = ep19.slice(0, 16);

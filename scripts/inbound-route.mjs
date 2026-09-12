@@ -238,16 +238,21 @@ const pickPendingFromLegacy = ({ pending, tokens }) => {
  *   换个 message_id 来重放照样 `m1a_mode_not_shadow` 拒。
  */
 const resumeCandidate = ({ pending, claims, endpointId, env }) => {
-  if (pending.length !== 1) return null;
-  const c = claims[0];
-  if (c.entry !== null || c.id === null) return null;
+  // PK2-I3-fix2 P1：候选资格看「符合四项恢复证据的条数」，**不是全机 pending 数**（`pending.length === 1`
+  //   的旧判据会把「另一条 lineage 的正常 pending」也数进去，卡死本条线合法的 committed-unclean 续跑）。
+  //   在全部 claims 里筛出同时满足 ①凭证条目已删 ②能解析到账本 live id ③账本 active ④pairing 证明
+  //   是码认领且 matched_om 与本代际根消息一致 的候选，再要求**恰一条**；两条真半笔 → 无从消歧 → null
+  //   （调用方折成 token_unknown 拒，绝不挑一个）。账本一次读入、全候选共用。
   const led = loadByEndpoint(endpointId, { env });
   if (!led.ok) return null;
-  const rec = led.doc.records?.[c.id];
-  if (!rec || rec.kind !== "live" || rec.facts?.binding !== "active") return null;
-  const proof = rec.binding_proof;
-  if (proof?.pending_token_state !== "present" || proof?.matched_om !== c.binding.generation?.root_message_id) return null;
-  return c;
+  const candidates = claims.filter((c) => {
+    if (c.entry !== null || c.id === null) return false;
+    const rec = led.doc.records?.[c.id];
+    if (!rec || rec.kind !== "live" || rec.facts?.binding !== "active") return false;
+    const proof = rec.binding_proof;
+    return proof?.pending_token_state === "present" && proof?.matched_om === c.binding.generation?.root_message_id;
+  });
+  return candidates.length === 1 ? candidates[0] : null;
 };
 
 /**

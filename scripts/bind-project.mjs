@@ -25,7 +25,8 @@ import { displaySafe } from "./display-safe.mjs";
 import { loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { bindingsForRoot, currentBinding, describeStatus, setBindingStatus } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding, withRegistryTransaction } from "./topic-generation-store.mjs";
-import { wirePauseResume, emitUncleanReceipt } from "./m1a/wiring.mjs";
+import { activeGeneration } from "./topic-generation.mjs";
+import { m1aWriteRoute, wirePauseResume, wirePauseResumeAuthoritative, uncleanWired, emitUncleanReceipt } from "./m1a/wiring.mjs";
 import { maintenanceDir } from "./maintenance/journal.mjs";
 import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
@@ -182,6 +183,50 @@ if (suspended.ok && suspended.suspended) {
   let r;
   let wiredResume = null;
   if (agentUid0) {
+    const resumeEndpoint = legacyEndpointId({ runtime: "claude", agentUid: agentUid0 });
+    // PK2-W3：authoritative → 走 `wirePauseResumeAuthoritative`（账本 restore 先行 → 索引复原）。
+    //   **只放开"恢复已暂停的既有 binding"这一支**：新建项目级绑定根本不走这里（runResume 只在既有行上跑）。
+    if (m1aWriteRoute({ endpointId: resumeEndpoint, env: process.env }).mode === "authoritative") {
+      const cur = currentBinding({ root, claudeSessionId: null });
+      const stR = loadClaudeTopicBinding({ root });
+      const om = activeGeneration(stR?.state)?.root_message_id
+        ?? cur?.mapping?.feishu_root_message_id_reference ?? cur?.entry?.root_message_id ?? null;
+      if (typeof om !== "string" || om.length === 0) {
+        console.error("这条 binding 没有根消息 locator（定位不到账本记录）：**不写**（先人工核对）。");
+        process.exit(1);
+      }
+      const wiredAuthR = wirePauseResumeAuthoritative({
+        endpointId: resumeEndpoint, env: process.env, action: "resume", locator: om,
+        publishIndex: () => runResume(),
+      });
+      if (!wiredAuthR.ok) {
+        console.error("恢复中止（M1a 权威写方拒：" + (wiredAuthR.reason ?? "m1a_reject") + (wiredAuthR.why ? "；" + wiredAuthR.why : "") + "）");
+        process.exit(1);
+      }
+      // P1-4（W3-fix4）：**统一 unclean 投影**（与 W1 同一份）—— 账本与索引都 clean、而 outer release
+      //   不净时 commit 仍 committed_clean，旧写法会一个回执都不留。prepare 就拒的那一支已 exit。
+      const resumeUnclean = uncleanWired(wiredAuthR);
+      if (!resumeUnclean.clean) emitUncleanReceipt("cli_bind_project_resume", wiredAuthR, { root, claudeSessionId: null, receiptDir: path.join(os.homedir(), ".claude", "feishu-bridge", "receipts") });
+      if (wiredAuthR.legacy?.ok !== true) {
+        console.error("恢复没落完（停在第 " + String(wiredAuthR.legacy?.phase ?? "?") + " 步：" + String(wiredAuthR.legacy?.message ?? wiredAuthR.legacy?.reason ?? "")
+          + "）。账本可能已提交：**按当前 origin op 证明已提交后补索引**（同一条命令重跑，不重复记）。");
+        process.exit(1);
+      }
+      if (wiredAuthR.commit !== "committed_clean") {
+        console.error("注意      这一步有提交不干净（commit=" + String(wiredAuthR.commit) + "）：已落机器回执。");
+      }
+      // P1-4（W3-fix5）：不干净 = **不许绿退出、也不许说"已恢复"**（回执已落）。
+      if (!resumeUnclean.clean) {
+        console.error("注意      这一次不干净（commit=" + String(wiredAuthR.commit ?? "?") + (resumeUnclean.releaseUnclean ? "，排序锁没交还干净" : "")
+          + "）：已落机器回执。**恢复的事实可能已经提交**（账本 restore / 索引 active 之一或两者已落地）——"
+          + "先跑 doctor 核对，再按同一条命令重跑补齐（不重复记）。");
+        process.exit(1);
+      }
+      const rr = wiredAuthR.legacy;
+      if (rr?.__fixedKind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");
+      console.log("\n已恢复（账本 restore 先行，再改索引）。");
+      process.exit(0);
+    }
     wiredResume = wirePauseResume({
       endpointId: legacyEndpointId({ runtime: "claude", agentUid: agentUid0 }),
       env: process.env,

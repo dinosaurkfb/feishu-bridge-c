@@ -867,6 +867,96 @@ export function wireVoidAuthoritative({
   } });
 }
 
+/* ── PK2-W3（M1b-W3）：切权威后的暂停 / 恢复（authoritative 复合写）──────────
+ *
+ * 复用 W1/W2 的 `runAuthoritative` 骨架。Codex 裁定（2026-09-12 00:10Z）：
+ *   · **实时写账本**：暂停 = `unbind`、恢复 = `restore`，**账本先行**再改索引 —— 只改索引会让 R66 的权威投递
+ *     仍把绑定视为 active，语义不成立。
+ *   · 索引后缀**复用现有状态助手**（feishu-unbind / bind-project 的现行写法：嵌套 binding_status + 恢复时的
+ *     routability / enabled），锁内重读再局部更新（W1 口径）。
+ *   · request key **不加 WAL**：由「目标 id + pause/resume + 当前不可变 `origin_operation_id`」派生；
+ *     账本提交后重跑**按记录现状**（当前 origin op 是本单类型 + 影响的就是这条）识别重放 → 只补索引
+ *     （committed_unclean 续跑，W1 口径；不扫历史同类型 op）。
+ *   · **族收口（W3-fix4 P1-3）**：本单只开 **B3 ↔ B3′** —— 账本 `restore()` 只接受 B3′，
+ *     暂停 A2/A3/B4 会落一个没有反向路径的 dormant 态，一律拒 `not_pausable`。
+ *   · sidecar 不动；rotate/void 归 W2；其余 wire* 在 authoritative 仍拒。
+ */
+export function wirePauseResumeAuthoritative({
+  endpointId, env = process.env, action, locator, publishIndex, now = Date.now(),
+}) {
+  const opType = action === "resume" ? "restore" : "unbind";
+  return runAuthoritative({ endpointId, env, prepare: () => {
+    if (action !== "pause" && action !== "resume") return { ok: false, reason: "bad_action", why: "action 只收 pause / resume" };
+    if (!en(locator)) return { ok: false, reason: "bad_external_id", why: "locator（这条绑定的根消息 om）必填" };
+    const L = loadByEndpoint(endpointId, { env });
+    if (!L.ok) return { ok: false, reason: "ledger_route_unavailable", why: "账本读不出（" + String(L.reason ?? "unknown") + "）：fail-closed，不回落 legacy" };
+    const resolved = resolveLiveId({ endpointId, locator, env });
+    if (!resolved.ok) return { ok: false, reason: "ledger_route_unavailable", why: "按根消息定位不到这条绑定的 live 记录（" + String(resolved.reason) + "）" };
+    const rec = L.doc.records?.[resolved.id];
+    if (!rec || rec.kind !== "live") return { ok: false, reason: "target_not_live", why: "目标不是 live 记录（" + resolved.id + "）" };
+    const originOperationId = rec.origin_operation_id ?? null;
+    if (!en(originOperationId)) return { ok: false, reason: "no_origin_operation", why: "这条记录没有 origin_operation_id，派不出确定的 request key（不加 WAL）" };
+    const k = rk(opType, action + ":" + resolved.id, originOperationId);
+    if (!k.ok) return { ok: false, reason: k.reason ?? "bad_external_id", why: k.why ?? null };
+    const fam = familyOf(rec.facts);
+    const dormant = rec.facts?.binding === "dormant";
+    // P1-2（W3-fix4）：**已提交态按记录现状判** —— 直查当前 `origin_operation_id` 指向的**那一条** op。
+    //   账本提交后 origin_operation_id 会被这一笔改写（unbind/restore 都写），重跑派出的 request key 也就随之不同，
+    //   所以“这一笔落地了吗”不能靠 key，只能看记录现状：那条 op ① 是本单的目标类型（pause→unbind /
+    //   resume→restore）② 影响的 id 就是这条记录（与账本自己的 G13 同一判据：旧形给 affected_id、
+    //   新形给 affected_live_ids_after_commit）。两个都对 ⇒ 已落地 → 只补索引（**在**前态拒绝之前判）。
+    //   不扫历史同类型 op（旧实现 `opDoneFor` 会把**别人的**那一笔也算成本笔已提交）。
+    const originOp = L.doc.operations?.[originOperationId] ?? null;
+    const originCommitted = originOp !== null && originOp.op_type === opType
+      && (originOp.result?.affected_id === resolved.id || originOp.result?.affected_live_ids_after_commit?.includes(resolved.id));
+    // 同 request key 已提交（首跑崩在“提交后、记录里的 origin 已改”之间那个窗口才可能命中）。
+    const committed = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === k.request_key);
+    if (action === "pause") {
+      // P1-3（W3-fix4）：本单只允许 **B3 ↔ B3′**（账本 `restore()` 只接受 B3′）。
+      //   暂停 A2/A3/B4 会落一个**没有反向路径**的 dormant 态，一律拒 not_pausable —— 不为 A 族另扩恢复设计。
+      if (fam !== "B3" && fam !== "B3'") {
+        return { ok: false, reason: "not_pausable",
+          why: "目标不是可暂停的族（family=" + String(fam) + "）：本单只开 B3 ↔ B3′（暂停别的族没有反向恢复路径）" };
+      }
+      // 已经 dormant（暂停那一笔已落地）→ **只补索引**（幂等：索引侧状态助手自己会 changed:false）。
+      if (dormant && originCommitted) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, ledgerDone: true };
+      if (dormant) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, alreadyDone: true };
+    } else {
+      // 恢复那一笔已落地（记录已 active 回来）→ 只补索引。这条判定必须在下面的“前态拒绝”**之前**：
+      //   首跑已提交、索引写失败时记录已经是 active B3，重跑的 key 又因 origin 已变而不同 ——
+      //   先撞 not_paused 就永远补不了索引（旧版的形状）。
+      if (!dormant && originCommitted) return { ok: true, b1Id: resolved.id, requestKey: k.request_key, ledgerDone: true };
+      if (!dormant && fam !== "B3'" && !committed) {
+        return { ok: false, reason: "not_paused", why: "这条绑定没有暂停过（facts.binding=" + String(rec.facts?.binding) + " / family=" + String(fam) + "）—— 没什么可恢复的，零写" };
+      }
+    }
+    const regProblem = strictRegistryProblem(env);
+    if (regProblem !== null) return regProblem;
+    if (typeof publishIndex !== "function") return { ok: false, reason: "no_publish_index", why: "调用方没给索引写方" };
+    return { ok: true, b1Id: resolved.id, requestKey: k.request_key, committed, action, dormant };
+  }, steps: [
+    { op: opType, run: ({ byOp }) => {
+      const prep = byOp.get("__prepare") ?? {};
+      if (prep.alreadyDone === true || prep.ledgerDone === true) return { ok: true, skipped: true, reason: null };
+      const fn = opType === "restore" ? restore : unbind;
+      return capture(opType, fn({ endpointId, requestKey: prep.requestKey, id: prep.b1Id, now, env }));
+    } },
+    { op: "index", run: ({ byOp }) => {
+      const prep = byOp.get("__prepare") ?? {};
+      if (prep.alreadyDone === true) return { ok: true, skipped: true };
+      let idx;
+      try { idx = publishIndex({ b1Id: prep.b1Id ?? null, action, endpointId, env }); }
+      catch (err) { return { ok: false, reason: "index_threw", why: String(err?.code ?? err?.message ?? err) }; }
+      return idx && idx.ok === true ? { ...idx } : { ok: false, reason: idx?.reason ?? "index_failed", why: idx?.why ?? idx?.error ?? null };
+    } },
+  ], buildLegacy: ({ byOp, failedOp }) => {
+    const prep = byOp.get("__prepare") ?? {};
+    if (failedOp === null) return { ok: true, b1Id: prep.b1Id ?? null, action, already: prep.alreadyDone === true, committed: prep.committed === true };
+    const phase = failedOp === "index" ? "registry" : "ledger";
+    return { ok: false, phase, reason: byOp.get(failedOp)?.reason ?? failedOp, message: byOp.get(failedOp)?.why ?? "（无 why）" };
+  } });
+}
+
 /* ── per-writer 具名函数（§5.1 每一行一个） ─────────────────── */
 
 /* A1 物化（chat）双写接线：把入站 chat 的 endpoint（agent_uid 派生）/oc_ chat_id / Aily

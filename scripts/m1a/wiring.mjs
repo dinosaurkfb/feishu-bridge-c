@@ -620,40 +620,80 @@ export function wireRotateAuthoritative({
       if (!inspected || inspected.ok !== true) return { ok: false, reason: inspected?.reason ?? "rotation_prepare_failed", why: inspected?.why ?? null };
     }
     const superseded = inspected?.superseded ?? null;
-    let frozen = null;
     // 裁定 2：**先**看同 request key 是否已提交 —— 已提交 = 这是同一轮转的续跑，不被"已有 pending"挡住。
     // P1-4：归属判据统一走 ownCreateB1Op（精确 request key + op_type + **当前 pending id**）；
     //   没有 pending 时它恒为 false —— 那就不该被当成"create_b1 后缀续跑"。
     const ownCommitted = ownCreateB1Op({ doc: L.doc, requestKey: kOwn.request_key, pendingId: pendingEntry === undefined ? null : pendingEntry[0] });
-    // 「已过期的那条」= 调用方退休的那条 pending（同 root_om）—— 它可以在本笔里被作废，不算"重复创建"。
+    // 「已过期的那条」= 调用方（索引侧只读预检）报出来的那条待认领代际（同 root_om）—— 它可以在本笔里被作废，
+    //   不算"重复创建"。
     const supersededIsPending = superseded !== null && pendingEntry !== undefined
       && superseded.rootOm === (pendingEntry[1]?.aliases?.root_om ?? null);
     if (pendingEntry && !ownCommitted && !supersededIsPending) {
       return { ok: false, reason: "rotation_pending_exists",
         why: "同 lineage 已有 live pending 代际（" + pendingEntry[0] + "）—— 去新话题 @ 认领，或 --cancel 显式取消，不能重复创建" };
     }
+    // A 法（W2-fix7 P1-b）：旧 pending 的账本 `void(expired)` 是**本笔第一个提交步**（不是发话题之后的补救）——
+    //   prepare 只读地把它判出来 + 取双键，真正提交交给步骤 ①。两种现场：
+    //   · 账本里那条还在 live pending → `voidPlan`（提交步要的四件：目标 / request key / 双键）；
+    //   · 账本里已经是 `voided_audit`（①提交后崩溃的重跑）→ 只记 retiredB1Id（提交步跳过，索引侧照旧退休）。
+    //   孤儿自愈（"索引已退休、账本仍 pending"）**已删** —— 那个现场是 B 法的产物，A 法下不再产生。
+    let voidPlan = null;
+    let existingVoidedId = null;
+    if (superseded !== null) {
+      if (supersededIsPending) {
+        // 1.0 账本不复核到期（记录上没有 handle_expires_at），所以**本层**复核：索引侧报出来的 claim 截止
+        //   必须是可解析的**过去时**。缺 / 读不出 / 未到 → 拒（fail-closed：绝不作废一条可能还没到期的记录）。
+        const claimExpiresAt = Date.parse(superseded.expiresAt ?? "");
+        if (!Number.isFinite(claimExpiresAt) || !(now >= claimExpiresAt)) {
+          return { ok: false, reason: "superseded_not_expired",
+            why: "索引报出的那条待认领代际没有可核的过期时间（expiresAt=" + String(superseded.expiresAt ?? null) + "）：不作废" };
+        }
+        const kSv = rk("void", superseded.opId ?? operationId, pendingEntry[0]);
+        if (!kSv.ok) return { ok: false, reason: kSv.reason ?? "bad_external_id", why: kSv.why ?? null };
+        voidPlan = { b1Id: pendingEntry[0], requestKey: kSv.request_key,
+          expectedHandle: pendingEntry[1]?.selection_handle ?? null, expectedExpiresAt: pendingEntry[1]?.handle_expires_at ?? null,
+          rootOm: superseded.rootOm ?? null, indexOpId: superseded.opId ?? null };
+      } else {
+        const hit = Object.entries(L.doc.records ?? {}).find(([, r]) => r?.kind === "voided_audit" && r?.root_om === superseded.rootOm) ?? null;
+        existingVoidedId = hit === null ? null : hit[0];
+      }
+    }
     const regProblem = strictRegistryProblem(env);
     if (regProblem !== null) return regProblem;
-    // 判据全过 → 现在才持久化 intent（freeze / supersede(phase:"freeze") 是同一份实现）
-    if (frozen === null) {
-      try {
-        frozen = typeof supersede === "function"
-          ? supersede({ operationId, currentTa: current[0], currentRecord: current[1], replay: ownCommitted, pendingEntry, phase: "freeze" })
-          : freeze({ operationId, currentTa: current[0], currentRecord: current[1], replay: ownCommitted });
-      } catch (err) { return { ok: false, reason: "rotation_prepare_threw", why: String(err?.code ?? err?.message ?? err) }; }
-      if (!frozen || frozen.ok !== true) return { ok: false, reason: frozen?.reason ?? "rotation_prepare_failed", why: frozen?.why ?? null };
-    }
-    if (!en(frozen.token)) return { ok: false, reason: "rotation_prepare_failed", why: "锁内冻结没有给出 pending token" };
-    return { ok: true, pendingToken: frozen.token, nextNumber: frozen.nextNumber ?? null, claimExpiresAt: frozen.claimExpiresAt ?? null,
-      reused: frozen.reused === true, replay: ownCommitted,
-      lineageId, requestKey: kOwn.request_key,
-      supersededVoid: supersededIsPending ? { b1Id: pendingEntry[0], opId: superseded.opId ?? null, rootOm: superseded.rootOm } : null,
+    // 只读到底：真正动索引的是步骤 ②（freeze），它**只能**在步骤 ①（账本 void）之后跑。
+    return { ok: true, lineageId, requestKey: kOwn.request_key, currentTa: current[0], currentRecord: current[1],
+      pendingEntry: pendingEntry === undefined ? null : pendingEntry[0], superseded, voidPlan,
+      retiredB1Id: voidPlan?.b1Id ?? existingVoidedId ?? null,
       inheritedTarget: current[1].binding_target ?? null, inheritedExpiryTa: current[0] };
   }, steps: [
-    { op: "topic", run: ({ byOp }) => {
+    // ① A 法：旧 pending 的账本作废 —— **显式的前置提交步**（在索引退休 / 冻结 / 发话题之前）。
+    { op: "void", run: ({ byOp }) => {
+      const plan = byOp.get("__prepare")?.voidPlan ?? null;
+      if (plan === null) return { ok: true, skipped: true, reason: null };
+      // 1.1+ 的 void(expired) 要双键 CAS —— 双键来自 prepare 只读读到的那条记录（同一把 outer 锁内，无人能改）。
+      return capture("void", voidPending({ endpointId, requestKey: plan.requestKey, b1Id: plan.b1Id, reason: "expired",
+        expectedHandle: plan.expectedHandle, expectedExpiresAt: plan.expectedExpiresAt, env }));
+    } },
+    // ② 索引侧：过期代际退休（调用方按 expired 关）+ 冻结本笔 PREPARING —— 在①之后。
+    { op: "freeze", run: ({ byOp }) => {
       const prep = byOp.get("__prepare") ?? {};
+      const cb = typeof supersede === "function" ? supersede : freeze;
+      if (typeof cb !== "function") return { ok: false, reason: "no_freeze", why: "调用方没给 freeze / supersede 回调" };
+      let frozen;
+      try {
+        frozen = cb({ operationId, currentTa: prep.currentTa, currentRecord: prep.currentRecord, replay: false,
+          pendingEntry: prep.pendingEntry, superseded: prep.superseded ?? null, voidPlan: prep.voidPlan ?? null,
+          phase: typeof supersede === "function" ? "freeze" : undefined });
+      } catch (err) { return { ok: false, reason: "freeze_threw", why: String(err?.code ?? err?.message ?? err) }; }
+      if (!frozen || frozen.ok !== true) return { ok: false, reason: frozen?.reason ?? "rotation_prepare_failed", why: frozen?.why ?? null };
+      if (!en(frozen.token)) return { ok: false, reason: "rotation_prepare_failed", why: "锁内冻结没有给出 pending token" };
+      return { ok: true, nextNumber: frozen.nextNumber ?? null, pendingToken: frozen.token,
+        claimExpiresAt: frozen.claimExpiresAt ?? null, reused: frozen.reused === true };
+    } },
+    { op: "topic", run: ({ byOp }) => {
+      const fr = byOp.get("freeze") ?? {};
       let t;
-      try { t = createTopic({ nextNumber: prep.nextNumber ?? null, pendingToken: prep.pendingToken ?? null }); }
+      try { t = createTopic({ nextNumber: fr.nextNumber ?? null, pendingToken: fr.pendingToken ?? null }); }
       catch (err) { return { ok: false, reason: "topic_failed", why: String(err?.code ?? err?.message ?? err) }; }
       return t && t.ok === true && en(t.root_message_id)
         ? { ok: true, root_message_id: t.root_message_id }
@@ -664,33 +704,18 @@ export function wireRotateAuthoritative({
       const om = byOp.get("topic")?.root_message_id ?? null;
       if (!en(om)) return { ok: false, reason: "bad_external_id", why: "新根话题 om 缺失" };
       if (!en(prep.requestKey) || !en(prep.lineageId)) return { op: "create_b1", ok: false, reason: "bad_external_id", why: "prepare 没给出锁内派生的 request key / lineage" };
-      const commits = [];
-      // 过期代际：**账本先作废**，否则 create_b1 会被 lineage_pending_exists 挡住（index 侧同一笔锁内已退休它）
-      if (prep.supersededVoid !== null && prep.supersededVoid !== undefined) {
-        const kSv = rk("void", prep.supersededVoid.opId ?? operationId, prep.supersededVoid.b1Id);
-        if (!kSv.ok) return { op: "void", ok: false, reason: kSv.reason ?? "bad_external_id", why: kSv.why ?? null };
-        // P1-1：1.1+ 账本的 void(expired) 要**双键 CAS** —— 双键从锁内那条 pending 记录逐字取。
-        // 锁内重读（`L` 只在 prepare 作用域里，这里取同一时刻的记录拿双键）
-        const svRec = (loadByEndpoint(endpointId, { env }).doc?.records ?? {})[prep.supersededVoid.b1Id] ?? null;
-        const sv = capture("void", voidPending({ endpointId, requestKey: kSv.request_key, b1Id: prep.supersededVoid.b1Id, reason: "expired",
-          expectedHandle: svRec?.selection_handle ?? null, expectedExpiresAt: svRec?.handle_expires_at ?? null, env }));
-        if (sv.ok !== true) return { ...sv, op: "void" };
-        commits.push({ op: "void", commit: sv.committed ?? "committed_clean", idempotent: sv.idempotent === true,
-          residue: sv.residue ?? null, lockUncleared: sv.lockUncleared ?? null, path: sv.path ?? null, error: sv.error ?? null });
-      }
       const r = capture("create_b1", createB1({ endpointId, requestKey: prep.requestKey, chatId, rootOm: om, lineageId: prep.lineageId,
         bindingTarget: prep.inheritedTarget, now, env }));
-      if (r.ok !== true) return { ...r, commits };
-      const id = r.result?.created_id ?? null;
-      return { ...r, commits, root_message_id: om, topic_agent_id: id };
+      if (r.ok !== true) return r;
+      return { ...r, root_message_id: om, topic_agent_id: r.result?.created_id ?? null };
     } },
     { op: "index", run: ({ byOp }) => {
-      const prep = byOp.get("__prepare") ?? {};
+      const fr = byOp.get("freeze") ?? {};
       const om = byOp.get("topic")?.root_message_id ?? null;
       if (!en(om)) return { ok: false, reason: "bad_external_id", why: "新根话题 om 缺失" };
       if (typeof publishIndex !== "function") return { ok: false, reason: "no_publish_index", why: "调用方没给代际索引写方" };
       let idx;
-      try { idx = publishIndex({ rootMessageId: om, nextNumber: prep.nextNumber ?? null, pendingToken: prep.pendingToken,
+      try { idx = publishIndex({ rootMessageId: om, nextNumber: fr.nextNumber ?? null, pendingToken: fr.pendingToken,
         topicAgentId: byOp.get("ledger")?.topic_agent_id ?? null, endpointId, env }); }
       catch (err) { return { ok: false, reason: "index_threw", why: String(err?.code ?? err?.message ?? err) }; }
       return idx && idx.ok === true ? { ...idx } : { ok: false, reason: idx?.reason ?? "index_failed", why: idx?.why ?? idx?.error ?? null };
@@ -698,13 +723,23 @@ export function wireRotateAuthoritative({
     { op: "sidecars", run: ({ byOp }) => {
       const ta = byOp.get("ledger")?.topic_agent_id ?? null;
       const prep = byOp.get("__prepare") ?? {};
+      const fr = byOp.get("freeze") ?? {};
       if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本 create_b1 未返回 topic_agent_id（无法写 sidecar 条目）" };
-      const claimExpiresAt = prep.claimExpiresAt ?? null;
+      // P1-c（W2-fix7）：被作废那一条的两条目（pending-claims + expiry）**必须删掉** —— 轮转内嵌的退休
+      //   旧实现两条都没删，I6 的 expiry.json entries === live B 精确对账会立即报多余条目。缺则幂等。
+      if (en(prep.retiredB1Id)) {
+        for (const name of ["pending-claims", "expiry"]) {
+          const del = mutateSidecarEntry({ endpointId, name, key: prep.retiredB1Id, env,
+            mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
+          if (del.ok !== true) return { ok: false, reason: name + "_" + String(del.reason ?? "failed"), why: del.why ?? null };
+        }
+      }
+      const claimExpiresAt = fr.claimExpiresAt ?? null;
       // 待认领条目：{token, claim_expires_at}（默认 null = 不过期，沿用 2026-08-28 的决定）
       const claim = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env,
-        mutate: (cur) => (cur?.token === prep.pendingToken && (cur?.claim_expires_at ?? null) === claimExpiresAt
+        mutate: (cur) => (cur?.token === fr.pendingToken && (cur?.claim_expires_at ?? null) === claimExpiresAt
           ? { ok: true, changed: false }
-          : { ok: true, changed: true, value: { token: prep.pendingToken, claim_expires_at: claimExpiresAt } }) });
+          : { ok: true, changed: true, value: { token: fr.pendingToken, claim_expires_at: claimExpiresAt } }) });
       if (claim.ok !== true) return { ok: false, reason: "pending_claims_" + String(claim.reason ?? "failed"), why: claim.why ?? null };
       // expiry：**继承 current 的到期值**（current 没有条目 = 没设到期 → 新代际也不写条目）
       const cur = readSidecarStore({ endpointId, name: "expiry", env });
@@ -724,14 +759,16 @@ export function wireRotateAuthoritative({
       return { ok: true, topic_agent_id: ta, pending_claims: claim.changed === true, expiry: exp.changed === true, inherited_expiry: inheritable };
     } },
   ], buildLegacy: ({ byOp, failedOp }) => {
-    const prep = byOp.get("__prepare") ?? {};
+    const fr = byOp.get("freeze") ?? {};
     const om = byOp.get("topic")?.root_message_id ?? null;
     if (failedOp === null) {
-      return { ok: true, root_message_id: om, next_generation: prep.nextNumber ?? null,
-        topic_agent_id: byOp.get("ledger")?.topic_agent_id ?? null, reused_intent: prep.reused === true };
+      return { ok: true, root_message_id: om, next_generation: fr.nextNumber ?? null,
+        topic_agent_id: byOp.get("ledger")?.topic_agent_id ?? null, reused_intent: fr.reused === true };
     }
     if (failedOp === "topic") return { ok: false, phase: "send", reason: byOp.get("topic")?.reason ?? "topic_failed", message: byOp.get("topic")?.why ?? "建新根话题失败" };
-    const phase = failedOp === "ledger" ? "ledger" : failedOp === "index" ? "registry" : "sidecar";
+    // A 法步骤序：① void ② freeze ③ topic ④ ledger ⑤ index ⑥ sidecars —— 步→阶段的映射照旧（外部契约不变）。
+    const phase = failedOp === "void" || failedOp === "ledger" ? "ledger"
+      : failedOp === "freeze" || failedOp === "index" ? "registry" : "sidecar";
     return { ok: false, phase, root_message_id: om, reason: byOp.get(failedOp)?.reason ?? failedOp, message: byOp.get(failedOp)?.why ?? "（无 why）" };
   } });
 }
@@ -795,10 +832,16 @@ export function wireVoidAuthoritative({
       const prep = byOp.get("__prepare") ?? {};
       const b1Id = prep.b1Id ?? null;
       if (!en(b1Id)) return { ok: false, reason: "bad_external_id", why: "prepare 没给出目标 id" };
-      const del = mutateSidecarEntry({ endpointId, name: "pending-claims", key: b1Id, env,
-        mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
-      if (del.ok !== true) return { ok: false, reason: "pending_claims_" + String(del.reason ?? "failed"), why: del.why ?? null };
-      return { ok: true, deleted: del.changed === true };
+      // P1-c（W2-fix7）：被作废记录的 **pending-claims 与 expiry 两条目**都要删（旧实现只删 pending-claims）。
+      //   缺则幂等 —— I6 的 expiry.json entries === live B 精确对账不允许留孤儿条目。
+      const deleted = {};
+      for (const name of ["pending-claims", "expiry"]) {
+        const del = mutateSidecarEntry({ endpointId, name, key: b1Id, env,
+          mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
+        if (del.ok !== true) return { ok: false, reason: name.replace("-", "_") + "_" + String(del.reason ?? "failed"), why: del.why ?? null };
+        deleted[name] = del.changed === true;
+      }
+      return { ok: true, deleted: deleted["pending-claims"] === true, deleted_expiry: deleted.expiry === true };
     } },
     { op: "index", run: ({ byOp }) => {
       const prep = byOp.get("__prepare") ?? {};

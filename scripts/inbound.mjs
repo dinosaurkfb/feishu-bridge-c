@@ -465,25 +465,30 @@ if (!routed.ok) {
             reason: "expired",
             legacy: wireExpireLegacy,
           });
-      // P1-1（W2-fix4）：收口与 feishu-rotate 的 authoritative 分步收口**同形** ——
+              // P1-1（W2-fix4）：收口与 feishu-rotate 的 authoritative 分步收口**同形** ——
       //   ① prepare/整笔拒（ok!==true）→ 落拒回执；② legacy 步失败 或 ③ commit !== committed_clean → 落 unclean 回执。
       //   旧版只看 failedStep/relFail，"准备阶段就拒"与"步骤全绿但提交不净"都会**不落回执**（K10 因此绿）。
-      const expiredPrepareReject = wiredExpire.ok !== true;
-      const expiredUnclean = wiredExpire.ok === true && (wiredExpire.legacy?.ok !== true || wiredExpire.commit !== "committed_clean");
-      if (expiredPrepareReject || expiredUnclean) {
-        writeReceipt("m1a-unclean-" + (event.message_id ?? "unknown"), {
-          status: expiredPrepareReject ? "rejected" : "unclean",
-          reason: expiredPrepareReject ? (wiredExpire.reason ?? "m1a_reject") : (wiredExpire.legacy?.reason ?? "committed_unclean"),
-          phase: wiredExpire.legacy?.phase ?? null, commit: wiredExpire.commit ?? null,
-          message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
-        });
+      //   P1-a（W2-fix7）：**整段只在 authoritative 下执行** —— 非权威走的是旧的 `wireVoid`（shadow 契约，
+      //   成功结果里**没有 `commit` 字段**），`undefined !== "committed_clean"` 会给一条本本份份走完的
+      //   legacy 过期兜底**误写一张 m1a-unclean 回执**。非权威一字不改。
+      if (expireAuthoritative) {
+        const expiredPrepareReject = wiredExpire.ok !== true;
+        const expiredUnclean = wiredExpire.ok === true && (wiredExpire.legacy?.ok !== true || wiredExpire.commit !== "committed_clean");
+        if (expiredPrepareReject || expiredUnclean) {
+          writeReceipt("m1a-unclean-" + (event.message_id ?? "unknown"), {
+            status: expiredPrepareReject ? "rejected" : "unclean",
+            reason: expiredPrepareReject ? (wiredExpire.reason ?? "m1a_reject") : (wiredExpire.legacy?.reason ?? "committed_unclean"),
+            phase: wiredExpire.legacy?.phase ?? null, commit: wiredExpire.commit ?? null,
+            message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
+          });
+        }
+        // 过期作废在 authoritative 下已经在账本里落地了（clean 或 unclean 都意味着 void 已提交）：
+        //   这条消息**不该**再落进 chat 兜底 —— chat 在权威下必拒（W2 清单封闭），进去只会把
+        //   用户与回执引到一句不相干的 `m1a_mode_not_shadow`，而唯一写着「已过期」的 unrouted 回执
+        //   因为 chatTurn 先 exit 而永远写不下。消息仍被拒，只是理由变成真的那一个。
+        //   shadow / 未接入一字未改：那里 legacy chat 能照答（"绑定没成不等于该拒"）。
+        if (wiredExpire.commit !== "not_committed") expiredSettledAuthoritative = true;
       }
-      // 过期作废在 authoritative 下已经在账本里落地了（clean 或 unclean 都意味着 void 已提交）：
-      //   这条消息**不该**再落进 chat 兜底 —— chat 在权威下必拒（W2 清单封闭），进去只会把
-      //   用户与回执引到一句不相干的 `m1a_mode_not_shadow`，而唯一写着「已过期」的 unrouted 回执
-      //   因为 chatTurn 先 exit 而永远写不下。消息仍被拒，只是理由变成真的那一个。
-      //   shadow / 未接入一字未改：那里 legacy chat 能照答（"绑定没成不等于该拒"）。
-      if (expireAuthoritative && wiredExpire.commit !== "not_committed") expiredSettledAuthoritative = true;
       const failedStep = (wiredExpire.shadow ?? []).find((s) => !s.ok);
       const relFail = wiredExpire.release && wiredExpire.release.ok !== true;
       if (failedStep || relFail) {

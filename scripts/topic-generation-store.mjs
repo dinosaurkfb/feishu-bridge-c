@@ -210,9 +210,16 @@ export function prepareClaudeTopicRotation({
   return mutateClaudeTopicBinding({
     root, claudeSessionId, registryFile, now,
     // supersedeExpired：过期的待认领代际在同一笔锁内退休 + 准备 + 冻结下一代编号（返回 nextGeneration / superseded）
+    // W2-fix7 P1-b（A 法）：**普通 prepare 也返回 nextGeneration** —— 下一代编号只能在锁内算（调用方拿锁外快照
+    //   自己 +1 就是“锁外快照”那个老错）；两条路径同一个字段名，调用方不必分叉。
     mutate: (state) => (supersedeExpired
       ? supersedeExpiredAndPrepareTopicRotation(state, { operationId, now })
-      : prepareTopicRotation(state, { operationId, now })),
+      : (() => {
+        const r = prepareTopicRotation(state, { operationId, now });
+        return r.ok === true
+          ? { ...r, nextGeneration: Math.max(...state.generations.map((generation) => generation.generation)) + 1 }
+          : r;
+      })()),
   });
 }
 

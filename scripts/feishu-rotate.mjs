@@ -224,7 +224,7 @@ const wired = writeRoute.mode === "authoritative"
       chatId: current.config.chat_id,
       // P1-3：supersede / freeze 收成**一份**两相实现 —— `phase:"inspect"` 只读（零写，回报过期那条能不能退休），
       //   `phase:"freeze"` 才持久化 PREPARING。判据（账本 pending / 登记表严格读）在调用方过完之后才走到 freeze 相。
-      supersede: ({ operationId: opId, phase }) => {
+      supersede: ({ operationId: opId, phase, superseded, voidPlan }) => {
         const st = loadClaudeTopicBinding({ root, claudeSessionId });
         if (!st.ok) return { ok: false, reason: "state_unreadable", why: "锁内读不到话题状态：" + String(st.reason ?? "unknown") };
         const rot = st.state?.rotation ?? null;
@@ -235,45 +235,35 @@ const wired = writeRoute.mode === "authoritative"
         }
         const mine = rot && rot.operation_id === opId && (rot.status === ROTATION_STATUS.PREPARING || rot.status === ROTATION_STATUS.FAILED);
         if (phase === "inspect") {
-          // 只读：这里只回答"那条过期 pending 能不能在本笔里退休"（未过期 / 别人的 pending → null，交给账本侧判）
+          // 只读（零写）：只回答"索引里那条待认领代际能不能在本笔里退休"，并把**复核到期要用的时间**一并给出去
+          //   （1.0 账本不复核到期，复核在 composite 的 prepare 里做）。未过期 / 别人的 pending → null。
+          //   A 法（W2-fix7 P1-b）：这里**不再**发明孤儿 —— "索引已退休、账本仍 pending"那个现场是 B 法的产物，
+          //   已随之删除；"账本已 void、索引未退休"的续跑靠下面 freeze 相的 close 识。
           const blk = pendingRotationBlocker(st.state);
-          let sup = blk.kind === "expired" ? { opId: rot?.operation_id ?? null, rootOm: blk.pending?.root_message_id ?? null, generation: blk.pending?.generation ?? null } : null;
-          // P1-3 崩溃窗（W2-fix5）：上一轮可能"索引侧已退休（PREPARING 也写了）而账本 void 还没提交"就崩了。
-          //   那种现场索引里已经没有 pending（blocker=none），账本却还有一条 pending —— 重跑会被
-          //   `rotation_pending_exists` **永久卡住**。这里把"账本有 pending、索引里**根本没有这一代**"
-          //   识别成"可退休的孤儿 pending"：把它交给账本侧按 expired 作废（指数退休已经在上一轮做过了）。
-          if (sup === null && blk.kind === "none") {
-            const ledPeek = loadByEndpoint(legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid }), { env: process.env });
-            if (ledPeek.ok === true) {
-              const lin = ledPeek.doc.records?.[Object.keys(ledPeek.doc.records).find((k) => ledPeek.doc.records[k]?.kind === "live"
-                && ledPeek.doc.records[k]?.aliases?.root_om === active.root_message_id)]?.generation_lineage_id ?? null;
-              const orphan = lin === null ? null : Object.entries(ledPeek.doc.records).find(([, r]) => r?.kind === "live"
-                && r.facts?.generation === "pending" && r.generation_lineage_id === lin) ?? null;
-              // "索引还认它吗"：只算**未退休**的代际（closePending 把它标 retired 但留在列表里 ——
-              //   留在列表 ≠ 索引仍认它是待认领代际）。
-              const known = new Set((st.state.generations ?? [])
-                .filter((g) => g.status !== "retired").map((g) => g.root_message_id));
-              if (orphan !== null && !known.has(orphan[1].aliases?.root_om)) {
-                sup = { opId: rot?.operation_id ?? null, rootOm: orphan[1].aliases?.root_om ?? null, generation: null, orphan: true };
-              }
-            }
-          }
+          const sup = blk.kind === "expired" ? { opId: rot?.operation_id ?? null, rootOm: blk.pending?.root_message_id ?? null,
+            generation: blk.pending?.generation ?? null, expiresAt: blk.deadline ?? null } : null;
           return { ok: true, superseded: sup, nextNumber: mine ? nextOf(st.state) : null };
         }
         if (mine) {
           const n = nextOf(st.state);
           return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: true, superseded: null };
         }
-        const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId: opId, supersedeExpired: true });
+        // phase === "freeze"：走到这里 = 账本侧的前置 void **已经提交**（或本来就没有可 void 的：①后崩溃的重跑）。
+        //   A 法（W2-fix7 P1-b）：索引侧现在才动 —— ① 把过期那条代际按 expired 退休（用**旧** rotation op id 核）
+        //   ② 冻结本笔 PREPARING。`supersedeExpired:true` 那条路**不再**用：索引不得先于账本退休。
+        if (superseded !== null && superseded !== undefined) {
+          const closed = closeClaudeTopicRotation({ root, claudeSessionId, operationId: rot?.operation_id ?? null, reason: ROTATION_STATUS.EXPIRED });
+          if (!closed.ok) return { ok: false, reason: closed.reason ?? "rotation_close_failed",
+            why: "索引侧退休过期代际失败（" + String(closed.reason ?? "unknown") + "）：不改 PREPARING，先核对登记表" };
+          if (closed.generation) console.log("已作废    第 " + closed.generation.generation + " 代（认领已过期）");
+        }
+        const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId: opId });
         if (!prepared.ok) {
-          return { ok: false, why: "锁内冻结 PREPARING 失败（" + String(prepared.reason) + "）",
+          return { ok: false, why: "锁内冻结 PREPARING 失败（" + String(prepared.reason ?? "") + "）",
             reason: prepared.reason === "rotation_already_pending" ? "rotation_pending_exists" : prepared.reason };
         }
-        if (prepared.superseded) console.log("已作废    第 " + prepared.superseded.generation + " 代（过期的待认领代际）");
         const n = prepared.nextGeneration;
-        return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: false,
-          superseded: prepared.superseded === null || prepared.superseded === undefined ? null
-            : { opId: rot?.operation_id ?? null, rootOm: prepared.superseded.root_message_id ?? null, generation: prepared.superseded.generation ?? null } };
+        return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: false, superseded: null };
       },
       createTopic: ({ nextNumber }) => {
         const { rootText } = plan(nextNumber);

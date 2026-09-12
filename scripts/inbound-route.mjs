@@ -14,11 +14,17 @@
  *      所以绑定必然分两段。第二段就是 Frank 在新话题里 @ 的那一下。
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { senderRole } from "./sender-roles.mjs";
 import path from "node:path";
 
 import { loadChainTemplate, p2pChatIdProblem } from "./chain-template.mjs";
+import { maintenanceDir } from "./maintenance/journal.mjs";
+import { endpointReceipt } from "./maintenance/ledger-receipt.mjs";
+import { readSidecarStore } from "./m1b/sidecar-store.mjs";
+import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
+import { decideLedgerRoute } from "./m1a/delivery-target.mjs";
 import {
   acquirePublishLock, loadRegistry, registryPath, releasePublishLock,
 } from "./registry.mjs";
@@ -143,9 +149,150 @@ export function findBindingForSession({ sessionId, registryFile, templateFile } 
 }
 
 // 只有写了显式截止的登记行才会过期；没写（或 null）= 不过期。
-const pendingDeadline = (entry) => {
-  const explicit = Date.parse(entry?.pending_expires_at ?? "");
+// PK2-I3：同一个解析器服务两个字段面 —— 登记行是 `pending_expires_at`，凭证库条目是 `claim_expires_at`。
+const deadlineOf = (row, field) => {
+  const explicit = Date.parse(row?.[field] ?? "");
   return Number.isFinite(explicit) ? explicit : Infinity;
+};
+const pendingDeadline = (entry) => deadlineOf(entry, "pending_expires_at");
+const claimDeadline = (entry) => deadlineOf(entry, "claim_expires_at");
+
+/** 定长比较：先比长度（长度不是秘密），相等再 `timingSafeEqual` —— 不写 `t1 === t2`。*/
+const sameToken = (a, b) => {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const x = Buffer.from(a, "utf-8");
+  const y = Buffer.from(b, "utf-8");
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
+/**
+ * bearer 凭证库（`ledger/<endpoint>/pending-claims.json`）的**唯一查询入口**（PK2-I3）。
+ *
+ * 为什么不直接 `entries[id].token === token`：这是凭证比对，不是普通字段比对 —— 按位比完再判，
+ * 早退的 `===` 会把"前几位对不对"这种信息泄出去。表很小（≤512），扫满不早退。
+ * 恰一条 → `{ok:true, id}`；零条 → `token_unknown`；多条 → `token_duplicated`（与 inbound 的
+ * PROMOTE_REJECT 三分同形，调用方按同一个词收口）。`token === null` 的条目（无码 B1，owner 配对不需要码）
+ * **永不**参与码认领。
+ */
+export function findByToken({ doc, token } = {}) {
+  if (typeof token !== "string" || token.length === 0) return { ok: false, reason: "token_unknown" };
+  const entries = doc?.entries;
+  if (entries === null || typeof entries !== "object" || Array.isArray(entries)) {
+    return { ok: false, reason: "token_store_invalid", why: "凭证库条目表不是对象" };
+  }
+  const hits = [];
+  for (const [id, entry] of Object.entries(entries)) {
+    const got = entry !== null && typeof entry === "object" ? entry.token : null;
+    if (got === null || got === undefined) continue;
+    if (sameToken(token, got)) hits.push(id);
+  }
+  if (hits.length === 0) return { ok: false, reason: "token_unknown" };
+  if (hits.length > 1) return { ok: false, reason: "token_duplicated", ids: hits };
+  return { ok: true, id: hits[0] };
+}
+
+/**
+ * 认领凭证面的**判源**（PK2-I3）：与投递目标/bypass 同一条矩阵（R66 `decideLedgerRoute` →
+ * `classifyLedgerAuthority`），不另立第二套。模板读不出 → 当 legacy（那条路上 `evaluatePromotion`
+ * 自己会以 malformed_template 拒，不会放行认领）。
+ */
+const pendingClaimsRoute = ({ templateFile, env = process.env } = {}) => {
+  const tpl = loadChainTemplate(templateFile);
+  if (!tpl.ok) return { mode: "legacy", why: "机器级链路配置不可用（" + tpl.reason + "）—— 不进凭证面" };
+  const endpointId = legacyEndpointId({ runtime: "claude", agentUid: tpl.template.agent_uid });
+  const recDir = maintenanceDir(env);
+  const receipt = (typeof recDir === "string" && recDir.length > 0)
+    ? endpointReceipt(recDir, endpointId)
+    : { ok: false, state: "unreadable", why: "维护目录不可派生" };
+  return { endpointId, ...decideLedgerRoute({ receipt, endpointId, env }) };
+};
+
+/** legacy / shadow：待认领的选择照旧由登记/映射里的 `pending_token` 定（一字未改）。 */
+const pickPendingFromLegacy = ({ pending, tokens }) => {
+  if (tokens.length === 1) {
+    const hits = pending.filter((b) => b.generation?.pending_token === tokens[0]);
+    // 认得出码但没人认领：与其回落到「只有一份」猜一个，不如明说 —— 回落会在
+    // 「Frank 在 A 话题说话、而待绑定的是 B」时把 B 绑给 A，静默且难查。
+    if (hits.length === 0) return { ok: false, reason: PROMOTE_REJECT.TOKEN_UNKNOWN, token: tokens[0] };
+    if (hits.length > 1) return { ok: false, reason: PROMOTE_REJECT.TOKEN_DUPLICATED, token: tokens[0], ids: hits.map((b) => b.id) };
+    return { ok: true, one: hits[0], matchedBy: "quoted_binding_token" };
+  }
+  if (pending.length > 1) return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
+  return { ok: true, one: pending[0], matchedBy: "only_pending" };
+};
+
+/**
+ * **半笔续跑**的识别（PK2-I3）。
+ *
+ * 为什么需要它：复合的顺序是「账本 activate → **删凭证条目** → 索引」（W1 P1-2）——于是存在一个中间态：
+ *   账本说 active、凭证已被消费、而索引还没写（现场在登记面仍 pending）。旧世界里「可认领」靠登记行的
+ *   `pending_token`（删凭证不影响它），所以同一条命令重跑能续上（T14）；I3 把读面换成凭证库后，
+ *   那一个中间态的码**注定查不到**（条目已经删了），续跑就会被自己挡死。
+ *
+ * 判据全在**权威事实**里（不回头看登记表的 `pending_token`）：
+ *   ① 全部 pending 中唯一一条符合半笔恢复证据的候选（PK2-I3-fix2：不再数全机 pending；多条符合证据 = 无从消歧 —— 宁可拒）；
+ *   ② 该候选在凭证库里**没有条目**（凭证确实被消费了）；
+ *   ③ 账本里这条 B1 已经 `active`（activate 提交过）；
+ *   ④ 账本自己那条 pairing 证明是**码认领**且 `matched_om` 就是本代际的根消息。
+ * 这条路只是让读面**不把续跑挡死**：真正的闸在复合里 —— `activate` 必须按同一 `claimKey` 重放命中，
+ *   换个 message_id 来重放照样 `m1a_mode_not_shadow` 拒。
+ */
+const resumeCandidate = ({ pending, claims, endpointId, env }) => {
+  // PK2-I3-fix2 P1：候选资格看「符合四项恢复证据的条数」，**不是全机 pending 数**（`pending.length === 1`
+  //   的旧判据会把「另一条 lineage 的正常 pending」也数进去，卡死本条线合法的 committed-unclean 续跑）。
+  //   在全部 claims 里筛出同时满足 ①凭证条目已删 ②能解析到账本 live id ③账本 active ④pairing 证明
+  //   是码认领且 matched_om 与本代际根消息一致 的候选，再要求**恰一条**；两条真半笔 → 无从消歧 → null
+  //   （调用方折成 token_unknown 拒，绝不挑一个）。账本一次读入、全候选共用。
+  const led = loadByEndpoint(endpointId, { env });
+  if (!led.ok) return null;
+  const candidates = claims.filter((c) => {
+    if (c.entry !== null || c.id === null) return false;
+    const rec = led.doc.records?.[c.id];
+    if (!rec || rec.kind !== "live" || rec.facts?.binding !== "active") return false;
+    const proof = rec.binding_proof;
+    return proof?.pending_token_state === "present" && proof?.matched_om === c.binding.generation?.root_message_id;
+  });
+  return candidates.length === 1 ? candidates[0] : null;
+};
+
+/**
+ * authoritative：**凭证只认 store**（`ledger/<ep>/pending-claims.json`），登记/映射里的 `pending_token`
+ *   不再是裁定依据；到期同样取 store 条目（`claim_expires_at` 为 null = 不过期）。
+ *   候选代际 → 账本 live id 用 `resolveLiveId`（代际根消息就是账本 locator），而 store 的键**就是**
+ *   `topic_agent_id` —— 两边靠 id 对上，不靠登记行里的 token。
+ *   store 读不出 / 缺席 → 拒 `ledger_route_unavailable`（fail-closed：bearer 凭证核不了就不认，
+ *   绝不回落到旧登记表那一列）。
+ */
+const pickPendingFromStore = ({ pending, tokens, endpointId, env }) => {
+  const store = readSidecarStore({ endpointId, name: "pending-claims", env });
+  if (store.ok !== true || store.absent === true) {
+    return { ok: false, reason: "ledger_route_unavailable", tokens,
+      why: "待认领凭证库读不出（" + String(store.why ?? store.reason ?? (store.absent === true ? "pending-claims.json 缺席" : "unknown"))
+        + "）：authoritative 下不回落旧登记表的 pending_token" };
+  }
+  const claims = pending.map((binding) => {
+    const resolved = resolveLiveId({ endpointId, locator: binding.generation?.root_message_id ?? null, env });
+    const id = resolved.ok === true ? resolved.id : null;
+    const entry = id !== null && Object.prototype.hasOwnProperty.call(store.entries, id) ? store.entries[id] : null;
+    return { binding, id, entry };
+  });
+  if (tokens.length === 1) {
+    const found = findByToken({ doc: store.doc, token: tokens[0] });
+    if (found.ok === true) {
+      const hits = claims.filter((c) => c.id === found.id);
+      // 码在库里、但不在**待认领**那几条里（代际已翻页/已认领）→ 与「码对不上」同一收口，不猜。
+      if (hits.length === 1) return { ok: true, one: hits[0].binding, matchedBy: "quoted_binding_token", storeBacked: true, deadline: claimDeadline(hits[0].entry) };
+      if (hits.length > 1) return { ok: false, reason: PROMOTE_REJECT.TOKEN_DUPLICATED, token: tokens[0], ids: hits.map((c) => c.binding.id) };
+      return { ok: false, reason: PROMOTE_REJECT.TOKEN_UNKNOWN, token: tokens[0] };
+    }
+    // 码不在库里：可能是「凭证已被消费、索引还没写」的半笔续跑（见 resumeCandidate），否则就是真对不上。
+    const res = resumeCandidate({ pending, claims, endpointId, env });
+    if (res !== null) return { ok: true, one: res.binding, matchedBy: "consumed_credential_resume", storeBacked: true, deadline: claimDeadline(res.entry) };
+    return { ok: false, token: tokens[0], ...(found.ids ? { ids: found.ids } : {}),
+      reason: found.reason === "token_duplicated" ? PROMOTE_REJECT.TOKEN_DUPLICATED : PROMOTE_REJECT.TOKEN_UNKNOWN };
+  }
+  if (pending.length > 1) return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
+  return { ok: true, one: claims[0].binding, matchedBy: "only_pending", storeBacked: true, deadline: claimDeadline(claims[0].entry) };
 };
 
 /**
@@ -162,7 +309,7 @@ const pendingDeadline = (entry) => {
  * 绑定码只从**引用块**里认，不看正文：正文是 Frank 打的，引用块是平台加的。
  * 手打一个码不能用来指定目标 —— 能指定目标的只有「你真的在那个话题里说话」这件事本身。
  */
-export function findPendingBinding({ content, registryFile, templateFile, now = Date.now() } = {}) {
+export function findPendingBinding({ content, registryFile, templateFile, now = Date.now(), env = process.env } = {}) {
   const listed = listBindings({ registryFile, templateFile });
   if (!listed.ok) return { ok: false, reason: listed.reason };
 
@@ -177,30 +324,23 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
     return { ok: false, reason: PROMOTE_REJECT.TOKEN_AMBIGUOUS, tokens };
   }
 
-  let one;
-  if (tokens.length === 1) {
-    const hits = pending.filter((b) => b.generation?.pending_token === tokens[0]);
-    // 认得出码但没人认领：与其回落到「只有一份」猜一个，不如明说 —— 回落会在
-    // 「Frank 在 A 话题说话、而待绑定的是 B」时把 B 绑给 A，静默且难查。
-    if (hits.length === 0) {
-      return { ok: false, reason: PROMOTE_REJECT.TOKEN_UNKNOWN, token: tokens[0] };
-    }
-    if (hits.length > 1) {
-      return { ok: false, reason: PROMOTE_REJECT.TOKEN_DUPLICATED, token: tokens[0],
-        ids: hits.map((b) => b.id) };
-    }
-    one = hits[0];
-  } else {
-    if (pending.length > 1) {
-      return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
-    }
-    one = pending[0];
-  }
+  // PK2-I3：判源分派 —— **只有 authoritative 换读面**（凭证库），legacy / shadow / reject 一律走原路径、一字未改。
+  //   reject 那一态（收据坏 / cutover 与账本对不上）**写面本来就 fail-closed**（复合必拒：m1a_ledger_absent /
+  //   m1a_mode_not_shadow，P2-① 钉的就是它）—— 在读面抢先改口只换一个字面、不多一分安全，却会动掉那条封闭判据。
+  //   注意「哪些代际在待认领」仍由登记/映射投影提供（那是话题身份面）；本单换的是**凭证**那一列。
+  const route = pendingClaimsRoute({ templateFile, env });
+  const picked = route.mode === "authoritative"
+    ? pickPendingFromStore({ pending, tokens, endpointId: route.endpointId, env })
+    : pickPendingFromLegacy({ pending, tokens });
+  if (picked.ok !== true) return picked;
 
+  const one = picked.one;
+  // 到期判源同源：authoritative 取 store 条目的 `claim_expires_at`（null = 不过期）；
+  //   legacy / shadow 仍按旧口径（代际的 claim_expires_at，否则登记行的 pending_expires_at）。
   const generationDeadline = Date.parse(one.generation?.claim_expires_at ?? "");
-  const deadline = Number.isFinite(generationDeadline)
-    ? generationDeadline
-    : pendingDeadline(one.entry);
+  const deadline = picked.storeBacked === true
+    ? picked.deadline
+    : (Number.isFinite(generationDeadline) ? generationDeadline : pendingDeadline(one.entry));
   if (now >= deadline) {
     return {
       ok: false,
@@ -215,7 +355,7 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
   }
   return {
     ok: true, ...one,
-    matchedBy: tokens.length === 1 ? "quoted_binding_token" : "only_pending",
+    matchedBy: picked.matchedBy,
     deadline,
     generationId: one.generation.channel_generation_id,
     operationId: one.mapping?.topic_generation_state?.rotation?.operation_id ?? null,
@@ -377,7 +517,10 @@ export function evaluatePromotion({ event, template, pending, now = Date.now(), 
   //   root-blind Aily 下 thread_root 无诚实来源）。六件事仍收敛为：唯一可认领 B1 恰一份 + token/到期均 null +
   //   sender 受验 owner + chat 与 B1 受验 chat 相等（由上方 CHAT_MISMATCH 守卫保证）+ 引用根逐字等于 B1 root +
   //   消息整条按 bind-only、正文不执行。
-  const isCodeClaim = pending?.matchedBy === "quoted_binding_token";
+  // PK2-I3：半笔续跑（`consumed_credential_resume`）与 token 认领**同一支** —— 它不是新铸的证明：账本那条 B1
+  //   的 binding_proof 本来就是 `pending_token_state:"present"` + `matched_om`=本代际根消息（`resumeCandidate` ④
+  //   就是逐字核这两项），本跑只是把复合要的那个 f4 按同一形状交回，且复合仍要求 activate 按同一 claimKey 重放命中。
+  const isCodeClaim = pending?.matchedBy === "quoted_binding_token" || pending?.matchedBy === "consumed_credential_resume";
   // #守卫①（Frank 裁定）：root-blind Aily 传输下 thread_root 维无诚实来源 —— owner_root_no_token_v1 停止生产。
   //   事件侧引用根 om 问题因此不复存在：无码认领（only_pending）直接不再产任何配对证明（f4=null）。
   //   只保留 token 认领（quoted_binding_token）的 binding_token_v1（完整四维 present，chat 必须真受验 env chat 非空且相等）。

@@ -71,6 +71,7 @@ import { readProcessStartTime } from "./process-start-time.mjs";
 import { forwardResultProblem, forwardStartedProblem, forwardReceiptResultProblem, FORWARD_KEY_RE } from "./forward-runner.mjs";
 import { maintenanceRootProblem, readStagedVerified } from "./m1b/staged-plan.mjs";
 import { livePolicySubjects, readPolicyStoreForAudit } from "./m1b/policy-store.mjs"; // PK2-I1 ⑱：策略 store 逐条目体检 + 与账本对账
+import { readSidecarStore } from "./m1b/sidecar-store.mjs"; // PK2-I3 ⑲：待认领凭证库（pending-claims）体检
 import { policySubjectId } from "./policy-store/validator.mjs"; // ⑱ 逐条目派生自洽核验（与 store 同一函数）
 import { loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, storeHashState, subscriptionAuditPendingPath, subscriptionStorePath } from "./subscription-store.mjs";
 
@@ -1275,6 +1276,58 @@ export function runDoctor({
             : "已切权威 " + authoritative18.length + " 个：" + parts18.join("、");
         add("policy_store", "⑱ policy store", problems18.length === 0, body18, null);
       }
+    }
+  }
+
+  // ── ⑲ pending-claims store（PK2-I3；fix1 消费 I6 判源）：authoritative 的 endpoint，待认领凭证已在
+  // `ledger/<ep>/pending-claims.json`（cutover 固化，之后由 bind / 认领做条目级读写）。逐 endpoint 核两件：
+  //   ① 受验读得出（0600 / 普通文件 / 单硬链接 / ≤1MiB，且过 `validateSidecarDoc("pending-claims")`）；
+  //   ② **与账本对账**：账本里有 pending B1 而凭证库里没条目（少）／凭证库有条目而账本里没有 pending B1（多），
+  //      两个方向各计数并点名 `topic_agent_id` 前 8 位。
+  // **判源与运行上下文只有一处**（fix1 P1）：直接消费 ⑳ 用的 `authority.mode` / `authority.endpoints`
+  //   （I6 `authorityRunContext({home})` 派生），两次读取都传 `authorityCtx.env` —— 不再自己调
+  //   `maintenanceDir()`、不再按收据另选 endpoint。否则 ⑳ 与 ⑲ 读不同运行上下文，会出「目标 home 的
+  //   store 已漂移，⑲ 却读了别处的健康 store 报绿」的 fail-open（双 home 行为钉钉死）。
+  // 读不出 / 缺席 / 对不上 → 红（fail-closed）。正文只出**计数与 id 前 8 位** ——
+  //   token 是 bearer 凭证，**不进诊断正文**（诊断会被贴进话题/回执）。
+  // 非 authoritative（legacy / shadow / reject）不作对账 —— 那些 endpoint 的待认领仍在旧登记面（⑳ 已如实报判源）。
+  {
+    const parts19 = [];
+    const problems19 = [];
+    if (authority.mode !== "authoritative") {
+      // PK2-I3-fix2 P2：reject 只能说明判源不可用，**不能断言旧登记面为准**（那是 legacy/shadow 才有的含义）。
+      const text19 = authority.mode === "legacy" ? "没有已切权威的 endpoint（authoritative 之后才出现）"
+        : authority.mode === "reject" ? "判源不可用，⑲ 不作对账；见 ⑳ 故障"
+        : "待认领仍在旧登记面，不作对账";
+      add("pending_claims_store", "⑲ pending-claims store", true, text19, null);
+    } else {
+      for (const ep19 of authority.endpoints) {
+        const short19 = ep19.slice(0, 16);
+        const store19 = readSidecarStore({ endpointId: ep19, name: "pending-claims", env: authorityCtx.env });
+        if (store19.ok !== true) { problems19.push(short19 + "：pending-claims.json 读不出（" + String(store19.why ?? store19.reason ?? "unknown") + "）"); continue; }
+        if (store19.absent === true) { problems19.push(short19 + "：pending-claims.json 缺席（cutover 之后不应缺席）"); continue; }
+        const led19 = loadByEndpoint(ep19, { env: authorityCtx.env });
+        if (!led19.ok) { problems19.push(short19 + "：账本读不出（" + String(led19.why ?? led19.reason ?? "unknown") + "）"); continue; }
+        const pendingIds19 = Object.values(led19.doc.records)
+          .filter((r) => r?.kind === "live" && r?.facts?.binding === "pending")
+          .map((r) => r.topic_agent_id).filter((id) => typeof id === "string");
+        const keys19 = Object.keys(store19.entries);
+        const missing19 = pendingIds19.filter((id) => !keys19.includes(id));
+        const extra19 = keys19.filter((id) => !pendingIds19.includes(id));
+        const shortId19 = (id) => id.slice(0, 8);
+        const list19 = (xs) => xs.slice(0, 3).map(shortId19).join("、") + (xs.length > 3 ? " 等" : "");
+        // 两个方向各计数；**计数写进问题行本身**（红的时候正文也要看得出多少条对不上）。
+        const counts19 = "少 " + missing19.length + " / 多 " + extra19.length;
+        if (missing19.length > 0) problems19.push(short19 + "：凭证库与账本对不上（" + counts19 + "）—— 账本有 " + missing19.length + " 条 pending B1 在凭证库里没有条目（" + list19(missing19) + "）");
+        if (extra19.length > 0) problems19.push(short19 + "：凭证库与账本对不上（" + counts19 + "）—— 凭证库多出 " + extra19.length + " 条（账本里没有对应的 pending B1：" + list19(extra19) + "）");
+        // 只出计数与 id 前 8 位：条目值（token / 到期）不进正文。
+        parts19.push(short19 + "（凭证库 " + keys19.length + " 条 vs 账本 pending " + pendingIds19.length + " 条，"
+          + (missing19.length + extra19.length === 0 ? "一致" : counts19) + "）");
+      }
+      const body19 = problems19.length > 0
+        ? "说不清 " + problems19.length + " 处：" + problems19.slice(0, 3).join("；")
+        : "已切权威 " + authority.endpoints.length + " 个：" + parts19.join("、");
+      add("pending_claims_store", "⑲ pending-claims store", problems19.length === 0, body19, null);
     }
   }
 

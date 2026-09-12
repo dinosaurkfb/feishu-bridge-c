@@ -15,8 +15,10 @@ import {
   closeClaudeTopicRotation, failClaudeTopicRotation, loadClaudeTopicBinding, prepareClaudeTopicRotation,
   registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
-import { wireRotate, wireVoid, wireRotateRecovery } from "./m1a/wiring.mjs";
+import { m1aWriteRoute, wireRotate, wireVoid, wireRotateRecovery, wireRotateAuthoritative, wireVoidAuthoritative, ownCreateB1Op } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
+import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
+import { requestKeyFor } from "./m1a/dual-write.mjs";
 import {
   ROTATION_STATUS, TOPIC_GENERATION_PREPARING_STALE_MS, activeGeneration, pendingGeneration, TOPIC_GENERATION_AUTO_ROTATE_MESSAGES, pendingRotationBlocker,
 } from "./topic-generation.mjs";
@@ -64,6 +66,45 @@ if (cancel) {
     process.exit(0);
   }
   const rotationOpId = current.state.rotation.operation_id;
+  const cancelEndpointId = legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid });
+  // PK2-W2：authoritative → 走 `wireVoidAuthoritative`（账本 void → 删待认领条目 → 代际索引，账本先于索引）；
+  //   shadow / 未接入 → 原路径一字未改。
+  if (m1aWriteRoute({ endpointId: cancelEndpointId, env: process.env }).mode === "authoritative") {
+    const wiredVoidA = wireVoidAuthoritative({
+      endpointId: cancelEndpointId, env: process.env, operationId: rotationOpId,
+      locator: pending.root_message_id, reason: "manual",
+      publishIndex: () => closeClaudeTopicRotation({ root, claudeSessionId, operationId: rotationOpId, reason: ROTATION_STATUS.CANCELLED }),
+    });
+    if (!wiredVoidA.ok) {
+      die("取消轮转中止（M1a 权威写方拒：" + (wiredVoidA.reason ?? "m1a_reject") + (wiredVoidA.why ? "；" + wiredVoidA.why : "") + "）。旧代际保持 active、待认领代际未被作废。");
+    }
+    if (wiredVoidA.legacy?.ok !== true) {
+      emitMachineReceipt("rotate-cancel-unclean", { status: "unclean", operationId: rotationOpId, binding_id: current.state.binding_id,
+        commit: wiredVoidA.commit ?? null, phase: wiredVoidA.legacy?.phase ?? null, reason: wiredVoidA.legacy?.reason ?? null,
+        steps: (wiredVoidA.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null })),
+        release: wiredVoidA.release ?? null });
+      die("取消轮转没落完（停在第 " + String(wiredVoidA.legacy?.phase ?? "?") + " 步：" + String(wiredVoidA.legacy?.message ?? wiredVoidA.legacy?.reason ?? "")
+        + "）。账本可能已提交：同一条命令重跑会按同一 request key 续做后缀（不重复作废）。");
+    }
+    const relFailA = releaseFailed(wiredVoidA);
+    if (relFailA) {
+      emitMachineReceipt("rotate-cancel-unclean", { status: "unclean", operationId: rotationOpId, binding_id: current.state.binding_id,
+        legacy_committed: true, release: wiredVoidA.release ?? null });
+      die("取消轮转已提交，但 outer 锁释放失败（" + wiredVoidA.release.reason + "）。详情见上方机器回执；先 doctor。");
+    }
+    // P1-②（W2-fix8）：账本原语返回 committed_unclean（residue / durability-uncertain）时**不许绿退出** ——
+    //   旧版只看 legacy.ok 与 outer release，会把真实的 committed_unclean 报成成功。
+    if (wiredVoidA.commit !== "committed_clean") {
+      emitMachineReceipt("rotate-cancel-unclean", { status: "unclean", operationId: rotationOpId, binding_id: current.state.binding_id,
+        commit: wiredVoidA.commit ?? null, legacy_committed: true, release: wiredVoidA.release ?? null,
+        steps: (wiredVoidA.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null })) });
+      die("取消轮转这一步不干净（commit=" + String(wiredVoidA.commit) + "）。**作废的事实可能已经提交**"
+        + "（账本 void / 待认领条目删除 / 代际索引之一或全部已落地）—— 已落机器回执（rotate-cancel-unclean）："
+        + "先跑 doctor 核对，再按同一条命令重跑补齐（幂等、不重复记）。");
+    }
+    console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
+    process.exit(0);
+  }
   // M1a 双写（W5，Frank 拍板）：cancel → void 镜像（ledger voidPending），reason 映射 cancelled→"manual"（枚举不扩）。
   // 目标由 resolver 按 pending 根消息 om 命中；resolver 未命中（如 legacy-only、无 B1）→ shadow fail-closed、legacy 照常取消。
   const wiredVoid = wireVoid({
@@ -104,7 +145,31 @@ if (cancel) {
   process.exit(0);
 }
 const blocker = pendingRotationBlocker(current.state);
-if (blocker.kind === "blocked") {
+// PK2-W2 **半笔续跑**：已有 pending 代际、而它正是**本笔自己**那一轮留下的（rotation.operation_id 还在）——
+//   那是"索引已提交、sidecar 还没写"那半笔：同一条命令重跑必须能补齐后缀，而不是被"不能重复创建"挡住。
+//   判据全在权威事实里（账本里同 request key 的 create_b1 已提交）+ 索引里那次轮转的操作号。
+const w2ResumeIntent = (() => {
+  if (blocker.kind !== "blocked" || !blocker.pending) return null;
+  const rot = current.state.rotation;
+  if (!rot || typeof rot.operation_id !== "string" || rot.operation_id.length === 0) return null;
+  const ep0 = legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid });
+  if (m1aWriteRoute({ endpointId: ep0, env: process.env }).mode !== "authoritative") return null;
+  const led = loadByEndpoint(ep0, { env: process.env });
+  if (!led.ok) return null;
+  const resolved = resolveLiveId({ endpointId: ep0, locator: blocker.pending.root_message_id, env: process.env });
+  if (!resolved.ok) return null;
+  const rec = led.doc.records?.[resolved.id];
+  const lin = rec?.generation_lineage_id;
+  const k = typeof lin === "string" ? requestKeyFor({ opType: "create_b1", externalRequestId: rot.operation_id, entityId: lin }) : null;
+  // P1-4③：归属判据与 composite 同一份（精确 request key + op_type + 当前 pending id）——不能只核 key。
+  const own = k?.ok === true && ownCreateB1Op({ doc: led.doc, requestKey: k.request_key, pendingId: resolved.id });
+  return own ? { opId: rot.operation_id, generation: blocker.pending.generation, rootOm: blocker.pending.root_message_id,
+    token: blocker.pending.pending_token, claimExpiresAt: blocker.pending.claim_expires_at ?? null } : null;
+})();
+if (w2ResumeIntent) {
+  console.log("续跑      已经有一代待认领（第 " + w2ResumeIntent.generation + " 代）且那一笔就是本轮转留下的：补齐它的后缀（话题幂等、账本重放命中）");
+}
+if (blocker.kind === "blocked" && !w2ResumeIntent) {
   die("已有等待认领的话题代际（第 " + blocker.pending.generation + " 代" + (blocker.deadline ? "，认领截止 " + blocker.deadline : "，不过期") +
     "）；去新话题 @ 完成认领，或 --cancel --apply 显式取消，不能重复创建。");
 }
@@ -143,12 +208,108 @@ if (!apply) {
 
 const operationId = "rotation_" + randomUUID();
 const identity = resolveLarkIdentity(current.config);
+// authoritative 分派时会用**复用或新建**的操作号（见下）；shadow 分支恒用这一次新铸的 `operationId`（行为不变）。
+const authOpId = (() => {
+  const rot = current.state.rotation;
+  const frozen = rot && typeof rot.operation_id === "string" && rot.operation_id.length > 0 &&
+    (rot.status === ROTATION_STATUS.PREPARING || rot.status === ROTATION_STATUS.FAILED) ? rot.operation_id : null;
+  return frozen ?? operationId;
+})();
 
 // M1a 双写（W3，Frank 拍板）：外层一致性锁在 sendToChat 之前取 —— 取不到 → 话题从未创建、无孤儿。
 // 「准备 + 建话题 + 登记 pending」是同一 legacy 闭包，锁覆盖整笔写事务；shadow create_b1 在锁内镜像。
 const ep = legacyEndpointId({ runtime: "claude", agentUid: current.config.agent_uid });
-const wired = wireRotate({
-  endpointId: ep,
+// PK2-W2：判源分派 —— authoritative 走 `wireRotateAuthoritative`（账本先于业务索引），
+//   shadow / 未接入走原来的 `wireRotate`（一字未改）。
+const effOpId = w2ResumeIntent ? w2ResumeIntent.opId : authOpId;
+const writeRoute = m1aWriteRoute({ endpointId: ep, env: process.env });
+const wired = writeRoute.mode === "authoritative"
+  ? wireRotateAuthoritative({
+      endpointId: ep,
+      env: process.env,
+      // 裁定 P1-1：持久 intent = 现有 PREPARING（发话题前冻结 operation id / 代数）。
+      //   上一轮留下的 preparing / failed 且操作号还在 → **复用同一个号**（重跑续做，不新建意图、话题幂等键也不变）。
+      operationId: w2ResumeIntent ? w2ResumeIntent.opId : effOpId,
+      locator: w2ResumeIntent ? w2ResumeIntent.rootOm : active.root_message_id,
+      chatId: current.config.chat_id,
+      // P1-3：supersede / freeze 收成**一份**两相实现 —— `phase:"inspect"` 只读（零写，回报过期那条能不能退休），
+      //   `phase:"freeze"` 才持久化 PREPARING。判据（账本 pending / 登记表严格读）在调用方过完之后才走到 freeze 相。
+      supersede: ({ operationId: opId, phase, superseded, voidPlan }) => {
+        const st = loadClaudeTopicBinding({ root, claudeSessionId });
+        if (!st.ok) return { ok: false, reason: "state_unreadable", why: "锁内读不到话题状态：" + String(st.reason ?? "unknown") };
+        const rot = st.state?.rotation ?? null;
+        const nextOf = (state) => Math.max(...state.generations.map((g) => g.generation)) + 1;
+        if (w2ResumeIntent && opId === w2ResumeIntent.opId) {
+          return { ok: true, nextNumber: w2ResumeIntent.generation, token: w2ResumeIntent.token,
+            claimExpiresAt: w2ResumeIntent.claimExpiresAt, reused: true, superseded: null };
+        }
+        const mine = rot && rot.operation_id === opId && (rot.status === ROTATION_STATUS.PREPARING || rot.status === ROTATION_STATUS.FAILED);
+        if (phase === "inspect") {
+          // 只读（零写）：只回答"索引里那条待认领代际能不能在本笔里退休"，并把**复核到期要用的时间**一并给出去
+          //   （1.0 账本不复核到期，复核在 composite 的 prepare 里做）。未过期 / 别人的 pending → null。
+          //   A 法（W2-fix7 P1-b）：这里**不再**发明孤儿 —— "索引已退休、账本仍 pending"那个现场是 B 法的产物，
+          //   已随之删除；"账本已 void、索引未退休"的续跑靠下面 freeze 相的 close 识。
+          const blk = pendingRotationBlocker(st.state);
+          const sup = blk.kind === "expired" ? { opId: rot?.operation_id ?? null, rootOm: blk.pending?.root_message_id ?? null,
+            generation: blk.pending?.generation ?? null, expiresAt: blk.deadline ?? null } : null;
+          return { ok: true, superseded: sup, nextNumber: mine ? nextOf(st.state) : null };
+        }
+        if (mine) {
+          const n = nextOf(st.state);
+          return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: true, superseded: null };
+        }
+        // phase === "freeze"：走到这里 = 账本侧的前置 void **已经提交**（或本来就没有可 void 的：①后崩溃的重跑）。
+        //   A 法（W2-fix7 P1-b）：索引侧现在才动 —— ① 把过期那条代际按 expired 退休（用**旧** rotation op id 核）
+        //   ② 冻结本笔 PREPARING。`supersedeExpired:true` 那条路**不再**用：索引不得先于账本退休。
+        if (superseded !== null && superseded !== undefined) {
+          const closed = closeClaudeTopicRotation({ root, claudeSessionId, operationId: rot?.operation_id ?? null, reason: ROTATION_STATUS.EXPIRED });
+          if (!closed.ok) return { ok: false, reason: closed.reason ?? "rotation_close_failed",
+            why: "索引侧退休过期代际失败（" + String(closed.reason ?? "unknown") + "）：不改 PREPARING，先核对登记表" };
+          if (closed.generation) console.log("已作废    第 " + closed.generation.generation + " 代（认领已过期）");
+        }
+        const prepared = prepareClaudeTopicRotation({ root, claudeSessionId, operationId: opId });
+        if (!prepared.ok) {
+          return { ok: false, why: "锁内冻结 PREPARING 失败（" + String(prepared.reason ?? "") + "）",
+            reason: prepared.reason === "rotation_already_pending" ? "rotation_pending_exists" : prepared.reason };
+        }
+        const n = prepared.nextGeneration;
+        return { ok: true, nextNumber: n, token: bindingToken(st.state.binding_id + "\n" + n), claimExpiresAt: null, reused: false, superseded: null };
+      },
+      createTopic: ({ nextNumber }) => {
+        const { rootText } = plan(nextNumber);
+        try {
+          const om = sendToChat({
+            profile: identity.profile, chatId: current.config.chat_id, text: rootText,
+            idempotencyKey: idempotencyKeyFor(current.state.binding_id + "\nrotation\n" + nextNumber),
+            larkBin: identity.bin, larkHome: identity.configDir, expectedAppId: identity.expectedAppId,
+          });
+          return { ok: true, root_message_id: om };
+        } catch (err) { return { ok: false, reason: "send_failed", message: err.message }; }
+      },
+      publishIndex: ({ rootMessageId, pendingToken }) => {
+        // 幂等（半笔续跑）：这一代**已经登记**且就是本笔（同操作号 / 同根消息 / 同 token）→ 零写返回，
+        //   不再走 register（那个状态机只接受 PREPARING，已 awaiting_claim 会以 operation_mismatch 拒）。
+        const st0 = loadClaudeTopicBinding({ root, claudeSessionId });
+        const pend0 = st0.ok ? pendingGeneration(st0.state) : null;
+        if (st0.ok && st0.state?.rotation?.operation_id === effOpId
+            && pend0?.root_message_id === rootMessageId && pend0?.pending_token === pendingToken) {
+          return { ok: true, count: pend0.generation ?? null, changed: false, already_registered: true };
+        }
+        const registered = registerClaudeTopicRotation({ root, claudeSessionId, operationId: effOpId, rootMessageId, pendingToken });
+        if (registered.ok) return { ok: true, count: registered.generation?.generation ?? null };
+        // 幂等：上一次跑到 index 之后才失败的极端情形 —— 已登记且就是本笔（同操作号 / 同根消息）→ 视为已生效
+        if (registered.reason === "rotation_already_pending") {
+          const st2 = loadClaudeTopicBinding({ root, claudeSessionId });
+          const pend = st2.ok ? pendingGeneration(st2.state) : null;
+          if (st2.ok && st2.state?.rotation?.operation_id === effOpId && pend?.root_message_id === rootMessageId && pend?.pending_token === pendingToken) {
+            return { ok: true, count: pend.generation ?? null, changed: false };
+          }
+        }
+        return { ok: false, reason: registered.reason ?? "register_failed", why: registered.error ?? registered.reason ?? null };
+      },
+    })
+  : wireRotate({
+      endpointId: ep,
   env: process.env,
   rotationOpId: operationId,
   lineageId: current.state.binding_id,
@@ -197,6 +358,30 @@ if (!wired.ok) {
   if (wired.reason === "legacy_failed") die("轮转失败：" + (wired.why ?? "legacy 异常"));
   die("无法开始轮转（M1a 一致性锁取不到：" + (wired.reason ?? "m1a_reject") + (wired.why ? "；" + wired.why : "") + "）。旧代际保持 active，未创建新话题。");
 }
+// PK2-W2：authoritative 的分步结果收口 —— 账本先于索引，所以"账本已提交、后缀没做完"必须如实说清、非零退出；
+//   同一条命令重跑按同一 request key / 同一冻结意图续做后缀（不新建话题、账本不重复记）。
+if (writeRoute.mode === "authoritative") {
+  const steps = (wired.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null }));
+  if (wired.legacy?.ok !== true) {
+    emitMachineReceipt("rotate-unclean", { status: "unclean", operationId: effOpId, binding_id: current.state.binding_id,
+      commit: wired.commit ?? null, phase: wired.legacy?.phase ?? null, reason: wired.legacy?.reason ?? null,
+      root_message_id: wired.legacy?.root_message_id ?? null, steps, release: wired.release ?? null });
+    die("轮转没落完（停在第 " + String(wired.legacy?.phase ?? "?") + " 步：" + String(wired.legacy?.message ?? wired.legacy?.reason ?? "")
+      + "）。" + (wired.commit === "committed_unclean"
+        ? "账本已提交：**同一条命令重跑**会按同一 request key 续做后缀（话题幂等、账本不重复记）。"
+        : "账本未提交：同一条命令重跑会从同一冻结意图继续，已发出的新话题按幂等键复用。"));
+  }
+  // P1-②（W2-fix8）：**所有步骤 ok:true 但某账本原语返回 committed_unclean（residue / durability-uncertain）**
+  //   也是不干净 —— 旧版只打一行警告就继续，最后还打印"轮转完成"，把真实 unclean 报成成功。
+  if (wired.commit !== "committed_clean") {
+    emitMachineReceipt("rotate-unclean", { status: "unclean", operationId: effOpId, binding_id: current.state.binding_id,
+      commit: wired.commit ?? null, steps, release: wired.release ?? null, legacy_committed: true,
+      root_message_id: wired.legacy?.root_message_id ?? null });
+    die("轮转这一步不干净（commit=" + String(wired.commit) + "）。**轮转的事实可能已经提交**"
+      + "（新话题 / 账本 create_b1 / 代际索引登记之一或全部已落地）—— 已落机器回执（rotate-unclean）："
+      + "先跑 doctor 核对，再按同一条命令重跑补齐（话题按幂等键复用、账本不重复记）。");
+  }
+}
 const rootMessageId = wired.legacy.root_message_id;
 
 // #R37 P1-3①：legacy 已提交（新话题已登记、rootMessageId 到手）但 shadow 的 create_b1 缺失/失败 →
@@ -204,7 +389,8 @@ const rootMessageId = wired.legacy.root_message_id;
 // 恢复在同一个 outer 锁内、create_b1 前重核 legacy 现场（P1-3②）：pending/operation-id/root 均已变 → 整笔拒、不略影像。
 const createB1Missing = (wired.shadow ?? []).some((s) => s.op === "create_b1" && s.ok !== true);
 let recovered = null;
-if (createB1Missing && wired.legacy && wired.legacy.root_message_id) {
+// 清单封闭：authoritative 下不再需要"补 create_b1"（顺序已经是账本先行）——wireRotateRecovery 在 authoritative 仍拒。
+if (writeRoute.mode !== "authoritative" && createB1Missing && wired.legacy && wired.legacy.root_message_id) {
   recovered = wireRotateRecovery({
     endpointId: ep,
     env: process.env,

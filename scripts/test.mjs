@@ -54203,6 +54203,47 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { x.f.cleanup(); }
   });
 
+  test("PK2-W2-fix9 条目缺席 + 索引未过期：真入口仍按 I3 口径拒 TOKEN_UNKNOWN、零写（不放宽 I3 守卫）", () => {
+    const { x, env, ta } = w2Rotatable("w2f9pin");
+    try {
+      const r0 = w2RotateCli(x, env, ["--apply"]);
+      assert.equal(r0.status, 0, "前置轮转：" + JSON.stringify({ err: String(r0.stderr).slice(-300) }).slice(0, 500));
+      const pendId = w2Live(x).find((r) => r.facts.binding === "pending").id;
+      const row = w2Row(x);
+      const gen = (row.topic_generation_state.generations ?? []).find((g) => g.status === "pending");
+      assert.ok(gen && gen.pending_token, "新代际有待认领码：" + String(gen?.pending_token));
+      assert.equal(gen.claim_expires_at, null, "前置：索引未过期（claim_expires_at 为 null）");
+      // 模拟「条目缺席」：删掉 pending-claims 条目（文件仍在且 0600 合法），但索引仍 pending
+      const del = mutateSidecarEntry({ endpointId: x.EP, name: "pending-claims", key: pendId, env: process.env,
+        mutate: () => ({ ok: true, changed: true, value: null }) });
+      assert.equal(del.ok, true, "夹具：删掉待认领凭证条目");
+      assert.equal(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries[pendId], undefined, "条目确实缺席");
+      const before = {
+        reg: fs.readFileSync(x.regFile),
+        ledger: fs.readFileSync(path.join(x.epDir, "ledger.json")),
+        store: fs.readFileSync(x.sidecar("pending-claims")),
+        expiry: fs.readFileSync(x.sidecar("expiry")),
+      };
+      // 直调 findPendingBinding：必须仍拒 binding_token_unknown（不得回落旧登记表，也不得误判过期）
+      const direct = findPendingBinding({ content: w2Quote(gen.pending_token), registryFile: x.regFile, templateFile: x.tplFile, env });
+      assert.deepEqual([direct.ok, direct.reason], [false, "binding_token_unknown"],
+        "读面：条目缺席 + 索引未过期 → 仍拒 binding_token_unknown（I3 守卫不放宽）：" + JSON.stringify(direct));
+      // 真入口：入站跑完，落拒收回执、零写
+      const r = w2Inbound(x, env, { messageId: "msg_w2f9_pin_1", content: w2Quote(gen.pending_token) });
+      assert.equal(r.status, 0, "入站跑完：" + JSON.stringify({ out: String(r.stdout).slice(0, 200), err: String(r.stderr).slice(0, 200) }));
+      assert.deepEqual(fs.readFileSync(x.regFile), before.reg, "零写：registry 未变");
+      assert.deepEqual(fs.readFileSync(path.join(x.epDir, "ledger.json")), before.ledger, "零写：ledger 未变");
+      assert.deepEqual(fs.readFileSync(x.sidecar("pending-claims")), before.store, "零写：pending-claims 未变");
+      assert.deepEqual(fs.readFileSync(x.sidecar("expiry")), before.expiry, "零写：expiry 未变");
+      const receipts = w2UnroutedReceipts(x);
+      const rej = receipts.filter((n) => n.includes("msg_w2f9_pin_1"));
+      assert.equal(rej.length, 1, "恰一张拒收回执：" + JSON.stringify(receipts));
+      const rc = w2Receipt(x, rej[0].replace(/\.json$/u, ""));
+      assert.equal(rc.status, "rejected", "回执 status 为 rejected：" + JSON.stringify(rc));
+      assert.deepEqual(receipts.filter((n) => n.startsWith("m1a-unclean-")), [], "不产生任何 m1a-unclean-* 回执");
+    } finally { x.f.cleanup(); }
+  });
+
   test("PK2-W2-fix7 P1-a 影子（shadow）面真入口：过期兜底的 legacy 分支照常退休索引 → **不产生任何 m1a-unclean-*** 回执", () => {
     const x = w1Fixture("w2f7shadow", { cutover: false });   // init-only 收据 → m1aWriteRoute = shadow
     try {

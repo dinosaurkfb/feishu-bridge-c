@@ -255,6 +255,29 @@ const resumeCandidate = ({ pending, claims, endpointId, env }) => {
   return candidates.length === 1 ? candidates[0] : null;
 };
 
+const makeExpiredResult = (binding) => ({
+  ok: false,
+  reason: PROMOTE_REJECT.PENDING_EXPIRED,
+  id: binding.id,
+  root: binding.root,
+  source: binding.source,
+  claudeSessionId: binding.claudeSessionId,
+  generationId: binding.generation?.channel_generation_id,
+  operationId: binding.mapping?.topic_generation_state?.rotation?.operation_id ?? null,
+});
+
+const isPendingGenerationExpired = (binding, now) => {
+  const genDeadline = Date.parse(binding.generation?.claim_expires_at ?? "");
+  return Number.isFinite(genDeadline) && now >= genDeadline;
+};
+
+const isRecordVoidedAudit = (endpointId, locator, env) => {
+  if (!locator) return false;
+  const L = loadByEndpoint(endpointId, { env });
+  if (!L.ok || !L.doc?.records) return false;
+  return Object.values(L.doc.records).some((r) => r?.kind === "voided_audit" && r?.root_om === locator);
+};
+
 /**
  * authoritative：**凭证只认 store**（`ledger/<ep>/pending-claims.json`），登记/映射里的 `pending_token`
  *   不再是裁定依据；到期同样取 store 条目（`claim_expires_at` 为 null = 不过期）。
@@ -263,7 +286,7 @@ const resumeCandidate = ({ pending, claims, endpointId, env }) => {
  *   store 读不出 / 缺席 → 拒 `ledger_route_unavailable`（fail-closed：bearer 凭证核不了就不认，
  *   绝不回落到旧登记表那一列）。
  */
-const pickPendingFromStore = ({ pending, tokens, endpointId, env }) => {
+const pickPendingFromStore = ({ pending, tokens, endpointId, env, now = Date.now() }) => {
   const store = readSidecarStore({ endpointId, name: "pending-claims", env });
   if (store.ok !== true || store.absent === true) {
     return { ok: false, reason: "ledger_route_unavailable", tokens,
@@ -288,11 +311,33 @@ const pickPendingFromStore = ({ pending, tokens, endpointId, env }) => {
     // 码不在库里：可能是「凭证已被消费、索引还没写」的半笔续跑（见 resumeCandidate），否则就是真对不上。
     const res = resumeCandidate({ pending, claims, endpointId, env });
     if (res !== null) return { ok: true, one: res.binding, matchedBy: "consumed_credential_resume", storeBacked: true, deadline: claimDeadline(res.entry) };
+
+    // PK2-W2-fix9：码不在库里，但索引里这条 pending 代际按自己的 claim_expires_at 已过期
+    // （例如首次过期作废已删掉 store 条目/账本已 voided_audit，重跑补索引半笔）。
+    // "索引里这条 pending 代际已过期" 优先于 "码对不上"：
+    const tokenHits = claims.filter((c) => sameToken(c.binding.generation?.pending_token, tokens[0]));
+    if (tokenHits.length === 1) {
+      const hit = tokenHits[0];
+      if (isPendingGenerationExpired(hit.binding, now)) {
+        if (hit.entry === null || isRecordVoidedAudit(endpointId, hit.binding.generation?.root_message_id, env)) {
+          return makeExpiredResult(hit.binding);
+        }
+      }
+    } else if (tokenHits.length > 1) {
+      return { ok: false, reason: PROMOTE_REJECT.TOKEN_DUPLICATED, token: tokens[0], ids: tokenHits.map((c) => c.binding.id) };
+    }
+
     return { ok: false, token: tokens[0], ...(found.ids ? { ids: found.ids } : {}),
       reason: found.reason === "token_duplicated" ? PROMOTE_REJECT.TOKEN_DUPLICATED : PROMOTE_REJECT.TOKEN_UNKNOWN };
   }
   if (pending.length > 1) return { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING, ids: pending.map((b) => b.id) };
-  return { ok: true, one: claims[0].binding, matchedBy: "only_pending", storeBacked: true, deadline: claimDeadline(claims[0].entry) };
+  const only = claims[0];
+  if (isPendingGenerationExpired(only.binding, now)) {
+    if (only.entry === null || isRecordVoidedAudit(endpointId, only.binding.generation?.root_message_id, env)) {
+      return makeExpiredResult(only.binding);
+    }
+  }
+  return { ok: true, one: only.binding, matchedBy: "only_pending", storeBacked: true, deadline: claimDeadline(only.entry) };
 };
 
 /**
@@ -330,7 +375,7 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
   //   注意「哪些代际在待认领」仍由登记/映射投影提供（那是话题身份面）；本单换的是**凭证**那一列。
   const route = pendingClaimsRoute({ templateFile, env });
   const picked = route.mode === "authoritative"
-    ? pickPendingFromStore({ pending, tokens, endpointId: route.endpointId, env })
+    ? pickPendingFromStore({ pending, tokens, endpointId: route.endpointId, env, now })
     : pickPendingFromLegacy({ pending, tokens });
   if (picked.ok !== true) return picked;
 
@@ -342,16 +387,7 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
     ? picked.deadline
     : (Number.isFinite(generationDeadline) ? generationDeadline : pendingDeadline(one.entry));
   if (now >= deadline) {
-    return {
-      ok: false,
-      reason: PROMOTE_REJECT.PENDING_EXPIRED,
-      id: one.id,
-      root: one.root,
-      source: one.source,
-      claudeSessionId: one.claudeSessionId,
-      generationId: one.generation.channel_generation_id,
-      operationId: one.mapping?.topic_generation_state?.rotation?.operation_id ?? null,
-    };
+    return makeExpiredResult(one);
   }
   return {
     ok: true, ...one,

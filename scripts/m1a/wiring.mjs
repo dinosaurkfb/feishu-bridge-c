@@ -508,6 +508,16 @@ export function wirePromoteAuthoritative({
   } });
 }
 
+/** W2-fix4 P1-4：create_b1 的**归属判据**（唯一一处）：精确 request key + op_type + **当前 pending id**。
+ *  `pendingId === null`（没有 pending）→ 一律**非续跑**（旧写法在无 pending 时 comparing created_id===created_id 恒真，
+ *  等于取消了身份核验）。lineage 已进 request key，不再检查并不存在的 `result.lineage_id`。 */
+export function ownCreateB1Op({ doc, requestKey, pendingId } = {}) {
+  if (typeof requestKey !== "string" || requestKey.length === 0) return false;
+  if (typeof pendingId !== "string" || pendingId.length === 0) return false;
+  return Object.values(doc?.operations ?? {}).some((op) => op?.request_key === requestKey
+    && op?.op_type === "create_b1" && op?.result?.created_id === pendingId);
+}
+
 /* ── PK2-W2（M1b-W2）：切权威后的轮转 / 作废（authoritative 复合写）──────────
  *
  * 复用 W1 的 `runAuthoritative` 骨架（outer 锁 → **锁内 prepare** → 顺序步骤 → 释放），本单只开两支：
@@ -574,9 +584,7 @@ export function wireRotateAuthoritative({
       const kP = rk("create_b1", operationId, linP);
       // P1-4：归属要核**三项**（op_type / result.created_id / lineage），不能只看 request key ——
       //   索引里的 operation id 漂移或被篡改时，光有同 key 会把另一笔 pending 当成本次续跑。
-      const ownP = kP.ok && Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === kP.request_key
-        && op?.op_type === "create_b1" && op?.result?.created_id === resolved.id
-        && op?.result?.lineage_id === undefined ? true : (op?.result?.lineage_id ?? linP) === linP);
+      const ownP = kP.ok && ownCreateB1Op({ doc: L.doc, requestKey: kP.request_key, pendingId: resolved.id });
       if (!ownP) return { ok: false, reason: "rotation_pending_exists", why: "同 lineage 已有别人那条 live pending 代际（" + resolved.id + "）—— 不能重复创建" };
       const curOfLineage = liveOfLineage(L.doc, linP).find(([, r]) => r.facts?.generation === "current");
       if (!curOfLineage) return { ok: false, reason: "rotation_no_current", why: "pending 那一代没有 active 的 current 可继承" };
@@ -614,11 +622,9 @@ export function wireRotateAuthoritative({
     const superseded = inspected?.superseded ?? null;
     let frozen = null;
     // 裁定 2：**先**看同 request key 是否已提交 —— 已提交 = 这是同一轮转的续跑，不被"已有 pending"挡住。
-    // P1-4：同 request key 命中还不够 —— 必须同时是 create_b1、且它的结果是**这条** pending 记录、lineage 对得上。
-    const ownCommitted = Object.values(L.doc.operations ?? {}).some((op) => op?.request_key === kOwn.request_key
-      && op?.op_type === "create_b1"
-      && op?.result?.created_id === (pendingEntry === undefined ? op?.result?.created_id : pendingEntry[0])
-      && (op?.result?.lineage_id ?? lineageId) === lineageId);
+    // P1-4：归属判据统一走 ownCreateB1Op（精确 request key + op_type + **当前 pending id**）；
+    //   没有 pending 时它恒为 false —— 那就不该被当成"create_b1 后缀续跑"。
+    const ownCommitted = ownCreateB1Op({ doc: L.doc, requestKey: kOwn.request_key, pendingId: pendingEntry === undefined ? null : pendingEntry[0] });
     // 「已过期的那条」= 调用方退休的那条 pending（同 root_om）—— 它可以在本笔里被作废，不算"重复创建"。
     const supersededIsPending = superseded !== null && pendingEntry !== undefined
       && superseded.rootOm === (pendingEntry[1]?.aliases?.root_om ?? null);
@@ -703,7 +709,14 @@ export function wireRotateAuthoritative({
       const cur = readSidecarStore({ endpointId, name: "expiry", env });
       if (cur.ok !== true) return { ok: false, reason: "expiry_" + String(cur.reason ?? "failed"), why: cur.why ?? null };
       const inherited = cur.absent === true ? null : (Object.prototype.hasOwnProperty.call(cur.entries, prep.inheritedExpiryTa) ? cur.entries[prep.inheritedExpiryTa] : null);
-      const inheritable = typeof inherited === "string" && !Number.isNaN(Date.parse(inherited)) ? new Date(inherited).toISOString() : null;
+      // P1-5（对齐 I2 已裁口径）：current 的 expiry 条目**缺席 / 文件缺席** → 该步失败（committed_unclean），
+      //   不许静默不写 —— 否则轮转会造出一条 doctor ⑤ 必红的新记录（"缺失授权事实"不许当"没设到期"）。
+      if (cur.absent === true || typeof inherited !== "string" || Number.isNaN(Date.parse(inherited))) {
+        return { ok: false, reason: "expiry_entry_absent",
+          why: "current（" + String(prep.inheritedExpiryTa) + "）的权威到期条目缺席 / 不是规范化 ISO："
+            + "不许把缺失当「没设到期」（I2 口径 fail-closed）—— 先核对 ledger/<ep>/expiry.json" };
+      }
+      const inheritable = new Date(inherited).toISOString();
       const exp = mutateSidecarEntry({ endpointId, name: "expiry", key: ta, env,
         mutate: (entry) => (entry === inheritable ? { ok: true, changed: false } : { ok: true, changed: true, value: inheritable }) });
       if (exp.ok !== true) return { ok: false, reason: "expiry_" + String(exp.reason ?? "failed"), why: exp.why ?? null };

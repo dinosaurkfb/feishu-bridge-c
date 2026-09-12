@@ -463,6 +463,19 @@ if (!routed.ok) {
             reason: "expired",
             legacy: wireExpireLegacy,
           });
+      // P1-1（W2-fix4）：收口与 feishu-rotate 的 authoritative 分步收口**同形** ——
+      //   ① prepare/整笔拒（ok!==true）→ 落拒回执；② legacy 步失败 或 ③ commit !== committed_clean → 落 unclean 回执。
+      //   旧版只看 failedStep/relFail，"准备阶段就拒"与"步骤全绿但提交不净"都会**不落回执**（K10 因此绿）。
+      const expiredPrepareReject = wiredExpire.ok !== true;
+      const expiredUnclean = wiredExpire.ok === true && (wiredExpire.legacy?.ok !== true || wiredExpire.commit !== "committed_clean");
+      if (expiredPrepareReject || expiredUnclean) {
+        writeReceipt("m1a-unclean-" + (event.message_id ?? "unknown"), {
+          status: expiredPrepareReject ? "rejected" : "unclean",
+          reason: expiredPrepareReject ? (wiredExpire.reason ?? "m1a_reject") : (wiredExpire.legacy?.reason ?? "committed_unclean"),
+          phase: wiredExpire.legacy?.phase ?? null, commit: wiredExpire.commit ?? null,
+          message_id: event.message_id ?? null, claim_acquired: false, handed_off: false,
+        });
+      }
       const failedStep = (wiredExpire.shadow ?? []).find((s) => !s.ok);
       const relFail = wiredExpire.release && wiredExpire.release.ok !== true;
       if (failedStep || relFail) {

@@ -15,7 +15,7 @@ import {
   closeClaudeTopicRotation, failClaudeTopicRotation, loadClaudeTopicBinding, prepareClaudeTopicRotation,
   registerClaudeTopicRotation,
 } from "./topic-generation-store.mjs";
-import { m1aWriteRoute, wireRotate, wireVoid, wireRotateRecovery, wireRotateAuthoritative, wireVoidAuthoritative } from "./m1a/wiring.mjs";
+import { m1aWriteRoute, wireRotate, wireVoid, wireRotateRecovery, wireRotateAuthoritative, wireVoidAuthoritative, ownCreateB1Op } from "./m1a/wiring.mjs";
 import { legacyEndpointId } from "./subscription.mjs";
 import { loadByEndpoint, resolveLiveId } from "./topic-agent-ledger.mjs";
 import { requestKeyFor } from "./m1a/dual-write.mjs";
@@ -151,7 +151,8 @@ const w2ResumeIntent = (() => {
   const rec = led.doc.records?.[resolved.id];
   const lin = rec?.generation_lineage_id;
   const k = typeof lin === "string" ? requestKeyFor({ opType: "create_b1", externalRequestId: rot.operation_id, entityId: lin }) : null;
-  const own = k?.ok === true && Object.values(led.doc.operations ?? {}).some((op) => op?.request_key === k.request_key);
+  // P1-4③：归属判据与 composite 同一份（精确 request key + op_type + 当前 pending id）——不能只核 key。
+  const own = k?.ok === true && ownCreateB1Op({ doc: led.doc, requestKey: k.request_key, pendingId: resolved.id });
   return own ? { opId: rot.operation_id, generation: blocker.pending.generation, rootOm: blocker.pending.root_message_id,
     token: blocker.pending.pending_token, claimExpiresAt: blocker.pending.claim_expires_at ?? null } : null;
 })();

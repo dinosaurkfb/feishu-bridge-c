@@ -100,9 +100,15 @@ if (agentUid) {
       process.exit(1);
     }
     if (wiredAuth.commit !== "committed_clean") {
-      console.error("注意      这一步有提交不干净（commit=" + String(wiredAuth.commit) + "）：已落机器回执，先 doctor 核对（暂停本身已完成）。");
-    } else if (!pauseUnclean.clean) {
-      console.error("注意      排序锁没交还干净：已落机器回执，先 doctor 核对（暂停本身已完成）。");
+      console.error("注意      这一步有提交不干净（commit=" + String(wiredAuth.commit) + "）：已落机器回执。");
+    }
+    // P1-4（W3-fix5）：不干净 = **不许绿退出、也不许说"已暂停"** —— 回执已经落了（上一拍），这里补一句
+    //   "事实可能已提交、需 doctor 后重跑补齐"并**非零退出**（与 committed-unclean 的既有口径同一条）。
+    if (!pauseUnclean.clean) {
+      console.error("注意      这一次不干净（commit=" + String(wiredAuth.commit ?? "?") + (pauseUnclean.releaseUnclean ? "，排序锁没交还干净" : "")
+        + "）：已落机器回执。**暂停的事实可能已经提交**（账本 unbind / 索引 paused 之一或两者已落地）——"
+        + "先跑 doctor 核对，再按同一条命令重跑补齐（不重复记）。");
+      process.exit(1);
     }
     console.log("\n已暂停（账本 unbind 先行，再改索引）。");
     console.log(describeStatus(currentBinding({ root, claudeSessionId }), bindingsForRoot({ root })));

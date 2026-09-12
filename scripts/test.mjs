@@ -53858,40 +53858,6 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { x.f.cleanup(); }
   });
 
-  test("PK2-W3-fix4 P1-4 release 不净也要留机器回执：feishu-unbind（暂停）与 bind-session（会话级恢复）各一条（账本/索引都 clean 时旧版一个字节都不留）", () => {
-    // 归属转换锁 .reap 拿在手里 → outer release 必 release_busy（主锁交不还，这正是"提交都干净"的 release 不净）
-    const reapLockOf = (x) => path.join(x.epDir, "m1a-order.lock.reap");
-    const a = w3Fixture("w3f4d1");
-    try {
-      const reap = reapLockOf(a.x);
-      const held = acquirePublishLock(reap);
-      assert.ok(held.ok, "夹具取 .reap 锁：" + JSON.stringify(held));
-      let rp;
-      try { rp = w3Spawn(a.x, a.env, "feishu-unbind.mjs"); } finally { releasePublishLock(reap); }
-      assert.equal(w3Rec(a.x, a.ta).facts.binding, "dormant", "暂停本身已完成（账本）：" + String(rp.status));
-      assert.equal(w3Status(a.x), "paused", "索引也已完成：" + String(w3Status(a.x)));
-      const recs = w3UncleanReceipts(a.x);
-      assert.equal(recs.length, 1, "release 不净也留下机器回执：" + JSON.stringify({ status: rp.status, out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-300), receipts: recs }));
-      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(a.x), recs[0]), "utf-8"));
-      assert.equal(body.releaseUnclean?.reason, "release_busy", "回执点名 release 不净：" + JSON.stringify(body.releaseUnclean));
-      assert.equal(body.clean, false, "投影自报不干净：" + String(body.clean));
-    } finally { a.x.f.cleanup(); }
-    const b = w3Fixture("w3f4d2");
-    try {
-      assert.equal(w3Pause(b.x, { om: b.om }).ok, true, "前置暂停（in-process）");
-      const reap = reapLockOf(b.x);
-      const held = acquirePublishLock(reap);
-      assert.ok(held.ok, "夹具再取 .reap 锁：" + JSON.stringify(held));
-      let rr;
-      try { rr = w3SpawnSession(b.x, b.env); } finally { releasePublishLock(reap); }
-      assert.equal(w3Rec(b.x, b.ta).facts.binding, "active", "恢复本身已完成（账本）：" + JSON.stringify({ status: rr.status, out: String(rr.stdout).slice(-300), err: String(rr.stderr).slice(-300) }));
-      const recs = w3UncleanReceipts(b.x);
-      assert.equal(recs.length, 1, "bind-session 的恢复分支也留回执：" + JSON.stringify(recs));
-      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(b.x), recs[0]), "utf-8"));
-      assert.equal(body.releaseUnclean?.reason, "release_busy", "回执点名 release 不净：" + JSON.stringify(body.releaseUnclean));
-    } finally { b.x.f.cleanup(); }
-  });
-
   test("PK2-W2 T1 手动轮转真入口：新话题恰一次 + 账本多一条 live pending B1（target 继承）+ 索引新代际 pending + 两份 sidecar 各多一条", () => {
     const { x, env, ta, om } = w2Rotatable("w2t1");
     try {
@@ -54725,6 +54691,98 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.notDeepEqual(w2PendingGen(x).root_message_id, cur.aliases.root_om, "新代际是另一个根话题：" + String(w2PendingGen(x).root_message_id) + " vs " + String(cur.aliases.root_om));
     } finally { x.f.cleanup(); }
   });
+
+  /** PK2-W3-fix5：**项目级**绑定的夹具（bind-project 的恢复支只认 `currentBinding({root})` 那条行）。
+   *  三步工序：① 影子期（init-only）用 bind-project 建项目级绑定（真入口，legacy+镜像）→ ② 真入口认领
+   *  （另一个会话，免得那条消息被路由走）→ ③ cutover 把这条端点切成 authoritative（账本以 shadow 事实为底）
+   *  → ④ 真入口暂停（feishu-unbind，项目级）⇒ 现场就位（`currentBinding({root}).suspended === true`）。 */
+  const w3ProjectFixture = (tag) => {
+    const x = w1Fixture(tag, { cutover: false });
+    const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
+    // ① 项目级绑定只能在 **never_initialized** 的端点上建（bind-project 在"已启用端点"上无条件拒）——
+    //   只把**维护目录**指到一个空目录（账本/登记表都还是夹具的），走 legacy-only，不写账本。
+    const emptyMaint = path.join(x.f.base, "no-m1a-attr");
+    fs.mkdirSync(emptyMaint, { recursive: true, mode: 0o700 });
+    const envNoM1a = { ...env, FEISHU_BRIDGE_MAINTENANCE_DIR: emptyMaint };
+    const r0 = w3Spawn(x, envNoM1a, "bind-project.mjs");
+    if (r0.status !== 0) { x.f.cleanup(); throw new Error("夹具：建项目级绑定失败：" + r0.stdout + r0.stderr); }
+    const row = x.registry().projects.find((p) => p.root_message_id);
+    if (!row) { x.f.cleanup(); throw new Error("夹具：没有项目级登记行：" + JSON.stringify(x.registry().projects)); }
+    // ② 真入口认领（换会话：认领那条消息的会话不能跟后面暂停/恢复用的会话撞）
+    const rc = w2Inbound(x, envNoM1a, { messageId: "msg_w3f5_claim", content: w2Quote(row.pending_token), sessionId: "aily_w3f5_claim" });
+    if (rc.status !== 0) { x.f.cleanup(); throw new Error("夹具：项目级认领失败：" + rc.stdout + rc.stderr); }
+    // ③ 把这条既有 legacy 绑定**补种**进影子账本（migrate_seed，真机同一条迁移入口）——否则 cutover 的双射不等
+    const rs = spawnSync(process.execPath, [path.resolve("scripts", "m1a-seed.mjs"), "--endpoint", x.EP, "--apply"],
+      { encoding: "utf-8", cwd: x.proj, env });
+    if (rs.status !== 0) { x.f.cleanup(); throw new Error("夹具：m1a-seed 失败：" + rs.stdout + rs.stderr); }
+    // ④ cutover（账本从影子事实升为权威）
+    const cut = LEDGER_OP.ledgerEnter(x.f.ctx, { kind: "cutover", endpointId: x.EP, chain: "claude", apply: true });
+    if (cut.phase !== "done") { x.f.cleanup(); throw new Error("夹具：cutover 失败：" + JSON.stringify(cut)); }
+    // ⑤ 真入口暂停（项目级：CLAUDE_CODE_SESSION_ID 不在路由表里 → currentBinding 挑项目级行）
+    const rp = w3Spawn(x, env, "feishu-unbind.mjs");
+    if (rp.status !== 0) { x.f.cleanup(); throw new Error("夹具：项目级暂停失败：" + rp.stdout + rp.stderr); }
+    const ta = Object.values(x.ledger().records).find((r) => r.kind === "live" && r.facts?.binding === "dormant")?.topic_agent_id ?? null;
+    if (!ta) { x.f.cleanup(); throw new Error("夹具：账本里没有 dormant B3′：" + JSON.stringify(Object.values(x.ledger().records).map((r) => [r.kind, r.facts?.binding]))); }
+    return { x, env, ta, rec: () => x.ledger().records[ta], status: () => x.registry().projects.find((p) => p.root_message_id)?.topic_generation_state?.binding_status ?? null };
+  };
+
+  test("PK2-W3-fix4 P1-4 release 不净也要留机器回执：feishu-unbind（暂停）与 bind-session（会话级恢复）各一条（账本/索引都 clean 时旧版一个字节都不留）；**且三条入口退出码均非零**（W3-fix5）", () => {
+    // 归属转换锁 .reap 拿在手里 → outer release 必 release_busy（主锁交不还，这正是"提交都干净"的 release 不净）
+    const reapLockOf = (x) => path.join(x.epDir, "m1a-order.lock.reap");
+    const a = w3Fixture("w3f4d1");
+    try {
+      const reap = reapLockOf(a.x);
+      const held = acquirePublishLock(reap);
+      assert.ok(held.ok, "夹具取 .reap 锁：" + JSON.stringify(held));
+      let rp;
+      try { rp = w3Spawn(a.x, a.env, "feishu-unbind.mjs"); } finally { releasePublishLock(reap); }
+      // W3-fix5 P1-4：不干净 = 非零退出（改前是 exit 0 + 打印"已暂停"：绿退出掩盖了不干净）
+      assert.notEqual(rp.status, 0, "feishu-unbind：不干净必须非零退出：" + JSON.stringify({ status: rp.status, out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-400) }));
+      assert.equal(/已暂停（账本 unbind 先行/.test(String(rp.stdout)), false, "不干净不许再打印最终成功：" + String(rp.stdout).slice(-300));
+      assert.equal(w3Rec(a.x, a.ta).facts.binding, "dormant", "暂停本身已完成（账本）：" + String(rp.status));
+      assert.equal(w3Status(a.x), "paused", "索引也已完成：" + String(w3Status(a.x)));
+      const recs = w3UncleanReceipts(a.x);
+      assert.equal(recs.length, 1, "release 不净也留下机器回执：" + JSON.stringify({ status: rp.status, out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-300), receipts: recs }));
+      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(a.x), recs[0]), "utf-8"));
+      assert.equal(body.releaseUnclean?.reason, "release_busy", "回执点名 release 不净：" + JSON.stringify(body.releaseUnclean));
+      assert.equal(body.clean, false, "投影自报不干净：" + String(body.clean));
+    } finally { a.x.f.cleanup(); }
+    const b = w3Fixture("w3f4d2");
+    try {
+      assert.equal(w3Pause(b.x, { om: b.om }).ok, true, "前置暂停（in-process）");
+      const reap = reapLockOf(b.x);
+      const held = acquirePublishLock(reap);
+      assert.ok(held.ok, "夹具再取 .reap 锁：" + JSON.stringify(held));
+      let rr;
+      try { rr = w3SpawnSession(b.x, b.env); } finally { releasePublishLock(reap); }
+      assert.notEqual(rr.status, 0, "bind-session：不干净必须非零退出：" + JSON.stringify({ status: rr.status, out: String(rr.stdout).slice(-300), err: String(rr.stderr).slice(-400) }));
+      assert.equal(/已恢复（账本 restore 先行/.test(String(rr.stdout)), false, "不干净不许再打印最终成功：" + String(rr.stdout).slice(-300));
+      assert.equal(w3Rec(b.x, b.ta).facts.binding, "active", "恢复本身已完成（账本）：" + JSON.stringify({ status: rr.status, out: String(rr.stdout).slice(-300), err: String(rr.stderr).slice(-300) }));
+      const recs = w3UncleanReceipts(b.x);
+      assert.equal(recs.length, 1, "bind-session 的恢复分支也留回执：" + JSON.stringify(recs));
+      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(b.x), recs[0]), "utf-8"));
+      assert.equal(body.releaseUnclean?.reason, "release_busy", "回执点名 release 不净：" + JSON.stringify(body.releaseUnclean));
+    } finally { b.x.f.cleanup(); }
+    // ③ bind-project（**项目级**恢复支）：同一条最小修也要在这条入口上钉住。夹具是
+    //   「影子期建项目级绑定 → 真入口认领 → cutover → 真入口暂停」，然后握着 .reap 跑恢复。
+    const c = w3ProjectFixture("w3f5proj");
+    try {
+      const reap = reapLockOf(c.x);
+      const held = acquirePublishLock(reap);
+      assert.ok(held.ok, "夹具取 .reap 锁：" + JSON.stringify(held));
+      let rq;
+      try { rq = w3Spawn(c.x, c.env, "bind-project.mjs"); } finally { releasePublishLock(reap); }
+      assert.notEqual(rq.status, 0, "bind-project：不干净必须非零退出：" + JSON.stringify({ status: rq.status, out: String(rq.stdout).slice(-300), err: String(rq.stderr).slice(-500) }));
+      assert.equal(/已恢复（账本 restore 先行/.test(String(rq.stdout)), false, "不干净不许再打印最终成功：" + String(rq.stdout).slice(-300));
+      assert.equal(c.rec().facts.binding, "active", "恢复本身已完成（账本）：" + JSON.stringify({ status: rq.status, out: String(rq.stdout).slice(-200), err: String(rq.stderr).slice(-300) }));
+      const recs = w3UncleanReceipts(c.x);
+      assert.equal(recs.length, 1, "bind-project 的恢复支也留回执：" + JSON.stringify(recs));
+      const body = JSON.parse(fs.readFileSync(path.join(w3ReceiptDir(c.x), recs[0]), "utf-8"));
+      assert.deepEqual([body.kind, body.releaseUnclean?.reason], ["cli_bind_project_resume", "release_busy"], "回执点名这条入口与 release 不净：" + JSON.stringify({ kind: body.kind, rel: body.releaseUnclean }));
+    } finally { c.x.f.cleanup(); }
+  });
+
+
 
   test("PK2-W2-fix6 K12 current 的 expiry 条目缺席 → rotate 的 sidecar 步失败（expiry_entry_absent / committed_unclean + 回执）；**文件**缺席同；补上后重跑干净", () => {
     const { x, env, ta } = w2Rotatable("w2f6k12");

@@ -213,9 +213,14 @@ if (suspended.ok && suspended.suspended) {
         process.exit(1);
       }
       if (wiredAuthR.commit !== "committed_clean") {
-        console.error("注意      这一步有提交不干净（commit=" + String(wiredAuthR.commit) + "）：已落机器回执，先 doctor 核对（恢复本身已完成）。");
-      } else if (!resumeUnclean.clean) {
-        console.error("注意      排序锁没交还干净：已落机器回执，先 doctor 核对（恢复本身已完成）。");
+        console.error("注意      这一步有提交不干净（commit=" + String(wiredAuthR.commit) + "）：已落机器回执。");
+      }
+      // P1-4（W3-fix5）：不干净 = **不许绿退出、也不许说"已恢复"**（回执已落）。
+      if (!resumeUnclean.clean) {
+        console.error("注意      这一次不干净（commit=" + String(wiredAuthR.commit ?? "?") + (resumeUnclean.releaseUnclean ? "，排序锁没交还干净" : "")
+          + "）：已落机器回执。**恢复的事实可能已经提交**（账本 restore / 索引 active 之一或两者已落地）——"
+          + "先跑 doctor 核对，再按同一条命令重跑补齐（不重复记）。");
+        process.exit(1);
       }
       const rr = wiredAuthR.legacy;
       if (rr?.__fixedKind === "reenabled") console.log("  登记表里那条是停用的，已启用回来。");

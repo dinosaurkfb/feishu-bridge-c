@@ -54379,6 +54379,98 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { y.x.f.cleanup(); }
   });
 
+  // ── PK2-W2-fix8：旧记录 sidecar 删除的崩溃窗（独立步 ②′）+ rotate/cancel 的 committed_unclean 绿退出 ──
+  /** 两份 sidecar 的键集 + 账本 live 集（doctor ⑤/⑲ 的对账口径）。 */
+  const w2KeySets = (x) => ({
+    live: Object.entries(x.ledger().records).filter(([, r]) => r.kind === "live").map(([id]) => id).sort(),
+    pending: Object.keys(readSidecarStore({ endpointId: x.EP, name: "pending-claims" }).entries ?? {}).sort(),
+    expiry: Object.keys(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries ?? {}).sort(),
+  });
+
+  test("PK2-W2-fix8 P1-c 旧记录两份 sidecar 的删除是「void 之后、freeze 之前」的独立步：在删除处注入崩溃 → 重跑补删、键集 == live B 集", () => {
+    for (const [label, lockName] of [["②′之前（第一份删除就失败）", "pending-claims"], ["两次删除之间（pending-claims 已删、expiry 未删）", "expiry"]]) {
+      const { x, env } = w2Rotatable("w2f8" + (lockName === "expiry" ? "e" : "p"));
+      try {
+        const r0 = w2RotateCli(x, env, ["--apply"]);
+        assert.equal(r0.status, 0, label + "：前置轮转：" + JSON.stringify({ err: String(r0.stderr).slice(-300) }).slice(0, 500));
+        const ex = w2ExpirePending(x);
+        assert.ok(readSidecarStore({ endpointId: x.EP, name: "expiry" }).entries[ex.pendingId], label + "：前置：旧那条有 expiry 条目");
+        // 注入：把要删的那份 sidecar 的锁拿在手里 → ②′ 的删除失败 → 整笔停在 ②′
+        const lockPath = x.sidecar(lockName) + ".lock";
+        const held = acquirePublishLock(lockPath);
+        assert.ok(held.ok, label + "：夹具取 sidecar 锁：" + JSON.stringify(held));
+        try { w2RotateCli(x, env, ["--apply"]); } finally { releasePublishLock(lockPath); }
+        assert.equal(x.ledger().records[ex.pendingId].kind, "voided_audit", label + "：① void 已提交（半笔停在 ②′）：" + String(x.ledger().records[ex.pendingId].kind));
+        assert.equal(w2PendingGen(x)?.channel_generation_id, ex.generationId, label + "：索引**还没**退休（崩点在 ②′）：" + JSON.stringify((w2Row(x).topic_generation_state.generations ?? []).map((g) => [g.generation, g.status])));
+        // 重跑：从 ②′ 续做（补删）→ 一路做完
+        const r2 = w2RotateCli(x, env, ["--apply"]);
+        assert.equal(r2.status, 0, label + "：重跑补齐：" + JSON.stringify({ status: r2.status, out: String(r2.stdout).slice(-300), err: String(r2.stderr).slice(-400) }).slice(0, 800));
+        const k = w2KeySets(x);
+        assert.deepEqual(k.expiry.filter((id) => !k.live.includes(id)), [], label + "：expiry 键集 == live B 集（doctor ⑤/⑲ 口径）：" + JSON.stringify(k));
+        assert.deepEqual(k.pending.filter((id) => !k.live.includes(id)), [], label + "：pending-claims 键集 == live B 集：" + JSON.stringify(k));
+        assert.equal(k.expiry.includes(ex.pendingId), false, label + "：被 void 那条的 expiry 条目已补删：" + JSON.stringify(k));
+        assert.equal(k.pending.includes(ex.pendingId), false, label + "：被 void 那条的 pending-claims 条目已补删：" + JSON.stringify(k));
+      } finally { x.f.cleanup(); }
+    }
+  });
+
+  /** 从 CLI 的 stderr 里取出**第一个** JSON 对象（机器回执是 pretty-print 的，收尾行是 `}`）。 */
+  const w2FirstJson = (text) => {
+    let acc = "";
+    for (const line of String(text).split("\n")) {
+      acc += line + "\n";
+      if (line === "}") { try { return JSON.parse(acc); } catch { return null; } }
+    }
+    return null;
+  };
+  /** 把当前 scripts 拷到临时目录，并在**拷贝**里把账本原语的「干净提交」注入成 `committed_with_residue`
+   *  （= 票面说的"注入账本原语返回 committed_unclean（residue）"）。复合与 CLI 都是真的，只有这一处被注入：
+   *  真实的 committed_unclean 在 CLI 层没法从外面注入（账本锁的注入会先撞 commit 段 → only reap_busy/not_committed；
+   *  端点目录必须精确 0700 → 也没法用权限让目录 fsync 失败）。 */
+  const w2ResidueCopy = () => {
+    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "w2fix8-residue-"));
+    const cp = spawnSync("bash", ["-c", "cp -R " + JSON.stringify(path.resolve("scripts")) + " " + JSON.stringify(path.join(dir, "scripts"))], { encoding: "utf-8" });
+    if (cp.status !== 0) { fs.rmSync(dir, { recursive: true, force: true }); throw new Error("夹具：拷 scripts 失败：" + cp.stderr); }
+    const led = path.join(dir, "scripts", "topic-agent-ledger.mjs");
+    const src = fs.readFileSync(led, "utf-8");
+    const needle = 'return finalize({ ok: true, commit: "committed_clean", revision: m.next.revision, result: committedResult });';
+    if (!src.includes(needle)) { fs.rmSync(dir, { recursive: true, force: true }); throw new Error("夹具：账本提交收口的注入点没找到"); }
+    fs.writeFileSync(led, src.replace(needle,
+      'return finalize({ ok: true, commit: "committed_with_residue", revision: m.next.revision, result: committedResult, residue: ["injected-residue"] });'));
+    return { scriptsDir: path.join(dir, "scripts"), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  };
+  const w2RotateWith = (scriptsDir, x, env, args) => spawnSync(process.execPath,
+    [path.join(scriptsDir, "feishu-rotate.mjs"), "--project", x.proj, "--claude-session-id", W1_UUID_A, ...args],
+    { encoding: "utf-8", cwd: x.proj, env });
+
+  test("PK2-W2-fix8 P1-② rotate / cancel 在 committed_unclean（账本原语 residue）时非零退出 + 机器回执 + 不打印最终成功", () => {
+    const inj = w2ResidueCopy();
+    try {
+    // ① 普通轮转：账本原语提交带 residue → 所有步骤仍 ok:true，但 runAuthoritative 的 commit = committed_unclean
+    const a = w2Rotatable("w2f8r");
+    try {
+      const r = w2RotateWith(inj.scriptsDir, a.x, a.env, ["--apply"]);
+      assert.notEqual(r.status, 0, "rotate：committed_unclean 必须非零退出（改前是 0）：" + JSON.stringify({ status: r.status, out: String(r.stdout).slice(-300), err: String(r.stderr).slice(-400) }).slice(0, 900));
+      assert.equal(/新话题已进入 pending/u.test(String(r.stdout)), false, "rotate：不干净不许再打印最终成功：" + String(r.stdout).slice(-400));
+      assert.equal(w2FirstJson(r.stderr)?.kind, "rotate-unclean", "rotate：机器回执 kind=rotate-unclean：" + JSON.stringify(String(r.stderr).slice(0, 200)));
+      assert.equal(Object.values(a.x.ledger().operations).some((op) => op.op_type === "create_b1"), true,
+        "rotate：账本那一笔确实已提交（所以「事实可能已提交」是实话）：" + JSON.stringify(Object.values(a.x.ledger().operations).map((o) => o.op_type)));
+    } finally { a.x.f.cleanup(); }
+    // ② cancel：同注入 → 旧版只看 legacy.ok / outer release，会把真实 unclean 报成成功
+    const b = w2Rotatable("w2f8c");
+    try {
+      const r0 = w2RotateCli(b.x, b.env, ["--apply"]);
+      assert.equal(r0.status, 0, "前置轮转：" + JSON.stringify({ err: String(r0.stderr).slice(-300) }).slice(0, 500));
+      const pendId = w2Live(b.x).find((r) => r.facts.binding === "pending").id;
+      const r = w2RotateWith(inj.scriptsDir, b.x, b.env, ["--cancel", "--apply"]);
+      assert.notEqual(r.status, 0, "cancel：committed_unclean 必须非零退出（改前是 0）：" + JSON.stringify({ status: r.status, out: String(r.stdout).slice(-300), err: String(r.stderr).slice(-400) }).slice(0, 900));
+      assert.equal(/已取消待认领代际/u.test(String(r.stdout)), false, "cancel：不干净不许再打印最终成功：" + String(r.stdout).slice(-400));
+      assert.equal(w2FirstJson(r.stderr)?.kind, "rotate-cancel-unclean", "cancel：机器回执 kind=rotate-cancel-unclean：" + JSON.stringify(String(r.stderr).slice(0, 200)));
+      assert.equal(b.x.ledger().records[pendId].kind, "voided_audit", "cancel：账本 void 确实已提交：" + String(b.x.ledger().records[pendId].kind));
+    } finally { b.x.f.cleanup(); }
+    } finally { inj.cleanup(); }
+  });
+
 }
 // ─────────────────── PK2-I4-fix1：P1-1 权威判源 / P1-2 确定性 operation 身份 / P2 探测口径 ───────────────────
 // 红反例（先写红再改）：① shadow 期也能 ledger-only retarget（双写分歧）；② 同一命令重跑不能幂等确认；

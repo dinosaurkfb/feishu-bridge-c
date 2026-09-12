@@ -674,6 +674,21 @@ export function wireRotateAuthoritative({
       return capture("void", voidPending({ endpointId, requestKey: plan.requestKey, b1Id: plan.b1Id, reason: "expired",
         expectedHandle: plan.expectedHandle, expectedExpiresAt: plan.expectedExpiresAt, env }));
     } },
+    // ②′ 旧记录的 sidecar **幂等删除**（独立步，在 ①void 之后、②freeze 之前）。
+    //   P1-c（W2-fix8）：放在最后一步的写法有崩溃窗 —— 一旦 ②freeze 之后（或更后面）崩了，重跑会走"新 pending 的
+    //   续跑"路径，那条路不再携带 retiredB1Id，旧 voided 记录的 sidecar 条目会永久留着（doctor ⑤/⑲ 持续报多余键）。
+    //   放在这里：任何崩溃重跑时索引里旧 pending 的 locator 还在 → prepare 能重新定位到那条 voided 记录（existingVoidedId）
+    //   → 本步补删。不新增 WAL / 字段。
+    { op: "sidecars-retire", run: ({ byOp }) => {
+      const prep = byOp.get("__prepare") ?? {};
+      if (!en(prep.retiredB1Id)) return { ok: true, skipped: true, reason: null };
+      for (const name of ["pending-claims", "expiry"]) {
+        const del = mutateSidecarEntry({ endpointId, name, key: prep.retiredB1Id, env,
+          mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
+        if (del.ok !== true) return { ok: false, reason: name.replace("-", "_") + "_" + String(del.reason ?? "failed"), why: del.why ?? null };
+      }
+      return { ok: true, deleted: true };
+    } },
     // ② 索引侧：过期代际退休（调用方按 expired 关）+ 冻结本笔 PREPARING —— 在①之后。
     { op: "freeze", run: ({ byOp }) => {
       const prep = byOp.get("__prepare") ?? {};
@@ -725,15 +740,7 @@ export function wireRotateAuthoritative({
       const prep = byOp.get("__prepare") ?? {};
       const fr = byOp.get("freeze") ?? {};
       if (!en(ta)) return { ok: false, reason: "bad_topic_agent_id", why: "账本 create_b1 未返回 topic_agent_id（无法写 sidecar 条目）" };
-      // P1-c（W2-fix7）：被作废那一条的两条目（pending-claims + expiry）**必须删掉** —— 轮转内嵌的退休
-      //   旧实现两条都没删，I6 的 expiry.json entries === live B 精确对账会立即报多余条目。缺则幂等。
-      if (en(prep.retiredB1Id)) {
-        for (const name of ["pending-claims", "expiry"]) {
-          const del = mutateSidecarEntry({ endpointId, name, key: prep.retiredB1Id, env,
-            mutate: (cur) => (cur === null ? { ok: true, changed: false } : { ok: true, changed: true, value: null }) });
-          if (del.ok !== true) return { ok: false, reason: name + "_" + String(del.reason ?? "failed"), why: del.why ?? null };
-        }
-      }
+      // 旧记录的 sidecar 删除已搬到独立的 ②′ 步（在 ①void 之后、②freeze 之前）——见那里的崩溃窗说明。
       const claimExpiresAt = fr.claimExpiresAt ?? null;
       // 待认领条目：{token, claim_expires_at}（默认 null = 不过期，沿用 2026-08-28 的决定）
       const claim = mutateSidecarEntry({ endpointId, name: "pending-claims", key: ta, env,
@@ -766,7 +773,8 @@ export function wireRotateAuthoritative({
         topic_agent_id: byOp.get("ledger")?.topic_agent_id ?? null, reused_intent: fr.reused === true };
     }
     if (failedOp === "topic") return { ok: false, phase: "send", reason: byOp.get("topic")?.reason ?? "topic_failed", message: byOp.get("topic")?.why ?? "建新根话题失败" };
-    // A 法步骤序：① void ② freeze ③ topic ④ ledger ⑤ index ⑥ sidecars —— 步→阶段的映射照旧（外部契约不变）。
+    // A 法步骤序：① void ②′ sidecars-retire ② freeze ③ topic ④ ledger ⑤ index ⑥ sidecars —— 步→阶段映射照旧
+    //   （void→ledger、freeze/index→registry、其余→sidecar；外部契约不变）。
     const phase = failedOp === "void" || failedOp === "ledger" ? "ledger"
       : failedOp === "freeze" || failedOp === "index" ? "registry" : "sidecar";
     return { ok: false, phase, root_message_id: om, reason: byOp.get(failedOp)?.reason ?? failedOp, message: byOp.get(failedOp)?.why ?? "（无 why）" };

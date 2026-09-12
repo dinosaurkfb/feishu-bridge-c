@@ -92,6 +92,16 @@ if (cancel) {
         legacy_committed: true, release: wiredVoidA.release ?? null });
       die("取消轮转已提交，但 outer 锁释放失败（" + wiredVoidA.release.reason + "）。详情见上方机器回执；先 doctor。");
     }
+    // P1-②（W2-fix8）：账本原语返回 committed_unclean（residue / durability-uncertain）时**不许绿退出** ——
+    //   旧版只看 legacy.ok 与 outer release，会把真实的 committed_unclean 报成成功。
+    if (wiredVoidA.commit !== "committed_clean") {
+      emitMachineReceipt("rotate-cancel-unclean", { status: "unclean", operationId: rotationOpId, binding_id: current.state.binding_id,
+        commit: wiredVoidA.commit ?? null, legacy_committed: true, release: wiredVoidA.release ?? null,
+        steps: (wiredVoidA.shadow ?? []).map((s) => ({ op: s.op, ok: s.ok ?? false, reason: s.reason ?? null, why: s.why ?? null })) });
+      die("取消轮转这一步不干净（commit=" + String(wiredVoidA.commit) + "）。**作废的事实可能已经提交**"
+        + "（账本 void / 待认领条目删除 / 代际索引之一或全部已落地）—— 已落机器回执（rotate-cancel-unclean）："
+        + "先跑 doctor 核对，再按同一条命令重跑补齐（幂等、不重复记）。");
+    }
     console.log("已取消待认领代际；旧话题仍是唯一 active，未删除任何飞书历史。");
     process.exit(0);
   }
@@ -361,10 +371,15 @@ if (writeRoute.mode === "authoritative") {
         ? "账本已提交：**同一条命令重跑**会按同一 request key 续做后缀（话题幂等、账本不重复记）。"
         : "账本未提交：同一条命令重跑会从同一冻结意图继续，已发出的新话题按幂等键复用。"));
   }
+  // P1-②（W2-fix8）：**所有步骤 ok:true 但某账本原语返回 committed_unclean（residue / durability-uncertain）**
+  //   也是不干净 —— 旧版只打一行警告就继续，最后还打印"轮转完成"，把真实 unclean 报成成功。
   if (wired.commit !== "committed_clean") {
     emitMachineReceipt("rotate-unclean", { status: "unclean", operationId: effOpId, binding_id: current.state.binding_id,
-      commit: wired.commit ?? null, steps, release: wired.release ?? null, legacy_committed: true });
-    console.error("注意      这一步有提交不干净（commit=" + String(wired.commit) + "）：已落机器回执，先 doctor 核对（轮转本身已完成）。");
+      commit: wired.commit ?? null, steps, release: wired.release ?? null, legacy_committed: true,
+      root_message_id: wired.legacy?.root_message_id ?? null });
+    die("轮转这一步不干净（commit=" + String(wired.commit) + "）。**轮转的事实可能已经提交**"
+      + "（新话题 / 账本 create_b1 / 代际索引登记之一或全部已落地）—— 已落机器回执（rotate-unclean）："
+      + "先跑 doctor 核对，再按同一条命令重跑补齐（话题按幂等键复用、账本不重复记）。");
   }
 }
 const rootMessageId = wired.legacy.root_message_id;

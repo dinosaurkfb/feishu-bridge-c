@@ -16,6 +16,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import { senderRole } from "./sender-roles.mjs";
 import path from "node:path";
 
@@ -33,9 +34,10 @@ import {
 } from "./project-resolve.mjs";
 import { bindingTokensInQuote, extractMentionIds } from "./selector.mjs";
 import {
-  MESSAGE_RECEIVE_EVENT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
-  legacyEndpointId, selectPendingSubscriptionClaim, stableControlId,
+  MESSAGE_RECEIVE_EVENT, SUBSCRIPTION_REJECT, buildLegacySubscriptionReadModel, compareFirstClaimShadow,
+  legacyEndpointId, selectPendingSubscriptionClaim, shadowControlPlaneInvalid, stableControlId,
 } from "./subscription.mjs";
+import { loadSubscriptionStore, subscriptionStorePath } from "./subscription-store.mjs";
 import {
   activatePendingTopicGeneration, activeGeneration, materializeLegacyTopicFields, pendingGeneration,
   topicGenerationStateForLegacy, effectiveBindingId,
@@ -399,7 +401,7 @@ export function findPendingBinding({ content, registryFile, templateFile, now = 
 
 /** 现有 Claude registry → Subscription v1；纯投影，不写 registry 或新控制面目录。 */
 export function buildClaudeSubscriptionProjection({
-  registryFile, templateFile, projectRoot = null,
+  registryFile, templateFile, projectRoot = null, controlPlane = null,
 } = {}) {
   const registry = loadRegistry(registryFile);
   if (!registry.ok) return { ok: false, reason: "registry_unreadable" };
@@ -455,16 +457,52 @@ export function buildClaudeSubscriptionProjection({
     });
   }
   return buildLegacySubscriptionReadModel({
-    runtime: "claude", endpointId, template, records, pendingWindowMs: PENDING_WINDOW_MS,
+    runtime: "claude", endpointId, template, records, pendingWindowMs: PENDING_WINDOW_MS, controlPlane,
   });
 }
 
-/** 首次认领的新旧结果对照；返回值只供审计，旧结果仍是唯一执行依据。 */
+/**
+ * 影子的控制面诊断（PK3-C1 第 3 条）：只读回执字段，不带 chat_id 明文之类的敏感内容 ——
+ * 它在受验字段之外，只要说清「在场吗 / 几条 / 哪里不对」。
+ */
+export function subscriptionControlPlaneDiagnostic(store) {
+  if (!store || typeof store !== "object") return { present: false, subscriptions: 0, problems: ["store_state_missing"] };
+  if (store.absent === true) return { present: false, subscriptions: 0, problems: [] };
+  const subs = Array.isArray(store.subscriptions) ? store.subscriptions.length : 0;
+  return { present: true, subscriptions: subs, problems: store.ok === true ? [] : (store.problems ?? ["store_unreadable"]) };
+}
+
+/** 首次认领的新旧结果对照；返回值只供审计，旧结果仍是唯一执行依据。
+ *
+ * PK3-C1（FR-2.6 切流实验第一步）：影子构造读模型时吃**订阅控制面** store（只读，生产路径
+ * <home>/.claude/feishu-bridge/subscriptions.json）。落点只有 shadow 字段：
+ *   · 文件缺席 / 空 store —— 与不带这个参数逐字节一致（合并器原样返回 legacy 模型）；
+ *   · 读不出 / 校验不过 —— 合并 fail-closed，影子记 control_plane_invalid 且**不比对**；
+ *   · 回执里多一个只读诊断 control_plane（present / 条数 / problems）。
+ * 权威面（findPendingBinding / evaluatePromotion / 投递）一行不碰：本函数不参与执行判定，
+ * 而且 selectPendingSubscriptionClaim 的调用面就只有这里。
+ */
 export function shadowClaudeFirstClaim({
   event, template, callerAgentUid, legacyPending, legacyPromotion,
-  registryFile, templateFile, now = Date.now(),
+  registryFile, templateFile, now = Date.now(), home = os.homedir(),
 } = {}) {
-  const model = buildClaudeSubscriptionProjection({ registryFile, templateFile });
+  const store = loadSubscriptionStore({ file: subscriptionStorePath({ home }) });
+  const controlPlane = subscriptionControlPlaneDiagnostic(store);
+  const model = buildClaudeSubscriptionProjection({
+    registryFile, templateFile,
+    controlPlane: store.absent === true ? null
+      : (store.ok === true ? { ok: true, subscriptions: store.subscriptions } : { ok: false, problems: store.problems }),
+  });
+  const legacy = {
+    ok: legacyPromotion?.ok === true,
+    target_key: legacyPromotion?.ok ? legacyPromotion.id : null,
+    reason: legacyPromotion?.reason ?? legacyPending?.reason,
+  };
+  // 控制面造成的 fail-closed：影子**不比对**（match 系列置 null），但也不说「一致」也不说「不一致」。
+  // 只认这个 reason —— 投影自己失败（登记表读不出等）是 legacy 侧的事，与 main 同口径。
+  if (model?.reason === SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID) {
+    return shadowControlPlaneInvalid({ legacy, controlPlane });
+  }
   const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template?.agent_uid });
   const candidate = selectPendingSubscriptionClaim({
     model,
@@ -480,14 +518,7 @@ export function shadowClaudeFirstClaim({
     bindingTokens: bindingTokensInQuote(event?.content),
     now,
   });
-  return compareFirstClaimShadow({
-    legacy: {
-      ok: legacyPromotion?.ok === true,
-      target_key: legacyPromotion?.ok ? legacyPromotion.id : null,
-      reason: legacyPromotion?.reason ?? legacyPending?.reason,
-    },
-    candidate,
-  });
+  return compareFirstClaimShadow({ legacy, candidate, controlPlane });
 }
 
 /**

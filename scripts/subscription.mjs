@@ -322,6 +322,33 @@ const reject = (reason, extra = {}) => ({ ok: false, reason, ...extra });
  * 而那个数组里躺着已绑定、暂停、过期的记录 —— 于是一个绑好的项目也会显示"待认领"，
  * 让人以为还有一步没做完。
  */
+/**
+ * 控制面读不出 / 校验不过时的影子形状（PK3-C1）：**不比对**。
+ *
+ * match 系列一律 null —— 既不说「一致」也不说「不一致」：旧结果（legacy）仍照旧执行，
+ * 但这一轮没有资格对新闻两条路是否收敛下结论。candidate_reason 记 control_plane_invalid，
+ * 细节留在 control_plane.problems（不静默丢）。
+ */
+export function shadowControlPlaneInvalid({ legacy, controlPlane = null } = {}) {
+  const legacyAccepted = legacy?.ok === true;
+  return {
+    schema_version: SUBSCRIPTION_SCHEMA_VERSION,
+    mode: "shadow",
+    match: null,
+    route_match: null,
+    disposition_match: null,
+    target_match: null,
+    reason_match: null,
+    legacy_disposition: legacyAccepted ? "accepted" : "rejected",
+    candidate_disposition: null,
+    legacy_reason: legacyAccepted ? null : (legacy?.reason ?? "unknown"),
+    candidate_reason: SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID,
+    candidate_subscription_id: null,
+    scope_unverified: [],
+    control_plane: controlPlane,
+  };
+}
+
 export function claimable(binding, now = Date.now()) {
   if (!binding || binding.status !== "active") return false;
   if (binding.inbound_state !== "pending") return false;
@@ -405,8 +432,9 @@ export function selectPendingSubscriptionClaim({ model, evidence, bindingTokens 
   };
 }
 
-/** 比较选路/授权结果；reason 文案变化单独报告，但只有结果或目标变化才算数据面不一致。 */
-export function compareFirstClaimShadow({ legacy, candidate } = {}) {
+/** 比较选路/授权结果；reason 文案变化单独报告，但只有结果或目标变化才算数据面不一致。
+ *  controlPlane 是 PK3-C1 加的**只读诊断**（present / 条数 / problems）—— 原样带出，不参与任何比较。 */
+export function compareFirstClaimShadow({ legacy, candidate, controlPlane = null } = {}) {
   const legacyAccepted = legacy?.ok === true;
   const candidateAccepted = candidate?.ok === true;
   const dispositionMatch = legacyAccepted === candidateAccepted;
@@ -429,5 +457,6 @@ export function compareFirstClaimShadow({ legacy, candidate } = {}) {
     reason_match: reasonMatch,
     candidate_subscription_id: candidateAccepted ? candidate.subscription_id : null,
     scope_unverified: candidate?.scope_unverified ?? [],
+    control_plane: controlPlane,
   };
 }

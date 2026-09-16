@@ -21796,6 +21796,228 @@ test("FR-2.6 单 2 · 状态维度：paused 订阅被 active 过滤拿掉、其 
 
 // ─── FR-2.6 单 3：群名登记与展示（chat_name / --chat-name / 三级群名） ──────────────────
 
+// ── PK3-C1（FR-2.6 切流实验第一步）：入站影子对照接订阅控制面（权威面零改动） ─────────────────
+// 设计依据 docs/implementation/multisub-cutover-experiment.md C1。store 走**生产路径**
+// <HOME>/.claude/feishu-bridge/subscriptions.json（夹具 HOME 指 tmp，不碰真机）。
+// 真入口优先：下面全部走 `aily-inbound.mjs`，只有 T2/T4 额外直调一次纯投影做对照。
+const C1_TPL = { chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t",
+  outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o", lark_cli_profile: "claude",
+  lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark", frank_sender_id: "12345", chat_name: "群",
+  chat_id: "oc_a", default_freshness_ms: 900000, agent_uid: "agent_x" };
+const C1_AT = '<at id="' + C1_TPL.transport_open_id + '" type="employee">' + C1_TPL.transport_agent_name + "</at> ";
+const C1_BIND = C1_AT + "\n\n**[引用]**\n绑定码    aaaaaa";
+const c1Endpoint = () => legacyEndpointId({ runtime: "claude", agentUid: C1_TPL.agent_uid });
+const c1SubId = (root, chatId) => subscriptionIdFor({
+  endpointId: c1Endpoint(), domainId: stableControlId("domain", "claude", root), chatId, agentUid: C1_TPL.agent_uid });
+/** 控制面条目（store 里那种形状）。 */
+const c1Entry = ({ root, chatId, over = {} }) => ({
+  schema_version: SUBSCRIPTION_SCHEMA_VERSION, artifact_type: SUBSCRIPTION_ARTIFACT_TYPE,
+  subscription_id: c1SubId(root, chatId), version: 1, endpoint_id: c1Endpoint(),
+  domain_id: stableControlId("domain", "claude", root), status: "active",
+  scope: { agent_uid: C1_TPL.agent_uid, transport_open_id: C1_TPL.transport_open_id, chat_id: chatId,
+    sender_ids: [C1_TPL.frank_sender_id], event_types: ["im.message.receive"] },
+  constraints: { freshness_ms: 900000 }, ...over,
+});
+const c1StoreDoc = (subscriptions) => ({ schema_version: SUBSCRIPTION_STORE_SCHEMA_VERSION,
+  artifact_type: SUBSCRIPTION_STORE_ARTIFACT_TYPE, subscriptions });
+const c1Fixture = (tag, rows) => {
+  const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-c1-" + tag + "-")));
+  const bin = path.join(local, "bin"); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...C1_TPL, senders: [] }));
+  const projects = rows.map((r, i) => {
+    const root = path.join(local, "project" + i); fs.mkdirSync(root, { recursive: true });
+    return { id: "prom" + i, root, name: "待认领", root_message_id: "om_p" + i, expires_at: "2099-01-01T00:00:00Z",
+      inbound_state: "pending", session_id: null, status: "active", pending_token: r.token ?? null,
+      bound_at: "2026-08-20T00:01:00.000Z", chat_id: r.chatId };
+  });
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects }));
+  for (const [name, body] of [["aily-cli", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"],
+    ["claude", "process.stdout.write('回答：ok\\n');"], ["lark-cli", "process.exit(1);"]]) {
+    fs.writeFileSync(path.join(bin, name), "#!/usr/bin/env node\n" + body + "\n", { mode: 0o700 });
+  }
+  return { local, bin, registryFile, templateFile, storeFile: subscriptionStorePath({ home: local }),
+    roots: projects.map((p) => p.root), projects };
+};
+const c1WriteStore = (f, doc, mode = 0o600) => {
+  fs.mkdirSync(path.dirname(f.storeFile), { recursive: true });
+  fs.writeFileSync(f.storeFile, typeof doc === "string" ? doc : JSON.stringify(doc, null, 2) + "\n", { mode });
+};
+const c1Run = (f, { content, chatId, messageId = "om_c1_msg" }) => {
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({
+    message: { id: messageId, sessionID: "aily_dm", role: "user", createdBy: C1_TPL.frank_sender_id,
+      createdAtMs: Date.now(), content } }) }] });
+  return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: {
+    ...process.env, PATH: f.bin + path.delimiter + path.dirname(process.execPath), HOME: f.local,
+    FEISHU_BRIDGE_REGISTRY: f.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: f.templateFile,
+    AILY_CLI_CALLER_AGENT_UID: C1_TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_c1",
+    FAKE_AILY_ENVELOPE: envelope, AILY_CLI_CHANNEL_CHAT_ID: chatId, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000" } });
+};
+/** 回执目录：路由前在 HOME 下（unrouted），路由后跟项目走。 */
+const c1Receipts = (f) => {
+  const out = [];
+  for (const dir of [path.join(f.local, ".claude", "feishu-bridge", "inbound", "receipts"),
+    ...f.roots.map((r) => path.join(r, ".runtime-data", "inbound", "receipts"))]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const n of fs.readdirSync(dir)) out.push({ dir, name: n, doc: JSON.parse(fs.readFileSync(path.join(dir, n), "utf-8")) });
+  }
+  return out;
+};
+const c1Only = (f, prefix) => {
+  const hits = c1Receipts(f).filter((r) => r.name.startsWith(prefix));
+  assert.equal(hits.length, 1, "应恰好一条 " + prefix + " 回执：" + JSON.stringify(c1Receipts(f).map((r) => r.name)));
+  return hits[0].doc;
+};
+
+test("PK3-C1 T1 store 缺席（未装订阅管理）：shadow 与 main 逐字节一致（快照断言）+ 权威照旧", () => {
+  const f = c1Fixture("t1", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  const r = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const rec = c1Only(f, "bound-");
+  assert.equal(rec.status, "bound");
+  // 快照：**main 的形状 + 本单唯一新增的只读诊断字段**（control_plane）
+  assert.deepEqual(rec.subscription_claim_shadow, {
+    schema_version: SUBSCRIPTION_SCHEMA_VERSION, mode: "shadow",
+    match: true, route_match: true, disposition_match: true, target_match: true,
+    legacy_disposition: "accepted", candidate_disposition: "accepted",
+    legacy_reason: null, candidate_reason: null, reason_match: true,
+    candidate_subscription_id: c1SubId(f.roots[0], "oc_a"), scope_unverified: ["chat_id"],
+    control_plane: { present: false, subscriptions: 0, problems: [] },
+  }, JSON.stringify(rec.subscription_claim_shadow));
+  // 权威结果（与 main 一致）：绑定成立、登记行转 bound、配对方式是引用块里的绑定码
+  assert.equal(JSON.parse(fs.readFileSync(f.registryFile, "utf-8")).projects[0].inbound_state, "bound");
+  assert.equal(rec.matched_by, "quoted_binding_token");
+  assert.equal(rec.binding_id, "prom0@registry");
+  fs.rmSync(f.local, { recursive: true, force: true });
+});
+
+test("PK3-C1 T2 store 在场、同域第二条订阅：影子模型吃控制面、claim 回执带 control_plane 诊断；权威照 legacy", () => {
+  const f = c1Fixture("t2", [{ chatId: "oc_b", token: "aaaaaa" }]);
+  const root = f.roots[0];
+  const subscriptions = [c1Entry({ root, chatId: "oc_a" }), c1Entry({ root, chatId: "oc_b" })];
+  c1WriteStore(f, c1StoreDoc(subscriptions));
+  const r = c1Run(f, { content: C1_BIND, chatId: "oc_b" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const rec = c1Only(f, "bound-");
+  assert.deepEqual(rec.subscription_claim_shadow.control_plane, { present: true, subscriptions: 2, problems: [] },
+    "claim 回执里的只读诊断：" + JSON.stringify(rec.subscription_claim_shadow.control_plane));
+  assert.equal(rec.subscription_claim_shadow.match, true);
+  assert.equal(rec.subscription_claim_shadow.candidate_subscription_id, c1SubId(root, "oc_b"),
+    "@ 来自第二群 → 影子的候选收敛到第二群那份订阅");
+  // 影子模型确实吃到了控制面；不带 controlPlane 的投影仍是 legacy 那一条（T4 的字节级判据在那边）
+  const merged = buildClaudeSubscriptionProjection({ registryFile: f.registryFile, templateFile: f.templateFile,
+    controlPlane: { ok: true, subscriptions } });
+  assert.deepEqual(merged.subscriptions.map((s) => s.scope.chat_id).sort(), ["oc_a", "oc_b"]);
+  assert.deepEqual(buildClaudeSubscriptionProjection({ registryFile: f.registryFile, templateFile: f.templateFile })
+    .subscriptions.map((s) => s.scope.chat_id), ["oc_b"], "不带 controlPlane → 仍是 legacy 单条");
+  assert.equal(JSON.parse(fs.readFileSync(f.registryFile, "utf-8")).projects[0].inbound_state, "bound",
+    "权威面照旧：这条认领跟控制面在不在无关");
+  fs.rmSync(f.local, { recursive: true, force: true });
+});
+
+test("PK3-C1 T3 store 读不出/校验不过：shadow 记 control_plane_invalid 且**不比对**；权威与 T1 一致、不抛不拒", () => {
+  const cases = [
+    ["坏 JSON", "{"],
+    ["schema 不对", JSON.stringify({ schema_version: "9.9", artifact_type: SUBSCRIPTION_STORE_ARTIFACT_TYPE, subscriptions: [] })],
+    ["多余顶层键", JSON.stringify({ schema_version: "1.0", artifact_type: SUBSCRIPTION_STORE_ARTIFACT_TYPE, subscriptions: [], sneak: 1 })],
+  ];
+  for (const [label, body] of cases) {
+    const f = c1Fixture("t3", [{ chatId: "oc_a", token: "aaaaaa" }]);
+    c1WriteStore(f, body);
+    const r = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+    assert.equal(r.status, 0, label + "：不抛不拒（真入口正常出口）：" + r.stdout + r.stderr);
+    const rec = c1Only(f, "bound-");
+    const shadow = rec.subscription_claim_shadow;
+    assert.equal(shadow.candidate_reason, SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID, label + "：记 control_plane_invalid");
+    for (const k of ["match", "route_match", "disposition_match", "target_match", "reason_match"]) {
+      assert.equal(shadow[k], null, label + "：" + k + " 必须置 null（不比对）：" + JSON.stringify(shadow));
+    }
+    assert.equal(shadow.candidate_subscription_id, null);
+    assert.deepEqual(shadow.control_plane.present, true, label + "：诊断说文件在场");
+    assert.ok(shadow.control_plane.problems.length > 0, label + "：诊断带 problems：" + JSON.stringify(shadow.control_plane));
+    // 权威与 T1 逐字一致：绑定照样成立、配对方式不变
+    assert.equal(rec.status, "bound");
+    assert.equal(rec.matched_by, "quoted_binding_token");
+    assert.equal(JSON.parse(fs.readFileSync(f.registryFile, "utf-8")).projects[0].inbound_state, "bound");
+  }
+  // 0644：**读端不看 mode**（它只认「普通文件 + 单硬链接」）—— 如实钉住现状：这不是「读不出」
+  const f = c1Fixture("t3m", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  c1WriteStore(f, c1StoreDoc([c1Entry({ root: f.roots[0], chatId: "oc_a" })]), 0o644);
+  const r = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const shadow = c1Only(f, "bound-").subscription_claim_shadow;
+  assert.deepEqual(shadow.control_plane, { present: true, subscriptions: 1, problems: [] },
+    "0644 目前算「合法且在场」（读端不核 mode）：" + JSON.stringify(shadow.control_plane));
+  assert.equal(shadow.match, true);
+  fs.rmSync(f.local, { recursive: true, force: true });
+});
+
+test("PK3-C1 T4 权威面零改动：同一夹具下 store 在场/缺席的权威回执逐字节一致；权威构造器不读控制面", () => {
+  const f = c1Fixture("t4", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  const root = f.roots[0];
+  // ➀ 缺席
+  const regBefore = fs.readFileSync(f.registryFile, "utf-8");
+  const r1 = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+  assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+  const rec1 = c1Only(f, "bound-");
+  const reg1 = fs.readFileSync(f.registryFile, "utf-8");
+  const legacyModel1 = JSON.stringify(buildClaudeSubscriptionProjection({ registryFile: f.registryFile, templateFile: f.templateFile }));
+  fs.rmSync(path.join(f.local, ".claude"), { recursive: true, force: true });
+  fs.rmSync(path.join(root, ".runtime-data"), { recursive: true, force: true });
+  fs.writeFileSync(f.registryFile, regBefore);
+  // ➁ 在场：故意放一份**会改影子结论**的控制面（把本群那份订阅改成 paused）→ 影子必须变、权威必须不变
+  c1WriteStore(f, c1StoreDoc([c1Entry({ root, chatId: "oc_a", over: { status: "paused" } })]));
+  const r2 = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+  assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+  const rec2 = c1Only(f, "bound-");
+  const reg2 = fs.readFileSync(f.registryFile, "utf-8");
+  const strip = (r) => { const { subscription_claim_shadow, recorded_at, ...rest } = r; return rest; };
+  assert.deepEqual(strip(rec2), strip(rec1), "store 在场时权威回执逐字节一致");
+  // 登记表写回里只有**本次运行的时间戳**（updated_at / inbound_bound_at）天然不同 —— 把时间戳归一后逐字节比。
+  const stripIso = (x) => x.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/gu, "<TS>");
+  assert.equal(stripIso(reg2), stripIso(reg1), "登记表写回（除本次时间戳）逐字节一致");
+  assert.equal(JSON.stringify(buildClaudeSubscriptionProjection({ registryFile: f.registryFile, templateFile: f.templateFile })),
+    legacyModel1, "权威侧的构造器在 store 在场时仍是 legacy 模型（字节一致）");
+  assert.notDeepEqual(rec2.subscription_claim_shadow, rec1.subscription_claim_shadow,
+    "对照：控制面确实进了影子（paused 订阅让影子结论变了）");
+  fs.rmSync(f.local, { recursive: true, force: true });
+});
+
+test("PK3-C1 T5 两群各一份 pending + 无码 @：shadow 判 AMBIGUOUS（C2 核心样本）；权威照旧拒、pending 一份不动", () => {
+  const f = c1Fixture("t5", [{ chatId: "oc_a", token: "aaaaaa" }, { chatId: "oc_b", token: "bbbbbb" }]);
+  try {
+    c1WriteStore(f, c1StoreDoc([
+      c1Entry({ root: f.roots[0], chatId: "oc_a" }), c1Entry({ root: f.roots[1], chatId: "oc_b" }),
+    ]));
+    // ① 真入口：权威面照旧 —— legacy 判 multi-pending，落进 chat 兜底回答，两份 pending 一份不动。
+    //    注意：chatTurn 会先 exit，带 shadow 的 unrouted 回执在这条路上**写不下来**（main 上就是如此），
+    //    所以核心样本在 ② 里拿 router 调的**同一个函数**、同一份夹具、同样的入参钉。
+    const r = c1Run(f, { content: C1_AT + "这条没有绑定码", chatId: "oc_a" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const chat = c1Only(f, "chat-");
+    assert.equal(chat.status, "chat");
+    assert.equal(chat.kind, "reply", "权威照旧：没认领、走 chat 默认态回答：" + JSON.stringify(chat));
+    assert.deepEqual(JSON.parse(fs.readFileSync(f.registryFile, "utf-8")).projects.map((p) => [p.inbound_state, p.pending_token]),
+      [["pending", "aaaaaa"], ["pending", "bbbbbb"]], "两份 pending 都没被认领");
+    // ② 影子：两群各一份 pending、无码、chat 未核验 → AMBIGUOUS（C2 要看的核心样本）
+    const now = Date.now();
+    const shadow = shadowClaudeFirstClaim({
+      event: { message_id: "om_c1_msg", session_id: "aily_dm", sender_id: C1_TPL.frank_sender_id,
+        content: C1_AT + "这条没有绑定码", created_at_ms: now },
+      template: { ...C1_TPL, senders: [] }, callerAgentUid: C1_TPL.agent_uid,
+      legacyPending: { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING },
+      legacyPromotion: { ok: false, reason: PROMOTE_REJECT.MULTIPLE_PENDING },
+      registryFile: f.registryFile, templateFile: f.templateFile, home: f.local, now,
+    });
+    assert.equal(shadow.candidate_reason, SUBSCRIPTION_REJECT.AMBIGUOUS,
+      "影子的核心样本：两群各一份 pending、无码 → subscription_ambiguous：" + JSON.stringify(shadow));
+    assert.equal(shadow.legacy_reason, PROMOTE_REJECT.MULTIPLE_PENDING);
+    assert.equal(shadow.legacy_disposition, "rejected");
+    assert.equal(shadow.candidate_disposition, "rejected");
+    assert.deepEqual(shadow.control_plane, { present: true, subscriptions: 2, problems: [] });
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
 test("FR-2.6 单 3：chat_name 1.0 拒 / 1.1 收、取值域封闭；身份与 chat_name 无关（id 哈希不进群名）；schema 同步 1.1 形状", () => {
   const template = { chain: "claude", agent_uid: "agent_m5claude", transport_open_id: "ou_bot", frank_sender_id: "u_frank", chat_id: "oc_x", default_freshness_ms: 600000 };
   const plain = planSubscriptionEntry({ runtime: "claude", template, domainKey: "/p", chatId: "oc_second" });

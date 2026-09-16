@@ -22,6 +22,7 @@ import { acquirePublishLock, releasePublishLock } from "./registry.mjs";
 import { canonKey } from "./maintenance/canon.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { createVerifiedSidecar } from "./verified-sidecar.mjs";
+import { forwardVersionUnsupportedText, forwardVersionUnsupportedVersionOf, isClaudeVersionToken } from "./claude-version.mjs";
 
 /**
  * `reply` 是一轮对话的**原文答复**，由 Stop 钩子从 last_assistant_message 直接取，
@@ -137,17 +138,22 @@ export function appendEvent({
 
 /** 转发失败回执的正文（R58 P1-4）：Frank 授权的是「失败回执」这一类，不是自动外发任意模型输出——正文只从
  * 封闭失败类别生成固定文案。**原始 reason_first_line 一个字都不进正文**（只留本地 result / doctor）。
- * 返回固定文案；传入类别不在四枚举里 → 拒（返回 null，不产出正文）。
+ * 返回固定文案；传入类别不在枚举里 → 拒（返回 null，不产出正文）。
+ * PK3-F140 加了第五类 `version_unsupported`（转发前版本前检不达标，issue #140 第四条）：它的正文
+ * 带一个**严格三段版本 token**（模板见 claude-version.mjs），除此以外仍是封闭模板 —— 反解端逐字
+ * 重建一次才算数，所以「任意模型输出进正文」这条路仍然关着。
  */
-export const FORWARD_FAILURE_CATEGORIES = Object.freeze(["session_error", "exit_nonzero", "spawn_failed", "unknown"]);
+export const FORWARD_FAILURE_CATEGORIES = Object.freeze(["session_error", "exit_nonzero", "spawn_failed", "unknown", "version_unsupported"]);
 export const FORWARD_FAILURE_TEXT = Object.freeze({
   session_error: "转发失败：会话执行报错；本条未送达，请重发或在终端查看 doctor ⑯",
   exit_nonzero: "转发失败：转发进程异常退出；本条未送达，请重发或在终端查看 doctor ⑯",
   spawn_failed: "转发失败：转发进程无法启动；本条未送达，请重发或在终端查看 doctor ⑯",
   unknown: "转发失败：原因见终端 doctor ⑯；本条未送达，请重发或在终端查看 doctor ⑯",
 });
-export function forwardFailureText(category) {
+export function forwardFailureText(category, version = null) {
   if (!FORWARD_FAILURE_CATEGORIES.includes(category)) return null;
+  // 第五类是「模板 + 严格版本 token」：token 形状不对 → 拒（不产出正文），与其余四类同一口径。
+  if (category === "version_unsupported") return isClaudeVersionToken(version) ? forwardVersionUnsupportedText(version) : null;
   return FORWARD_FAILURE_TEXT[category];
 }
 
@@ -178,7 +184,7 @@ export function forwardFailureReceiptProblem(record, { expectedKey = null } = {}
   if (record.message_id !== null && (typeof record.message_id !== "string" || !OM_BUILTIN.test(record.message_id))) return "message_id 不是 om_ 形状或 null";
   if (record.source !== "forward-runner") return "source 不是 forward-runner";
   if (!usableGeneration(record.target_channel_generation_id)) return "target_channel_generation_id 缺失或不可用（不许 null）";
-  if (!Object.values(FORWARD_FAILURE_TEXT).includes(record.text)) return "text 不是固定文案";
+  if (!Object.values(FORWARD_FAILURE_TEXT).includes(record.text) && forwardVersionUnsupportedVersionOf(record.text) === null) return "text 不是固定文案";
   if (record.created_at !== record.publish_eligible_at || !isCanonicalIso(record.created_at)) return "created_at !== publish_eligible_at 或非法时间（born eligible）";
   if (record.published_at !== null && !isCanonicalIso(record.published_at)) return "published_at 不是 null 或规范时间";
   if (record.input_origin !== null || record.input_text !== null || record.run_id !== null) return "input_origin/input_text/run_id 必须为 null";
@@ -285,14 +291,15 @@ export const FORWARD_FAILURE_RECEIPT_SUFFIX = ".forward-failed.outbox.json";
  */
 export function appendForwardFailureReceipt({
   outboxDir, forwardKey, category, messageId, targetGenerationId,
-  source = "forward-runner", resultSha256 = null, _inject = null,
+  source = "forward-runner", resultSha256 = null, version = null, _inject = null,
 }) {
   if (typeof outboxDir !== "string" || outboxDir.length === 0) return { ok: false, reason: "outbox_dir_missing" };
   if (typeof forwardKey !== "string" || !/^[0-9a-f]{64}$/u.test(forwardKey)) return { ok: false, reason: "key_shape" };
   // P1-1：代际必须可用（可用冻结代际）。缺失 / 不可用 → 不生成回执、不写 null（绝不写 null 令发布器回落当前话题）。
   if (!usableGeneration(targetGenerationId)) return { ok: false, reason: "generation_unavailable", why: "targetGenerationId 缺失或不可用（不生成回执、不写 null）" };
   // P1-4：正文封闭 —— 类别必须合法，reasonFirstLine 一个字不进正文。
-  const text = forwardFailureText(category);
+  // PK3-F140：version_unsupported 的正文只多一个严格版本 token（同一判据的两端都在这条路上）。
+  const text = forwardFailureText(category, version);
   if (text === null) return { ok: false, reason: "unknown_failure_category", why: "未知失败类别（不接受任意模型输出进正文）" };
   // P1-5：回执记录带 result_sha256（result 文件内容摘要）；缺失/非 64hex → 拒（证据链不闭合）。
   if (typeof resultSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(resultSha256)) return { ok: false, reason: "result_sha256_missing", why: "result_sha256 缺失或非 64hex" };

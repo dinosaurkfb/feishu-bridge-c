@@ -22,16 +22,23 @@
  * 2026-09-10 已预授权这类自动写入），让 owner 知道那条消息没送达 —— 发布走既有
  * 出站发布器（同一身份、同一话题选择规则），本模块不新增任何发送代码。成功不写；
  * 超时（started 有、result 无）语义不变，仍归 doctor ⑯ 的「结果缺失」，不发回执。
+ *
+ * PK3-F140（issue #140 产品侧第四条）：起 claude 之前先做**版本前检**。事故的根因不只是
+ * 「没看结果」，还有「解析到了旧的那一份」——PATH 上 /opt/homebrew/bin 排在 ~/.local/bin
+ * 前面，解析到 2.1.248。现在候选顺序是 ~/.local/bin/claude → PATH，逐个探 `--version`，
+ * 第一个达标的胜出；全都过旧 → 不起进程，直接落失败终态 + 失败回执（正文带那条版本号）。
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { isDirectRun } from "./direct-run.mjs";
 import { isCanonicalIso } from "./canonical-time.mjs";
 import { appendForwardFailureReceipt } from "./outbox.mjs";
+import { MIN_FORWARD_CLAUDE_VERSION, claudeVersionBelow, parseClaudeVersion } from "./claude-version.mjs";
 import { ROLE_ENV } from "./live-session.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 
@@ -174,16 +181,68 @@ export function forwardStartedProblem(doc, { now = Date.now(), expectedKey = nul
 /** 逐段扫 PATH 找可执行文件 —— 也就是 which。找不到返回 null。
  *  空分量按 execvp 语义 = 当前目录（path.join("", name) 得相对路径，stat/spawn 都相对 cwd 解析），
  *  与 execvp 保持一致，不做额外跳过。 */
+function isExecutableFile(p) {
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch { return false; }
+}
+
 function resolveOnPath(name, envPath) {
   for (const dir of String(envPath ?? "").split(path.delimiter)) {
     const candidate = dir === "" ? name : path.join(dir, name);
-    try {
-      if (!fs.statSync(candidate).isFile()) continue;
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch { /* 这一段没有或不可执行：看下一段 */ }
+    if (isExecutableFile(candidate)) return candidate;
   }
   return null;
+}
+
+/**
+ * 候选二进制，按优先级：`~/.local/bin/claude` → PATH 上第一个 claude。
+ * **「不依赖 PATH 顺序」就是 issue #140 的根因修复**：事故里 /opt/homebrew/bin 排在
+ * ~/.local/bin 前面，解析到旧版 2.1.248，而 ~/.local 那份早就更新过了。
+ * 它读的是 $HOME —— 测试必须把 HOME 指到夹具目录（见 test.mjs 的 f140Fixture），
+ * 否则会解析到真机那份。
+ */
+export function resolveClaudeCandidates({ envPath = process.env.PATH, home = os.homedir() } = {}) {
+  const out = [];
+  const preferred = path.join(home, ".local", "bin", "claude");
+  if (isExecutableFile(preferred)) out.push(preferred);
+  const onPath = resolveOnPath("claude", envPath);
+  if (onPath !== null && onPath !== preferred) out.push(onPath);
+  return out;
+}
+
+/** 探一次 `claude --version`（5 秒预算）。取不到 → null。 */
+function probeClaudeVersion(exePath) {
+  try {
+    const r = spawnSync(exePath, ["--version"], { encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024 });
+    return parseClaudeVersion(r.stdout) ?? parseClaudeVersion(r.stderr);
+  } catch { return null; }
+}
+
+/**
+ * 选一个能用的二进制。**判据不是「有没有看到过旧版本」，而是「能不能证明它们都过旧」**：
+ *   ① 任一候选探出**达标**版本 → 用它（优先选确实能干活的那个）；
+ *   ② 否则，只要有候选**版本读不出**（unknown）→ 用那个 unknown 照旧启动 —— 读不出不等于过旧，
+ *      前检只捕自己看得懂的错，硬拦会把「其实能用」的那份也一并掩掉；
+ *   ③ 只有**所有可执行候选都探出了版本且都低于下限**时才 version_unsupported（带那条版本）；
+ *   ④ 一个候选都没有 → not_found（旧路径）。
+ * 用例把 unknown→old 与 old→unknown 两个顺序都钉住了（PK3-F140-fix2 P1）。
+ */
+export function pickClaude(candidates) {
+  if (candidates.length === 0) return { ok: false, reason: "not_found" };
+  let unknown = null;   // 版本读不出的第一个候选
+  let old = null;       // 明确低于下限的第一个候选（报版本用）
+  for (const exe of candidates) {
+    const version = probeClaudeVersion(exe);
+    if (version === null) { if (unknown === null) unknown = exe; continue; }
+    if (!claudeVersionBelow(version, MIN_FORWARD_CLAUDE_VERSION)) return { ok: true, path: exe, version };
+    if (old === null) old = { path: exe, version };
+  }
+  if (unknown !== null) return { ok: true, path: unknown, version: null };
+  // 走到这里：每个候选都读出了版本且都低于下限（old 必非空）
+  return { ok: false, reason: "version_unsupported", path: old.path, version: old.version };
 }
 
 /** result 行 / init 行。坏行跳过 —— 坏行造成的 result 缺席自然按 crash 投影。 */
@@ -202,16 +261,18 @@ function parseRunLines(lines) {
  *              subtype="crash"、duration_ms 用 wall clock（#140 里那 2–4 秒本身就是证据）；
  *   起不来   → 同步（PATH 上找不到 claude）subtype="claude_not_found"；异步（spawn 成功但 exec 失败，
  *              如解释器缺失）subtype="spawn_error"（R58 返修二 P2：失败类别按**结构化 subtype** 分，
- *              不再只看 reason_first_line 那一条字符串）。
+ *              不再只看 reason_first_line 那一条字符串）；
+ *   版本过旧 → 前检没让进程起来，subtype="claude_version_unsupported"（PK3-F140）。
  */
-function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false, spawnError = false }) {
+function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], claudePath = null, startedAt = null, finishedAt, notFound = false, spawnError = false, versionUnsupported = false, version = null }) {
   const { resultLine, initLine } = parseRunLines(lines);
   const malformed = resultLine !== null && resultLineProblem(resultLine) !== null; // #141 二轮 P1-1：坏形状绝不进成功公式
-  const crashed = !notFound && !spawnError && resultLine === null;
+  const crashed = !notFound && !spawnError && !versionUnsupported && resultLine === null;
   const resultText = !malformed && resultLine !== null && typeof resultLine.result === "string" ? resultLine.result : "";
-  // resultLine 为 null 时不许读它的字段（起不来 / 崩溃两条路径）——短路判据要显式。
-  const is_error = notFound || spawnError || crashed || malformed || (resultLine !== null && resultLine.is_error === true);
-  const reason_first_line = notFound ? "claude_not_found"
+  // resultLine 为 null 时不许读它的字段（起不来 / 崩溃 / 前检拦下三条路径）——短路判据要显式。
+  const is_error = versionUnsupported || notFound || spawnError || crashed || malformed || (resultLine !== null && resultLine.is_error === true);
+  const reason_first_line = versionUnsupported ? "claude_version_unsupported(" + version + ")"
+    : notFound ? "claude_not_found"
     : spawnError ? "spawn_error"
     : malformed ? "malformed_result"
     : crashed ? "no_result_line" + (exitCode === null ? "" : "(exit=" + exitCode + ")")
@@ -223,12 +284,12 @@ function summarizeForwardRun({ spec, pid = null, exitCode = null, lines = [], cl
     pid,
     exit_code: exitCode,
     is_error,
-    subtype: notFound ? "claude_not_found" : spawnError ? "spawn_error" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
-    num_turns: crashed || notFound || spawnError || malformed || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
-    duration_ms: notFound ? null
+    subtype: versionUnsupported ? "claude_version_unsupported" : notFound ? "claude_not_found" : spawnError ? "spawn_error" : crashed ? "crash" : malformed ? "malformed_result" : (resultLine.subtype ?? null),
+    num_turns: crashed || notFound || spawnError || malformed || versionUnsupported || !Number.isFinite(resultLine.num_turns) ? null : resultLine.num_turns,
+    duration_ms: (notFound || versionUnsupported) ? null
       : (crashed || spawnError) ? Math.max(0, finishedAt - startedAt)
       : (malformed || !Number.isFinite(resultLine.duration_ms)) ? null : resultLine.duration_ms,
-    claude_code_version: initLine?.claude_code_version ?? initLine?.version ?? null,
+    claude_code_version: versionUnsupported ? version : (initLine?.claude_code_version ?? initLine?.version ?? null),
     model: initLine?.model ?? resultLine?.model ?? null,
     reason_first_line,
     sent: !malformed && !is_error && exitCode === 0 && resultText === "sent",
@@ -327,9 +388,11 @@ function writeValidatedDoc(targetPath, errPath, doc, problemFn, maxBytes, expect
  * **按结构化 subtype 分**：起不来的两条路（同步 claude_not_found / 异步 spawn_error）都归 spawn_failed。
  * 旧版只认 reason_first_line === "claude_not_found" 这一条字符串，于是异步 spawn error（进程起来了、
  * exec 失败）被折成 session_error —— owner 收到的说法与事实不符。
+ * PK3-F140：前检拦下的那条单独一类（version_unsupported），正文带版本号。
  */
 function failureCategory(doc) {
   if (doc.sent === true) return null;
+  if (doc.subtype === "claude_version_unsupported") return "version_unsupported";
   if (doc.subtype === "claude_not_found" || doc.subtype === "spawn_error") return "spawn_failed";
   if (doc.is_error === true) return "session_error";
   if (doc.exit_code !== null && doc.exit_code !== 0) return "exit_nonzero";
@@ -346,10 +409,14 @@ function writeFailureReceipt({ spec, doc, errPath, resultSha256 }) {
     messageId: spec.messageId ?? null,
     targetGenerationId: spec.originGenerationId ?? null,
     resultSha256,
+    // 前检那一类要在正文里报版本 —— 只接受严格三段形状的 token（outbox 侧还会再验一次）。
+    version: doc.subtype === "claude_version_unsupported" ? doc.claude_code_version : null,
   });
   // duplicate = 同 key 的回执已经在（重放）：正是想要的结果，不算失败。
+  // PK3-F140：把 why 也记上 —— receipt_invalid 这类拒绝原本只记一个 reason，排障时看不出是哪一项
+  //（本次排查就撞上了：message_id 非 om_ 形状被封闭校验器拦下，日志里只看到 receipt_invalid）。
   if (!r.ok && r.reason !== "duplicate") {
-    noteErr(errPath, "失败回执没写成（" + r.reason + (r.error ? "：" + r.error : "") + "）");
+    noteErr(errPath, "失败回执没写成（" + r.reason + (r.why ? "：" + r.why : (r.error ? "：" + r.error : "")) + "）");
   }
 }
 
@@ -393,13 +460,22 @@ function runForwardRunner(spec) {
   const startedPath = path.join(runsDir, spec.key + ".forward.started.json");
   const resultPath = path.join(runsDir, spec.key + ".forward.result.json");
 
-  const claudePath = resolveOnPath("claude", process.env.PATH);
-  if (claudePath === null) {
+  const picked = pickClaude(resolveClaudeCandidates());
+  if (picked.ok !== true && picked.reason === "not_found") {
     writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
       spec, startedAt: Date.now(), finishedAt: Date.now(), notFound: true,
     }), spec);
     return;
   }
+  if (picked.ok !== true) {
+    // 候选全过旧：**不起转发进程**，直接落失败终态 + 失败回执（带版本）。
+    writeResultAndMaybeReceipt(resultPath, errPath, summarizeForwardRun({
+      spec, startedAt: Date.now(), finishedAt: Date.now(),
+      versionUnsupported: true, claudePath: picked.path, version: picked.version,
+    }), spec);
+    return;
+  }
+  const claudePath = picked.path;
 
   const out = fs.openSync(jsonlPath, "a");
   const err = fs.openSync(errPath, "a");

@@ -385,7 +385,10 @@ references/
 
 两套 runtime 共用确定性核心，但各自维护运行时相关的会话发现与续接：
 
-- Claude 优先把消息投递给项目内活着的交互会话；没有现场时才后台 `--continue`；
+- Claude 优先把消息投递给项目内活着的交互会话；没有现场时才后台 `--continue`；两者都先解析一次二进制
+  并核 `claude --version`（顺序是 `~/.local/bin/claude` → PATH，**不依赖 PATH 顺序** —— 2026-09-08 那次
+  就是 PATH 上的旧版占了先），版本过旧不起进程、直接发「转发失败：本机 claude 版本 x.y.z 过旧」；
+  转发明确失败由 outbox 的 `forward_failed` 回执如实告知，受理回执在结果出来前只说「正在转发」（issue #140）；
 - Codex 使用精确 thread id 执行 `codex exec resume`，并通过严格 watcher 判断后台回合终局；
 - 两套安装入口、用户状态目录和技能彼此独立，新用户不要把两份安装步骤混着执行。
 

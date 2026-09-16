@@ -82,6 +82,8 @@ import {
   routableProjectsForRoot,
 } from "./registry.mjs";
 import * as outboxModule from "./outbox.mjs";
+// PK3-F140：版本前检的叶子模块（回执正文的模板/反解在写端与读端共用这一份）
+import * as claudeVersion from "./claude-version.mjs";
 import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
   codexReplyEventKey, composeDigest, explainabilityGaps,
@@ -40617,6 +40619,15 @@ const r54Shim = (argvLog, body) => [
   body,
 ].filter(Boolean).join("\n") + "\n";
 
+/**
+ * 转发夹具的 env（R54 / R58 / PK3-F140 共用）。两条隔离都是必需的：
+ *   · PATH 只留**假二进制目录 + node 目录**，不带真 PATH 尾巴 —— 版本前检会把真机那份 claude
+ *     当成达标候选选走，测试就会真起一个会话（冒烟时真踩到过：result.claude_path 是真机路径）；
+ *   · HOME 指到夹具目录 —— 前检先看 ~/.local/bin/claude，不隔离就会解析到真机那份（不动真 HOME）。
+ */
+const FWD_NODE_DIR = path.dirname(process.execPath);
+const fwdEnv = (home, bin, extra = {}) => ({ HOME: home, PATH: bin + path.delimiter + FWD_NODE_DIR, ...extra });
+
 const r54WaitResult = (file, ms = 5000) => {
   const deadline = Date.now() + ms;
   while (!fs.existsSync(file) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
@@ -40631,13 +40642,13 @@ test("R54 转发结果落盘：三种结局投影 + claude 参数逐字 + 路由
   const bin = path.join(local, "bin"); const proj = path.join(local, "proj"); const runs = path.join(local, "runs");
   fs.mkdirSync(bin); fs.mkdirSync(proj);
   const argvLog = path.join(local, "claude-argv.jsonl");
-  const deliver = (key, claudeBody, envPath = bin + path.delimiter + process.env.PATH) => {
+  const deliver = (key, claudeBody, envPath = bin + path.delimiter + FWD_NODE_DIR) => {
     fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, claudeBody), { mode: 0o700 });
     const t0 = Date.now();
     const run = deliverToLiveSession({
       target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
       instruction: "帮我改一下代码", messageId: "msg_" + key, createdAtMs: Date.now(),
-      projectRoot: proj, runsDir: runs, key, env: { PATH: envPath },
+      projectRoot: proj, runsDir: runs, key, env: fwdEnv(local, envPath),
     });
     run.tReturned = Date.now() - t0; // 返回耗时只记录不再当正确性判据（P2-6：改由阻塞场景比较先后）
     assert.equal(run.resultPath, path.join(runs, key + ".forward.result.json"), "返回值带 resultPath");
@@ -40713,8 +40724,10 @@ test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "fwdack", root, name: "fwdack", root_message_id: "om_fwdack", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_fwdack", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
   fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
   const argvLog = path.join(local, "claude-argv.jsonl");
-  // 假 claude：记 argv、不写任何 stream 输出、退出 0 → runner 落 crash 投影（存在性即证明链路通）
-  fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, ""), { mode: 0o700 });
+  // 假 claude：记 argv、不写任何 stream 输出、退出 0 → runner 落 crash 投影（存在性即证明链路通）；
+  // 对 --version 必须回一行版本（PK3-F140 前检先探一次）—— 不回的话前检会继续走到 PATH 尾巴上
+  // 真机那份 claude，那就不是「假 claude」了（本用例 PATH 保真，就是为了走真入口）。
+  fs.writeFileSync(path.join(bin, "claude"), r54Shim(argvLog, "if (process.argv.includes('--version')) { process.stdout.write('9.9.9\\n'); process.exit(0); }"), { mode: 0o700 });
   fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.stderr.write('fake lark-cli: refusing');", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
   const sessionsDir = path.join(local, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
   fs.writeFileSync(path.join(sessionsDir, "1.json"), JSON.stringify({ sessionId: "33333333-3333-4333-8333-333333333333", name: "live-0", pid: process.pid, kind: "interactive", cwd: root, startedAt: new Date().toISOString() }));
@@ -40730,7 +40743,9 @@ test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执
   // runner 转发的参数逐字一致；结果文件最终落盘（无 result 行 → crash 投影，存在即链路通）
   const deadline = Date.now() + 5000;
   while (!fs.existsSync(argvLog) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-  const argv = JSON.parse(fs.readFileSync(argvLog, "utf-8").trim().split("\n").pop());
+  // PK3-F140：前检先记一行 ["--version"] —— 等的是**转发那一次**的 argv（"-p" 那行）
+  while (Date.now() < deadline && !fs.readFileSync(argvLog, "utf-8").includes('"-p"')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  const argv = JSON.parse(fs.readFileSync(argvLog, "utf-8").trim().split("\n").filter((l) => l.includes('"-p"')).pop());
   assert.equal(argv[0], "-p");
   assert.deepEqual(argv.slice(2), ["--output-format", "stream-json", "--verbose"]);
   assert.match(argv[1], /SendMessage/u);
@@ -40937,7 +40952,7 @@ test("R54 返修一 P1-5：落盘纪律——目标已是 symlink 不跟随不�
     const run = deliverToLiveSession({
       target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
       instruction: "帮我改一下代码", messageId: "msg_" + key, createdAtMs: Date.now(),
-      projectRoot: proj, runsDir: runs, key, env: { PATH: bin + path.delimiter + process.env.PATH },
+      projectRoot: proj, runsDir: runs, key, env: fwdEnv(local, bin),
     });
     assert.ok(Date.now() - t0 < 200, "路由器调用 200ms 内返回");
     return run;
@@ -40994,7 +41009,7 @@ test("R54 返修二 P1-1：源 result 行缺 is_error → 投影 malformed_resul
   const run = deliverToLiveSession({
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "msg_mal", createdAtMs: Date.now(),
-    projectRoot: proj, runsDir: runs, key: r54Key(19), env: { PATH: bin + path.delimiter + process.env.PATH },
+    projectRoot: proj, runsDir: runs, key: r54Key(19), env: fwdEnv(local, bin),
   });
   const deadline = Date.now() + 5000;
   let r = null;
@@ -41073,7 +41088,7 @@ test("R54 返修二 P2-6：假 claude 阻塞 2 秒——路由器在子进程结
   const run = deliverToLiveSession({
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "msg_blk", createdAtMs: Date.now(),
-    projectRoot: proj, runsDir: runs, key: r54Key(21), env: { PATH: bin + path.delimiter + process.env.PATH },
+    projectRoot: proj, runsDir: runs, key: r54Key(21), env: fwdEnv(local, bin),
   });
   const tReturn = Date.now();
   assert.ok(!fs.existsSync(run.resultPath), "路由器返回时子进程还没结束（结果未落盘）");
@@ -41116,7 +41131,7 @@ test("R54 返修三 P1-1：源 result 行 num_turns 为负 → 投影 malformed_
   const run = deliverToLiveSession({
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "msg_f3a", createdAtMs: Date.now(),
-    projectRoot: proj, runsDir: runs, key: r54Key(31), env: { PATH: bin + path.delimiter + process.env.PATH },
+    projectRoot: proj, runsDir: runs, key: r54Key(31), env: fwdEnv(local, bin),
   });
   const deadline = Date.now() + 5000;
   let r = null;
@@ -41508,7 +41523,7 @@ test("R58 失败回执行为（假 claude）：is_error 失败 → outbox 一条
       instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
       projectRoot: proj, runsDir: runs, key,
       outboxDir: outbox, originGenerationId: "gen-r58",
-      env: { PATH: bin + path.delimiter + process.env.PATH },
+      env: fwdEnv(local, bin),
     });
   };
   // ① is_error 失败 → 回执出现，正文含原因首行（控制字符转空格）、不含第二行
@@ -41653,7 +41668,7 @@ test("R58 返修一 P1-5：result 受验写失败 → 不建回执（gated：先
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
     projectRoot: proj, runsDir: runs, key, outboxDir: outbox, originGenerationId: "gen-r58",
-    env: { PATH: bin + path.delimiter + process.env.PATH },
+    env: fwdEnv(local, bin),
   });
   // 等待 runner 结束（result 写失败路径也应收敛，不挂起）
   const deadline = Date.now() + 8000;
@@ -41667,7 +41682,7 @@ test("R58 返修一 P1-5：result 受验写失败 → 不建回执（gated：先
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "om_msg" + key2.slice(-4), createdAtMs: Date.now(),
     projectRoot: proj, runsDir: runs, key: key2, outboxDir: outbox, originGenerationId: "gen-r58",
-    env: { PATH: bin + path.delimiter + process.env.PATH },
+    env: fwdEnv(local, bin),
   });
   const ctl = r58WaitReceipt(path.join(outbox, key2 + R58_RECEIPT_SUFFIX));
   assert.ok(ctl, "控制组：result 写成了 → 回执出现（证明 gating 是唯一挡点）");
@@ -41870,7 +41885,7 @@ test("R58 返修二 P1-3：result 目录 fsync 失败 → 不建回执（没写�
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
     projectRoot: proj, runsDir: runs, key, outboxDir: outbox, originGenerationId: "gen-r58",
-    env: { PATH: bin + path.delimiter + process.env.PATH, NODE_OPTIONS: "--require " + hook },
+    env: fwdEnv(local, bin, { NODE_OPTIONS: "--require " + hook }),
   });
   const errPath = path.join(runs, key + ".forward.stderr.log");
   const resultPath = path.join(runs, key + ".forward.result.json");
@@ -41952,7 +41967,7 @@ test("R58 返修二 P2：spawn 异步 error 归 spawn_failed（按结构化 subt
     target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
     instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
     projectRoot: proj, runsDir: runs, key, outboxDir: outbox, originGenerationId: "gen-r58",
-    env: { PATH: bin + path.delimiter + process.env.PATH },
+    env: fwdEnv(local, bin),
   });
   const r47 = r54WaitResult(path.join(runs, key + ".forward.result.json"));
   assert.ok(r47 && r47.sent === false, "夹具自证：这次转发是失败：" + JSON.stringify(r47));
@@ -42028,6 +42043,211 @@ test("R58 返修三 P2-1：本批含 forward_failed 而入口不给核对器 →
   const withEvidence = publishOutboxAttempt({ ...args, receiptEvidence: (rec) => (rec?.kind === "forward_failed" ? null : null) });
   assert.equal(withEvidence.status, "published", "② 给了核对器就该发：" + JSON.stringify({ status: withEvidence.status, reason: withEvidence.reason }));
   assert.equal(publishes, 1, "② 发布回调被调一次");
+});
+
+// ── PK3-F140（issue #140 产品侧第四条）：转发前的版本前检 / 二进制解析 ──────────────────────────
+// 2026-09-08 那次：PATH 上 /opt/homebrew/bin 排在 ~/.local/bin 前面，解析到旧版 2.1.248，转发进程
+// 秒退（result.is_error=true，stderr 为空），而回执已经冒充送达。R58 的失败回执是**事后**如实告知；
+// 这里补的是**事前**：先解析不依赖 PATH 顺序的二进制，再核版本，不达标就不起进程。
+// HOME 一律指到夹具目录 —— 前检会看 ~/.local/bin/claude，不隔离 HOME 就会解析到真机那份（真 HOME 不动）。
+const f140Fixture = (tag) => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-f140-" + tag + "-"));
+  const home = path.join(local, "home");
+  const localBin = path.join(home, ".local", "bin");
+  const pathBin = path.join(local, "pathbin");
+  const proj = path.join(local, "proj");
+  fs.mkdirSync(localBin, { recursive: true }); fs.mkdirSync(pathBin, { recursive: true }); fs.mkdirSync(proj, { recursive: true });
+  return { local, home, localBin, pathBin, proj, runs: path.join(local, "runs"),
+    outbox: path.join(proj, ".runtime-data", "outbound", "outbox") };
+};
+/** 假 claude：记 argv；version 非 null 时对 --version 回一行版本并退出；否则照旧写一行 result。 */
+const f140Shim = (logFile, version) => [
+  "#!/usr/bin/env node",
+  "require('node:fs').appendFileSync(" + JSON.stringify(logFile) + ", JSON.stringify(process.argv.slice(2)) + '\\n');",
+  version === null ? null : "if (process.argv.includes('--version')) { process.stdout.write(" + JSON.stringify(version) + " + '\\n'); process.exit(0); }",
+  "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'sent', num_turns: 1, duration_ms: 10 }) + '\\n');",
+].filter(Boolean).join("\n") + "\n";
+const f140Deliver = (f, key) => deliverToLiveSession({
+  target: { sessionId: "11111111-1111-4111-8111-111111111111", name: "现场会话", pid: process.pid },
+  instruction: "帮我改一下代码", messageId: "om_msg" + key.slice(-4), createdAtMs: Date.now(),
+  projectRoot: f.proj, runsDir: f.runs, key, outboxDir: f.outbox, originGenerationId: "gen-f140",
+  env: { HOME: f.home, PATH: f.pathBin + path.delimiter + FWD_NODE_DIR },
+});
+const f140Argv = (logFile) => (fs.existsSync(logFile)
+  ? fs.readFileSync(logFile, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+
+test("PK3-F140 T6 版本前检：本机 claude 低于转发所需 → 不起转发进程、失败回执含版本（issue #140 第四条）", () => {
+  const f = f140Fixture("v");
+  try {
+    const log = path.join(f.local, "local-argv.jsonl");
+    fs.writeFileSync(path.join(f.localBin, "claude"), f140Shim(log, "2.1.248 (Claude Code)"), { mode: 0o700 });
+    const key = r54Key(61);
+    f140Deliver(f, key);
+    const r = r54WaitResult(path.join(f.runs, key + ".forward.result.json"));
+    assert.ok(r, "前检失败也要落 result 终态（失败回执的证据链挂在它上面）");
+    assert.deepEqual([r.is_error, r.sent, r.subtype, r.claude_code_version, r.exit_code, r.num_turns, r.pid],
+      [true, false, "claude_version_unsupported", "2.1.248", null, null, null], JSON.stringify(r));
+    assert.deepEqual(f140Argv(log), [["--version"]], "只调过 --version：转发进程没起（#140 里那条 2–4 秒秒退的路径根本不进）");
+    assert.equal(fs.existsSync(path.join(f.runs, key + ".forward.jsonl")), false, "没起进程就不该有 jsonl");
+    const rec = r58WaitReceipt(path.join(f.outbox, key + R58_RECEIPT_SUFFIX));
+    assert.ok(rec, "失败回执已发（走 R58 的既有出站回执通道）");
+    assert.equal(rec.kind, "forward_failed");
+    assert.match(rec.text, /2\.1\.248/u, "回执正文含版本：" + rec.text);
+    assert.equal(rec.text, outboxModule.forwardFailureText("version_unsupported", "2.1.248"), "正文 = 封闭模板 + 严格版本 token：" + rec.text);
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
+test("PK3-F140 T1 真入口：转发失败 → 受理回执只说「正在转发」+ outbox 一条失败回执 + 登记表/账本零写", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "bridge-cc-f140in-"));
+  const root = path.join(local, "project"); const bin = path.join(local, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: TPL.frank_sender_id, role: "owner" }] }));
+  fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "f140in", root, name: "f140in", root_message_id: "om_f140in", expires_at: "2099-01-01T00:00:00Z", session_id: "aily_f140in", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  // 假 claude：#140 同款失败（result 行 is_error=true）；对 --version 回版本（前检先探一次）
+  fs.writeFileSync(path.join(bin, "claude"), [
+    "#!/usr/bin/env node",
+    "if (process.argv.includes('--version')) { process.stdout.write('9.9.9\\n'); process.exit(0); }",
+    "process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 400 model not found', num_turns: 1, duration_ms: 2500 }) + '\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, "lark-cli"), ["#!/usr/bin/env node", "process.stderr.write('fake lark-cli: refusing');", "process.exit(1);"].join("\n") + "\n", { mode: 0o700 });
+  const sessionsDir = path.join(local, ".claude", "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(path.join(sessionsDir, "1.json"), JSON.stringify({ sessionId: "44444444-4444-4444-8444-444444444444", name: "live-f140", pid: process.pid, kind: "interactive", cwd: root, startedAt: new Date().toISOString() }));
+  const content = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 帮我改一下代码";
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "om_f140inmsg", sessionID: "aily_f140in", role: "user", createdBy: TPL.frank_sender_id, createdAtMs: Date.now(), content } }) }] });
+  const p = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
+    env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+      AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_f140in", AILY_CLI_RUN_ID: "run_f140in", FAKE_AILY_ENVELOPE: envelope } });
+  assert.equal(p.status, 0, p.stdout + p.stderr);
+  assert.match(p.stdout, /正在转发到你正开着的会话（live-f140）/u, "受理回执只能说「正在转发」：" + p.stdout);
+  // 零写对照面：路由器已经返回，之后还在跑的就只有转发进程
+  const regBefore = fs.readFileSync(registryFile, "utf-8");
+  const treeOf = (d) => (fs.existsSync(d) ? fs.readdirSync(d, { recursive: true }).sort().join("\n") : "<absent>");
+  const maintTreeBefore = treeOf(path.join(local, ".claude", "feishu-bridge"));
+  const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
+  const waitFor = (pred, ms = 8000) => {
+    const dl = Date.now() + ms;
+    while (Date.now() < dl) { const v = pred(); if (v) return v; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); }
+    return null;
+  };
+  const result = waitFor(() => {
+    const n = fs.existsSync(runsDir) ? fs.readdirSync(runsDir).find((x) => x.endsWith(".forward.result.json")) : null;
+    return n ? JSON.parse(fs.readFileSync(path.join(runsDir, n), "utf-8")) : null;
+  });
+  assert.ok(result && result.is_error === true && result.sent === false, "失败终态落盘（result.is_error 被消费）：" + JSON.stringify(result));
+  const outboxDir = path.join(root, ".runtime-data", "outbound", "outbox");
+  const rec = waitFor(() => {
+    const n = fs.existsSync(outboxDir) ? fs.readdirSync(outboxDir).find((x) => x.endsWith(".forward-failed.outbox.json")) : null;
+    return n ? JSON.parse(fs.readFileSync(path.join(outboxDir, n), "utf-8")) : null;
+  });
+  assert.ok(rec, "失败回执落进 outbox（发布由既有出站发布器做）：" + JSON.stringify(fs.existsSync(outboxDir) ? fs.readdirSync(outboxDir) : null));
+  assert.equal(rec.kind, "forward_failed");
+  assert.equal(rec.forward_key, result.key, "回执与 result 同一个 key（证据链）");
+  assert.equal(rec.text, outboxModule.FORWARD_FAILURE_TEXT.session_error, "正文 = 封闭固定文案（reason 首行一个字不进正文）：" + rec.text);
+  assert.equal(fs.readFileSync(registryFile, "utf-8"), regBefore, "转发不写登记表");
+  assert.equal(treeOf(path.join(local, ".claude", "feishu-bridge")), maintTreeBefore, "转发不写账本/维护目录");
+  fs.rmSync(local, { recursive: true, force: true });
+});
+
+// PK3-F140-fix2 P1（Codex 一轮）：**不能证明所有候选都过旧时不许硬拦**。
+// 「版本读不出」和「确认过旧」是两回事：前检只能捕自己看得懂的错，看不懂的那个候选
+// 照旧启动（真坏了由失败回执如实收口）。两个候选顺序都要钉：unknown→old 与 old→unknown。
+test("PK3-F140-fix2 P1：候选里有一个版本读不出、另一个旧 → 不许硬拦，用那个读不出的照旧启动", () => {
+  // unknown→old：~/.local 那份读不出版本（可执行、但 --version 无声），PATH 上是可解析的旧版
+  const fa = f140Fixture("p1a");
+  try {
+    const localLog = path.join(fa.local, "local-argv.jsonl");
+    const pathLog = path.join(fa.local, "path-argv.jsonl");
+    fs.writeFileSync(path.join(fa.localBin, "claude"), f140Shim(localLog, null), { mode: 0o700 });
+    fs.writeFileSync(path.join(fa.pathBin, "claude"), f140Shim(pathLog, "2.1.248 (Claude Code)"), { mode: 0o700 });
+    const keyA = r54Key(65);
+    f140Deliver(fa, keyA);
+    const ra = r54WaitResult(path.join(fa.runs, keyA + ".forward.result.json"));
+    assert.ok(ra && ra.sent === true, "读不出版本不是「确定过旧」→ 照旧启动：" + JSON.stringify(ra));
+    assert.equal(ra.claude_path, path.join(fa.localBin, "claude"), "用的是那个 unknown 候选（不是被跳过后硬拦住）");
+    assert.equal(fs.existsSync(path.join(fa.outbox, keyA + R58_RECEIPT_SUFFIX)), false, "没有失败回执（根本没拦）");
+  } finally { fs.rmSync(fa.local, { recursive: true, force: true }); }
+  // old→unknown：~/.local 那份是明确可解析的旧版，PATH 上那个读不出版本 —— 同样不许硬拦
+  const fb = f140Fixture("p1b");
+  try {
+    const localLog = path.join(fb.local, "local-argv.jsonl");
+    const pathLog = path.join(fb.local, "path-argv.jsonl");
+    fs.writeFileSync(path.join(fb.localBin, "claude"), f140Shim(localLog, "2.1.248 (Claude Code)"), { mode: 0o700 });
+    fs.writeFileSync(path.join(fb.pathBin, "claude"), f140Shim(pathLog, null), { mode: 0o700 });
+    const keyB = r54Key(66);
+    f140Deliver(fb, keyB);
+    const rb = r54WaitResult(path.join(fb.runs, keyB + ".forward.result.json"));
+    assert.ok(rb && rb.sent === true, "有 unknown 候选就不硬拦：" + JSON.stringify(rb));
+    assert.equal(rb.claude_path, path.join(fb.pathBin, "claude"), "unknown 优先于「确定过旧」");
+    assert.equal(fs.existsSync(path.join(fb.outbox, keyB + R58_RECEIPT_SUFFIX)), false, "没有失败回执（根本没拦）");
+  } finally { fs.rmSync(fb.local, { recursive: true, force: true }); }
+});
+
+// PK3-F140-fix2 P2（Codex 一轮）：第五类回执正文只验形状不够 —— 版本必须**真的**低于下限，
+// 否则「版本 9.9.9 过旧」这种自相矛盾的正文会被当成合法回执收下（读端/审计会信它）。
+test("PK3-F140-fix2 P2：版本过旧回执正文必须真的低于下限——9.9.9 冒充 → 封闭校验器拒", () => {
+  const key = r54Key(67);
+  const bogus = r58ReceiptDoc(key, { text: claudeVersion.forwardVersionUnsupportedText("9.9.9") });
+  assert.equal(outboxModule.forwardFailureReceiptProblem(bogus, { expectedKey: key }), "text 不是固定文案",
+    "达标版本不许冒充「过旧」正文");
+  assert.equal(claudeVersion.forwardVersionUnsupportedVersionOf(bogus.text), null, "反解端也要拒（两个方向同源）");
+  // 走共用审计与发布器：规范文件名、字段互相自洽，唯一缺陷是正文自称「9.9.9 过旧」
+  const p = r58Project("f140p2");
+  const key2 = r54Key(68);
+  const body = r58FailedBody(key2, "API Error: 400 z", p.rel);
+  fs.writeFileSync(path.join(p.runsDir, key2 + ".forward.result.json"), body, { mode: 0o600 });
+  fs.writeFileSync(path.join(p.outbox, key2 + R58_RECEIPT_SUFFIX),
+    JSON.stringify(r58ReceiptDoc(key2, { text: claudeVersion.forwardVersionUnsupportedText("9.9.9"), result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
+  const audit = outboxModule.auditOutbox(p.outbox);
+  const bad2 = audit.unexplainable.find((u) => u.file === key2 + R58_RECEIPT_SUFFIX);
+  assert.ok(bad2, "审计解释不了这条正文：" + JSON.stringify(audit.unexplainable));
+  assert.match(String(bad2.why), /不是固定文案/u, "why 点名正文没过封闭校验：" + bad2.why);
+  const dp = drainProject({ root: p.root, dryRun: true });
+  assert.equal(dp.status, "error", "发布 dry-run fail-closed（不发一条伪造的「过旧」）：" + JSON.stringify({ status: dp.status, reason: dp.reason }));
+  assert.equal(dp.records?.length ?? 0, 0, "不冒充「已经发过了」：" + JSON.stringify(dp.records));
+  // 对照：同一条路 + **真的**过旧的版本 → 审计收、发布器进队列（证明上面拦的是「不低于下限」）
+  const p2 = r58Project("f140p2ok");
+  const key3 = r54Key(69);
+  const body2 = r58FailedBody(key3, "API Error: 400 z", p2.rel);
+  fs.writeFileSync(path.join(p2.runsDir, key3 + ".forward.result.json"), body2, { mode: 0o600 });
+  fs.writeFileSync(path.join(p2.outbox, key3 + R58_RECEIPT_SUFFIX),
+    JSON.stringify(r58ReceiptDoc(key3, { text: claudeVersion.forwardVersionUnsupportedText("2.1.248"), result_sha256: r58ShaOf(body2) }), null, 2) + "\n", { mode: 0o600 });
+  assert.deepEqual(outboxModule.auditOutbox(p2.outbox).unexplainable, [], "真过旧的那条审计必须收");
+  const ok = drainProject({ root: p2.root, dryRun: true });
+  assert.equal(ok.status, "dry_run", "对照：正常进队列：" + JSON.stringify({ status: ok.status, reason: ok.reason }));
+  assert.equal(ok.count, 1, "对照：进队列的就是它");
+  assert.equal(outboxModule.forwardFailureText("version_unsupported", "2.1.248"), claudeVersion.forwardVersionUnsupportedText("2.1.248"), "写端产物就是受验通过的那份");
+});
+
+test("PK3-F140 前检·二进制解析：~/.local/bin/claude 压过 PATH 上先出现的旧版（#140 根因就是 PATH 顺序）", () => {
+  const f = f140Fixture("pref");
+  try {
+    const localLog = path.join(f.local, "local-argv.jsonl");
+    const pathLog = path.join(f.local, "path-argv.jsonl");
+    fs.writeFileSync(path.join(f.pathBin, "claude"), f140Shim(pathLog, "2.1.248 (Claude Code)"), { mode: 0o700 });
+    fs.writeFileSync(path.join(f.localBin, "claude"), f140Shim(localLog, "2.1.263 (Claude Code)"), { mode: 0o700 });
+    const key = r54Key(62);
+    f140Deliver(f, key);
+    const r = r54WaitResult(path.join(f.runs, key + ".forward.result.json"));
+    assert.ok(r && r.sent === true, "新版可用 → 照常转发（不是「一律拒」）：" + JSON.stringify(r));
+    assert.equal(r.claude_path, path.join(f.localBin, "claude"), "用的是 ~/.local 那份，不是 PATH 上先出现的旧版");
+    assert.deepEqual(f140Argv(pathLog), [], "PATH 上那份旧版一次都没被起");
+    assert.equal(f140Argv(localLog).filter((a) => a[0] === "-p").length, 1, "转发进程用的正是被选中的那份");
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
+test("PK3-F140 前检：版本读不出 → 不拦、不猜，照旧起进程，由失败回执如实收口", () => {
+  const f = f140Fixture("unk");
+  try {
+    const log = path.join(f.local, "path-argv.jsonl");
+    fs.writeFileSync(path.join(f.pathBin, "claude"), f140Shim(log, null), { mode: 0o700 });
+    const key = r54Key(63);
+    f140Deliver(f, key);
+    const r = r54WaitResult(path.join(f.runs, key + ".forward.result.json"));
+    assert.ok(r && r.sent === true, "版本形状不认识时不许把转发拦死：" + JSON.stringify(r));
+    assert.equal(r.claude_path, path.join(f.pathBin, "claude"));
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
 });
 
 test("R58 返修三 P2-2：selection-plan 的返回形逐字保留（薄适配层不许把 verified-sidecar 的新字段漏出去）", () => {

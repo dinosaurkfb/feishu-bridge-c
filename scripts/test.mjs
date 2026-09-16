@@ -61,6 +61,7 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
+import { resumeHint, describeStatus as describeStatusCtl } from "./feishu-control.mjs"; // PK2-W3-fix8：恢复提示一处分流
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { resolveDeliveryTargetFromLedger, decideInboundDeliveryTarget, appendShadowDivergenceNote, classifyLedgerAuthority } from "./m1a/delivery-target.mjs"; // R66：入站投递目标解析/判源/决策
 import { activeGenerationForSession, effectiveBindingId, generationForSession, resolveMappingOutboundGeneration, pendingRotationBlocker, supersedeExpiredAndPrepareTopicRotation } from "./topic-generation.mjs";
@@ -53658,6 +53659,34 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
     } finally { x.f.cleanup(); }
   });
 
+  test("PK2-W3-fix8 红反例：会话级绑定 feishu-unbind --apply 的结尾恢复提示是 bind-session（不得错指 bind-project）", () => {
+    const { x, env } = w3Fixture("w3f8");
+    try {
+      const rp = spawnSync(process.execPath, [path.resolve("scripts", "feishu-unbind.mjs"), "--project", x.proj, "--apply"],
+        { encoding: "utf-8", cwd: x.proj, env });
+      assert.equal(rp.status, 0, "暂停真入口退出码 0：" + JSON.stringify({ status: rp.status, out: String(rp.stdout).slice(-300), err: String(rp.stderr).slice(-300) }));
+      const out = String(rp.stdout);
+      assert.doesNotMatch(out, /bind-project/u, "会话级不得错指 bind-project：" + out.slice(-400));
+      assert.match(out, /bind-session/u, "结尾恢复提示要用 bind-session（预演与 --apply 一致）：" + out.slice(-400));
+    } finally { x.f.cleanup(); }
+  });
+
+  test("PK2-W3-fix8 对照：项目级与 helper 两支（resumeHint / describeStatus 挂起尾行）按级别分流", () => {
+    // helper 两支
+    assert.match(resumeHint({ level: "session" }), /bind-session/u, resumeHint({ level: "session" }));
+    assert.doesNotMatch(resumeHint({ level: "session" }), /bind-project/u);
+    assert.match(resumeHint({ level: "project" }), /bind-project/u, resumeHint({ level: "project" }));
+    assert.doesNotMatch(resumeHint({ level: "project" }), /bind-session/u);
+    // describeStatus 挂起尾行同源（两种级别）
+    const mk = (level) => ({ ok: true, suspended: true, level, displayName: "d", pending: 0,
+      activeGeneration: null, policy: { ok: false }, inboundBound: true, readOnlyGenerations: 0, pendingGeneration: null });
+    const projText = describeStatusCtl(mk("project"), []);
+    const sessText = describeStatusCtl(mk("session"), []);
+    assert.match(projText, /恢复：node scripts\/bind-project\.mjs --apply/u, projText);
+    assert.match(sessText, /恢复：.+bind-session/u, "挂起尾行也要按级别分流：" + sessText);
+    assert.doesNotMatch(sessText, /bind-project/u, sessText);
+  });
+
   test("PK2-W3 T1 暂停：账本 unbind 先行（facts.binding=dormant + 一笔 unbind）→ 索引 paused；sidecar 字节不变", () => {
     const { x, env, ta, om } = w3Fixture("w3t1");
     try {
@@ -54961,6 +54990,9 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       s = s.replace(W2FIX3_ISO_RE, (m) => getPh(m, "TS"));
       s = s.replace(/"pid":\s*\d+/gu, '"pid":<PID>');            // 子进程 pid：本来就不同
       s = s.replace(/-\d{1,7}\.json/gu, "-<PID>.json");           // 回执文件名里的 <ts>-<pid>.json
+      // PK2-W3-fix8：恢复提示收成一处 helper 按 st.level 分流 —— 基线（b9ff7e8）与分支的措辞差异是
+      //   本单**有意**的措辞变更，归一成同一占位（落盘文件照比不受影响；哪一级指哪个脚本由 fix8 用例守）。
+      s = s.replace(/恢复：[^\n]*(?:bind-project|bind-session)[^\n]*/gu, "恢复：<RESUME_HINT>");
       return s;
     };
     return { normalize, valToPlaceholder, counts };

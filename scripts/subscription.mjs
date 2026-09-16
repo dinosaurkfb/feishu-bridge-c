@@ -457,6 +457,9 @@ export function compareFirstClaimShadow({ legacy, candidate, controlPlane = null
     reason_match: reasonMatch,
     candidate_subscription_id: candidateAccepted ? candidate.subscription_id : null,
     scope_unverified: candidate?.scope_unverified ?? [],
-    control_plane: controlPlane,
+    // P1-2（Codex 一轮）：**只在真的传了诊断时才展开这个键** —— 共用的比较器还给 Codex 影子用
+    //（shadowCodexFirstClaim 不传 controlPlane），无条件展开会给它凭空多一个 control_plane:null，
+    // 那就是顺带改了另一条链 shadow 回执的可观察 schema。
+    ...(controlPlane == null ? {} : { control_plane: controlPlane }),
   };
 }

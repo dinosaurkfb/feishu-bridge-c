@@ -488,17 +488,22 @@ export function shadowClaudeFirstClaim({
 } = {}) {
   const store = loadSubscriptionStore({ file: subscriptionStorePath({ home }) });
   const controlPlane = subscriptionControlPlaneDiagnostic(store);
-  const model = buildClaudeSubscriptionProjection({
-    registryFile, templateFile,
-    controlPlane: store.absent === true ? null
-      : (store.ok === true ? { ok: true, subscriptions: store.subscriptions } : { ok: false, problems: store.problems }),
-  });
   const legacy = {
     ok: legacyPromotion?.ok === true,
     target_key: legacyPromotion?.ok ? legacyPromotion.id : null,
     reason: legacyPromotion?.reason ?? legacyPending?.reason,
   };
-  // 控制面造成的 fail-closed：影子**不比对**（match 系列置 null），但也不说「一致」也不说「不一致」。
+  // P1-1（Codex 一轮）：**按 store 的结果优先短路**。
+  //   旧写法只从最终 model.reason 反推，而 legacy 投影（登记表/模板读不出）会**先**返回，
+  //   根本进不到控制面合并 —— 于是 store 明摆着损坏也会走下去比对。读不出 / 校验不过一律不比对。
+  if (store.absent !== true && store.ok !== true) {
+    return shadowControlPlaneInvalid({ legacy, controlPlane });
+  }
+  const model = buildClaudeSubscriptionProjection({
+    registryFile, templateFile,
+    controlPlane: store.absent === true ? null : { ok: true, subscriptions: store.subscriptions },
+  });
+  // 兜底：控制面造成的 fail-closed（例如合并时才发现某条目校验不过）也一律不比对。
   // 只认这个 reason —— 投影自己失败（登记表读不出等）是 legacy 侧的事，与 main 同口径。
   if (model?.reason === SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID) {
     return shadowControlPlaneInvalid({ legacy, controlPlane });

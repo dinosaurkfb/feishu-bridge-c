@@ -21820,11 +21820,11 @@ const c1Entry = ({ root, chatId, over = {} }) => ({
 });
 const c1StoreDoc = (subscriptions) => ({ schema_version: SUBSCRIPTION_STORE_SCHEMA_VERSION,
   artifact_type: SUBSCRIPTION_STORE_ARTIFACT_TYPE, subscriptions });
-const c1Fixture = (tag, rows) => {
+const c1Fixture = (tag, rows, templatePatch = {}) => {
   const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-c1-" + tag + "-")));
   const bin = path.join(local, "bin"); fs.mkdirSync(bin);
   const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
-  fs.writeFileSync(templateFile, JSON.stringify({ ...C1_TPL, senders: [] }));
+  fs.writeFileSync(templateFile, JSON.stringify({ ...C1_TPL, senders: [], ...templatePatch }));
   const projects = rows.map((r, i) => {
     const root = path.join(local, "project" + i); fs.mkdirSync(root, { recursive: true });
     return { id: "prom" + i, root, name: "待认领", root_message_id: "om_p" + i, expires_at: "2099-01-01T00:00:00Z",
@@ -22017,6 +22017,72 @@ test("PK3-C1 T5 两群各一份 pending + 无码 @：shadow 判 AMBIGUOUS（C2 �
     assert.equal(shadow.candidate_disposition, "rejected");
     assert.deepEqual(shadow.control_plane, { present: true, subscriptions: 2, problems: [] });
   } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
+test("PK3-C1-fix1 T6：store 损坏 + legacy 投影同时失败 → 影子仍记 control_plane_invalid 且不比对（P1-1）", () => {
+  // 修前的形状：只有最终 model.reason === control_plane_invalid 才短路，而 legacy 投影**先**失败时
+  // 根本进不去合并（buildLegacySubscriptionReadModel 提前 return），于是损坏的 store 被放过、照旧比对。
+  // 这一态在**真入口**里到不了：链模板不可用时入站自己先以 template_unusable 退出、影子根本不会跑
+  //（实测：模板缺 chat_id、senders:[{}] 都会让入站先退），所以拿 router 调的**同一个函数**、同样的入参钉。
+  const now = Date.now();
+  const base = {
+    event: { message_id: "om_c1_msg", session_id: "aily_dm", sender_id: C1_TPL.frank_sender_id,
+      content: C1_BIND, created_at_ms: now },
+    template: { ...C1_TPL, senders: [] }, callerAgentUid: C1_TPL.agent_uid,
+    legacyPending: { ok: false, reason: PROMOTE_REJECT.NO_PENDING },
+    legacyPromotion: { ok: false, reason: PROMOTE_REJECT.NO_PENDING },
+    now,
+  };
+  const f = c1Fixture("t6", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  try {
+    const brokenReg = path.join(f.local, "broken-registry.json");
+    fs.writeFileSync(brokenReg, "{");                       // legacy 投影先失败：loadRegistry → bad_json
+    c1WriteStore(f, "{");                                    // 控制面也明确损坏
+    const shadow = shadowClaudeFirstClaim({ ...base, registryFile: brokenReg, templateFile: f.templateFile, home: f.local });
+    assert.equal(shadow.candidate_reason, SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID,
+      "store 损坏必须优先短路，不许被 legacy 投影的失败盖过：" + JSON.stringify(shadow));
+    for (const k of ["match", "route_match", "disposition_match", "target_match", "reason_match"]) {
+      assert.equal(shadow[k], null, k + " 必须置 null（不比对）：" + JSON.stringify(shadow));
+    }
+    assert.equal(shadow.candidate_disposition, null);
+    assert.equal(shadow.legacy_disposition, "rejected");
+    assert.equal(shadow.legacy_reason, PROMOTE_REJECT.NO_PENDING, "legacy_reason 记 legacy 那侧的原因");
+    assert.equal(shadow.control_plane.present, true);
+    assert.ok(shadow.control_plane.problems.length > 0, "诊断带 problems：" + JSON.stringify(shadow.control_plane));
+    // 对照：同一组坏 registry + **没有 store** → 照 main 口径记 legacy 侧的原因（不是 control_plane_invalid）
+    const clean = c1Fixture("t6c", [{ chatId: "oc_a", token: "aaaaaa" }]);
+    try {
+      const brokenReg2 = path.join(clean.local, "broken-registry.json");
+      fs.writeFileSync(brokenReg2, "{");
+      const noStore = shadowClaudeFirstClaim({ ...base, registryFile: brokenReg2, templateFile: clean.templateFile, home: clean.local });
+      assert.equal(noStore.candidate_reason, "registry_unreadable", "没有 store 时照 main：registry_unreadable：" + JSON.stringify(noStore));
+      assert.deepEqual(noStore.control_plane, { present: false, subscriptions: 0, problems: [] });
+    } finally { fs.rmSync(clean.local, { recursive: true, force: true }); }
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+  // 权威侧照旧（真入口那半条）：**同一夹具、同一 root**跑两遍（第二遍把登记表恢复成跑前字节），
+  // 只差 store 坏没坏 → 权威回执（除 shadow/时间戳）与登记表写回（除本次时间戳）逐字节一致。
+  const g = c1Fixture("t6r", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  try {
+    const regBefore = fs.readFileSync(g.registryFile, "utf-8");
+    const r1 = c1Run(g, { content: C1_BIND, chatId: "oc_a" });
+    assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+    const rec1 = c1Only(g, "bound-");
+    const reg1 = fs.readFileSync(g.registryFile, "utf-8");
+    fs.rmSync(path.join(g.local, ".claude"), { recursive: true, force: true });
+    fs.rmSync(path.join(g.roots[0], ".runtime-data"), { recursive: true, force: true });
+    fs.writeFileSync(g.registryFile, regBefore);
+    c1WriteStore(g, "{");
+    const r2 = c1Run(g, { content: C1_BIND, chatId: "oc_a" });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    const rec2 = c1Only(g, "bound-");
+    const reg2 = fs.readFileSync(g.registryFile, "utf-8");
+    const strip = (r) => { const { subscription_claim_shadow, recorded_at, ...rest } = r; return rest; };
+    assert.deepEqual(strip(rec2), strip(rec1), "坏 store 不改变权威回执");
+    const stripIso = (x) => x.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/gu, "<TS>");
+    assert.equal(stripIso(reg2), stripIso(reg1), "坏 store 不改变登记表写回（除本次时间戳）");
+    assert.equal(rec2.subscription_claim_shadow.candidate_reason, SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID);
+    assert.equal(rec2.subscription_claim_shadow.match, null);
+  } finally { fs.rmSync(g.local, { recursive: true, force: true }); }
 });
 
 test("FR-2.6 单 3：chat_name 1.0 拒 / 1.1 收、取值域封闭；身份与 chat_name 无关（id 哈希不进群名）；schema 同步 1.1 形状", () => {

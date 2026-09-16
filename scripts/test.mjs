@@ -21939,6 +21939,7 @@ test("PK3-C1 T3 store 读不出/校验不过：shadow 记 control_plane_invalid 
     assert.equal(rec.status, "bound");
     assert.equal(rec.matched_by, "quoted_binding_token");
     assert.equal(JSON.parse(fs.readFileSync(f.registryFile, "utf-8")).projects[0].inbound_state, "bound");
+    fs.rmSync(f.local, { recursive: true, force: true });
   }
   // 0644：**读端不看 mode**（它只认「普通文件 + 单硬链接」）—— 如实钉住现状：这不是「读不出」
   const f = c1Fixture("t3m", [{ chatId: "oc_a", token: "aaaaaa" }]);

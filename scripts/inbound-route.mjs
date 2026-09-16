@@ -484,7 +484,7 @@ export function subscriptionControlPlaneDiagnostic(store) {
  */
 export function shadowClaudeFirstClaim({
   event, template, callerAgentUid, legacyPending, legacyPromotion,
-  registryFile, templateFile, now = Date.now(), home = os.homedir(),
+  registryFile, templateFile, now = Date.now(), home = os.homedir(), env = process.env,
 } = {}) {
   const store = loadSubscriptionStore({ file: subscriptionStorePath({ home }) });
   const controlPlane = subscriptionControlPlaneDiagnostic(store);
@@ -509,6 +509,14 @@ export function shadowClaudeFirstClaim({
     return shadowControlPlaneInvalid({ legacy, controlPlane });
   }
   const endpointId = legacyEndpointId({ runtime: "claude", agentUid: template?.agent_uid });
+  // PK3-C1b（真机样本 S1，2026-09-16T12:18Z）：chat 证据与 legacy **同源** ——
+  //   env.AILY_CLI_CHANNEL_CHAT_ID。channel-locator-verdict.md §2 已裁定它就是本消息所在的飞书
+  //   chat_id（2026-09-02 真机对照）；legacy 的 chat 维校验用的也是它（本文件 evaluatePromotion）。
+  //   旧版这里写死 null，于是跨群样本上两条路拿的不是同一份证据：legacy 判 chat_mismatch 拒，
+  //   影子却 fail-open 配到了模板群那份 pending（S1 就是这么来的）。
+  //   取不到（未注入 / 空串）仍为 null —— scope_unverified 照旧记 chat_id，不猜。
+  const envChatId = typeof env?.AILY_CLI_CHANNEL_CHAT_ID === "string" && env.AILY_CLI_CHANNEL_CHAT_ID.length > 0
+    ? env.AILY_CLI_CHANNEL_CHAT_ID : null;
   const candidate = selectPendingSubscriptionClaim({
     model,
     evidence: {
@@ -517,7 +525,7 @@ export function shadowClaudeFirstClaim({
       sender_id: event?.sender_id,
       mention_ids: extractMentionIds(event?.content),
       event_type: MESSAGE_RECEIVE_EVENT,
-      chat_id: null, // 现有 envelope 尚未验证稳定 chat locator；只在 shadow 中显式记为未核验。
+      chat_id: envChatId,
       created_at_ms: event?.created_at_ms,
     },
     bindingTokens: bindingTokensInQuote(event?.content),

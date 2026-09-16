@@ -21847,11 +21847,15 @@ const c1Run = (f, { content, chatId, messageId = "om_c1_msg" }) => {
   const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({
     message: { id: messageId, sessionID: "aily_dm", role: "user", createdBy: C1_TPL.frank_sender_id,
       createdAtMs: Date.now(), content } }) }] });
-  return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env: {
+  const env = {
     ...process.env, PATH: f.bin + path.delimiter + path.dirname(process.execPath), HOME: f.local,
     FEISHU_BRIDGE_REGISTRY: f.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: f.templateFile,
     AILY_CLI_CALLER_AGENT_UID: C1_TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_dm", AILY_CLI_RUN_ID: "run_c1",
-    FAKE_AILY_ENVELOPE: envelope, AILY_CLI_CHANNEL_CHAT_ID: chatId, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000" } });
+    FAKE_AILY_ENVELOPE: envelope, FEISHU_BRIDGE_CHAT_TIMEOUT_MS: "5000" };
+  // PK3-C1b：只有给了非空 chatId 才注入 —— 不给就是不注入（真机缺 chat locator 的样子），
+  // 不是把 undefined 塞进 env（那会变成字符串 "undefined"）。
+  if (typeof chatId === "string" && chatId.length > 0) env.AILY_CLI_CHANNEL_CHAT_ID = chatId;
+  return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8", env });
 };
 /** 回执目录：路由前在 HOME 下（unrouted），路由后跟项目走。 */
 const c1Receipts = (f) => {
@@ -21871,7 +21875,9 @@ const c1Only = (f, prefix) => {
 
 test("PK3-C1 T1 store 缺席（未装订阅管理）：shadow 与 main 逐字节一致（快照断言）+ 权威照旧", () => {
   const f = c1Fixture("t1", [{ chatId: "oc_a", token: "aaaaaa" }]);
-  const r = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+  // PK3-C1b：影子从这一单起会吃 env 的 chat 证据 —— 这条快照钉的是「与 main 逐字节一致」，
+  // 所以入参必须是**没有 chat 证据**的那种（有证据时影子按设计就会偏离 main，那是 C1b T1/T2 的事）。
+  const r = c1Run(f, { content: C1_BIND, chatId: null });
   assert.equal(r.status, 0, r.stdout + r.stderr);
   const rec = c1Only(f, "bound-");
   assert.equal(rec.status, "bound");
@@ -22083,6 +22089,103 @@ test("PK3-C1-fix1 T6：store 损坏 + legacy 投影同时失败 → 影子仍记
     assert.equal(rec2.subscription_claim_shadow.candidate_reason, SUBSCRIPTION_REJECT.CONTROL_PLANE_INVALID);
     assert.equal(rec2.subscription_claim_shadow.match, null);
   } finally { fs.rmSync(g.local, { recursive: true, force: true }); }
+});
+
+// ── PK3-C1b：影子的 chat 证据接 env（真机样本 S1） ─────────────────────────────────────────────
+// 2026-09-16T12:18Z：Frank 在第二群 @M5Claude。legacy 判 chat_mismatch 拒（对），影子却 accepted
+//（配到模板群那份 pending），scope_unverified=["chat_id"]。根因是两条路用了**不同的证据源**：
+// legacy 用 env.AILY_CLI_CHANNEL_CHAT_ID（channel-locator-verdict.md §2 已裁定它就是飞书 chat_id），
+// 影子写死 null。这里把影子接到同一个来源；权威面一行不动。
+// T1/T3/T4 是效果与守恒；T2 是 S1 那条真机样本（**修前必须红**）。
+test("PK3-C1b T1 env chat = 模板群、模板群有 1 份 pending → 候选收敛到模板群订阅、scope_unverified 空、与 legacy 一致", () => {
+  const f = c1Fixture("c1bt1", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  try {
+    c1WriteStore(f, c1StoreDoc([c1Entry({ root: f.roots[0], chatId: "oc_a" })]));
+    const r = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const rec = c1Only(f, "bound-");
+    const sh = rec.subscription_claim_shadow;
+    assert.deepEqual(sh.scope_unverified, [], "chat 证据已核到 → 不许再记未核验：" + JSON.stringify(sh));
+    assert.equal(sh.match, true, JSON.stringify(sh));
+    assert.equal(sh.candidate_subscription_id, c1SubId(f.roots[0], "oc_a"), "收敛到模板群那份订阅");
+    assert.deepEqual(sh.control_plane, { present: true, subscriptions: 1, problems: [] });
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
+test("PK3-C1b T2【S1 真机样本】控制面在第二群、env chat = 第二群、pending 只在模板群 → 影子 NO_PENDING_BINDING；legacy chat_mismatch", () => {
+  const f = c1Fixture("c1bt2", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  try {
+    // 第二群那份订阅来自控制面（同域另一群），模板群那份是 legacy 投影
+    c1WriteStore(f, c1StoreDoc([
+      c1Entry({ root: f.roots[0], chatId: "oc_a" }), c1Entry({ root: f.roots[0], chatId: "oc_b" }),
+    ]));
+    // S1 那条真机样本带绑定码（不带码的话 legacy 根本走不到 chat 维）：token 在本群候选里没有命中
+    // → selector 给的是 binding_token_unknown（票面写的是 NO_PENDING_BINDING，那是**不带码**那条路；
+    //   下一段补上，两种形状都钉住）。修前两者都是 accepted —— 那才是 S1 的 fail-open。
+    const r = c1Run(f, { content: C1_BIND, chatId: "oc_b", messageId: "om_c1b_t2a" });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const rec = c1Only(f, "unrouted-om_c1b_t2a");
+    assert.equal(rec.reason, PROMOTE_REJECT.CHAT_MISMATCH, "权威照旧：chat 维不匹配就拒：" + JSON.stringify({ reason: rec.reason }));
+    const sh = rec.subscription_claim_shadow;
+    assert.equal(sh.candidate_reason, SUBSCRIPTION_REJECT.TOKEN_UNKNOWN,
+      "修前这条是 accepted（fail-open 配到模板群那份）—— 现在必须说「本群里没有这份绑定码」：" + JSON.stringify(sh));
+    assert.equal(sh.candidate_disposition, "rejected");
+    assert.equal(sh.disposition_match, true, "两侧都拒：" + JSON.stringify(sh));
+    assert.equal(sh.reason_match, false, "拒的理由不同（chat_mismatch ≠ binding_token_unknown），要如实报出来");
+    assert.deepEqual(sh.scope_unverified, [], "chat 证据来自 env，已核到：" + JSON.stringify(sh));
+    assert.deepEqual(sh.control_plane, { present: true, subscriptions: 2, problems: [] });
+    // 不带绑定码的同一条：chat 收敛后本群确实没有 pending → no_pending_binding
+    const r2 = c1Run(f, { content: C1_AT + "这条没有绑定码", chatId: "oc_b", messageId: "om_c1b_t2b" });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    const rec2 = c1Only(f, "unrouted-om_c1b_t2b");
+    assert.equal(rec2.reason, PROMOTE_REJECT.CHAT_MISMATCH, "权威照旧：" + JSON.stringify({ reason: rec2.reason }));
+    const sh2 = rec2.subscription_claim_shadow;
+    assert.equal(sh2.candidate_reason, SUBSCRIPTION_REJECT.NO_PENDING_BINDING,
+      "不带码时：本群没有待认领：" + JSON.stringify(sh2));
+    assert.equal(sh2.candidate_disposition, "rejected");
+    assert.equal(sh2.disposition_match, true);
+    assert.equal(sh2.reason_match, false);
+    assert.deepEqual(sh2.scope_unverified, []);
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
+test("PK3-C1b T3 env 缺 chat locator → 与 PK3-C1 现状逐字一致（scope_unverified 记 chat_id，不比不拒）", () => {
+  const f = c1Fixture("c1bt3", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  try {
+    const r = c1Run(f, { content: C1_BIND, chatId: null });   // 不注入 AILY_CLI_CHANNEL_CHAT_ID
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const rec = c1Only(f, "bound-");
+    const sh = rec.subscription_claim_shadow;
+    assert.deepEqual(sh.scope_unverified, ["chat_id"], "缺证据就如实记未核验：" + JSON.stringify(sh));
+    assert.equal(sh.match, true);
+    assert.equal(sh.candidate_subscription_id, c1SubId(f.roots[0], "oc_a"));
+    assert.deepEqual(sh.control_plane, { present: false, subscriptions: 0, problems: [] });
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
+});
+
+test("PK3-C1b T4 权威面零改动：同夹具同 root，env 带 chat / 不带 chat 各跑一遍 → 权威回执与登记表写回逐字节一致", () => {
+  const f = c1Fixture("c1bt4", [{ chatId: "oc_a", token: "aaaaaa" }]);
+  try {
+    const regBefore = fs.readFileSync(f.registryFile, "utf-8");
+    const r1 = c1Run(f, { content: C1_BIND, chatId: null });
+    assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+    const rec1 = c1Only(f, "bound-");
+    const reg1 = fs.readFileSync(f.registryFile, "utf-8");
+    fs.rmSync(path.join(f.local, ".claude"), { recursive: true, force: true });
+    fs.rmSync(path.join(f.roots[0], ".runtime-data"), { recursive: true, force: true });
+    fs.writeFileSync(f.registryFile, regBefore);
+    const r2 = c1Run(f, { content: C1_BIND, chatId: "oc_a" });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    const rec2 = c1Only(f, "bound-");
+    const reg2 = fs.readFileSync(f.registryFile, "utf-8");
+    const strip = (r) => { const { subscription_claim_shadow, recorded_at, ...rest } = r; return rest; };
+    assert.deepEqual(strip(rec2), strip(rec1), "权威回执除 shadow/时间戳外逐字节一致");
+    const stripIso = (x) => x.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/gu, "<TS>");
+    assert.equal(stripIso(reg2), stripIso(reg1), "登记表写回（除本次时间戳）逐字节一致");
+    // 对照：唯一变的确实是影子的 chat 证据
+    assert.deepEqual(rec2.subscription_claim_shadow.scope_unverified, []);
+    assert.deepEqual(rec1.subscription_claim_shadow.scope_unverified, ["chat_id"]);
+  } finally { fs.rmSync(f.local, { recursive: true, force: true }); }
 });
 
 test("FR-2.6 单 3：chat_name 1.0 拒 / 1.1 收、取值域封闭；身份与 chat_name 无关（id 哈希不进群名）；schema 同步 1.1 形状", () => {

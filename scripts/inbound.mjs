@@ -505,6 +505,9 @@ if (!routed.ok) {
     legacyPending: pending,
     legacyPromotion: promo,
     now: promotionNow,
+    // PK3-C1b：影子与 legacy 用**同一份** chat 证据（AILY_CLI_CHANNEL_CHAT_ID 由 daemon 注入到
+    // process.env，evaluatePromotion 默认吃的也是它）。这里显式传，免得以后换了一边忘了另一边。
+    env: process.env,
   });
 
   // 绑定没成不等于该拒：没有 pending / 多份 / 绑定码对不上 / 过期 / 发送者不是 owner → 落进 chat 默认态重新判

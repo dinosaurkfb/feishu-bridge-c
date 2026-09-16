@@ -879,6 +879,30 @@ test("Codex 首次认领 shadow 与现行绑定码选择一致且不写 task reg
   assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), before);
 });
 
+test("PK3-C1-fix1 T7：Codex shadow 回执不带 control_plane 键（共用比较器不许把 Claude 的诊断泼过去）（P1-2）", () => {
+  const home = temp();
+  const root = path.join(home, "same-project");
+  fs.mkdirSync(root);
+  const now = Date.parse("2026-08-22T08:00:00Z");
+  const a = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "5fba30", now });
+  const b = makeTaskEntry({ root, threadId: THREAD_B, name: "B", rootMessageId: "om_b", token: "62ca4f", now });
+  writeRegistryFixtureUnvalidated([a, b], path.join(home, "registry.json"));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = { message_id: "msg_shadow_c1", session_id: "session_shadow", sender_id: TEMPLATE.frank_sender_id,
+    created_at_ms: now - 1000, content: '<at id="ou_same">M5Codex</at>\n> 绑定码  62ca4f' };
+  const pending = findPendingTask({ home, content: event.content, now });
+  const legacy = evaluatePromotion({ event, template: TEMPLATE, pending, now });
+  const shadow = shadowCodexFirstClaim({ event, template: TEMPLATE, callerAgentUid: TEMPLATE.agent_uid,
+    legacyPending: pending, legacyPromotion: legacy, home, now });
+  assert.equal(shadow.match, true, "夹具自证：这条 shadow 真跑了比较（而不是撞上 invalid 才没键）");
+  assert.equal(Object.hasOwn(shadow, "control_plane"), false,
+    "Codex shadow 的键集不许变（Claude 的控制面诊断不该沏进来）：" + JSON.stringify(Object.keys(shadow)));
+  // 键集逐字钉住：少一个 / 多一个都拒
+  assert.deepEqual(Object.keys(shadow).sort(), ["candidate_disposition", "candidate_reason", "candidate_subscription_id",
+    "disposition_match", "legacy_disposition", "legacy_reason", "match", "mode", "reason_match", "route_match",
+    "schema_version", "scope_unverified", "target_match"], JSON.stringify(shadow));
+});
+
 test("P1-3①：Codex 认领四维真核——evaluatePromotion 产出封闭 F4（matched_om=generation 根消息 om）；chat 维不匹配→拒；无 AILY 群 env→照常放行", () => {
   const home = temp();
   const root = path.join(home, "same-project");

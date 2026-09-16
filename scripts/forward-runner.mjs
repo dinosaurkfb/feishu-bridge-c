@@ -222,23 +222,27 @@ function probeClaudeVersion(exePath) {
 }
 
 /**
- * 选一个能用的二进制：
- *   ① 逐个候选探版本，第一个**达标**的胜出（不再看 PATH 顺序）；
- *   ② 都不达标但至少有一个版本读得出 → version_unsupported（带那条版本）；
- *   ③ 一个候选都没有 → not_found（旧路径）；
- *   ④ 有候选但版本读不出 → 用第一个，照旧起进程（**不猜**：真坏了也有失败回执如实收口）。
+ * 选一个能用的二进制。**判据不是「有没有看到过旧版本」，而是「能不能证明它们都过旧」**：
+ *   ① 任一候选探出**达标**版本 → 用它（优先选确实能干活的那个）；
+ *   ② 否则，只要有候选**版本读不出**（unknown）→ 用那个 unknown 照旧启动 —— 读不出不等于过旧，
+ *      前检只捕自己看得懂的错，硬拦会把「其实能用」的那份也一并掩掉；
+ *   ③ 只有**所有可执行候选都探出了版本且都低于下限**时才 version_unsupported（带那条版本）；
+ *   ④ 一个候选都没有 → not_found（旧路径）。
+ * 用例把 unknown→old 与 old→unknown 两个顺序都钉住了（PK3-F140-fix2 P1）。
  */
 export function pickClaude(candidates) {
-  let old = null;
+  if (candidates.length === 0) return { ok: false, reason: "not_found" };
+  let unknown = null;   // 版本读不出的第一个候选
+  let old = null;       // 明确低于下限的第一个候选（报版本用）
   for (const exe of candidates) {
     const version = probeClaudeVersion(exe);
-    if (version === null) continue;
+    if (version === null) { if (unknown === null) unknown = exe; continue; }
     if (!claudeVersionBelow(version, MIN_FORWARD_CLAUDE_VERSION)) return { ok: true, path: exe, version };
     if (old === null) old = { path: exe, version };
   }
-  if (old !== null) return { ok: false, reason: "version_unsupported", path: old.path, version: old.version };
-  if (candidates.length === 0) return { ok: false, reason: "not_found" };
-  return { ok: true, path: candidates[0], version: null };
+  if (unknown !== null) return { ok: true, path: unknown, version: null };
+  // 走到这里：每个候选都读出了版本且都低于下限（old 必非空）
+  return { ok: false, reason: "version_unsupported", path: old.path, version: old.version };
 }
 
 /** result 行 / init 行。坏行跳过 —— 坏行造成的 result 缺席自然按 crash 投影。 */

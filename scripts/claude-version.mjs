@@ -47,9 +47,12 @@ export function forwardVersionUnsupportedText(version) {
   return OLD_PREFIX + version + OLD_SUFFIX;
 }
 
-/** 反解：正文必须逐字等于「模板 + 某条严格版本 token」，否则不认（回执封闭校验器用）。 */
+/** 反解：正文必须逐字等于「模板 + 某条严格版本 token」**且那条版本真的低于下限**，否则不认。
+ *  只验三段数字不够（Codex 一轮 P2）：「本机 claude 版本 9.9.9 过旧」这种自相矛盾的正文
+ *  形状完全合法，读端/审计会当真；这里把写端同一个 claudeVersionBelow 再跑一遍。 */
 export function forwardVersionUnsupportedVersionOf(text) {
   if (typeof text !== "string" || !text.startsWith(OLD_PREFIX) || !text.endsWith(OLD_SUFFIX)) return null;
   const v = text.slice(OLD_PREFIX.length, text.length - OLD_SUFFIX.length);
-  return isClaudeVersionToken(v) ? v : null;
+  if (!isClaudeVersionToken(v)) return null;
+  return claudeVersionBelow(v) ? v : null;
 }

@@ -82,6 +82,8 @@ import {
   routableProjectsForRoot,
 } from "./registry.mjs";
 import * as outboxModule from "./outbox.mjs";
+// PK3-F140：版本前检的叶子模块（回执正文的模板/反解在写端与读端共用这一份）
+import * as claudeVersion from "./claude-version.mjs";
 import {
   MAX_AUTO_PUBLISH_ATTEMPTS, appendEvent, auditOutbox, classifyOutboxRecord,
   codexReplyEventKey, composeDigest, explainabilityGaps,
@@ -42146,6 +42148,76 @@ test("PK3-F140 T1 真入口：转发失败 → 受理回执只说「正在转发
   assert.equal(fs.readFileSync(registryFile, "utf-8"), regBefore, "转发不写登记表");
   assert.equal(treeOf(path.join(local, ".claude", "feishu-bridge")), maintTreeBefore, "转发不写账本/维护目录");
   fs.rmSync(local, { recursive: true, force: true });
+});
+
+// PK3-F140-fix2 P1（Codex 一轮）：**不能证明所有候选都过旧时不许硬拦**。
+// 「版本读不出」和「确认过旧」是两回事：前检只能捕自己看得懂的错，看不懂的那个候选
+// 照旧启动（真坏了由失败回执如实收口）。两个候选顺序都要钉：unknown→old 与 old→unknown。
+test("PK3-F140-fix2 P1：候选里有一个版本读不出、另一个旧 → 不许硬拦，用那个读不出的照旧启动", () => {
+  // unknown→old：~/.local 那份读不出版本（可执行、但 --version 无声），PATH 上是可解析的旧版
+  const fa = f140Fixture("p1a");
+  try {
+    const localLog = path.join(fa.local, "local-argv.jsonl");
+    const pathLog = path.join(fa.local, "path-argv.jsonl");
+    fs.writeFileSync(path.join(fa.localBin, "claude"), f140Shim(localLog, null), { mode: 0o700 });
+    fs.writeFileSync(path.join(fa.pathBin, "claude"), f140Shim(pathLog, "2.1.248 (Claude Code)"), { mode: 0o700 });
+    const keyA = r54Key(65);
+    f140Deliver(fa, keyA);
+    const ra = r54WaitResult(path.join(fa.runs, keyA + ".forward.result.json"));
+    assert.ok(ra && ra.sent === true, "读不出版本不是「确定过旧」→ 照旧启动：" + JSON.stringify(ra));
+    assert.equal(ra.claude_path, path.join(fa.localBin, "claude"), "用的是那个 unknown 候选（不是被跳过后硬拦住）");
+    assert.equal(fs.existsSync(path.join(fa.outbox, keyA + R58_RECEIPT_SUFFIX)), false, "没有失败回执（根本没拦）");
+  } finally { fs.rmSync(fa.local, { recursive: true, force: true }); }
+  // old→unknown：~/.local 那份是明确可解析的旧版，PATH 上那个读不出版本 —— 同样不许硬拦
+  const fb = f140Fixture("p1b");
+  try {
+    const localLog = path.join(fb.local, "local-argv.jsonl");
+    const pathLog = path.join(fb.local, "path-argv.jsonl");
+    fs.writeFileSync(path.join(fb.localBin, "claude"), f140Shim(localLog, "2.1.248 (Claude Code)"), { mode: 0o700 });
+    fs.writeFileSync(path.join(fb.pathBin, "claude"), f140Shim(pathLog, null), { mode: 0o700 });
+    const keyB = r54Key(66);
+    f140Deliver(fb, keyB);
+    const rb = r54WaitResult(path.join(fb.runs, keyB + ".forward.result.json"));
+    assert.ok(rb && rb.sent === true, "有 unknown 候选就不硬拦：" + JSON.stringify(rb));
+    assert.equal(rb.claude_path, path.join(fb.pathBin, "claude"), "unknown 优先于「确定过旧」");
+    assert.equal(fs.existsSync(path.join(fb.outbox, keyB + R58_RECEIPT_SUFFIX)), false, "没有失败回执（根本没拦）");
+  } finally { fs.rmSync(fb.local, { recursive: true, force: true }); }
+});
+
+// PK3-F140-fix2 P2（Codex 一轮）：第五类回执正文只验形状不够 —— 版本必须**真的**低于下限，
+// 否则「版本 9.9.9 过旧」这种自相矛盾的正文会被当成合法回执收下（读端/审计会信它）。
+test("PK3-F140-fix2 P2：版本过旧回执正文必须真的低于下限——9.9.9 冒充 → 封闭校验器拒", () => {
+  const key = r54Key(67);
+  const bogus = r58ReceiptDoc(key, { text: claudeVersion.forwardVersionUnsupportedText("9.9.9") });
+  assert.equal(outboxModule.forwardFailureReceiptProblem(bogus, { expectedKey: key }), "text 不是固定文案",
+    "达标版本不许冒充「过旧」正文");
+  assert.equal(claudeVersion.forwardVersionUnsupportedVersionOf(bogus.text), null, "反解端也要拒（两个方向同源）");
+  // 走共用审计与发布器：规范文件名、字段互相自洽，唯一缺陷是正文自称「9.9.9 过旧」
+  const p = r58Project("f140p2");
+  const key2 = r54Key(68);
+  const body = r58FailedBody(key2, "API Error: 400 z", p.rel);
+  fs.writeFileSync(path.join(p.runsDir, key2 + ".forward.result.json"), body, { mode: 0o600 });
+  fs.writeFileSync(path.join(p.outbox, key2 + R58_RECEIPT_SUFFIX),
+    JSON.stringify(r58ReceiptDoc(key2, { text: claudeVersion.forwardVersionUnsupportedText("9.9.9"), result_sha256: r58ShaOf(body) }), null, 2) + "\n", { mode: 0o600 });
+  const audit = outboxModule.auditOutbox(p.outbox);
+  const bad2 = audit.unexplainable.find((u) => u.file === key2 + R58_RECEIPT_SUFFIX);
+  assert.ok(bad2, "审计解释不了这条正文：" + JSON.stringify(audit.unexplainable));
+  assert.match(String(bad2.why), /不是固定文案/u, "why 点名正文没过封闭校验：" + bad2.why);
+  const dp = drainProject({ root: p.root, dryRun: true });
+  assert.equal(dp.status, "error", "发布 dry-run fail-closed（不发一条伪造的「过旧」）：" + JSON.stringify({ status: dp.status, reason: dp.reason }));
+  assert.equal(dp.records?.length ?? 0, 0, "不冒充「已经发过了」：" + JSON.stringify(dp.records));
+  // 对照：同一条路 + **真的**过旧的版本 → 审计收、发布器进队列（证明上面拦的是「不低于下限」）
+  const p2 = r58Project("f140p2ok");
+  const key3 = r54Key(69);
+  const body2 = r58FailedBody(key3, "API Error: 400 z", p2.rel);
+  fs.writeFileSync(path.join(p2.runsDir, key3 + ".forward.result.json"), body2, { mode: 0o600 });
+  fs.writeFileSync(path.join(p2.outbox, key3 + R58_RECEIPT_SUFFIX),
+    JSON.stringify(r58ReceiptDoc(key3, { text: claudeVersion.forwardVersionUnsupportedText("2.1.248"), result_sha256: r58ShaOf(body2) }), null, 2) + "\n", { mode: 0o600 });
+  assert.deepEqual(outboxModule.auditOutbox(p2.outbox).unexplainable, [], "真过旧的那条审计必须收");
+  const ok = drainProject({ root: p2.root, dryRun: true });
+  assert.equal(ok.status, "dry_run", "对照：正常进队列：" + JSON.stringify({ status: ok.status, reason: ok.reason }));
+  assert.equal(ok.count, 1, "对照：进队列的就是它");
+  assert.equal(outboxModule.forwardFailureText("version_unsupported", "2.1.248"), claudeVersion.forwardVersionUnsupportedText("2.1.248"), "写端产物就是受验通过的那份");
 });
 
 test("PK3-F140 前检·二进制解析：~/.local/bin/claude 压过 PATH 上先出现的旧版（#140 根因就是 PATH 顺序）", () => {

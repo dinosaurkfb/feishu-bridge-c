@@ -167,6 +167,13 @@ export function bindingsForRoot({ root, registryFile } = {}) {
 }
 
 /** 人类可读的状态摘要。刻意不打印任何 locator（话题 id、session id 全长、凭据）。 */
+/** 暂停后的恢复提示 —— **一处、按绑定级别分流**（PK2-W3-fix8）：feishu-unbind 的预演、--apply
+ *  结尾的状态打印（describeStatus 挂起尾行）都调它，两处不再各写一份（旧版 --apply 尾行写死
+ *  bind-project，会话级绑定照它跑会走错支）。 */
+export const resumeHint = (st) => (st.level === "session"
+  ? "在**这条工作线的会话里**跑 node scripts/bind-session.mjs --apply（复用原话题，不新建）"
+  : "node scripts/bind-project.mjs --apply（复用原话题，不新建）");
+
 export function describeStatus(st, others = [], { now = Date.now() } = {}) {
   if (!st.ok) {
     if (st.reason === "not_bound") {
@@ -218,6 +225,6 @@ export function describeStatus(st, others = [], { now = Date.now() } = {}) {
     }
   }
 
-  if (st.suspended) lines.push("", "恢复：node scripts/bind-project.mjs --apply（会复用原话题，不新建）");
+  if (st.suspended) lines.push("", "恢复：" + resumeHint(st));
   return lines.join("\n");
 }

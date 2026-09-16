@@ -17,7 +17,7 @@ import os from "node:os";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 import {
-  SUSPENDED, bindingsForRoot, currentBinding, describeStatus, setBindingStatus,
+  SUSPENDED, bindingsForRoot, currentBinding, describeStatus, resumeHint, setBindingStatus,
 } from "./feishu-control.mjs";
 import { loadClaudeTopicBinding } from "./topic-generation-store.mjs";
 import { activeGeneration } from "./topic-generation.mjs";
@@ -53,9 +53,7 @@ console.log("暂停之后：");
 console.log("  · 出站停发，进展**留在本地**（现有 " + st.pending + " 条），恢复后一并发出");
 console.log("  · 入站一律拒绝，话题里发指令会收到明确的拒绝回执");
 console.log("  · 话题、历史、登记、回执**全部保留**，不删任何东西，也不往飞书发消息");
-console.log("  · 恢复：" + (st.level === "session"
-  ? "在**这条工作线的会话里**跑 node scripts/bind-session.mjs --apply（复用原话题，不新建）"
-  : "node scripts/bind-project.mjs --apply（复用原话题，不新建）"));
+console.log("  · 恢复：" + resumeHint(st));   // PK2-W3-fix8：与 --apply 结尾共用一处（按 st.level 分流）
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没做。加 --apply 才真的暂停。");

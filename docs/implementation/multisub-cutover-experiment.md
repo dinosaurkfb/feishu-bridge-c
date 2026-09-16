@@ -39,5 +39,5 @@
 
 | 单 | 难度 | 内容 |
 |---|---|---|
-| C1 shadow 接控制面 | S | shadowClaudeFirstClaim 模型构造加 controlPlane + 回归断言（权威面零改动） |
+| C1 shadow 接控制面 | S | shadowClaudeFirstClaim 模型构造加 controlPlane + 回归断言（权威面零改动）—— **已落地（PR #210）**：store 缺席/空 = 与 main 逐字节一致；读不出/校验不过 = 记 `control_plane_invalid` 且不比对；影子回执多一个只读诊断 `control_plane{present,subscriptions,problems}`；权威面零改动 |
 | C2 实验执行手册 | — | 本文档 §3 步骤逐条执行（主会话 + Frank 配合），产出切流评估文档 |

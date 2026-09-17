@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import { displaySafe } from "./display-safe.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -167,7 +168,7 @@ function ackText(kind, detail) {
       // issue #140：转发是 fire-and-forget（spawn 即返回），结果要等 forward-runner 落盘才知道 ——
       // 回执不许冒充送达（2026-09-08 三条消息拿到送达回执、转发进程秒退、消息从未到达会话）。
       // 措辞里的旧字样已被 R54 测试用 git grep 级全仓扫描禁止 —— 注释里也不许再出现。
-      live_session: "正在转发到你正开着的会话（" + detail.targetName + "）；转发结果落在运行目录，doctor 可查",
+      live_session: "正在转发到你正开着的会话（" + detail.targetName + "）（跨会话转发，附凭证）；转发结果落在运行目录，doctor 可查",
       resume: "已续起本话题绑定的那条会话，后台执行",
       continue: "已起一轮后台执行（沿用本项目最近的对话）",
       reply_only: "已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）",
@@ -515,9 +516,12 @@ if (!routed.ok) {
   if (!promo.ok && CHAT_FALLBACK_REASONS.includes(promo.reason) && !expiredSettledAuthoritative) chatTurn({ chain: "claude", template, event, dryRun, ledgerDir: path.join(UNROUTED_RT, "chat-claims") });
 
   if (!promo.ok) {
+    const unroutedSenderRole = senderRole({ frank_sender_id: template?.frank_sender_id, senders: template?.senders }, event?.sender_id);
     writeReceipt("unrouted-" + (event.message_id ?? "unknown") + "-" + Date.now(), {
       status: "rejected", reason: promo.reason, reason_text: promo.reasonText,
       message_id: event.message_id ?? null, session_id: event.session_id ?? null,
+      sender_id: event?.sender_id ?? null,
+      sender_role: unroutedSenderRole ?? null,
       claim_acquired: false, handed_off: false,
       subscription_claim_shadow: subscriptionClaimShadow,
     });
@@ -804,11 +808,17 @@ if (dryRun) {
 
 if (verdict.decision === "reject") {
   const policyOutcome = handlePolicy();
+  const rejectSenderRole = senderRole({
+    frank_sender_id: mapping?.frank_sender_id ?? bootTpl.template?.frank_sender_id,
+    senders: config?.senders ?? bootTpl.template?.senders,
+  }, event?.sender_id);
   writeReceipt("reject-" + (event?.message_id ?? "unknown") + "-" + Date.now(), {
     status: "rejected",
     reason: verdict.reason,
     reason_text: verdict.reasonText,
     message_id: event?.message_id ?? null,
+    sender_id: event?.sender_id ?? null,
+    sender_role: rejectSenderRole ?? null,
     project_root: routed.root,
     binding_source: routed.source,
     claim_acquired: false,
@@ -851,7 +861,9 @@ const risk = classifyRisk({ intent, mode: policyEvaluation.policy_id });
 authz = authorize({ role: senderRoleValue, riskClass: risk.riskClass, mode: policyEvaluation.policy_id, chain: "claude" });
 if (!authz.allow) {
   writeReceipt("authz-" + verdict.messageId, {
-    status: "rejected", reason: "not_authorized", authz_reason: authz.reason, role: senderRoleValue, risk_class: risk.riskClass, risk_kind: risk.kind,
+    status: "rejected", reason: "not_authorized", authz_reason: authz.reason, role: senderRoleValue,
+    sender_id: event?.sender_id ?? null, sender_role: senderRoleValue ?? null,
+    risk_class: risk.riskClass, risk_kind: risk.kind,
     policy_id: policyEvaluation.policy_id, required_roles: authz.required, message_id: verdict.messageId, project_root: routed.root, binding_source: routed.source, claim_acquired: false, handed_off: false,
   });
   finish("rejected", { reasonText: authz.text, taskName: config.task_display_name }, { reason: "not_authorized", authz_reason: authz.reason, risk_class: risk.riskClass });
@@ -1222,6 +1234,9 @@ const reserveDialogue = (runtimeTargetId, { beforeReject = null } = {}) => {
   return outcome;
 };
 
+const deliveryNonce = crypto.randomBytes(16).toString("hex");
+const receiptRelPath = ".runtime-data/inbound/receipts/accepted-" + verdict.messageId + ".json";
+let bodySha256;
 let run;
 
 if (target && !replyOnly) {
@@ -1229,12 +1244,68 @@ if (target && !replyOnly) {
   // 也不需要守望者 —— 那个会话结束时它自己的 Stop 钩子会把进展发出去。
   try {
     if (dialogueMode) policyRun = reserveDialogue(target.sessionId);
+    const rawInstruction = dialogueMode
+      ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
+        policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
+      : policyRun.runRequest.userInput;
+    bodySha256 = crypto.createHash("sha256").update(rawInstruction, "utf-8").digest("hex");
+
+    // 幂等列表独立放 sidecar
+    appendConsumed(routed.root, verdict.messageId, {
+      claudeSessionId: routed.mapping?.claude_session_id ?? null,
+      seed: mapping.consumed_message_ids ?? [],
+    });
+
+    const topicActivity = recordClaudeActivityAndMaybeRotate({
+      root: routed.root,
+      claudeSessionId: routed.mapping?.claude_session_id ?? null,
+      generationId: policyRun.runRequest.origin.channelGenerationId,
+      eventKey: "inbound:claude:" + verdict.messageId,
+      messageDelta: 1,
+    });
+
+    const runLogPath = path.join(RUNS, policyRun.runRequest.runId + ".forward.jsonl");
+
+    // PK3-A1-fix1 P2-2：回执必须在触发 forward 之前落盘且可读，保证目标会话收到消息核验时回执已在
+    writeReceipt("accepted-" + verdict.messageId, {
+      status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+      sender_id: event?.sender_id ?? null,
+      sender_role: senderRoleValue ?? null,
+      body_sha256: bodySha256,
+      delivery_nonce: deliveryNonce,
+      run_id: policyRun.runRequest.runId,
+      local_target_id: policyRun.runRequest.localTargetId,
+      origin_channel_generation_id: policyRun.runRequest.origin.channelGenerationId,
+      policy_id: policyRun.policy_id,
+      policy_version: policyRun.policy_version,
+      policy_disposition: policyRun.disposition,
+      ...(dialogueMode ? {
+        dialogue_id: policyRun.runRequest.policy.dialogue_id,
+        dialogue_turn_index: policyRun.runRequest.policy.turn_index,
+      } : {}),
+      ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
+      project_root: routed.root, binding_source: routed.source,
+      binding_level: boundSession ? "session" : "project",
+      bound_claude_session_id: boundSession,
+      claim_acquired: true, handed_off: true, completion_observed: false,
+      completion_owner: "outbound_publisher",
+      run_log: runLogPath,
+      envelope_attempts: fetched.attempts ?? 1,
+      delivery_mode: "live_session",
+      target_session_id: target.sessionId ?? null,
+      target_session_name: target.name ?? null,
+      topic_activity: topicActivity.ok ? {
+        counted: topicActivity.counted === true,
+        message_count: topicActivity.messageCount ?? null,
+        auto_rotation_requested: topicActivity.shouldAutoRotate === true,
+        auto_rotation_launched: topicActivity.rotationLaunch?.ok ?? null,
+      } : { counted: false, reason: topicActivity.reason },
+      ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
+    });
+
     run = deliverToLiveSession({
       target,
-      instruction: dialogueMode
-        ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
-          policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
-        : policyRun.runRequest.userInput,
+      instruction: rawInstruction,
       messageId: verdict.messageId,
       createdAtMs: event.created_at_ms,
       projectRoot: config.project_dir,
@@ -1244,8 +1315,23 @@ if (target && !replyOnly) {
       // 落点跟绑定走（会话级绑定 → outbox-<sid>），与该会话 Stop 钡排空的是同一个目录。
       outboxDir: outboxDirOf(config.project_dir, boundSession),
       originGenerationId: policyRun.runRequest.origin.channelGenerationId,
+      deliveryNonce,
+      bodySha256,
+      receiptRelPath,
     });
+
+    recordClaimState({
+      claimsDir: CLAIMS, key: claim.key, state: "handed_off",
+      detail: { pid: run.pid, log_path: run.logPath, started_at: run.startedAt },
+    });
+
+    finish("accepted", {
+      taskName: config.task_display_name, messageId: verdict.messageId, key: claim.key,
+      mode: run.mode, targetName: run.targetName,
+    }, { claim_key: claim.key, run_log: run.logPath, delivery_mode: run.mode });
   } catch (err) {
+    const receiptFile = path.join(RECEIPTS, "accepted-" + verdict.messageId + ".json");
+    try { fs.rmSync(receiptFile, { force: true }); } catch {}
     if (dialogueMode) {
       finalizeClaudeDialogueTurn({
         root: routed.root, claudeSessionId: boundSession, runId: claim.key,
@@ -1315,13 +1401,18 @@ if (target && !replyOnly) {
         beforeReject: () => { if (!replyOnly) releaseSessionLock(LOCK); },
       });
     }
+    const rawInstruction = dialogueMode
+      ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
+        policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
+      : policyRun.runRequest.userInput;
+    bodySha256 = crypto.createHash("sha256").update(rawInstruction, "utf-8").digest("hex");
     const stamped = stampInstruction({
-      instruction: dialogueMode
-        ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id + " · turn " +
-          policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
-        : policyRun.runRequest.userInput,
+      instruction: rawInstruction,
       messageId: verdict.messageId,
       createdAtMs: event.created_at_ms,
+      deliveryNonce,
+      bodySha256,
+      receiptRelPath,
     });
     // 投递层只看 runRequest 里的 capability，不重新判角色
     if (policyRun.runRequest.capability !== capability) throw new Error("runRequest 的执行边界与授权结果不一致");
@@ -1388,6 +1479,10 @@ const topicActivity = recordClaudeActivityAndMaybeRotate({
 
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+  sender_id: event?.sender_id ?? null,
+  sender_role: senderRoleValue ?? null,
+  body_sha256: bodySha256,
+  delivery_nonce: run.deliveryNonce ?? deliveryNonce,
   run_id: policyRun.runRequest.runId,
   local_target_id: policyRun.runRequest.localTargetId,
   origin_channel_generation_id: policyRun.runRequest.origin.channelGenerationId,

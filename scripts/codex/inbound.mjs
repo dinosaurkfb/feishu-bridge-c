@@ -2,6 +2,7 @@
 /** M5Codex 唯一入站入口：确定性校验、原子 claim、精确 thread 非阻塞投递、秒级回执（唯一例外：无绑定上下文的 chat 默认态是有预算的同步回答，contract §14c）。 */
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import { displaySafe } from "../display-safe.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -408,8 +409,12 @@ if (!routed.ok) {
     // 措辞（如「没有真实 @ M5Codex」），按 promotion 标出的 off_template_hint 把 hint 接上。
     const reasonText = (REASON_TEXT[promotion.reason] ?? promotion.reason) +
       (promotion.off_template_hint ? OFF_TEMPLATE_HINT : "");
+    const unroutedSenderRole = senderRole({ frank_sender_id: template?.template?.frank_sender_id, senders: template?.template?.senders }, event?.sender_id);
     writeReceipt("unrouted-" + (event.message_id ?? Date.now()), {
       status: "rejected", reason: promotion.reason, claim_acquired: false, handed_off: false,
+      message_id: event.message_id ?? null,
+      sender_id: event?.sender_id ?? null,
+      sender_role: unroutedSenderRole ?? null,
       subscription_claim_shadow: subscriptionClaimShadow,
     });
     if (dryRun) finish("rejected", { reasonText: "[dry-run] " + reasonText, taskName: null },
@@ -553,8 +558,14 @@ if (dryRun) {
 
 if (verdict.decision === "reject") {
   const policyOutcome = handlePolicy();
+  const rejectSenderRole = senderRole({
+    frank_sender_id: routed.mapping?.frank_sender_id ?? template?.template?.frank_sender_id,
+    senders: routed.config?.senders ?? template?.template?.senders,
+  }, event?.sender_id);
   writeReceipt("reject-" + (event.message_id ?? Date.now()), {
     status: "rejected", reason: verdict.reason, message_id: event.message_id,
+    sender_id: event?.sender_id ?? null,
+    sender_role: rejectSenderRole ?? null,
     logical_task_key: task.logical_task_key, claim_acquired: false, handed_off: false,
     policy_id: policyOutcome.policy_id,
     policy_version: policyOutcome.policy_version,
@@ -926,8 +937,17 @@ const topicActivity = recordCodexActivityAndMaybeRotate({
   eventKey: "inbound:codex:" + verdict.messageId,
   messageDelta: 1,
 });
+const rawInstruction = (dialogueMode ? "[Dialogue · " + policyRun.runRequest.policy.dialogue_id +
+  " · turn " + policyRun.runRequest.policy.turn_index + "]\n" : "") + policyRun.runRequest.userInput;
+const bodySha256 = crypto.createHash("sha256").update(rawInstruction, "utf-8").digest("hex");
+const deliveryNonce = crypto.randomBytes(16).toString("hex");
+
 writeReceipt("accepted-" + verdict.messageId, {
   status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+  sender_id: event?.sender_id ?? null,
+  sender_role: senderRoleValue ?? null,
+  body_sha256: bodySha256,
+  delivery_nonce: deliveryNonce,
   run_id: policyRun.runRequest.runId,
   local_target_id: policyRun.runRequest.localTargetId,
   origin_channel_generation_id: policyRun.runRequest.origin.channelGenerationId,

@@ -475,6 +475,13 @@ function runForwardRunner(spec) {
     }), spec);
     return;
   }
+  // PK3-A1-fix1 P2-2：确保回执落盘可读后再起 claude 转发，避免现场会话接收凭证时遇 receipt_missing
+  if (spec.receiptPath) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !fs.existsSync(spec.receiptPath)) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
   const claudePath = picked.path;
 
   const out = fs.openSync(jsonlPath, "a");
@@ -532,7 +539,8 @@ if (isDirectRun(import.meta.url)) {
     // R58 可选字段：给了就必须成形（outboxDir 要拿去写文件， messageId/代际进回执记录）
     || (spec.outboxDir !== undefined && (typeof spec.outboxDir !== "string" || !path.isAbsolute(spec.outboxDir)))
     || (spec.messageId !== undefined && (typeof spec.messageId !== "string" || spec.messageId.length === 0))
-    || (spec.originGenerationId !== undefined && (typeof spec.originGenerationId !== "string" || spec.originGenerationId.length === 0));
+    || (spec.originGenerationId !== undefined && (typeof spec.originGenerationId !== "string" || spec.originGenerationId.length === 0))
+    || (spec.receiptPath !== undefined && (typeof spec.receiptPath !== "string" || !path.isAbsolute(spec.receiptPath)));
   if (bad) {
     process.stderr.write("forward-runner：spec 不对（需要 key/runsDir/projectRoot/targetName/prompt 的 JSON）\n");
     process.exit(2);

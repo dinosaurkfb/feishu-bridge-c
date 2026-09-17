@@ -9526,6 +9526,12 @@ test("Codex 真入口：off-template mismatch + 无 @ → 拒绝回执带诊断 
   assert.equal(mism.status, 0, mism.stdout + mism.stderr);
   assert.match(mism.stdout, /没有真实 @ M5Codex/u, "Codex 化措辞不变：" + mism.stdout);
   assert.match(mism.stdout, /诊断：本轮频道与登记群不一致/u, "hint 不许被本地重建文案丢掉：" + mism.stdout);
+  // PK3-A1-fix1 P2-1：未路由回执 sender_role 必须正确从 template.template 获取（owner → owner）
+  const unroutedReceiptFile = path.join(home, "receipts", "unrouted-msg_hint_1.json");
+  assert.equal(fs.existsSync(unroutedReceiptFile), true, "未路由回执应落盘");
+  const unroutedReceipt = JSON.parse(fs.readFileSync(unroutedReceiptFile, "utf-8"));
+  assert.equal(unroutedReceipt.sender_id, TEMPLATE.frank_sender_id);
+  assert.equal(unroutedReceipt.sender_role, "owner", "owner 的未路由回执 sender_role 必须为 owner，不可为 null：" + JSON.stringify(unroutedReceipt));
   const sameChat = run({ AILY_CLI_CHANNEL_CHAT_ID: TEMPLATE.chat_id });
   assert.match(sameChat.stdout, /没有真实 @ M5Codex/u, sameChat.stdout);
   assert.doesNotMatch(sameChat.stdout, /诊断：/u, "同群没有 mismatch，不许带 hint：" + sameChat.stdout);

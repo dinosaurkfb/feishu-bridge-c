@@ -364,14 +364,18 @@ const REAL_HOME = os.userInfo().homedir;
 const SANDBOXED = os.homedir() !== REAL_HOME;
 
 const launchctl = (args, { tolerate = false } = {}) => {
-  if (SANDBOXED) return { ok: false, skipped: true };
+  const injected = process.env.FEISHU_BRIDGE_LAUNCHCTL;
+  if (!injected) {
+    if (SANDBOXED) return { ok: false, skipped: true };
+  }
+  const bin = injected || "/bin/launchctl";
   try {
-    execFileSync("/bin/launchctl", args, { stdio: "pipe", timeout: 15_000 });
+    execFileSync(bin, args, { stdio: "pipe", timeout: 15_000 });
     return { ok: true };
   } catch (err) {
     // 失败要把**它说的话**带回来：卸载那一步要区分「本来就没有这个 job」与「真失败」。
     const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
-    if (!tolerate) console.error("  launchctl " + args.join(" ") + " 失败：" + text);
+    if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + text);
     return { ok: false, text, absent: absentJob(text) };
   }
 };
@@ -397,18 +401,18 @@ const systemctl = (args, { tolerate = false } = {}) => {
   }
 };
 
-const domain = "gui/" + process.getuid();
 /**
- * 跑计划里的一条命令。计划里的 `commands` 是**给人看的命令行**（首项是程序名，launchd 那条还带 `gui/<uid>`
+ * 跑计划里的一条命令。计划里的 `commands` 是**给人看的命令行**（首项是程序名，launchd 那条还带 `<uid>`
  * 占位符），直接拿去 execFileSync 会变成 `systemctl systemctl --user disable --now …` /
  * `launchctl launchctl bootout gui/<uid>/…` —— 两件都是静默失败（fix1 的卸载就是这么写的，所以那句
- * "已卸载"从来没真卸过）。执行只能走这里：去掉程序名、补齐真实 uid，二进制用本脚本自己的
- * （可以被 FEISHU_BRIDGE_SYSTEMCTL 注入替换）。
+ * "已卸载"从来没真卸过）。执行只能走这里：去掉程序名、对每个参数做子串替换补齐真实 uid，
+ * 二进制用本脚本自己的（可以被 FEISHU_BRIDGE_LAUNCHCTL / FEISHU_BRIDGE_SYSTEMCTL 注入替换）。
  */
 const timerCmd = (argv) => {
   const [program, ...rest] = argv;
   if (program !== "launchctl" && program !== "systemctl") throw new Error("兜底定时器计划里不认识的程序：" + program);
-  const args = rest.map((a) => (a === "gui/<uid>" ? domain : a));
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "";
+  const args = rest.map((a) => a.replaceAll("<uid>", uid));
   return program === "launchctl" ? launchctl(args, { tolerate: true }) : systemctl(args, { tolerate: true });
 };
 let launchNote;
@@ -458,8 +462,8 @@ if (uninstall) {
     fs.writeFileSync(f.path, f.text);
   }
   if (TIMER_PLAN.kind === "launchd") {
-    launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
-    const loaded = launchctl(["bootstrap", domain, TIMER_FILES[0].path]);
+    timerCmd(TIMER_PLAN.commands[0]); // bootout: 没装过时必然失败，正常
+    const loaded = timerCmd(TIMER_PLAN.commands[1]);
     launchNote = loaded.skipped
       // 说出来，别让人以为兜底装好了。沙箱安装不碰真实 launchd 是有意的，见 launchctl 处的说明。
       ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 launchd）"

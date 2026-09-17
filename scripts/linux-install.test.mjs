@@ -13,7 +13,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, timerKindFor } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, timerKindFor } from "./drain-schedule.mjs";
 import { claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan } from "./install-projection.mjs";
 import { runDoctor } from "./doctor.mjs";
 import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
@@ -420,4 +420,78 @@ test("fix2/P2 is-active 的 inactive 是**读到了状态**（installed_not_load
   assert.equal(unverifiable.ok, null, unverifiable.detail);
   assert.match(unverifiable.detail, /查不清/u);
   assert.match(unverifiable.detail, /Failed to connect to bus/u);
+});
+
+/** darwin 定时器夹具：沙箱 HOME + 注入 launchctl。 */
+function darwinTimerFixture() {
+  const base = tmpBase("pk3fix4-darwin-");
+  const home = path.join(base, "home");
+  const log = path.join(base, "calls.log");
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const plistFile = claudeDrainPlistPath(home);
+  // 假 launchctl：每次调用记一行 —— 调用参数 + **此刻 plist 文件还在不在**
+  const fake = (name, body) => {
+    const file = path.join(base, name);
+    fs.writeFileSync(file, "#!/bin/sh\nprintf '%s | %s\\n' \"$*\" \"$( [ -f '" + plistFile + "' ] && echo present || echo gone )\" >> \"$PK3_LOG\"\n" + body, { mode: 0o755 });
+    return file;
+  };
+  const ok = fake("launchctl-ok", "exit 0\n");
+  const fails = fake("launchctl-fails", "if [ \"$1\" = \"bootout\" ]; then echo 'Boot-out failed: 5: Input/output error' >&2; exit 1; fi\nexit 0\n");
+  const absent = fake("launchctl-absent", "if [ \"$1\" = \"bootout\" ]; then echo 'Could not find service \"com.frank.feishu-bridge-cc.drain\" in domain' >&2; exit 1; fi\nexit 0\n");
+  const env = (bin) => installerEnv(home, { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin", FEISHU_BRIDGE_LAUNCHCTL: bin, PK3_LOG: log });
+  return { home, log, plistFile, ok, fails, absent, env, readLog: () => (fs.existsSync(log) ? fs.readFileSync(log, "utf-8").trim().split("\n") : []) };
+}
+
+test("fix4/P1 Darwin 卸载 argv 钉：bootout 收到真实 uid 且不含字面量 <uid>，bootout 失败时不删 plist 退非零（子进程 + 注入 launchctl）", () => {
+  const fx = darwinTimerFixture();
+  assert.equal(runInstaller(fx.env(fx.ok), ["--apply"]).status, 0, "先装一次");
+  assert.ok(fs.existsSync(fx.plistFile), "装完 plist 在");
+
+  // ① 卸载成功：断言 argv 钉（真实 uid，无字面量 <uid>），且 plist 被删
+  const callsBefore = fx.readLog().length;
+  const un = runInstaller(fx.env(fx.ok), ["--uninstall", "--apply"]);
+  assert.equal(un.status, 0, un.stderr);
+  assert.equal(fs.existsSync(fx.plistFile), false, "正常卸载 plist 删掉了");
+  assert.match(un.stdout, /已卸载/u);
+  const uninstCalls = fx.readLog().slice(callsBefore);
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "";
+  assert.equal(uninstCalls.length, 1, "卸载阶段只调一次 bootout：" + JSON.stringify(uninstCalls));
+  assert.equal(uninstCalls[0], "bootout gui/" + uid + "/" + CLAUDE_DRAIN_LAUNCH_LABEL + " | present",
+    "bootout argv 钉：必须替换 <uid> 为真实 uid：" + uninstCalls[0]);
+  assert.equal(uninstCalls[0].includes("<uid>"), false, "不许带字面量 <uid>");
+
+  // ② bootout 真失败（非 absent）：不删 plist、退非零、不报已卸载
+  const fxFails = darwinTimerFixture();
+  assert.equal(runInstaller(fxFails.env(fxFails.ok), ["--apply"]).status, 0, "先装一次");
+  assert.ok(fs.existsSync(fxFails.plistFile), "装完 plist 在");
+  const unFails = runInstaller(fxFails.env(fxFails.fails), ["--uninstall", "--apply"]);
+  assert.notEqual(unFails.status, 0, "**bootout 失败必须退非零**");
+  assert.ok(fs.existsSync(fxFails.plistFile), "**一个文件都没删**（plist 仍在）：" + fxFails.plistFile);
+  assert.equal(/已卸载/u.test(unFails.stdout), false, "不许报已卸载");
+  assert.match(unFails.stdout + unFails.stderr, /Boot-out failed: 5: Input\/output error/u, "打印失败原因");
+  assert.match(unFails.stdout + unFails.stderr, /一个文件都没删/u);
+
+  // ③ bootout 报 absent（服务本来不存在）：正常删除 plist、报已卸载、退出 0
+  const fxAbsent = darwinTimerFixture();
+  assert.equal(runInstaller(fxAbsent.env(fxAbsent.ok), ["--apply"]).status, 0, "先装一次");
+  const unAbsent = runInstaller(fxAbsent.env(fxAbsent.absent), ["--uninstall", "--apply"]);
+  assert.equal(unAbsent.status, 0, unAbsent.stderr);
+  assert.equal(fs.existsSync(fxAbsent.plistFile), false, "「本来就没有」照旧删 plist");
+  assert.match(unAbsent.stdout, /已卸载/u);
+});
+
+test("fix4/P1 Darwin 安装 bootstrap argv 钉：bootstrap 收到真实 uid 且不含字面量 <uid>（子进程 + 注入 launchctl）", () => {
+  const fx = darwinTimerFixture();
+  const inst = runInstaller(fx.env(fx.ok), ["--apply"]);
+  assert.equal(inst.status, 0, inst.stderr);
+  assert.ok(fs.existsSync(fx.plistFile), "装完 plist 在");
+  assert.match(inst.stdout, /已加载/u);
+  const calls = fx.readLog();
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "";
+  const bootstrapCall = calls.find((l) => l.startsWith("bootstrap"));
+  assert.ok(bootstrapCall, "安装必须调过 bootstrap：" + JSON.stringify(calls));
+  assert.equal(bootstrapCall, "bootstrap gui/" + uid + " " + fx.plistFile + " | present",
+    "bootstrap argv 钉：必须替换 <uid> 为真实 uid：" + bootstrapCall);
+  assert.equal(bootstrapCall.includes("<uid>"), false, "不许带字面量 <uid>");
 });

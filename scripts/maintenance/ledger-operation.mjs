@@ -51,7 +51,7 @@ const LEDGER_FORWARD_PHASES = Object.freeze(["ledger_initializing", "ledger_cutt
 // 评审 P1-8：readlink 三态——只有 ENOENT 算“absent”（原本就没有）；EACCES / 其他 IO 是“unclear”（持有状态说不清，不许当“没有”）。
 const readlinkOrNull = (p) => { try { return { state: "value", value: fs.readlinkSync(p) }; } catch (err) { return err?.code === "ENOENT" ? { state: "absent", value: null } : { state: "unclear", value: null, why: String(err?.code ?? err?.message) }; } };
 const errText = (err) => String(err?.code ?? err?.message ?? err);
-const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
+const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node, platform: ctx.platform });
 // capability 只携带身份（token/kind/endpointId）；维护目录 / 门位置由 verifier 从 env 派生（评审 F1），不写自述路径
 const capabilityOf = (ctx, token, kind, endpointId) => ({ token, kind, endpointId });
 // 评审 P1-8：释放失败不许静默吞（release() 自身已包 try/catch，这里只兜“非函数 / 意外抛错”，失败如实报出）。
@@ -525,9 +525,9 @@ export function ledgerReopening(ctx, token, lease, env = process.env) {
         catch (err) { incomplete.push({ id: st.id, why: "plist 写回失败：" + errText(err) }); continue; }
       }
     }
-    const cur = timerPhase({ ...facts.timer, run: ctx.launchctl });
+    const cur = timerPhase({ ...facts.timer, run: ctx.launchctl, systemctl: ctx.systemctl });
     if (cur.phase === "loaded") continue;
-    const r = bootstrapTimer({ label: facts.timer.label, plistFile: facts.timer.plistFile, expect: facts.timer.expect, domain: ctx.domain, run: ctx.launchctl });
+    const r = bootstrapTimer({ ...facts.timer, domain: ctx.domain, run: ctx.launchctl, systemctl: ctx.systemctl });
     if (!r.ok) { incomplete.push({ id: st.id, why: "定时器恢复失败：" + r.why }); continue; }
     const f = noted("timer:" + chain + " 已恢复 loaded");
     if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };

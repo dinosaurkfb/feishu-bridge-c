@@ -5757,6 +5757,15 @@ test("launchd 核验要精确到完整参数 —— 跑 /bin/echo 的同名 job 
 });
 
 test("plist 必须是 macOS 真的能解析的 XML", () => {
+  if (process.platform !== "darwin") {
+    console.log("  跳过：无 plutil");
+    return;
+  }
+  const which = spawnSync("which", ["plutil"], { encoding: "utf-8" });
+  if (which.status !== 0) {
+    console.log("  跳过：无 plutil");
+    return;
+  }
   // 字符串断言只能证明"我写的字符串里有转义"。真解析才能证明 launchd 读得进去。
   const body = plistBody({ home: "/Users/a&b/工 作 <区>/o'brien",
     node: "/opt/homebrew/bin/node" });

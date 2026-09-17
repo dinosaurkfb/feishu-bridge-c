@@ -46,7 +46,7 @@ const SCRIPT_SHAPE = /^(codex\/)?[A-Za-z0-9_.-]+\.mjs$/u;
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 const errText = (err) => String(err?.code ?? err?.message ?? err);
 const readlinkOrNull = (p) => { try { return fs.readlinkSync(p); } catch { return null; } };
-const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
+const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node, platform: ctx.platform });
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
 const keysOf = (o) => Object.keys(o).sort().join(",");

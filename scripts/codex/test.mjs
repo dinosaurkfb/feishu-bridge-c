@@ -18,6 +18,7 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
+import { drainTimerText } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台
 import {
   classifyOutboxRecord, codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
@@ -10503,6 +10504,17 @@ test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext �
   const drift = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim(), ownerContext: { frankSenderId: "12345", senders: [], chatId: "oc_test", endpoint: "endpoint_" + "9".repeat(24) } });
   assert.equal(drift.ok, false, "② endpoint 漂移必须拒：" + JSON.stringify(drift));
   assert.equal(drift.reason, "select_endpoint_mismatch", "② " + drift.reason);
+});
+
+// ── PK3-L2：Codex 侧兜底定时器文案按平台（注入 platform 钉）──
+test("PK3-L2 兜底排空文案按平台：linux 说 systemd --user（不说 launchd）、darwin 说 launchd、其它说未实现", () => {
+  const linux = drainTimerText({ platform: "linux" });
+  assert.match(linux, /systemd --user/u, linux);
+  assert.doesNotMatch(linux, /launchd/u, linux);
+  const darwin = drainTimerText({ platform: "darwin" });
+  assert.match(darwin, /launchd/u, darwin);
+  const other = drainTimerText({ platform: "win32" });
+  assert.match(other, /没有实现|未实现/u, other);
 });
 
 sealSummary();

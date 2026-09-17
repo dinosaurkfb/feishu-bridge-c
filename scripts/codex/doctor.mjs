@@ -11,7 +11,7 @@ import { defaultRouteHandler } from "../inbound-routes.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { acceptsHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { SKILL_NAMES, auditSkills } from "./skill-content.mjs";
-import { PHASE_TEXT, serviceState } from "./drain-service.mjs";
+import { PHASE_TEXT, drainTimerText, serviceState } from "./drain-service.mjs"; // drainTimerText：PK3-L2 文案按平台
 
 import {
   bridgeHome, loadCodexTemplate, loadRegistry, registryFile,
@@ -220,13 +220,15 @@ try {
        svc.phase === "loaded_other" || svc.phase === "orphan" ||
        svc.phase === "plist_unreadable") ? false
     : null;
+  // PK3-L2：文案按平台出 —— linux 上不再出现「launchd 状态查不出来」这种误导。
+  const kindLine = drainTimerText() + "。";   // PK3-L2：文案按平台，同一处派生（drain-service 库）
   add("兜底排空", ok,
-    (PHASE_TEXT[svc.phase] ?? svc.phase) +
+    kindLine + (PHASE_TEXT[svc.phase] ?? svc.phase) +
       (svc.phase === "absent" && svc.backlog.ok && svc.backlog.total > 0
         ? "；还有 " + svc.backlog.total + " 条历史积压未分类" : ""),
     ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null);
 } catch (err) {
-  add("兜底排空", null, "状态读不出来（" + err.message + "）");
+  add("兜底排空", null, drainTimerText() + "；状态读不出来（" + err.message + "）");
 }
 
 /**

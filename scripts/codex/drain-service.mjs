@@ -25,6 +25,7 @@
  */
 
 import fs from "node:fs";
+import { timerKindFor } from "../drain-schedule.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
@@ -251,6 +252,17 @@ const PHASE_BLOCKS = {
   plist_unreadable: "plist 读不出来",
   unverifiable: "launchd 状态查不出来",
 };
+
+/** PK3-L2：兜底排空（Codex 侧）的**文案**按平台出 —— linux 说 systemd --user、darwin 说 launchd、
+ *  其它说未实现。omm 实测：linux 上 Claude 侧 ⑥ 文案已正确，Codex 侧这行仍是
+ *  「launchd 状态查不出来」—— Linux 上误导。kind 由 drain-schedule.timerKindFor 同一份派生。
+ *  住库不放 doctor：doctor 是顶层执行脚本，import 它会把整份体检（含 process.exitCode=1）带进测试。 */
+export function drainTimerText({ platform = process.platform } = {}) {
+  const kind = timerKindFor(platform);
+  if (kind === "systemd") return "兜底定时器（systemd --user）—— 与 Claude 侧同一套按平台判定";
+  if (kind === "launchd") return "兜底定时器（launchd）—— " + PHASE_TEXT.unverifiable;
+  return "兜底定时器在本平台没有实现（timerKind=null）";
+}
 
 export function enableBlockers(state) {
   const blockers = [];

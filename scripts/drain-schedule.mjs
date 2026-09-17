@@ -63,7 +63,15 @@ export function resolveNodeForHooks({
   const candidates = [];
   if (typeof installed === "string" && installed.length > 0) candidates.push(installed);
   if (platform === "linux") {
-    candidates.push(...fromPath(), "/usr/local/bin/node", path.join(homedir, ".local", "bin", "node"));
+    // PK3-L2：mise shim **先于 PATH** —— mise 会重写子进程的 PATH，把 installs/<版本>/bin 插到
+    //   shims 前面，扫 PATH 先命中的是版本真身（omm 实测解析到 …/installs/node/26/bin/node）。
+    //   危害：mise use -g 换版本后旧线可能被清掉，hook 指向空路径；shim 不随版本变，拿到它才稳。
+    //   位置：${XDG_DATA_HOME:-~/.local/share}/mise/shims/node（路径存在且可执行即用，
+    //   不依赖 __MISE_SHIM / __MISE_DIFF 之类线索 —— omm 的 node 进程里有它们，但别把正确性押在别的工具的私有变量上）。
+    const dataHome = typeof env?.XDG_DATA_HOME === "string" && env.XDG_DATA_HOME.length > 0
+      ? env.XDG_DATA_HOME : path.join(homedir, ".local", "share");
+    candidates.push(path.join(dataHome, "mise", "shims", "node"),
+      ...fromPath(), "/usr/local/bin/node", path.join(homedir, ".local", "bin", "node"));
   } else {
     candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", ...fromPath(),
       path.join(homedir, ".local", "bin", "node"));

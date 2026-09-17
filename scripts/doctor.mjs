@@ -49,8 +49,10 @@ import { resolveProject } from "./project-resolve.mjs";
 import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
-import { spawnSync } from "node:child_process";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, claudeDrainSystemdPaths, claudeDrainSystemdUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
+import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   familyOf, loadByEndpoint, resolveEndpointDir, ENDPOINT_SHAPE, validateLedgerRoot,
 } from "./topic-agent-ledger.mjs";
@@ -61,9 +63,21 @@ import { collectClaudeLegacySnapshot, collectCodexLegacySnapshot } from "./m1a/l
 import { claudeSources } from "./m1a/cutover-reconcile.mjs";
 import { reconcileLegacyEndpoint } from "./m1a/reconcile.mjs";
 import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
+
+/** systemctl 的测试隔离点（与 FEISHU_BRIDGE_LAUNCHCTL 同一口径）。 */
+const SYSTEMCTL_ENV = "FEISHU_BRIDGE_SYSTEMCTL";
+
+/**
+ * `systemctl is-active / is-enabled` 的已知状态词（PK3-L1-fix2 P2）：非零退出 + 这些词 = **读到了**状态。
+ * `is-active` 对正常的 inactive 也是非零退出（stdout 就是状态词）—— 旧版把它折成"查不清"，诊断不准。
+ * "not-found" 不在这里：它走 systemdUnitAbsent（"本来就没有这个单元"），与安装侧卸载共用一份判据。
+ */
+const SYSTEMCTL_STATE_WORDS = new Set(["active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance",
+  "enabled", "enabled-runtime", "disabled", "static", "indirect", "linked", "linked-runtime",
+  "masked", "masked-runtime", "alias", "generated", "transient", "unknown"]);
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs";
-import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
+import { inspectInstalledSurface, installedSurfacePath, readInstalledSurface } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
@@ -288,6 +302,10 @@ export function runDoctor({
   routesFile = undefined,
   providersFile = undefined,
   launchctl = undefined,
+  // PK3-L1：兜底定时器按平台（darwin launchd / linux systemd --user / 其它没有实现）。
+  // systemctl 注入口径与 launchctl 一致（沙箱里不碰真 systemctl）。
+  platform = process.platform,
+  systemctl = undefined,
   // **默认不执行状态入口脚本**：它们是外部代码，可能写盘 —— 只有显式要求才跑，副作用属于登记入口自己的信任边界。
   probeProviders = false,
   // R54 返修四 P2-3：进程启动时刻读取器可注入（测试密闭，不依赖真机 ps）；默认 = 可信读取器。
@@ -543,18 +561,101 @@ export function runDoctor({
   // 也不许去探测当前机器的 launchd（评审探针记录到了真实 launchctl 调用）。
   const sandboxed = path.resolve(ctx.home) !== path.resolve(os.userInfo().homedir);
   const injected = typeof launchctl === "function" || Boolean(process.env[LAUNCHCTL_ENV]);
+  const systemctlInjected = typeof systemctl === "function" || Boolean(process.env[SYSTEMCTL_ENV]);
+  const systemctlFn = (args) => {
+    if (typeof systemctl === "function") return systemctl(args);
+    const bin = process.env[SYSTEMCTL_ENV] || "systemctl";
+    try { return { ok: true, out: execFileSync(bin, args, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }) }; }
+    catch (err) { return { ok: false, out: String(err?.stdout ?? ""), err: String(err?.stderr ?? err?.message ?? err) }; }
+  };
+  const timerKind = timerKindFor(platform);
+  // 「现有安装里那个 node」（PK3-L1-fix2 P1-1）：与安装器同一份接线（收据 + 桥 hook + 现有 plist/unit）。
+  // doctor 要核的是**线上那份配置的参数**，不是"当前偏好顺序会写成什么"—— 后者会把一个本来在跑的 job
+  // 报成参数不符。拿不到（没装过 / 收据还没有）时回落到常规顺序，行为与以前相同。
+  const receiptDoc = (() => {
+    const r = readInstalledSurface({ file: installedSurfacePath({ chain: "claude", home }) });
+    return r.state === "valid" ? r.doc : null;
+  })();
+  const claudeNode = () => pickClaudeNode({ installed: installedClaudeNode({ home, platform, receipt: receiptDoc }) });
   let claudePhase = "unverifiable";
   let claudePhaseWhy = null;
-  if (sandboxed && !injected) { claudePhaseWhy = "体检的 home 不是当前用户的家目录（沙箱），不碰真实 launchctl"; }
-  else {
+  if (timerKind === null) {
+    // 其它平台：**明说没有实现**，不给「该不该红」的假结论（安装器也照同一句说）。
+    claudePhaseWhy = "本平台（" + platform + "）没有兜底定时器实现，未装";
+  } else if (sandboxed && !(timerKind === "launchd" ? injected : systemctlInjected)) {
+    claudePhaseWhy = "体检的 home 不是当前用户的家目录（沙箱），不碰真实 "
+      + (timerKind === "launchd" ? "launchctl" : "systemctl --user");
+  } else if (timerKind === "systemd") {
+    // PK3-L1-fix1 P1-3 / fix2 P1-3：**核投影**，不只看 is-enabled/is-active —— 同名 timer 跑错程序（旧 ExecStart /
+    // 旧 node）时只核状态会报「已加载」，那是假绿。判据与 launchd 分支同口径（loaded_other = 参数不符）。
+    const unit = CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer";
+    const service = CLAUDE_DRAIN_SYSTEMD_UNIT + ".service";
+    const enabled = systemctlFn(["is-enabled", unit]);
+    const active = systemctlFn(["is-active", unit]);
+    const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
+    // P2（fix2）：已知状态词算"读到了"，不是"查不清"。只有命令不在 / 连不上 manager 才是查不清。
+    const stateWord = (r) => {
+      const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+      return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
+    };
+    // systemctl 自己不可用（命令不在、实例连不上、权限不行）≠ 没装 —— 必须与 not_installed 分开。
+    //「本来就没有这个单元」的判据与安装侧卸载**共用一份**（systemdUnitAbsent），不各写一遍。
+    const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
+    const broken = (r) => !readable(r);
+    if (broken(enabled) || broken(active)) {
+      claudePhaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).slice(0, 120) + "）—— 查不清，不等于没在跑";
+    } else {
+      const paths = claudeDrainSystemdPaths(home);
+      const units = claudeDrainSystemdUnits({ home, node: claudeNode() });
+      const readUnit = (f) => { try { return fs.readFileSync(f, "utf-8"); } catch { return null; } };
+      const projected = readUnit(paths.service) === units.service && readUnit(paths.timer) === units.timer;
+      const isEnabled = String(enabled.out ?? "").trim() === "enabled";
+      const isActive = String(active.out ?? "").trim() === "active";
+      if (isEnabled && isActive) {
+        if (!projected) {
+          claudePhase = "loaded_other";
+          claudePhaseWhy = "磁盘上的 systemd 单元与当前投影不一致（ExecStart / OnUnitActiveSec / node 路径）";
+        } else {
+          const show = systemctlFn(["show", service, "-p", "ExecStart", "--value"]);
+          const expectedArgs = claudeDrainExpectedJob({ home, node: claudeNode() }).args;
+          const loadedArgv = systemdShowExecArgv(String(show.out ?? ""));
+          const sameExec = show.ok === true && loadedArgv !== null &&
+            (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
+          if (show.ok !== true) {
+            claudePhase = "unverifiable";
+            claudePhaseWhy = "systemctl --user show 查不了（" + say(show).slice(0, 120) + "）—— 已加载的定义核不了，查不清";
+          } else if (!sameExec) {
+            claudePhase = "loaded_other";
+            claudePhaseWhy = "systemd manager 里**已加载**的 ExecStart 与当前投影不一致（磁盘改了但没 daemon-reload 成，或跑的是旧的那份）";
+          } else {
+            claudePhase = "loaded";
+          }
+        }
+      } else if (isEnabled || isActive) {
+        claudePhase = "installed_not_loaded";
+        claudePhaseWhy = "systemd timer " + (isEnabled ? "已 enable 但未 active" : "在跑但没 enable");
+      } else {
+        const hasFiles = readUnit(paths.service) !== null || readUnit(paths.timer) !== null;
+        claudePhase = hasFiles ? "installed_not_loaded" : "absent";
+        if (hasFiles) claudePhaseWhy = "systemd timer 未启用且未在跑";
+      }
+    }
+  } else {
     // 核**完整 ProgramArguments**，不只看同名 job 在不在（评审探针：同名 job 跑 /bin/echo 也曾被说成在发）。
-    try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: pickClaudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
+    try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: claudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
     catch (err) { claudePhaseWhy = String(err?.message ?? err).slice(0, 120); }
   }
   const publisherRunning = claudePhase === "loaded" ? true
-    : (claudePhase === "installed_not_loaded" || claudePhase === "loaded_other") ? false : null;
-  const publisherText = claudePhaseWhy ? "兜底定时器状态查不清（" + claudePhaseWhy + "）"
-    : "兜底定时器 " + (PHASE_TEXT[claudePhase] ?? claudePhase);
+    : (claudePhase === "installed_not_loaded" || claudePhase === "loaded_other" || claudePhase === "absent") ? false : null;
+  /** systemd 分支上阶段文案的替换：launchd 版措辞（plist / launchd 加载）对着 systemd timer 说是错的。 */
+  const timerPhaseText = (timerKind === "systemd"
+    ? { ...PHASE_TEXT, installed_not_loaded: "**单元已写入但没被 systemd --user 加载 —— 定时器不会跑**" }
+    : PHASE_TEXT)[claudePhase] ?? claudePhase;
+  // 查不清是"不知道"；已知故障（参数不符 / 没加载）必须按**已知**说，不能一律套上"查不清"（PK3-L1-fix2 P2 口径同源）。
+  const publisherText = claudePhase === "unverifiable"
+    ? "兜底定时器状态查不清（" + String(claudePhaseWhy ?? "说不清") + "）"
+    : "兜底定时器 " + (timerKind === "systemd" ? "（systemd --user）" : "") + timerPhaseText +
+      (claudePhaseWhy ? "：" + claudePhaseWhy : "");
   const backlogText = (backlog > 0 ? "积压 " + backlog + " 条" : "无积压") +
     (backlogProblems > 0 ? "，账本说不清 " + backlogProblems + " 处" : "") +
     (backlogWhere.length ? "：" + backlogWhere.join("、") : "");
@@ -567,6 +668,36 @@ export function runDoctor({
   add("backlog_vs_publisher", "⑥ 积压有人发（Claude 侧）", backlogOk,
     (!registry.ok ? "登记表读不出来，查不清" : backlogText) + "；" + publisherText,
     backlogOk === false ? (backlogProblems > 0 ? PREVIEW.feishuOutbox : PREVIEW.installOutbound) : null);
+
+  // ⑧′ 机器人发送凭据的密钥在哪（PK3-L1，仅在 linux 上核）：
+  // aily（provision）把每个 agent 的密钥写在 <configDir>/data/lark-cli/；linux 上 lark-cli 不用钥匙串、
+  // 改用文件加密库，默认根是 ~/.local/share/lark-cli/ —— 桥给它设 LARKSUITE_CLI_DATA_DIR=<configDir>/data
+  // 之后它才去 aily 写的地方找。**两边各自都成功、就是没对上** 是最难查的一类，所以两个目录都打印。
+  {
+    // PK3-L1-fix1 P2-1：模板路径从**本次体检的上下文**派生（home + env，与其它项同一份 claudeSources）——
+    // 旧版 loadChainTemplate() 用进程真实 HOME 的默认路径：runDoctor({home}) 传隔离 home 时会读到真机模板。
+    const tpl = loadChainTemplate(claudeSources(process.env, path.join(ctx.home, ".claude", "feishu-bridge")).templateFile);
+    const template = tpl?.ok === true ? tpl.template : null;
+    const appId = template ? (template.outbound_app_id ?? template.transport_app_id) : null;
+    const configDir = template ? (resolveLarkIdentity(template)?.configDir ?? null) : null;
+    const written = larkProvisionedSecretPath({ configDir, appId });
+    if (platform !== "linux") {
+      // 非 linux **不加这一项**：macOS 走系统钥匙串，没有「文件形式的密钥路径」可核 ——
+      // 加一条恒为 unknown 的项会把每台 mac 的体检结论拖成 incomplete（好机器也不 ready）。
+      // 本项只在 linux 上有意义（aily 写的目录 vs lark-cli 找的目录）。
+      void written;
+    } else if (written === null) {
+      add("lark_cli_secret", "⑧′ 机器人发送凭据（lark-cli 密钥）", null,
+        "链模板读不出（" + String(tpl?.reason ?? "template_unusable") + "），派生不出凭据目录 —— 查不清", null);
+    } else {
+      const found = fs.existsSync(written);
+      add("lark_cli_secret", "⑧′ 机器人发送凭据（lark-cli 密钥）", found,
+        (found ? "密钥文件在" : "**找不到密钥文件**") + "：" + written +
+        "；桥给 lark-cli 设的查找根 LARKSUITE_CLI_DATA_DIR=" + path.join(configDir, "data") +
+        "（它会在下面再补一层 lark-cli）",
+        found ? null : PREVIEW.installOutbound);
+    }
+  }
 
   // Codex 侧：**引用**既有的 scripts/codex/doctor.mjs（子进程，--json），不重写它的判据。
   // Claude 侧代码不依赖 scripts/codex/（依赖单向），所以只能这样引用。沙箱里同样不碰真 launchctl。

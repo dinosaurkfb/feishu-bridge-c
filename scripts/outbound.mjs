@@ -15,7 +15,7 @@ import { CLAIM_KEY_SHAPE, CLAIM_STATE, claimKey } from "./claim.mjs";
 import { CONSUMED_TMP_RE, CONTROL_QUARANTINE_RE, classifyControlLockEntry, inspectControlClaim, inspectControlLockArtifact, readConsumedRecord } from "./control-command.mjs";
 import { inspectRejectedClaim } from "./reject-control.mjs";
 
-import { assertPublishIdentity, identityErrorText } from "./chain-template.mjs";
+import { assertPublishIdentity, identityErrorText, larkCliEnv } from "./chain-template.mjs";
 
 import { execFileSync } from "node:child_process";
 
@@ -679,8 +679,8 @@ export function classifyPublishFailure({
       larkBin ?? "lark-cli",
       ["im", "+messages-mget", "--message-ids", rootMessageId, "--as", "bot", "--json"],
       { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
-               ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
+        // PK3-L1：linux 上还要指 LARKSUITE_CLI_DATA_DIR（aily 写的密钥在哪，见 larkCliEnv 的注释）
+        env: larkCliEnv({ configDir: larkHome ?? null, profile }),
         timeout: timeoutMs ?? 15_000, maxBuffer: 4 * 1024 * 1024 },
     );
     parsed = JSON.parse(out);
@@ -747,8 +747,8 @@ export function publishDraft({
       // 调用方的 stderr —— 出站发布器现在跑在会话结束钩子里，那等于喷到 Frank 的终端上。
       // 失败信息不会丢：execFileSync 抛出的 error 上带着 stdout/stderr。
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
-             ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
+      // PK3-L1：linux 上还要指 LARKSUITE_CLI_DATA_DIR（见 larkCliEnv 的注释）
+      env: larkCliEnv({ configDir: larkHome ?? null, profile }),
       // 会话结束钩子会传一个更短的超时：那条路径卡住的是 Frank 的终端，
       // 不能为了发一条进展让他的会话吊在那里。发不出去就留在 outbox 等兜底定时器。
       timeout: timeoutMs ?? 30_000, maxBuffer: 4 * 1024 * 1024 },
@@ -777,8 +777,8 @@ export function sendToChat({ profile, chatId, text, idempotencyKey, larkBin, lar
   const out = execFileSync(larkBin ?? "lark-cli", args, {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
-           ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
+    // PK3-L1：linux 上还要指 LARKSUITE_CLI_DATA_DIR（见 larkCliEnv 的注释）
+    env: larkCliEnv({ configDir: larkHome ?? null, profile }),
     timeout: timeoutMs ?? 30_000, maxBuffer: 4 * 1024 * 1024,
   });
   const parsed = JSON.parse(out);

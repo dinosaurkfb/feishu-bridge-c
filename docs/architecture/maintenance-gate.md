@@ -31,6 +31,11 @@
 | Claude hooks（UserPromptSubmit ×2、Stop） | `~/.claude/settings.json` | 收据 sha 相等（桥拥有的封闭条目）；桥拥有的条目各恰好一条；**任何提到运行时根的 hook 命令都必须是桥拥有的**（多一个 shell 动作、第二个 node → 拒） |
 | Codex hooks（Prompt / Stop） | `~/.codex/hooks.json` 里带 `FEISHU_BRIDGE_CODEX_HOOK:` 标记的条目 | 同上（`codex/hook-command.mjs` 的投影） |
 | 技能（两链） | `~/.claude/skills/<n>/…`、`~/.codex/skills/<n>/…` | 收据 sha 逐字相等（fd 绑定读：符号链接 / 管道 / 多硬链接都不算"制品还在"） |
+> **启动源按平台（PK3-L1）**：darwin 用 launchd（LaunchAgent plist），linux 用 systemd `--user`
+> （`~/.config/systemd/user/feishu-bridge-cc-drain.{service,timer}`，`OnUnitActiveSec=30min`），
+> 其它平台**没有兜底定时器实现**（安装器明说未装）。**维护门（issue #81）目前只覆盖 launchd，
+> systemd 未支持** —— 在 systemd 主机上跑维护门之前先手工停掉该 timer（或先补门）。
+
 | launchd（两链） | `launchctl list <label>` + plist | `loadedPhase` ∈ {loaded, installed_not_loaded, absent}（下文统称**原始三态**）且 plist 字节与投影相等；`loaded_other` / `orphan` / `plist_unreadable` / `unverifiable` → 不受验（预检拒了，journal 只会记到原始三态） |
 | 路由表 | `~/.claude/feishu-bridge/routes.json` | 只核**有效默认路由**（`defaultRouteHandler` 判据）的 handler；非默认外部 handler（如 cc2cd）不核、只记账（窗口内一样被分发器桩挡） |
 | 所有脚本路径 | — | `realpath` 后落在两条 `runtime/current/scripts/` 真实路径下，文件名在桩清单里 |

@@ -3065,10 +3065,30 @@ test("Claude registry binding 原子保存 Dialogue 模式、回合与终局", (
     id: "dialogue-claude", root, root_message_id: "om_root", session_id: "session_feishu",
     status: "active", expires_at: "2027-01-01T00:00:00.000Z",
   }] }));
+  // PK3-L1：自带链模板夹具 —— 写面（set/reserve/finalize）走 claudePolicyRoute，它要模板的 agent_uid
+  // 才派得出 ledger endpoint。不给就落到 DEFAULT_TEMPLATE（真家目录那份）：Mac 上有、全新主机上没有，
+  // 于是同一条用例在两个平台上结论不同。测试一律自带夹具，不依赖真 HOME。
+  // 自带的链模板夹具（**就地定义**：TPL 这个共用常量在本文件更靠后的位置，注册即执行，取不到）。
+  const tplFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify({
+    chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t",
+    outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o",
+    lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark",
+    frank_sender_id: "12345", chat_name: "群", chat_id: "oc_abc", default_freshness_ms: 900000,
+    agent_uid: "agent_x",
+  }));
+  // 写面（set/reserve/finalize）走 claudePolicyRoute，它的模板路径来自 **process.env**
+  // （chain-template.templatePath() 只看 process.env，不看调用方传的 env）—— 所以这里改 process.env，
+  // 用例末尾用 restoreMachineEnv 恢复（套件的 envDrift 不变量会核）。
+  // 账本 / 维护目录同样自带：空目录 = 本端点没有收据 = **legacy 判源**（确定性，与真机装没装、
+  // 与别的用例写过什么全无关系）。
+  process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = tplFile;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(local, "maintenance");
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(local, "ledger");
   const enabled = setClaudeInteractionMode({
     root, mode: "dialogue", registryFile: regFile, now: NOW,
   });
-  assert.equal(enabled.ok, true);
+  assert.equal(enabled.ok, true, "setClaudeInteractionMode：" + JSON.stringify(enabled).slice(0, 300));
   const reserved = reserveClaudeDialogueTurn({
     root, eventId: "om_dialogue", runId: "claim_dialogue", localTargetId: "local_target",
     originChannelGenerationId: "generation", runtimeTargetId: "claude_session_private",
@@ -3086,6 +3106,7 @@ test("Claude registry binding 原子保存 Dialogue 模式、回合与终局", (
   assert.equal(loaded.state.dialogue.usage.rounds_started, 1);
   assert.equal(JSON.parse(fs.readFileSync(regFile, "utf-8"))
     .projects[0].interaction_policy_state.dialogue.last_turn.status, "completed");
+  restoreMachineEnv("FEISHU_BRIDGE_CHAIN_TEMPLATE", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_LEDGER_DIR");
 });
 
 test("Claude feishu-mode 默认只读，只有 --apply 才切换当前 binding", () => {
@@ -5717,17 +5738,22 @@ test("已消费列表会进 mapping —— 幂等那道闸才拦得住重复消�
 
 // ---------- lark-cli 的环境变量名（写错了不会报错，只会安静地不生效） ----------
 
-test("出站传的是 LARKSUITE_CLI_CONFIG_DIR，不是那个不存在的 LARKSUITE_CLI_HOME", () => {
-  const src = fs.readFileSync(path.resolve("scripts", "outbound.mjs"), "utf-8");
-  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  assert.ok(code.includes("LARKSUITE_CLI_CONFIG_DIR"), "必须用真实存在的那个变量名");
-  assert.ok(!code.includes("LARKSUITE_CLI_HOME"),
+test("出站每个 lark-cli 入口都按统一助手指身份；用的是 LARKSUITE_CLI_CONFIG_DIR，不是那个不存在的 LARKSUITE_CLI_HOME", () => {
+  const code = fs.readFileSync(path.resolve("scripts", "outbound.mjs"), "utf-8");
+  // PK3-L1：环境构造收进 chain-template 的 larkCliEnv（linux 还要补 LARKSUITE_CLI_DATA_DIR）——
+  //   所以这条守卫改成两半：① 出站那 3 个入口都走同一个助手；② 助手里用的变量名是对的。
+  //   入口一个都不能漏：两个发送入口 + 失败分类里那个只读探测（探测用错身份 → 读错 → 内容被永久抑制）。
+  assert.equal((code.match(/larkCliEnv\(/g) ?? []).length, 3, "3 个 lark-cli 入口都要走 larkCliEnv");
+  const helper = fs.readFileSync(path.resolve("scripts", "chain-template.mjs"), "utf-8");
+  assert.ok(helper.includes("LARKSUITE_CLI_CONFIG_DIR"), "必须用真实存在的那个变量名");
+  // 「用了那个不存在的变量名」= **真的去设/读它**（赋值或取属性），不是注释里提一句。
+  // 评审教训：拿正则剥注释再扫会被注释里的语法骗过；直接钉「赋值/取值」这个形状不会。
+  assert.ok(!/LARKSUITE_CLI_HOME\s*[:=]/u.test(helper),
     "LARKSUITE_CLI_HOME 在 lark-cli 二进制里出现 0 次 —— 设了等于没设，而且不会报错");
-  // **每一个调 lark-cli 的入口**都要钉住身份，不只是发送的那两个：
-  // 两个发送入口 + 失败分类里那个只读探测。探测要是用错身份会得出错的判定，
-  // 而错的判定会让一条本可以发出去的内容被**永久抑制** —— 读错比发错更隐蔽。
-  assert.equal((code.match(/LARKSUITE_CLI_CONFIG_DIR/g) ?? []).length, 3);
-  assert.equal((code.match(/LARKSUITE_CLI_PROFILE/g) ?? []).length, 3);
+  for (const rel of ["outbound.mjs", path.join("codex", "lark-message.mjs"), "chain-template.mjs"]) {
+    const text = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    assert.ok(!/LARKSUITE_CLI_HOME\s*[:=]/u.test(text), rel + "：不许设那个不存在的变量名");
+  }
 });
 
 // ---------- 身份解析与凭据归属校验 ----------
@@ -8212,7 +8238,17 @@ test("R60 守卫行为钉：HOME 移到套件私有 mkdtemp；真家目录桥配
     try {
       const r = TAL.ensureLedgerRoot({ env: process.env });
       assert.equal(r.ok, false, "ensureLedgerRoot 被拒：" + JSON.stringify(r));
-      assert.match(String(r.why ?? ""), /test-home-isolation/u, "结构化拒因点名守卫：" + JSON.stringify(r));
+      // PK3-L1：拒因有两种，取决于**前置链在不在**，两种都必须拒、都必须零目录：
+      //   · 父目录存在（装过桥的机器）→ realpath 过了、mkdir 撞守卫 → why 点名 test-home-isolation
+      //   · 父目录不存在（全新机器，例如没跑过 init-chain-template 的 Linux）→ realpath 自己就 ENOENT
+      //     → 结构化拒因是 parent_absent（产品语义，不是缺陷）
+      // 守卫对**这条探针路径**的覆盖由下面那句无条件钉住 —— 父链在不在都一样要被拒。
+      const probeParent = path.dirname(process.env.FEISHU_BRIDGE_LEDGER_DIR);
+      const parentExists = fs.existsSync(probeParent);
+      assert.match(String(r.why ?? ""), parentExists ? /test-home-isolation/u : /父目录 realpath/u,
+        "结构化拒因（父链" + (parentExists ? "在" : "不在") + "）：" + JSON.stringify(r));
+      assert.throws(() => fs.mkdirSync(process.env.FEISHU_BRIDGE_LEDGER_DIR, { recursive: true }), /test-home-isolation/u,
+        "同一条探针路径直接建目录也必须被守卫拒（与父链在不在无关）");
       assert.equal(fs.existsSync(process.env.FEISHU_BRIDGE_LEDGER_DIR), false, "零目录");
     } finally {
       if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
@@ -19355,6 +19391,11 @@ test("老话题的指令：现场会话的 Stop 把回复发回受理时冻结�
 
 test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，Stop 终结回合并把回复发回老话题", () => {
   const fx = rotatedRegistryFixture();
+  // PK3-L1：进程内那几个写面调用走 claudePolicyRoute，模板路径只认 **process.env** —— 夹具要写进
+  // process.env（末尾 restoreMachineEnv 恢复；套件 envDrift 不变量会核），子进程从 process.env 派生。
+  process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = fx.templateFile;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(fx.local, "maintenance");
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(fx.local, "ledger");
   const env = { ...process.env, FEISHU_BRIDGE_REGISTRY: fx.registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: fx.templateFile, HOME: fx.local };
   const stopHook = path.join(path.resolve("scripts"), "stop-hook.mjs");
   const session = "claude-live-dialogue";
@@ -19405,6 +19446,7 @@ test("老话题的指令（Dialogue 模式）：回合的 origin 是老代际，
   assert.equal(after.length, 1, "策略状态无效、又没有本轮来源记录 → 零入队");
   const unrouted = path.join(fx.root, ".runtime-data", "outbound", "unrouted-replies");
   assert.equal(fs.readdirSync(unrouted).length, 1);
+  restoreMachineEnv("FEISHU_BRIDGE_CHAIN_TEMPLATE", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_LEDGER_DIR");
 });
 
 test("一个 session 只属于一个代际：校验器拦重复、激活拒绝复用历史 session；跨绑定 / 跨 task 多命中返回歧义", () => {
@@ -20134,6 +20176,12 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   fs.mkdirSync(root); fs.mkdirSync(bin);
   const registryFile = path.join(local, "registry.json");
   const templateFile = path.join(local, "chain-config.json");
+  // PK3-L1：进程内写面（setClaudeInteractionMode 等）走 claudePolicyRoute，模板路径只认 **process.env**
+  // （chain-template.templatePath()）—— 夹具写进 process.env，用例末尾恢复（套件 envDrift 不变量会核）。
+  // 账本/维护目录同样自带：空 = 没有收据 = legacy 判源，与真机装没装、别的用例写过什么无关。
+  process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = templateFile;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(local, "maintenance");
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(local, "ledger");
   fs.writeFileSync(templateFile, JSON.stringify(TPL));
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{
     id: "ctl", root, name: "控制演示", root_message_id: "om_ctl", expires_at: "2099-01-01T00:00:00Z",
@@ -20148,6 +20196,7 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
     return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
       encoding: "utf-8",
       env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(local, "maintenance"), FEISHU_BRIDGE_LEDGER_DIR: path.join(local, "ledger"),
         AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_claude_ctl", AILY_CLI_RUN_ID: "run_ctl", FAKE_AILY_ENVELOPE: envelope },
     });
   };
@@ -20303,7 +20352,8 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   assert.equal(readConsumedRecord({ claimsDir, key: key6 }).status, "valid", "终态已写，残骸只是没清");
   fs.rmSync(stuckResidue, { recursive: true });
   assert.equal(repair("--project", root, "--key", key6, "--apply").status, 0);
-  assert.equal(setClaudeInteractionMode({ root, claudeSessionId: null, mode: MAPPING_POLICY_ID, registryFile }).ok, true);
+  const backToMapping = setClaudeInteractionMode({ root, claudeSessionId: null, mode: MAPPING_POLICY_ID, registryFile });
+  assert.equal(backToMapping.ok, true, "回切 mapping 失败：" + JSON.stringify(backToMapping).slice(0, 300));
 
   // ── 评审第 5 轮 ──
   // ① 写锁内用的是锁内刚读出的身份：期望算完之后绑定换代 → 旧 claim 不许把新绑定切走
@@ -20591,6 +20641,8 @@ test("Claude 真入口：已绑定项目收到正文恰为 /feishu-mode dialogue
   const notControl = run("/feishu-mode dialogue 吧", "msg_c4");
   assert.doesNotMatch(notControl.stdout, /已切换|模式未变/u, "多一个字就不是控制命令：" + notControl.stdout);
   assert.equal(policyOf(), MAPPING_POLICY_ID);
+  restoreMachineEnv("FEISHU_BRIDGE_CHAIN_TEMPLATE", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_LEDGER_DIR");
+
 });
 
 test("consumed 记录封闭校验：坏 JSON / 非普通文件 / 字段缺失进账本 problems（consumed_unreadable），合法的不进", () => {
@@ -23467,6 +23519,12 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-authz-"));
   const root = path.join(local, "project"); const bin = path.join(local, "bin"); fs.mkdirSync(root); fs.mkdirSync(bin);
   const registryFile = path.join(local, "registry.json"); const templateFile = path.join(local, "chain-config.json");
+  // PK3-L1：进程内写面（setClaudeInteractionMode 等）走 claudePolicyRoute，模板路径只认 **process.env**
+  // （chain-template.templatePath()）—— 夹具写进 process.env，用例末尾恢复（套件 envDrift 不变量会核）。
+  // 账本/维护目录同样自带：空 = 没有收据 = legacy 判源，与真机装没装、别的用例写过什么无关。
+  process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = templateFile;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(local, "maintenance");
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(local, "ledger");
   fs.writeFileSync(templateFile, JSON.stringify({ ...TPL, senders: [{ open_id: "222", role: "operator" }, { open_id: "333", role: "participant" }] }));
   fs.writeFileSync(registryFile, JSON.stringify({ schema_version: "1.0", projects: [{ id: "authz", root, name: "权限演示", root_message_id: "om_authz", expires_at: "2099-01-01T00:00:00Z",
     session_id: "aily_authz", inbound_state: "bound", status: "active", bound_at: "2026-08-20T00:00:00.000Z" }] }));
@@ -23489,6 +23547,7 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
     const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: { id: "msg_authz_" + seq, sessionID: "aily_authz", role: "user", createdBy: sender, createdAtMs: Date.now(), content } }) }] });
     return spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], { encoding: "utf-8",
       env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(local, "maintenance"), FEISHU_BRIDGE_LEDGER_DIR: path.join(local, "ledger"),
         AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_authz", AILY_CLI_RUN_ID: "run_authz", FAKE_AILY_ENVELOPE: envelope } });
   };
   const claimsDir = path.join(root, ".runtime-data", "inbound", "delivery-claims");
@@ -23562,7 +23621,13 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   const p5Key = fs.readdirSync(claimsDir).filter((n) => n.endsWith(".claim")).map((n) => n.slice(0, -".claim".length))
     .find((k) => JSON.parse(fs.readFileSync(path.join(claimsDir, k + ".claim", "claim.json"), "utf-8")).message_id === "msg_authz_" + seq);
   assert.ok(p5Key, "participant 的 claim 在");
-  finalizeClaudeDialogueTurn({ root, claudeSessionId: null, runId: p5Key, status: DIALOGUE_TURN_STATUS.COMPLETED, registryFile });
+  // 写面读 process.env 的模板路径 → 与上面那些真入口子进程同一套（末尾恢复）
+  process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = templateFile;
+  process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = path.join(local, "maintenance");
+  process.env.FEISHU_BRIDGE_LEDGER_DIR = path.join(local, "ledger");
+  finalizeClaudeDialogueTurn({ root, claudeSessionId: null, runId: p5Key, status: DIALOGUE_TURN_STATUS.COMPLETED,
+    runtimeTargetId: null, reason: null, registryFile, now: Date.now() });
+  restoreMachineEnv("FEISHU_BRIDGE_CHAIN_TEMPLATE", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_LEDGER_DIR");
   const o5 = run("我也问一句", "222");
   assert.doesNotMatch(o5.stdout, /你的角色是|需要 owner 权限/u, o5.stdout);
   assert.equal(claudeArgv(2).length, 2, "operator 的对话同样走只回复路径（不被上一条只回复的 run 挡住 —— 只回复不占会话锁）：" + o5.stdout + o5.stderr);
@@ -23592,6 +23657,8 @@ test("入站权限判定（第 2 层）：风险归类、交叉表逐格、两�
   assert.match(run("写飞书", "222").stdout, /你的角色是 operator，R4（授权类） 需要 owner 权限/u);
   assert.equal(claimCount(), claimsBeforeNs, "这些拒绝都不取 claim");
   assert.equal(policyOf(), DIALOGUE_POLICY_ID);
+  restoreMachineEnv("FEISHU_BRIDGE_CHAIN_TEMPLATE", "FEISHU_BRIDGE_MAINTENANCE_DIR", "FEISHU_BRIDGE_LEDGER_DIR");
+
 });
 
 
@@ -24284,7 +24351,14 @@ test("chat 默认态：无绑定上下文不再一律拒 —— 三道闸后按 
   try { lostOuter = recordChatOutcome({ ledgerDir, key: closedKey, now: 3002, outcome: { status: "answered", text: "outer-after-loss", elapsed_ms: 1 } }); }
   finally { fs.openSync = originalOpenForRace; Date.now = originalNow; }
   assert.deepEqual([reapedOnce, reapedNested?.ok, lostOuter.ok, lostOuter.reason, lostOuter.lockLost, /提交前核对锁失败；热路径不删/u.test(lostOuter.tmpResidue?.why), fs.existsSync(lostOuter.tmpResidue?.path ?? ""), inspectChat({ ledgerDir, key: closedKey }).record.text, tmpNames().length], [true, true, false, "chat_ledger_lock_lost", true, true, true, "nested-after-reap", 1], "锁被合法回收后不覆盖：" + JSON.stringify({ reapedNested, lostOuter }));
-  assert.equal(sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 }).candidates.filter((c2) => c2.removed).length, 1, "残骸交 sweep 清");
+  // PK3-L1：sweep 的判据是 ageMs = now - mtime **严格大于** olderThanMs（chat-ledger.mjs:298）。
+  // 写残骸与跑 sweep 落在同一毫秒里（Linux 上更快、文件系统时间戳粒度也不同）→ ageMs = 0 → 落进 young
+  // → removed 0 条，用例偶红（omm 单跑 5 轮 2 红）。把残骸**显式做旧 1 秒**，判据就与调度速度无关了。
+  const fencedResiduePath = lostOuter.tmpResidue?.path ?? "";
+  assert.ok(fencedResiduePath && fs.existsSync(fencedResiduePath), "残骸应在原地：" + fencedResiduePath);
+  const agedAt = new Date(Date.now() - 1000);
+  fs.utimesSync(fencedResiduePath, agedAt, agedAt);
+  assert.equal(sweepScratch({ ledgerDir: realLedger, apply: true, olderThanMs: 0 }).candidates.filter((c2) => c2.removed).length, 1, "残骸交 sweep 清（显式做旧 1 秒，去掉同毫秒竞速）");
   fs.rmSync(recFile(closedKey), { force: true });
   // ── 读记录不许被命名管道卡死、不许跟符号链接；终态进位残骸在锁内只能是残骸；枚举封闭
   const fifoKey = chatKey({ chain: "claude", messageId: "fifo_1", sessionId: "aily_dm" });

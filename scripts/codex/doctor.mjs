@@ -215,7 +215,8 @@ const failed = (check) => check.ok === false;
 //   launchd 探测）—— **非 darwin 不探测 launchd**（不读 LaunchAgents、不 spawn launchctl），
 //   直接报「尚未实现」；darwin 四态映射照旧。诊断里不再出现「launchd 状态查不出来」的 Linux 误导。
 {
-  const c = drainTimerCheck({ platform: process.platform });
+  const platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform;
+  const c = drainTimerCheck({ platform });
   add(c.name, c.ok, c.detail, c.next);
 }
 

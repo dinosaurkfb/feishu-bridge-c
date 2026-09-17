@@ -19,14 +19,15 @@ export const CLAUDE_DRAIN_LAUNCH_LABEL = "com.frank.feishu-bridge-cc.drain";
  * 而钩子的失败又是安静的）。优先取 brew 那个不带版本的稳定软链。
  */
 /**
- * 给 hooks / 定时器解析 node 的**唯一**入口（PK3-L1）。
+ * 给 hooks / 定时器解析 node 的**唯一**入口（PK3-L1，PK3-L2 校准）。
  *
- * 顺序：env.FEISHU_BRIDGE_NODE → PATH 逐段找 node → /opt/homebrew/bin/node → /usr/local/bin/node
- *       → ~/.local/bin/node；都没有 → 抛（把找过的路径全列出来）。
+ * 顺序（按平台化实际顺序）：
+ *   darwin：显式 env.FEISHU_BRIDGE_NODE → 已安装（installed）→ /opt/homebrew/bin/node → /usr/local/bin/node → PATH → ~/.local/bin/node
+ *   linux ：显式 env.FEISHU_BRIDGE_NODE → 已安装（installed）→ mise shim → PATH → /usr/local/bin/node → ~/.local/bin/node
+ *   都没有 → 抛（把找过的路径全列出来）。
  *
  * **不用 process.execPath**：Stop 钩子契约里写着 Claude Code 自带的那个 node 不能当外部路径用
  * （钩子是 Claude Code 派生出来的，它的 node 不保证在别处可用）。
- * PATH 优先也是为了 mise/nvm 这类版本管理器：拿到的是 shim（切版本后 shim 路径不变，真身会变）。
  * 显式指定但不存在 → 直接抛（不静默换成别的二进制）。
  */
 export function resolveNodeForHooks({

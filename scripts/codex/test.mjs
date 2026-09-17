@@ -10534,5 +10534,57 @@ test("PK3-L2-fix1 P1：linux 不探 launchd、报尚未实现（launchctl 调用
   assert.match(darwin.detail, /launchd 状态查不出来/u, darwin.detail);
 });
 
+test("PK3-L2-fix2 P1-1：Linux 下无参运行 drain-service 报「尚未实现」且 launchctl 调用 0 次", () => {
+  const dir = temp();
+  const marker = path.join(dir, "CALLED");
+  const f = path.join(dir, "launchctl");
+  fs.writeFileSync(f, '#!/bin/sh\necho called >> ' + JSON.stringify(marker) + '\nexit 0\n', { mode: 0o755 });
+  const bridge = path.join(dir, "bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
+
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
+    { encoding: "utf-8", env: isolatedEnv({
+      HOME: path.join(dir, "home"),
+      CODEX_HOME: path.join(dir, "codex"),
+      FEISHU_CODEX_BRIDGE_HOME: bridge,
+      FEISHU_BRIDGE_PLATFORM: "linux",
+      FEISHU_BRIDGE_LAUNCHCTL: f,
+    }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /尚未实现/u, "无参运行输出必须含「尚未实现」：" + r.stdout);
+  assert.doesNotMatch(r.stdout, /launchd 状态查不出来/u, "不许出现 launchd 状态查不出来：" + r.stdout);
+  assert.equal(fs.existsSync(marker), false, "Linux 下无参运行不得调用 launchctl");
+});
+
+test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {
+  const throwingServiceState = () => {
+    const err = new Error("disk I/O error (EIO)");
+    err.code = "EIO";
+    throw err;
+  };
+  const res = drainTimerCheck({ platform: "darwin", serviceStateFn: throwingServiceState });
+  assert.equal(res.ok, null, "抛错必须收口为 ok: null");
+  assert.equal(res.phase, "unverifiable", "抛错归为 unverifiable 相位");
+  assert.match(res.detail, /状态读不出来：disk I\/O error \(EIO\)/u, "detail 必须包含错误信息：" + res.detail);
+});
+
+test("PK3-L2-fix2 P2-3：darwin absent 且有积压时保留「还有 N 条历史积压未分类」诊断后缀", () => {
+  const withBacklog = drainTimerCheck({
+    platform: "darwin",
+    serviceStateFn: () => ({ phase: "absent", backlog: { ok: true, total: 3 } }),
+  });
+  assert.equal(withBacklog.ok, null);
+  assert.match(withBacklog.detail, /；还有 3 条历史积压未分类$/u, "有积压时保留诊断后缀：" + withBacklog.detail);
+
+  const withoutBacklog = drainTimerCheck({
+    platform: "darwin",
+    serviceStateFn: () => ({ phase: "absent", backlog: { ok: true, total: 0 } }),
+  });
+  assert.equal(withoutBacklog.ok, null);
+  assert.doesNotMatch(withoutBacklog.detail, /历史积压未分类/u, "无积压时不带后缀：" + withoutBacklog.detail);
+});
+
 sealSummary();
 printSummary({ suiteLabel: "Codex adapter" });

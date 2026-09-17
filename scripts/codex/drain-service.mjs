@@ -25,7 +25,6 @@
  */
 
 import fs from "node:fs";
-import { timerKindFor } from "../drain-schedule.mjs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
@@ -253,29 +252,32 @@ const PHASE_BLOCKS = {
   unverifiable: "launchd 状态查不出来",
 };
 
-/** PK3-L2：兜底排空（Codex 侧）的**文案**按平台出 —— linux 说 systemd --user、darwin 说 launchd、
- *  其它说未实现。omm 实测：linux 上 Claude 侧 ⑥ 文案已正确，Codex 侧这行仍是
- *  「launchd 状态查不出来」—— Linux 上误导。kind 由 drain-schedule.timerKindFor 同一份派生。
- *  住库不放 doctor：doctor 是顶层执行脚本，import 它会把整份体检（含 process.exitCode=1）带进测试。 */
-/** PK3-L2-fix1 P1：兜底排空检查（可注入 platform 与 launchd 探测函数，doctor 与用例共用）。
- *  **非 darwin 不探测**：不读 LaunchAgents、不 spawn launchctl、不核 plist —— Codex 侧没有
- *  systemd 实现，`timerKindFor("linux")` 描述的是 Claude 侧定时器能力，不能拿来声称 systemd；
- *  直接报「尚未实现」（不是未启用、不是查不清），状态记 null。启停入口（main 的 enable/disable）
- *  同样在非 darwin 明确拒绝。 */
-export function drainTimerCheck({ platform = process.platform, serviceStateFn = serviceState } = {}) {
+/** PK3-L2-fix1 P1 / fix2：兜底排空检查（可注入 platform 与 launchd 探测函数，doctor 与用例共用）。
+ *  **非 darwin 不探测**：不读 LaunchAgents、不 spawn launchctl、不核 plist —— Codex 侧目前
+ *  只有 darwin launchd 实现，直接报「尚未实现」（不是未启用、不是查不清），状态记 null。
+ *  启停入口与无参状态入口同样在非 darwin 走 drainTimerCheck / 拒绝，不探 launchctl。 */
+export function drainTimerCheck({ platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform, serviceStateFn = serviceState } = {}) {
   if (platform !== "darwin") {
-    return { name: "兜底排空", ok: null, detail: drainTimerText({ platform }), next: null };
+    return { name: "兜底排空", ok: null, phase: "unverifiable", detail: drainTimerText({ platform }), next: null };
   }
-  const svc = serviceStateFn();
+  let svc;
+  try {
+    svc = serviceStateFn();
+  } catch (err) {
+    return { name: "兜底排空", ok: null, phase: "unverifiable", detail: "状态读不出来：" + (err?.message ?? err), next: null };
+  }
   const ok = svc.phase === "loaded" ? true
     : (svc.phase === "stale" || svc.phase === "installed_not_loaded" ||
        svc.phase === "loaded_other" || svc.phase === "orphan" ||
        svc.phase === "plist_unreadable") ? false
     : null;
-  return { name: "兜底排空", ok, detail: (PHASE_TEXT[svc.phase] ?? svc.phase), next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
+  const backlogSuffix = svc.phase === "absent" && svc.backlog?.ok && svc.backlog.total > 0
+    ? "；还有 " + svc.backlog.total + " 条历史积压未分类"
+    : "";
+  return { name: "兜底排空", ok, phase: svc.phase, detail: (PHASE_TEXT[svc.phase] ?? svc.phase) + backlogSuffix, next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
 }
 
-export function drainTimerText({ platform = process.platform } = {}) {
+export function drainTimerText({ platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform } = {}) {
   // PK3-L2-fix1 P1：**只在 darwin 有 launchd 实现** —— 非 darwin 不许声称 systemd（那是 Claude 侧
   //  的能力，Codex 侧没有），也不许探 launchd。Codex systemd 定时器另单实现。
   if (platform !== "darwin") {
@@ -326,11 +328,19 @@ function main() {
     process.exit(1);
   }
 
-  // PK3-L2-fix1 P1：非 darwin 直接拒（在 serviceState 探测 launchd **之前**）——
-  //   Codex 侧没有 systemd 实现，启停在 Linux 上既不可用也不该去探 launchd。
-  if (process.platform !== "darwin" && (enable || disable)) {
-    console.error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— enable / disable 在这里不可用。");
-    process.exit(1);
+  const platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform;
+
+  // PK3-L2-fix1 P1 / fix2 P1-1：非 darwin 在探测 launchd 之前短路 ——
+  //   Codex 侧没有 systemd 实现，启停在 Linux 上不可用；无参状态入口走 drainTimerCheck，不探 launchd。
+  if (platform !== "darwin") {
+    if (enable || disable) {
+      console.error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— enable / disable 在这里不可用。");
+      process.exit(1);
+    }
+    const check = drainTimerCheck({ platform });
+    console.log("状态      " + check.detail);
+    console.log("\n只报状态。要动它加 --enable --apply 或 --disable --apply。");
+    process.exit(0);
   }
 
   const home = os.homedir();

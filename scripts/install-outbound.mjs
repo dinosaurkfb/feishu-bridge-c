@@ -432,7 +432,14 @@ if (uninstall) {
     }
     for (const path0 of TIMER_REMOVE) fs.rmSync(path0, { force: true });
     // 删完之后才 reload：manager 里那份定义要跟着盘上一起更新（顺序反了就是"文件删了、它还在"）。
-    for (const args of TIMER_PLAN.commandsAfterRemove ?? []) timerCmd(args);
+    const ranAfter = (TIMER_PLAN.commandsAfterRemove ?? []).map(timerCmd);
+    const failedAfter = ranAfter.findIndex((r) => !r.ok && !r.skipped);
+    if (failedAfter >= 0) {
+      const failed = ranAfter[failedAfter];
+      console.error("已停止、单元文件已删，但 systemd --user daemon-reload 失败：" +
+        String(failed.text ?? "说不清") + "；请手工执行 systemctl --user daemon-reload");
+      process.exit(1);
+    }
     const skipped = ran.some((r) => r.skipped);
     const what = TIMER_PLAN.kind === "launchd" ? "plist" : "systemd 单元";
     const live = TIMER_PLAN.kind === "launchd" ? "launchd" : "systemd --user";
@@ -462,12 +469,24 @@ if (uninstall) {
   } else {
     // 安装也是**计划驱动**（与实际执行同一份）：两条命令的顺序与内容都来自 drainTimerPlan。
     const reloaded = timerCmd(TIMER_PLAN.commands[0]);
-    const enabled = reloaded.skipped ? { skipped: true } : timerCmd(TIMER_PLAN.commands[1]);
-    launchNote = enabled.skipped
-      ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）"
-      : enabled.ok
-        ? "已加载（systemd user timer）" + (TIMER_PLAN.note ? "；" + TIMER_PLAN.note : "")
-        : "**单元已写入但 systemctl enable --now 失败 —— 兜底重试目前不生效**";
+    if (reloaded.skipped) {
+      launchNote = "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）";
+    } else if (!reloaded.ok) {
+      console.error("  systemctl --user daemon-reload 失败：" + String(reloaded.text ?? "说不清"));
+      launchNote = "**单元已写入但 systemctl daemon-reload 失败 —— 定时器未加载**";
+      process.exitCode = 1;
+    } else {
+      const enabled = timerCmd(TIMER_PLAN.commands[1]);
+      if (enabled.skipped) {
+        launchNote = "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）";
+      } else if (enabled.ok) {
+        launchNote = "已加载（systemd user timer）" + (TIMER_PLAN.note ? "；" + TIMER_PLAN.note : "");
+      } else {
+        console.error("  systemctl --user enable --now 失败：" + String(enabled.text ?? "说不清"));
+        launchNote = "**单元已写入但 systemctl enable --now 失败 —— 兜底重试目前不生效**";
+        process.exitCode = 1;
+      }
+    }
   }
 }
 

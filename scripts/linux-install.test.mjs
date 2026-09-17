@@ -295,6 +295,44 @@ test("fix2/P1-2 停不下来就不删、不报已卸载、退非零：disable �
   assert.match(un2.stdout, /已卸载/u);
 });
 
+test("fix3/P1-1 Linux 安装：daemon-reload 失败不得继续 enable 且非零退出（子进程 + 注入 systemctl）", () => {
+  const fx = linuxUninstallFixture();
+  const reloadFails = path.join(path.dirname(fx.ok), "systemctl-reload-fails");
+  fs.writeFileSync(reloadFails, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PK3_LOG\"\nif [ \"$2\" = \"daemon-reload\" ]; then echo 'Failed to reload: Bus communication error' >&2; exit 1; fi\nexit 0\n", { mode: 0o755 });
+  const inst = runInstaller(fx.env(reloadFails), ["--apply"]);
+  assert.notEqual(inst.status, 0, "daemon-reload 失败必须非零退出");
+  assert.match(inst.stdout + inst.stderr, /daemon-reload 失败/u);
+  assert.match(inst.stdout + inst.stderr, /Bus communication error/u);
+  assert.equal(/已加载/u.test(inst.stdout), false, "不许报已加载");
+  const calls = fx.readLog();
+  assert.equal(calls.some((l) => l.includes("enable")), false, "daemon-reload 失败后决不能继续调用 enable：" + JSON.stringify(calls));
+});
+
+test("fix3/P1-1 Linux 安装：enable --now 失败非零退出且不报已加载（子进程 + 注入 systemctl）", () => {
+  const fx = linuxUninstallFixture();
+  const enableFails = path.join(path.dirname(fx.ok), "systemctl-enable-fails");
+  fs.writeFileSync(enableFails, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PK3_LOG\"\nif [ \"$2\" = \"enable\" ]; then echo 'Failed to enable: Unit file is masked' >&2; exit 1; fi\nexit 0\n", { mode: 0o755 });
+  const inst = runInstaller(fx.env(enableFails), ["--apply"]);
+  assert.notEqual(inst.status, 0, "enable 失败必须非零退出");
+  assert.match(inst.stdout + inst.stderr, /enable --now 失败/u);
+  assert.match(inst.stdout + inst.stderr, /Unit file is masked/u);
+  assert.equal(/已加载/u.test(inst.stdout), false, "不许报已加载");
+});
+
+test("fix3/P1-2 Linux 卸载：删 unit 后的 daemon-reload 失败要外显并非零退出、不报已卸载（子进程 + 注入 systemctl）", () => {
+  const fx = linuxUninstallFixture();
+  assert.equal(runInstaller(fx.env(fx.ok), ["--apply"]).status, 0, "先装一次");
+  assert.ok(fs.existsSync(fx.unitFile), "装完单元在");
+  const reloadFails = path.join(path.dirname(fx.ok), "systemctl-uninst-reload-fails");
+  fs.writeFileSync(reloadFails, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PK3_LOG\"\nif [ \"$2\" = \"daemon-reload\" ]; then echo 'Failed to reload: Connection reset by peer' >&2; exit 1; fi\nexit 0\n", { mode: 0o755 });
+  const un = runInstaller(fx.env(reloadFails), ["--uninstall", "--apply"]);
+  assert.notEqual(un.status, 0, "daemon-reload 失败必须非零退出");
+  assert.equal(fs.existsSync(fx.unitFile), false, "文件已删（已停止且文件已删）");
+  assert.equal(/已卸载/u.test(un.stdout), false, "不许报已卸载");
+  assert.match(un.stdout + un.stderr, /已停止、单元文件已删，但 systemd --user daemon-reload 失败：/u);
+  assert.match(un.stdout + un.stderr, /请手工执行 systemctl --user daemon-reload/u);
+});
+
 /** doctor ⑥ 的 linux 夹具：盘上单元按投影写对、已安装 node 是 fixture 里那个、一个有积压的项目（有积压 ⑥ 才看发布器）。 */
 function linuxDoctorFixture() {
   const base = tmpBase("pk3fix2-doctor-");

@@ -243,7 +243,7 @@ const readTextOrNull = (p) => { try { return fs.readFileSync(p, "utf-8"); } catc
  * settings.json 里**我们自己的** hook 命令文本（`installedNodeFrom` 的来源②）。纯函数。
  * 只收三条桥 hook（Stop / UserPromptSubmit 两条）：别的工具的命令就算恰好含 `[ -x '…' ]` 也不是我们的。
  */
-export function bridgeHookCommands(text) {
+function bridgeHookCommands(text) {
   let settings = null;
   try { settings = JSON.parse(text); } catch { return []; }
   const names = ["stop-hook.mjs", "inbound-hook.mjs", "init-hook.mjs"];
@@ -263,7 +263,7 @@ export function bridgeHookCommands(text) {
  * 现有兜底定时器文件的正文（`installedNodeFrom` 的来源③）：按平台读该位置，缺席跳过。
  * read 可注入（与 drainTimerPlan 同一口径）—— 这条路径要能在测试里不碰真机文件。
  */
-export function existingTimerTexts({ home = os.homedir(), platform = process.platform, read = readTextOrNull } = {}) {
+function existingTimerTexts({ home = os.homedir(), platform = process.platform, read = readTextOrNull } = {}) {
   const files = timerKindFor(platform) === "launchd" ? [claudeDrainPlistPath(home)]
     : timerKindFor(platform) === "systemd" ? [claudeDrainSystemdPaths(home).service, claudeDrainSystemdPaths(home).timer]
       : [];

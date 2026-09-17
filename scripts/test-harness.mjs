@@ -224,6 +224,12 @@ export function installTestHomeIsolation({ env = process.env, passwdHome = null,
     FEISHU_BRIDGE_MAINTENANCE_DIR: tripwire.maintenance,
     FEISHU_BRIDGE_MAINTENANCE_GATE: tripwire.gate,
     FEISHU_CODEX_BRIDGE_HOME: tripwire.codexHome,
+    // PK3-L1：链模板也进绊线 —— **指向套件私有目录里一个不存在的位置**（故意不建）。
+    //   为什么：`chain-template.mjs` 的 DEFAULT_TEMPLATE 是模块加载时用 os.homedir() 算的，
+    //   那时套件还没把 HOME 改到私有目录 —— 于是没设这个变量的用例会读到**真家目录**那份模板。
+    //   结果：Mac（装了桥、有模板）绿，全新 Linux 主机（没模板）红，而红的是用例“偷偷依赖真 HOME”。
+    //   绊线之后，不提供模板的用例在**任何平台**都拿到 no_template —— 依赖当场暴露，不再只在 Linux 上暴露。
+    FEISHU_BRIDGE_CHAIN_TEMPLATE: path.join(suiteHome, ".claude", "feishu-bridge", "chain-config.json"),
   });
   for (const [name, value] of Object.entries(machineEnv)) env[name] = value;
   const guardedRoots = [

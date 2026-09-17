@@ -16,7 +16,7 @@ import path from "node:path";
 
 import { runtimeScript } from "./runtime-install.mjs";
 import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor } from "./drain-schedule.mjs";
 
 /** 埋进命令里的显式归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
 export const HOOK_TAG = "FEISHU_BRIDGE_HOOK:";
@@ -186,7 +186,95 @@ ${job.args.map((a) => "    <string>" + a + "</string>").join("\n")}
 }
 export const claudeDrainPlistPath = (home = os.homedir()) => path.join(home, "Library", "LaunchAgents", CLAUDE_DRAIN_LAUNCH_LABEL + ".plist");
 
+// ── Linux：systemd --user 的两份单元（PK3-L1）──────────────────────────────────────────────
+// 与 plist **同语义**：跑 drain-outbox.mjs --all，30 分钟一次，不对齐日历（OnUnitActiveSec）。
+// 只写 ~/.config/systemd/user/ 下我们自己的两个文件；那个目录里别的东西（Omarchy 放的 .wants）不碰。
+export const CLAUDE_DRAIN_SYSTEMD_UNIT = "feishu-bridge-cc-drain";
+export const claudeDrainSystemdDir = (home = os.homedir()) => path.join(home, ".config", "systemd", "user");
+export const claudeDrainSystemdPaths = (home = os.homedir()) => {
+  const dir = claudeDrainSystemdDir(home);
+  return { dir,
+    service: path.join(dir, CLAUDE_DRAIN_SYSTEMD_UNIT + ".service"),
+    timer: path.join(dir, CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer") };
+};
+
+/** systemd 单元里的一个参数：安全字符原样，其余按 shell 引用（单元文件也会被 systemd 拆词）。 */
+const systemdQuote = (arg) => (/^[A-Za-z0-9@%+=:,./_-]+$/u.test(arg) ? arg : JSON.stringify(arg));
+
+/** 两份单元正文（与 doctor 核 systemd 用的 expectedJob 同源）。 */
+export function claudeDrainSystemdUnits({ home = os.homedir(), node = pickClaudeNode() } = {}) {
+  const job = claudeDrainExpectedJob({ home, node });
+  const bridgeRoot = path.dirname(path.dirname(runtimeScript("stop-hook.mjs", home, "claude")));
+  const log = path.join(home, ".claude", "feishu-bridge", "drain.log");
+  const exec = job.args.map(systemdQuote).join(" ");
+  const service = `[Unit]
+Description=feishu-bridge 兜底发布（Claude 链，drain --all）
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${bridgeRoot}
+ExecStart=${exec}
+StandardOutput=append:${log}
+StandardError=append:${log}
+`;
+  const timer = `[Unit]
+Description=feishu-bridge 兜底发布定时器（每 30 分钟）
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=${CLAUDE_DRAIN_SYSTEMD_UNIT}.service
+
+[Install]
+WantedBy=timers.target
+`;
+  return { service, timer };
+}
+
 /** 出站安装器装的 8 个技能：仓库源目录名 → ~/.claude/skills 目录名。 */
+/**
+ * 兜底定时器的**安装计划**（PK3-L1）：纯函数，平台可注入。安装器照它执行、测试照它断言。
+ *
+ *   darwin → launchd：写 LaunchAgent plist，`launchctl bootout/bootstrap`
+ *   linux  → systemd --user：写 .service + .timer，`systemctl --user daemon-reload` + `enable --now <timer>`
+ *   其它   → kind:null、unsupported：**明说本平台没有实现，未装**（不假装装好，安装继续）
+ *
+ * `read` 注入的是「现在盘上是什么」（返回 null = 文件不在）：只用来判 will-install / will-update / unchanged。
+ */
+export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), platform = process.platform,
+  read = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } } } = {}) {
+  const kind = timerKindFor(platform);
+  if (kind === null) {
+    return { kind: null, action: "unsupported", files: [], commands: [],
+      note: "本平台（" + platform + "）没有兜底定时器实现，未装 —— 事件驱动的发布照常，只是没有 30 分钟兜底重试" };
+  }
+  const actionOf = (path, text) => {
+    const current = read(path);
+    return current === null ? "will-install" : (current === text ? "unchanged" : "will-update");
+  };
+  if (kind === "launchd") {
+    const path = claudeDrainPlistPath(home);
+    const text = claudeDrainPlist({ home, node });
+    return { kind, action: actionOf(path, text), files: [{ path, text }],
+      commands: [["launchctl", "bootout", "gui/<uid>/" + CLAUDE_DRAIN_LAUNCH_LABEL], ["launchctl", "bootstrap", "gui/<uid>", path]],
+      note: null };
+  }
+  const paths = claudeDrainSystemdPaths(home);
+  const units = claudeDrainSystemdUnits({ home, node });
+  const serviceAction = actionOf(paths.service, units.service);
+  const timerAction = actionOf(paths.timer, units.timer);
+  const action = serviceAction === "unchanged" && timerAction === "unchanged" ? "unchanged"
+    : (serviceAction === "will-update" || timerAction === "will-update") ? "will-update" : "will-install";
+  return { kind, action,
+    files: [{ path: paths.service, text: units.service }, { path: paths.timer, text: units.timer }],
+    commands: [["systemctl", "--user", "daemon-reload"],
+      ["systemctl", "--user", "enable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"]],
+    // 没登录也想让定时器跑，需要 linger —— 那条要 sudo，安装器只打印提示，不执行。
+    note: "若这台机器不常驻登录会话，兜底要生效还需 `loginctl enable-linger " + "<你的用户>" + "`（要 sudo，交 Frank 决定）" };
+}
+
 export const CLAUDE_SKILLS = Object.freeze([
   { src: "claude-longtask-progress", dst: "claude-longtask-progress" },
   { src: "claude-feishu-bind",       dst: "feishu-bind" },

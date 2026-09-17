@@ -39,7 +39,7 @@
 
 | 依赖 | 要求 | 怎么验 |
 |---|---|---|
-| macOS | 用到 launchd 和 `~/.claude` 路径 | — |
+| 操作系统 | **macOS**：launchd 兜底定时器 + `~/.claude` 路径；**Linux**：systemd `--user` 兜底定时器（见下「Linux（systemd --user）」）；其它平台**能装、但没有兜底定时器**（安装器会明说未装） | `uname -s` |
 | Node.js | ≥ 22 | `node -v` |
 | Claude Code | 支持 Stop 钩子、`--continue`、跨会话 `SendMessage` | `claude --help \| grep continue` |
 | aily-cli | 已登录，daemon 在线 | `aily-cli doctor` 应当全 OK |
@@ -158,7 +158,7 @@ node scripts/install-outbound.mjs --apply
 
 它装五样，**都只追加、改前备份**：Stop 钩子（把最终回答与同轮输入配对并自动发回话题）、
 UserPromptSubmit 钩子（缓存本地文本输入，并在 `/init` 成功后提示显式运行 `/feishu-bind`）、`bind-preview` 的权限白名单、
-项目登记表 + 全局技能、launchd 兜底定时器。
+项目登记表 + 全局技能、兜底定时器（macOS 写 LaunchAgent；Linux 写 systemd `--user` 单元，见下）。
 
 **验证**：
 
@@ -200,6 +200,31 @@ tail ~/.claude/feishu-bridge/stop-hook.log         # 出站钩子每次干了什
 ```
 
 ---
+
+### Linux（systemd --user）
+
+同一套安装器，按 `process.platform` 自动选兜底实现 —— 不用传任何参数：
+
+- **Windows 之类其它平台**：安装继续，但兜底定时器那一行会**明说「本平台没有兜底定时器实现，未装」**，
+  不会写一个永远不生效的文件、也不假装装好。
+- **Linux**：写两份单元到 `~/.config/systemd/user/`（那个目录里别的东西不动）：
+
+  ```
+  ~/.config/systemd/user/feishu-bridge-cc-drain.service
+  ~/.config/systemd/user/feishu-bridge-cc-drain.timer
+  ```
+
+  然后 `systemctl --user daemon-reload` + `systemctl --user enable --now feishu-bridge-cc-drain.timer`。
+  语义与 macOS 的 plist 一致：跑 `drain-outbox.mjs --all`，`OnUnitActiveSec=30min`。
+- **不常驻登录时**还要 `loginctl enable-linger <你的用户>`（要 sudo）—— 安装器只**打印**这条提示，
+  不执行（sudo 的动作交给你）。
+- **凭据位置（只在 Linux）**：lark-cli 在 Linux 上不用系统钥匙串，改用文件加密库，默认根
+  `~/.local/share/lark-cli/`；而 aily 给每个 agent 写的密钥在 `<agent 凭据目录>/data/lark-cli/`。
+  桥会给每个 lark-cli 调用补上 `LARKSUITE_CLI_DATA_DIR=<agent 凭据目录>/data`，让两边对上。
+  `node scripts/doctor.mjs` 在 Linux 上会多查一项「⑧′ 机器人发送凭据」，把**aily 写的目录**与
+  **lark-cli 找的目录**都打印出来（两边各自成功、就是没对上，是最难查的那类）。
+- **node 从哪来**：hooks 与单元里的 node 是**解析**出来的（`FEISHU_BRIDGE_NODE` → PATH → 常见安装位置），
+  不写死 macOS 的 `/opt/homebrew/bin/node`；版本管理器（mise/nvm）下拿到的是 shim，切版本也不会失效。
 
 ## 四、接一个新项目（两下）
 

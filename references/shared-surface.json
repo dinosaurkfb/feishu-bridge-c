@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-16T09:52:54.678Z",
+  "generated_at": "2026-09-17T04:54:52.646Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -44,6 +44,8 @@
       "assertPublishIdentity",
       "describeTemplateWrite",
       "identityErrorText",
+      "larkCliEnv",
+      "larkProvisionedSecretPath",
       "loadChainTemplate",
       "materializeProjectConfig",
       "p2pChatIdProblem",
@@ -343,6 +345,7 @@
       "validateRoutesDoc"
     ],
     "install-projection.mjs": [
+      "CLAUDE_DRAIN_SYSTEMD_UNIT",
       "CLAUDE_INBOUND_SKILL",
       "CLAUDE_SKILLS",
       "HOOK_TAG",
@@ -350,10 +353,14 @@
       "claimSingleHook",
       "claudeDrainPlist",
       "claudeDrainPlistPath",
+      "claudeDrainSystemdDir",
+      "claudeDrainSystemdPaths",
+      "claudeDrainSystemdUnits",
       "claudeHookCommands",
       "claudeSettingsOwnedEntries",
       "claudeSkillFiles",
       "countHooks",
+      "drainTimerPlan",
       "legacyOwnsHook",
       "ownsHook",
       "referencedRuntimeScripts",

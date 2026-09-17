@@ -2,7 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 
-import { assertPublishIdentity, identityErrorText } from "../chain-template.mjs";
+import { assertPublishIdentity, identityErrorText, larkCliEnv } from "../chain-template.mjs";
 
 function preflight({ configDir, profile, expectedAppId }) {
   if (!expectedAppId) return;
@@ -32,8 +32,8 @@ export function updateTextMessage({
       encoding: "utf-8",
       input: body,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, LARKSUITE_CLI_PROFILE: profile,
-             ...(larkHome ? { LARKSUITE_CLI_CONFIG_DIR: larkHome } : {}) },
+      // PK3-L1：linux 上还要指 LARKSUITE_CLI_DATA_DIR（aily 写的密钥在哪，见 larkCliEnv）
+      env: larkCliEnv({ configDir: larkHome ?? null, profile }),
       timeout: timeoutMs ?? 30_000,
       maxBuffer: 4 * 1024 * 1024,
     },

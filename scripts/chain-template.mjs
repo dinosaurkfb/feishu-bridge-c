@@ -219,6 +219,37 @@ export function materializeProjectConfig({ template, projectRoot, displayName })
  * 刻意推导而不是再加一个字段：多一个开关，就多一种「开关说 A、身份字段说 B」的
  * 不一致状态，而那种状态查起来最费劲。推导让两者**构造上**就不可能打架。
  */
+/**
+ * 按 agent 凭据目录构造 lark-cli 的环境（PK3-L1，omm 实测过的真实根因）。
+ *
+ * Linux 上 lark-cli **不用系统钥匙串**，改用文件加密库：默认根 `~/.local/share/lark-cli/`
+ * （master.key + appsecret_<appId>.enc）；而 aily 给每个 agent 写的密钥在
+ * `<configDir>/data/lark-cli/` —— lark-cli 默认不会去那儿找，于是报 missing app secret，
+ * 而 aily 的 provision 文件还写着 preflight ok（两边各自都「成功」，就是没对上）。
+ *
+ * 修法：`LARKSUITE_CLI_DATA_DIR=<configDir>/data`。**注意指向 data，不是 data/lark-cli**：
+ * lark-cli 自己会在它下面再补一层 lark-cli；指错成 data/lark-cli 会报 not_configured。
+ *
+ * macOS 走钥匙串，多设这个变量的后果**没有实测过** → 只在 linux 设（platform 可注入，测试用）。
+ * 这是纯函数：只算环境，不碰磁盘、不执行任何命令。
+ */
+export function larkCliEnv({ env = process.env, configDir = null, profile = null, platform = process.platform } = {}) {
+  const out = { ...env };
+  if (typeof profile === "string" && profile.length > 0) out.LARKSUITE_CLI_PROFILE = profile;
+  if (typeof configDir === "string" && configDir.length > 0) out.LARKSUITE_CLI_CONFIG_DIR = configDir;
+  if (platform === "linux" && typeof configDir === "string" && configDir.length > 0) {
+    out.LARKSUITE_CLI_DATA_DIR = path.join(configDir, "data");
+  }
+  return out;
+}
+
+/** aily（provision）把 agent 密钥写在哪：<configDir>/data/lark-cli/appsecret_<appId>.enc。 */
+export function larkProvisionedSecretPath({ configDir, appId }) {
+  if (typeof configDir !== "string" || configDir.length === 0) return null;
+  if (typeof appId !== "string" || appId.length === 0) return null;
+  return path.join(configDir, "data", "lark-cli", "appsecret_" + appId + ".enc");
+}
+
 export function resolveLarkIdentity(config) {
   const singleAgent =
     typeof config?.outbound_app_id === "string" &&

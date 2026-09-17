@@ -27,7 +27,7 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
-import { CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
@@ -168,13 +168,16 @@ const PLIST = claudeDrainPlistPath(os.homedir());
 // plist 正文只有一份（install-projection.mjs），与 doctor 核 launchd 的 expectedJob 同源。
 const plistBody = claudeDrainPlist({ home: os.homedir(), node: NODE_BIN });
 
+// PK3-L1：兜底定时器按平台 —— darwin launchd / linux systemd --user / 其它明说没实现。
+// 计划是**纯函数**（install-projection.drainTimerPlan），安装器照它执行、测试照它断言。
+const TIMER_PLAN = drainTimerPlan({ home: os.homedir(), node: NODE_BIN });
+const TIMER_FILES = TIMER_PLAN.files;
+
 let plistAction = "unchanged";
 if (uninstall) {
-  if (fs.existsSync(PLIST)) plistAction = "will-remove";
+  if (TIMER_FILES.some((f) => fs.existsSync(f.path))) TIMER_PLAN.action = "will-remove";
 } else {
-  let current = null;
-  try { current = fs.readFileSync(PLIST, "utf-8"); } catch { /* 还没装 */ }
-  if (current !== plistBody) plistAction = current === null ? "will-install" : "will-update";
+  plistAction = TIMER_PLAN.action;
 }
 
 // ---------- 落盘 ----------
@@ -341,6 +344,21 @@ const launchctl = (args, { tolerate = false } = {}) => {
   }
 };
 
+// systemd 那一侧同一条纪律（PK3-L1）：沙箱 HOME 不碰**真实** systemd --user 实例 —— 理由与 launchctl 处
+// 逐字相同：systemctl --user 操作的是当前登录用户的实例，跟 HOME 一点关系都没有。
+// FEISHU_BRIDGE_SYSTEMCTL 是测试隔离点（与 FEISHU_BRIDGE_LAUNCHCTL 同一口径）。
+const systemctl = (args, { tolerate = false } = {}) => {
+  if (SANDBOXED) return { ok: false, skipped: true };
+  const bin = process.env.FEISHU_BRIDGE_SYSTEMCTL || "systemctl";
+  try {
+    execFileSync(bin, args, { stdio: "pipe", timeout: 15_000 });
+    return { ok: true };
+  } catch (err) {
+    if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + String(err.message).split("\n")[0]);
+    return { ok: false };
+  }
+};
+
 const domain = "gui/" + process.getuid();
 let launchNote;
 if (uninstall) {
@@ -351,17 +369,32 @@ if (uninstall) {
   launchNote = booted.skipped
     ? "plist 已删，但真实 launchd 未动（HOME 被重定向到 " + os.homedir() + "）"
     : "已卸载";
+} else if (TIMER_PLAN.kind === null) {
+  // 其它平台：**明说没装**，安装继续（不假装装好）。计划里已经带了这句话。
+  launchNote = TIMER_PLAN.note;
 } else {
-  fs.mkdirSync(path.dirname(PLIST), { recursive: true });
-  fs.writeFileSync(PLIST, plistBody);
-  launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
-  const loaded = launchctl(["bootstrap", domain, PLIST]);
-  launchNote = loaded.skipped
-    // 说出来，别让人以为兜底装好了。沙箱安装不碰真实 launchd 是有意的，见 launchctl 处的说明。
-    ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 launchd）"
-    : loaded.ok
-      ? "已加载"
-      : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+  for (const f of TIMER_FILES) {
+    fs.mkdirSync(path.dirname(f.path), { recursive: true });
+    fs.writeFileSync(f.path, f.text);
+  }
+  if (TIMER_PLAN.kind === "launchd") {
+    launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
+    const loaded = launchctl(["bootstrap", domain, PLIST]);
+    launchNote = loaded.skipped
+      // 说出来，别让人以为兜底装好了。沙箱安装不碰真实 launchd 是有意的，见 launchctl 处的说明。
+      ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 launchd）"
+      : loaded.ok
+        ? "已加载"
+        : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
+  } else {
+    const reloaded = systemctl(["daemon-reload"], { tolerate: true });
+    const enabled = reloaded.skipped ? { skipped: true } : systemctl(["enable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"]);
+    launchNote = enabled.skipped
+      ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）"
+      : enabled.ok
+        ? "已加载（systemd user timer）" + (TIMER_PLAN.note ? "；" + TIMER_PLAN.note : "")
+        : "**单元已写入但 systemctl enable --now 失败 —— 兜底重试目前不生效**";
+  }
 }
 
 // 机器级安装收据（维护门 PR B）—— **放在全部制品（settings / 技能 / plist）都写完之后**：记的是已经落盘的东西，不是打算写的。记下这次往线上写了什么（settings 只记桥拥有的封闭条目、plist 与技能整文件）与引用的脚本。
@@ -370,10 +403,14 @@ if (!uninstall) {
   const installedVersion = verifyRuntime().version ?? null;
   const artifacts = [
     { path: SETTINGS, kind: "claude-settings", sha256: artifactSha({ kind: "claude-settings", text: settingsAfter, home: os.homedir(), node: NODE_BIN }) },
-    { path: PLIST, kind: "plist", sha256: artifactSha({ kind: "plist", text: plistBody }) },
+    // darwin：plist（kind=plist）；linux：两个 systemd 单元（kind=file —— 受控集合里没有 systemd 专用 kind，
+    //   而收据记的是「这次往线上写了哪些文件 + 它们的内容摘要」，用 file 如实表达）。
+    ...TIMER_FILES.map((f) => ({ path: f.path, kind: TIMER_PLAN.kind === "launchd" ? "plist" : "file",
+      sha256: artifactSha({ kind: TIMER_PLAN.kind === "launchd" ? "plist" : "file", text: f.text }) })),
     ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
   ];
-  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
+  const timerText = TIMER_FILES.map((f) => f.text).join("\n");
+  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerText, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
   const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
   console.log("安装收据 : " + report.text);

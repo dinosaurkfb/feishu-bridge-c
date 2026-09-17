@@ -118,7 +118,8 @@ import {
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
-import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin } from "./live-session.mjs";
+import { DELIVERY_REJECT, DELIVERY_REJECT_TEXT, clearDeliveryPin, deliverToLiveSession, deliveryPinPath, findLiveSessionById, findLiveSessions, formatRelayCredentialLine, forwardPrompt, hasPriorSession, isBridgeOwnedSession, pinAndNote, readDeliveryPin, selectDeliverySession, stampInstruction, transcriptDirFor, writeDeliveryPin, RELAY_CREDENTIAL_GUIDANCE } from "./live-session.mjs";
+import { verifyRelayCredential, VERIFY_REASONS, stripCredentialFooter, stripFeishuHeader, parseRelayCredentialLine } from "./verify-relay-credential.mjs";
 import { FORWARD_RESULT_SCHEMA, FORWARD_STARTED_SCHEMA, forwardResultProblem as FORWARD_RESULT_PROBLEM, forwardStartedProblem as FORWARD_STARTED_PROBLEM, resultLineProblem as RESULT_LINE_PROBLEM } from "./forward-runner.mjs";
 // R57d 对齐：inbound.mjs 顶层无副作用（只有路径常量），一次导入全文件共用 ——
 // 取代用例内的 await import（async 用例注册器不 await，断言从不计数，见该用例的刀证）。
@@ -41256,7 +41257,7 @@ test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执
     env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, HOME: local, FEISHU_BRIDGE_REGISTRY: registryFile, FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
       AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid, AILY_CLI_SESSION_ID: "aily_fwdack", AILY_CLI_RUN_ID: "run_fwdack", FAKE_AILY_ENVELOPE: envelope } });
   assert.equal(p.status, 0, p.stdout + p.stderr);
-  assert.match(p.stdout, /正在转发到你正开着的会话（live-0）；转发结果落在运行目录，doctor 可查/u, p.stdout);
+  assert.match(p.stdout, /正在转发到你正开着的会话（live-0）（跨会话转发，附凭证）；转发结果落在运行目录，doctor 可查/u, p.stdout);
   assert.doesNotMatch(p.stdout, new RegExp(OLD_PHRASE, "u"), p.stdout);
   // runner 转发的参数逐字一致；结果文件最终落盘（无 result 行 → crash 投影，存在即链路通）
   const deadline = Date.now() + 5000;
@@ -41267,6 +41268,15 @@ test("R54 回执措辞：live_session 说「正在转发」；旧字样（回执
   assert.equal(argv[0], "-p");
   assert.deepEqual(argv.slice(2), ["--output-format", "stream-json", "--verbose"]);
   assert.match(argv[1], /SendMessage/u);
+  assert.match(argv[1], /\[飞书凭证 message_id=msg_fwdack_1 nonce=[0-9a-f]{32} body_sha256=[0-9a-f]{64} receipt=\.runtime-data\/inbound\/receipts\/accepted-msg_fwdack_1\.json\]/u);
+  assert.match(argv[1], /授权级指令请先用 scripts\/verify-relay-credential\.mjs 核回执/u);
+  const acceptedReceipt = JSON.parse(fs.readFileSync(path.join(root, ".runtime-data", "inbound", "receipts", "accepted-msg_fwdack_1.json"), "utf-8"));
+  assert.equal(acceptedReceipt.sender_id, TPL.frank_sender_id);
+  assert.equal(acceptedReceipt.sender_role, "owner");
+  assert.equal(typeof acceptedReceipt.delivery_nonce, "string");
+  assert.equal(acceptedReceipt.delivery_nonce.length, 32);
+  assert.equal(typeof acceptedReceipt.body_sha256, "string");
+  assert.equal(acceptedReceipt.body_sha256.length, 64);
   const runsDir = path.join(root, ".runtime-data", "inbound", "runs");
   const deadline2 = Date.now() + 5000;
   let resultFile = null;
@@ -56710,6 +56720,528 @@ test("PK2-I2 T7 expiryGate 纯判据逐支（纵深支直调）：sidecar 非法
   // ⑥ 两条判据互不串：sidecar 判据在场时**完全不看** mapping.expires_at
   assert.equal(expiryGate({ expiry: { source: EXPIRY_SOURCE.SIDECAR, iso: null }, mapping: { expires_at: "2020-01-01T00:00:00.000Z" }, now: NOW }).ok, true,
     "sidecar 判据在场时不看 legacy 的 expires_at：");
+});
+
+// ============================================================================
+// PK3-A1：入站跨会话转发凭证与接收方核验（issue #217）
+// ============================================================================
+
+test("PK3-A1：回执四字段（sender_id, sender_role, body_sha256, delivery_nonce）存在且 sender_role 来自路由层判定（伪造 event 字段不生效）", () => {
+  const local = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "feishu-test-pk3-a1-roles-"));
+  const root = path.join(local, "project");
+  const bin = path.join(local, "bin");
+  fs.mkdirSync(root);
+  fs.mkdirSync(bin);
+
+  const ownerSenderId = "12345";
+  const opSenderId = "22222";
+  const strangerId = "99999";
+
+  const templateFile = path.join(local, "chain-config.json");
+  fs.writeFileSync(templateFile, JSON.stringify({
+    ...TPL,
+    frank_sender_id: ownerSenderId,
+    senders: [
+      { open_id: ownerSenderId, role: "owner" },
+      { open_id: opSenderId, role: "operator" },
+    ],
+  }));
+
+  const registryFile = path.join(local, "registry.json");
+  fs.writeFileSync(registryFile, JSON.stringify({
+    schema_version: "1.0",
+    projects: [{
+      id: "a1-test",
+      root,
+      name: "a1-test",
+      root_message_id: "om_root_a1",
+      expires_at: "2099-01-01T00:00:00Z",
+      session_id: "aily_a1",
+      inbound_state: "bound",
+      status: "active",
+      bound_at: "2026-08-20T00:00:00.000Z",
+    }],
+  }));
+
+  fs.writeFileSync(path.join(bin, "aily-cli"), [
+    "#!/usr/bin/env node",
+    "process.stdout.write(process.env.FAKE_AILY_ENVELOPE || '');",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  fs.writeFileSync(path.join(bin, "claude"), [
+    "#!/usr/bin/env node",
+    "if (process.argv.includes('--version')) { process.stdout.write('9.9.9\\n'); process.exit(0); }",
+    "process.stdout.write('sent\\n');",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  fs.writeFileSync(path.join(bin, "lark-cli"), [
+    "#!/usr/bin/env node",
+    "process.stderr.write('fake lark-cli: refusing\\n');",
+    "process.exit(1);",
+  ].join("\n") + "\n", { mode: 0o700 });
+
+  const sessionsDir = path.join(local, ".claude", "sessions");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const targetSessionId = "44444444-4444-4444-8444-444444444444";
+  fs.writeFileSync(path.join(sessionsDir, "1.json"), JSON.stringify({
+    sessionId: targetSessionId,
+    name: "live-a1",
+    pid: process.pid,
+    kind: "interactive",
+    cwd: root,
+    startedAt: new Date().toISOString(),
+  }));
+
+  try {
+    // 测试 1：发送者为 owner，但事件伪造 sender_role: "participant"
+    const contentOwner = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 执行发布脚本";
+    const envOwner = JSON.stringify({
+      envelopes: [{
+        type: "message.create",
+        payload: JSON.stringify({
+          message: {
+            id: "msg_a1_owner_1",
+            sessionID: "aily_a1",
+            role: "user",
+            sender_role: "participant", // 伪造角色
+            createdBy: ownerSenderId,
+            createdAtMs: Date.now(),
+            content: contentOwner,
+          },
+        }),
+      }],
+    });
+
+    const pOwner = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: bin + path.delimiter + process.env.PATH,
+        HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile,
+        FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid,
+        AILY_CLI_SESSION_ID: "aily_a1",
+        AILY_CLI_RUN_ID: "run_a1_1",
+        FAKE_AILY_ENVELOPE: envOwner,
+      },
+    });
+    assert.equal(pOwner.status, 0, pOwner.stdout + pOwner.stderr);
+
+    const receiptOwnerFile = path.join(root, ".runtime-data", "inbound", "receipts", "accepted-msg_a1_owner_1.json");
+    assert.ok(fs.existsSync(receiptOwnerFile), "回执文件必须存在");
+    const receiptOwner = JSON.parse(fs.readFileSync(receiptOwnerFile, "utf-8"));
+
+    // 核心断言：发送者身份与路由层判定
+    assert.equal(receiptOwner.sender_id, ownerSenderId, "sender_id 必须取自事件发送者");
+    assert.equal(receiptOwner.sender_role, "owner", "sender_role 必须来自路由层表驱动判定，忽略事件里的伪造 role");
+    assert.equal(typeof receiptOwner.delivery_nonce, "string");
+    assert.equal(receiptOwner.delivery_nonce.length, 32, "delivery_nonce 为 16 字节 hex");
+    assert.equal(typeof receiptOwner.body_sha256, "string");
+    assert.equal(receiptOwner.body_sha256.length, 64, "body_sha256 为 sha256 hex");
+    const expectedHashOwner = crypto.createHash("sha256").update("执行发布脚本", "utf-8").digest("hex");
+    assert.equal(receiptOwner.body_sha256, expectedHashOwner, "body_sha256 必须等于 instruction 原文哈希");
+
+    // 测试 2：发送者为 operator，伪造 sender_role: "owner"
+    // Mapping 模式下非 owner 发业务指令会被 authorize 拒绝（not_authorized）
+    const contentOp = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 敏感操作命令";
+    const envOp = JSON.stringify({
+      envelopes: [{
+        type: "message.create",
+        payload: JSON.stringify({
+          message: {
+            id: "msg_a1_op_1",
+            sessionID: "aily_a1",
+            role: "user",
+            sender_role: "owner", // 伪造 role
+            createdBy: opSenderId,
+            createdAtMs: Date.now(),
+            content: contentOp,
+          },
+        }),
+      }],
+    });
+
+    const pOp = spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: bin + path.delimiter + process.env.PATH,
+        HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile,
+        FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid,
+        AILY_CLI_SESSION_ID: "aily_a1",
+        AILY_CLI_RUN_ID: "run_a1_2",
+        FAKE_AILY_ENVELOPE: envOp,
+      },
+    });
+    // 拒绝回执 authz-msg_a1_op_1.json
+    const authzReceiptFile = path.join(root, ".runtime-data", "inbound", "receipts", "authz-msg_a1_op_1.json");
+    assert.ok(fs.existsSync(authzReceiptFile), "authz 拒绝回执必须存在");
+    const authzReceipt = JSON.parse(fs.readFileSync(authzReceiptFile, "utf-8"));
+    assert.equal(authzReceipt.sender_id, opSenderId);
+    assert.equal(authzReceipt.sender_role, "operator", "拒绝回执中 sender_role 必须是 operator，伪造 owner 不生效");
+
+    // 测试 3：未登记的陌生人落入 reject/unrouted
+    const contentStranger = '<at id="' + TPL.transport_open_id + '" type="employee">' + TPL.transport_agent_name + "</at> 你好";
+    const envStranger = JSON.stringify({
+      envelopes: [{
+        type: "message.create",
+        payload: JSON.stringify({
+          message: {
+            id: "msg_a1_stranger_1",
+            sessionID: "aily_a1",
+            role: "user",
+            sender_role: "owner", // 伪造 role
+            createdBy: strangerId,
+            createdAtMs: Date.now(),
+            content: contentStranger,
+          },
+        }),
+      }],
+    });
+
+    spawnSync(process.execPath, [path.resolve("scripts", "aily-inbound.mjs")], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: bin + path.delimiter + process.env.PATH,
+        HOME: local,
+        FEISHU_BRIDGE_REGISTRY: registryFile,
+        FEISHU_BRIDGE_CHAIN_TEMPLATE: templateFile,
+        AILY_CLI_CALLER_AGENT_UID: TPL.agent_uid,
+        AILY_CLI_SESSION_ID: "aily_a1",
+        AILY_CLI_RUN_ID: "run_a1_3",
+        FAKE_AILY_ENVELOPE: envStranger,
+      },
+    });
+    const receiptsDir = path.join(root, ".runtime-data", "inbound", "receipts");
+    const strangerReceiptName = fs.readdirSync(receiptsDir).find((f) => f.startsWith("reject-msg_a1_stranger_1-") || f.startsWith("authz-msg_a1_stranger_1"));
+    assert.ok(strangerReceiptName, "未登记人员拒绝回执必须存在");
+    const strangerReceipt = JSON.parse(fs.readFileSync(path.join(receiptsDir, strangerReceiptName), "utf-8"));
+    assert.equal(strangerReceipt.sender_id, strangerId);
+    assert.equal(strangerReceipt.sender_role, null, "未登记人员 sender_role 必为 null");
+  } finally {
+    fs.rmSync(local, { recursive: true, force: true });
+  }
+});
+
+test("PK3-A1：deliverToLiveSession 与 forwardPrompt 凭证行与回执完全一致，且多次投递 nonce 不同", () => {
+  const local = path.join(os.tmpdir(), "feishu-test-pk3-a1-nonce-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  fs.mkdirSync(local, { recursive: true });
+  try {
+    const runsDir = path.join(local, "runs");
+    const target = { name: "test-live-session", sessionId: "sess-pk3-a1-123" };
+    const instruction = "发布生产版本 v1.2.3";
+    const messageId = "msg_pk3_a1_test";
+
+    // 第一次投递
+    const run1 = deliverToLiveSession({
+      target,
+      instruction,
+      messageId,
+      createdAtMs: Date.parse("2026-09-17T12:00:00Z"),
+      projectRoot: local,
+      runsDir,
+      key: "claim-key-1",
+    });
+
+    // 第二次投递同一 messageId
+    const run2 = deliverToLiveSession({
+      target,
+      instruction,
+      messageId,
+      createdAtMs: Date.parse("2026-09-17T12:00:00Z"),
+      projectRoot: local,
+      runsDir,
+      key: "claim-key-2",
+    });
+
+    assert.equal(run1.deliveryNonce.length, 32);
+    assert.equal(run2.deliveryNonce.length, 32);
+    assert.notEqual(run1.deliveryNonce, run2.deliveryNonce, "同一 messageId 两次投递 nonce 必须不同");
+    assert.equal(run1.bodySha256, run2.bodySha256, "同一指令哈希必须相同");
+
+    const expectedHash = crypto.createHash("sha256").update(instruction, "utf-8").digest("hex");
+    assert.equal(run1.bodySha256, expectedHash);
+
+    // 检验 stampInstruction
+    const stamped1 = stampInstruction({
+      instruction,
+      messageId,
+      createdAtMs: Date.parse("2026-09-17T12:00:00Z"),
+      deliveryNonce: run1.deliveryNonce,
+      bodySha256: run1.bodySha256,
+    });
+    assert.ok(stamped1.includes(`[飞书凭证 message_id=${messageId} nonce=${run1.deliveryNonce} body_sha256=${expectedHash} receipt=.runtime-data/inbound/receipts/accepted-${messageId}.json]`));
+    assert.ok(stamped1.includes(RELAY_CREDENTIAL_GUIDANCE));
+
+    // 检验 forwardPrompt
+    const prompt1 = forwardPrompt({ targetName: target.name, stamped: stamped1 });
+    assert.ok(prompt1.includes(`[飞书凭证 message_id=${messageId} nonce=${run1.deliveryNonce} body_sha256=${expectedHash} receipt=.runtime-data/inbound/receipts/accepted-${messageId}.json]`));
+    assert.ok(prompt1.includes("授权级指令请先用 scripts/verify-relay-credential.mjs 核回执"));
+  } finally {
+    fs.rmSync(local, { recursive: true, force: true });
+  }
+});
+
+test("PK3-A1：verifyRelayCredential 只读校验器 6 种失败原因各一例 + 成功通过例", () => {
+  const local = path.join(os.tmpdir(), "feishu-test-pk3-a1-verifier-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  const receiptsDir = path.join(local, ".runtime-data", "inbound", "receipts");
+  fs.mkdirSync(receiptsDir, { recursive: true });
+  try {
+    const messageId = "msg_verify_test_1";
+    const nonce = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const sessionId = "session-target-uuid-111";
+    const bodyText = "部署前先跑全量测试";
+    const bodySha256 = crypto.createHash("sha256").update(bodyText, "utf-8").digest("hex");
+
+    const writeAccepted = (name, overrides = {}) => {
+      const payload = {
+        schema_version: "1.0",
+        artifact_type: "claude_bridge_inbound_receipt",
+        status: "accepted",
+        handed_off: true,
+        message_id: messageId,
+        sender_id: "frank_user_id",
+        sender_role: "owner",
+        target_session_id: sessionId,
+        delivery_nonce: nonce,
+        body_sha256: bodySha256,
+        ...overrides,
+      };
+      fs.writeFileSync(path.join(receiptsDir, `accepted-${name}.json`), JSON.stringify(payload, null, 2) + "\n");
+    };
+
+    writeAccepted(messageId);
+
+    // 成功通过例
+    const pass = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce,
+      sessionId,
+      body: bodyText,
+    });
+    assert.equal(pass.ok, true, "所有项匹配必须通过：" + JSON.stringify(pass));
+    assert.equal(pass.senderRole, "owner");
+    assert.equal(pass.deliveryNonce, nonce);
+    assert.equal(pass.bodySha256, bodySha256);
+
+    // 失败 1: receipt_missing（回执文件不存在）
+    const failMissing = verifyRelayCredential({
+      projectRoot: local,
+      messageId: "msg_non_existent",
+      nonce,
+      sessionId,
+      body: bodyText,
+    });
+    assert.deepEqual(failMissing, { ok: false, reason: VERIFY_REASONS.RECEIPT_MISSING });
+
+    // 失败 2: not_handed_off（状态不是 accepted 或 handed_off 为 false）
+    writeAccepted("msg_not_handed_off", { handed_off: false });
+    const failHandoff = verifyRelayCredential({
+      projectRoot: local,
+      messageId: "msg_not_handed_off",
+      nonce,
+      sessionId,
+      body: bodyText,
+    });
+    assert.deepEqual(failHandoff, { ok: false, reason: VERIFY_REASONS.NOT_HANDED_OFF });
+
+    // 失败 3: sender_not_owner（发送者不是 owner）
+    writeAccepted("msg_op_sender", { sender_role: "operator" });
+    const failRole = verifyRelayCredential({
+      projectRoot: local,
+      messageId: "msg_op_sender",
+      nonce,
+      sessionId,
+      body: bodyText,
+    });
+    assert.deepEqual(failRole, { ok: false, reason: VERIFY_REASONS.SENDER_NOT_OWNER });
+
+    // 失败 4: target_mismatch（会话 ID 与 target_session_id 不匹配）
+    const failTarget = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce,
+      sessionId: "different-session-uuid",
+      body: bodyText,
+    });
+    assert.deepEqual(failTarget, { ok: false, reason: VERIFY_REASONS.TARGET_MISMATCH });
+
+    // 失败 5: nonce_mismatch（投递 nonce 不匹配）
+    const failNonce = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce: "wrong_nonce_00000000000000000000",
+      sessionId,
+      body: bodyText,
+    });
+    assert.deepEqual(failNonce, { ok: false, reason: VERIFY_REASONS.NONCE_MISMATCH });
+
+    // 失败 6: body_mismatch（正文不匹配）
+    const failBody = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce,
+      sessionId,
+      body: "完全不同的正文内容",
+    });
+    assert.deepEqual(failBody, { ok: false, reason: VERIFY_REASONS.BODY_MISMATCH });
+  } finally {
+    fs.rmSync(local, { recursive: true, force: true });
+  }
+});
+
+test("PK3-A1：正文篡改一个字报 body_mismatch，且凭证行不参与哈希", () => {
+  const local = path.join(os.tmpdir(), "feishu-test-pk3-a1-tamper-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  const receiptsDir = path.join(local, ".runtime-data", "inbound", "receipts");
+  fs.mkdirSync(receiptsDir, { recursive: true });
+  try {
+    const messageId = "msg_tamper_test";
+    const nonce = "11223344556677889900aabbccddeeff";
+    const sessionId = "session-target-222";
+    const originalInstruction = "执行发布命令 --version=1.0";
+    const bodySha256 = crypto.createHash("sha256").update(originalInstruction, "utf-8").digest("hex");
+
+    const receipt = {
+      schema_version: "1.0",
+      artifact_type: "claude_bridge_inbound_receipt",
+      status: "accepted",
+      handed_off: true,
+      message_id: messageId,
+      sender_id: "frank_id",
+      sender_role: "owner",
+      target_session_id: sessionId,
+      delivery_nonce: nonce,
+      body_sha256: bodySha256,
+    };
+    fs.writeFileSync(path.join(receiptsDir, `accepted-${messageId}.json`), JSON.stringify(receipt, null, 2) + "\n");
+
+    // 完整转发正文（包含来源戳、原始指令、凭证行、引导语）
+    const fullForwardedMessage = stampInstruction({
+      instruction: originalInstruction,
+      messageId,
+      createdAtMs: Date.parse("2026-09-17T15:00:00Z"),
+      deliveryNonce: nonce,
+      bodySha256,
+    });
+
+    // 1. 传入完整转发消息也能成功核验
+    const passFull = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce,
+      sessionId,
+      body: fullForwardedMessage,
+    });
+    assert.equal(passFull.ok, true, "完整转发消息校验通过");
+
+    // 2. 正文被篡改一个字（例如把 1.0 改成 1.1）
+    const tamperedMessage = fullForwardedMessage.replace("1.0", "1.1");
+    const failTampered = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce,
+      sessionId,
+      body: tamperedMessage,
+    });
+    assert.deepEqual(failTampered, { ok: false, reason: VERIFY_REASONS.BODY_MISMATCH }, "正文篡改一个字必须报 body_mismatch");
+
+    // 3. 凭证行不参与哈希：修改凭证行中的 receipt 路径或附加空白，正文哈希不改变
+    const tamperedCredentialLine = fullForwardedMessage.replace(
+      /receipt=[^\s\]]+/,
+      "receipt=.runtime-data/inbound/receipts/accepted-other.json"
+    );
+    // 因为凭证行剥除后，原始 instruction 字节未变，body 校验依然成功！
+    const passTamperedCred = verifyRelayCredential({
+      projectRoot: local,
+      messageId,
+      nonce,
+      sessionId,
+      body: tamperedCredentialLine,
+    });
+    assert.equal(passTamperedCred.ok, true, "凭证行不参与哈希校验，修改凭证行中的路径不影响 body 校验");
+  } finally {
+    fs.rmSync(local, { recursive: true, force: true });
+  }
+});
+
+test("PK3-A1：verify-relay-credential CLI 命令行测试（退出码 0/1、--json 格式、--body-file）", () => {
+  const local = path.join(os.tmpdir(), "feishu-test-pk3-a1-cli-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  const receiptsDir = path.join(local, ".runtime-data", "inbound", "receipts");
+  fs.mkdirSync(receiptsDir, { recursive: true });
+  try {
+    const messageId = "msg_cli_test";
+    const nonce = "deadbeefcafebabe1234567890abcdef";
+    const sessionId = "session-cli-test";
+    const instruction = "清理缓存并重启服务";
+    const bodySha256 = crypto.createHash("sha256").update(instruction, "utf-8").digest("hex");
+
+    fs.writeFileSync(path.join(receiptsDir, `accepted-${messageId}.json`), JSON.stringify({
+      schema_version: "1.0",
+      artifact_type: "claude_bridge_inbound_receipt",
+      status: "accepted",
+      handed_off: true,
+      message_id: messageId,
+      sender_id: "frank_id",
+      sender_role: "owner",
+      target_session_id: sessionId,
+      delivery_nonce: nonce,
+      body_sha256: bodySha256,
+    }, null, 2) + "\n");
+
+    const bodyFile = path.join(local, "message_body.txt");
+    fs.writeFileSync(bodyFile, stampInstruction({
+      instruction,
+      messageId,
+      createdAtMs: Date.now(),
+      deliveryNonce: nonce,
+      bodySha256,
+    }));
+
+    const verifierScript = path.resolve("scripts", "verify-relay-credential.mjs");
+
+    // CLI 成功用例：--body-file
+    const pSuccess = spawnSync(process.execPath, [
+      verifierScript,
+      "--project", local,
+      "--message-id", messageId,
+      "--nonce", nonce,
+      "--session-id", sessionId,
+      "--body-file", bodyFile,
+      "--json",
+    ], { encoding: "utf-8" });
+    assert.equal(pSuccess.status, 0, pSuccess.stderr);
+    const jsonRes = JSON.parse(pSuccess.stdout);
+    assert.equal(jsonRes.ok, true);
+    assert.equal(jsonRes.senderRole, "owner");
+
+    // CLI 失败用例：篡改 body
+    const pFail = spawnSync(process.execPath, [
+      verifierScript,
+      "--project", local,
+      "--message-id", messageId,
+      "--nonce", nonce,
+      "--session-id", sessionId,
+      "--body", "篡改过的正文",
+    ], { encoding: "utf-8" });
+    assert.equal(pFail.status, 1, "篡改必须非零退出");
+    assert.match(pFail.stderr, /body_mismatch/u);
+
+    // CLI 自动从 body 解析 messageId 与 nonce
+    const pAuto = spawnSync(process.execPath, [
+      verifierScript,
+      "--project", local,
+      "--session-id", sessionId,
+      "--body-file", bodyFile,
+    ], { encoding: "utf-8" });
+    assert.equal(pAuto.status, 0, "自动从凭证行解析 message_id 和 nonce 成功");
+  } finally {
+    fs.rmSync(local, { recursive: true, force: true });
+  }
 });
 
 sealSummary();

@@ -1249,6 +1249,60 @@ if (target && !replyOnly) {
         policyRun.runRequest.policy.turn_index + "]\n" + policyRun.runRequest.userInput
       : policyRun.runRequest.userInput;
     bodySha256 = crypto.createHash("sha256").update(rawInstruction, "utf-8").digest("hex");
+
+    // 幂等列表独立放 sidecar
+    appendConsumed(routed.root, verdict.messageId, {
+      claudeSessionId: routed.mapping?.claude_session_id ?? null,
+      seed: mapping.consumed_message_ids ?? [],
+    });
+
+    const topicActivity = recordClaudeActivityAndMaybeRotate({
+      root: routed.root,
+      claudeSessionId: routed.mapping?.claude_session_id ?? null,
+      generationId: policyRun.runRequest.origin.channelGenerationId,
+      eventKey: "inbound:claude:" + verdict.messageId,
+      messageDelta: 1,
+    });
+
+    const runLogPath = path.join(RUNS, policyRun.runRequest.runId + ".forward.jsonl");
+
+    // PK3-A1-fix1 P2-2：回执必须在触发 forward 之前落盘且可读，保证目标会话收到消息核验时回执已在
+    writeReceipt("accepted-" + verdict.messageId, {
+      status: "accepted", message_id: verdict.messageId, claim_key: claim.key,
+      sender_id: event?.sender_id ?? null,
+      sender_role: senderRoleValue ?? null,
+      body_sha256: bodySha256,
+      delivery_nonce: deliveryNonce,
+      run_id: policyRun.runRequest.runId,
+      local_target_id: policyRun.runRequest.localTargetId,
+      origin_channel_generation_id: policyRun.runRequest.origin.channelGenerationId,
+      policy_id: policyRun.policy_id,
+      policy_version: policyRun.policy_version,
+      policy_disposition: policyRun.disposition,
+      ...(dialogueMode ? {
+        dialogue_id: policyRun.runRequest.policy.dialogue_id,
+        dialogue_turn_index: policyRun.runRequest.policy.turn_index,
+      } : {}),
+      ...(verdict.admission_shadow ? { mapping_admission_shadow: verdict.admission_shadow } : {}),
+      project_root: routed.root, binding_source: routed.source,
+      binding_level: boundSession ? "session" : "project",
+      bound_claude_session_id: boundSession,
+      claim_acquired: true, handed_off: true, completion_observed: false,
+      completion_owner: "outbound_publisher",
+      run_log: runLogPath,
+      envelope_attempts: fetched.attempts ?? 1,
+      delivery_mode: "live_session",
+      target_session_id: target.sessionId ?? null,
+      target_session_name: target.name ?? null,
+      topic_activity: topicActivity.ok ? {
+        counted: topicActivity.counted === true,
+        message_count: topicActivity.messageCount ?? null,
+        auto_rotation_requested: topicActivity.shouldAutoRotate === true,
+        auto_rotation_launched: topicActivity.rotationLaunch?.ok ?? null,
+      } : { counted: false, reason: topicActivity.reason },
+      ...(subscriptionClaimShadow ? { subscription_claim_shadow: subscriptionClaimShadow } : {}),
+    });
+
     run = deliverToLiveSession({
       target,
       instruction: rawInstruction,
@@ -1265,7 +1319,19 @@ if (target && !replyOnly) {
       bodySha256,
       receiptRelPath,
     });
+
+    recordClaimState({
+      claimsDir: CLAIMS, key: claim.key, state: "handed_off",
+      detail: { pid: run.pid, log_path: run.logPath, started_at: run.startedAt },
+    });
+
+    finish("accepted", {
+      taskName: config.task_display_name, messageId: verdict.messageId, key: claim.key,
+      mode: run.mode, targetName: run.targetName,
+    }, { claim_key: claim.key, run_log: run.logPath, delivery_mode: run.mode });
   } catch (err) {
+    const receiptFile = path.join(RECEIPTS, "accepted-" + verdict.messageId + ".json");
+    try { fs.rmSync(receiptFile, { force: true }); } catch {}
     if (dialogueMode) {
       finalizeClaudeDialogueTurn({
         root: routed.root, claudeSessionId: boundSession, runId: claim.key,

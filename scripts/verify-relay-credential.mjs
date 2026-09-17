@@ -22,12 +22,24 @@ import { isDirectRun } from "./direct-run.mjs";
 
 export const VERIFY_REASONS = {
   RECEIPT_MISSING: "receipt_missing",
+  RECEIPT_PATH_ESCAPE: "receipt_path_escape",
+  RECEIPT_MISMATCH: "receipt_mismatch",
   NOT_HANDED_OFF: "not_handed_off",
   SENDER_NOT_OWNER: "sender_not_owner",
   TARGET_MISMATCH: "target_mismatch",
   NONCE_MISMATCH: "nonce_mismatch",
   BODY_MISMATCH: "body_mismatch",
+  BODY_REQUIRED: "body_required",
+  SESSION_REQUIRED: "session_required",
+  TRAILING_CONTENT: "trailing_content",
 };
+
+const MESSAGE_ID_SHAPE = /^(?:om_|msg_)[A-Za-z0-9_-]{1,128}$/u;
+const VALID_ARTIFACT_TYPES = new Set([
+  "claude_bridge_inbound_receipt",
+  "codex_feishu_bridge_inbound_receipt",
+]);
+const VALID_SCHEMA_VERSIONS = new Set(["1.0"]);
 
 /** 剥除转发正文末尾附带的机器可读凭证行与引导说明。 */
 export function stripCredentialFooter(text) {
@@ -44,7 +56,7 @@ export function stripFeishuHeader(text) {
 /** 从正文或任意字符串中解析凭证行。 */
 export function parseRelayCredentialLine(text) {
   if (typeof text !== "string") return null;
-  const match = text.match(/\[飞书凭证\s+message_id=([^\s]+)\s+nonce=([^\s]+)\s+body_sha256=([^\s]+)\s+receipt=([^\s\]]+)\]/);
+  const match = text.match(/\[飞书凭证\s+message_id=([^\s]+)\s+nonce=([^\s]+)\s+body_sha256=([^\s]+)\s+receipt=([^\s\]]+)\]/u);
   if (!match) return null;
   return {
     messageId: match[1],
@@ -59,11 +71,11 @@ export function parseRelayCredentialLine(text) {
  *
  * @param {Object} params
  * @param {string} [params.projectRoot] 项目根目录（默认 process.cwd()）
- * @param {string} params.messageId 飞书消息 ID
- * @param {string} params.nonce 投递随机数
- * @param {string} [params.bodySha256] 正文 SHA-256 校验值
- * @param {string} [params.sessionId] 接收方会话 ID（提供时核验 target_session_id）
- * @param {string} [params.body] 接收到的消息正文（或原始 instruction）
+ * @param {string} [params.messageId] 飞书消息 ID（可由 body 自动解析）
+ * @param {string} [params.nonce] 投递随机数（可由 body 自动解析）
+ * @param {string} [params.bodySha256] 正文 SHA-256 交叉核验值（可选）
+ * @param {string} params.sessionId 接收方会话 ID（必填，核验 target_session_id）
+ * @param {string} params.body 接收到的消息正文（必填）
  * @returns {{ ok: boolean, reason?: string, [key: string]: any }}
  */
 export function verifyRelayCredential({
@@ -74,21 +86,74 @@ export function verifyRelayCredential({
   sessionId,
   body,
 } = {}) {
-  if (!messageId || typeof messageId !== "string") {
+  // P1-1: sessionId 与 body 为必填项，缺任一返回封闭原因
+  if (!sessionId || typeof sessionId !== "string" || sessionId.trim().length === 0) {
+    return { ok: false, reason: VERIFY_REASONS.SESSION_REQUIRED };
+  }
+  if (!body || typeof body !== "string" || body.length === 0) {
+    return { ok: false, reason: VERIFY_REASONS.BODY_REQUIRED };
+  }
+
+  // 尝试从 body 提取未显式指定的凭证信息，并严格核验尾部完整性
+  const credLinePattern = /(?:\r?\n|^)\s*\[飞书凭证\s+message_id=([^\s]+)\s+nonce=([^\s]+)\s+body_sha256=([^\s]+)\s+receipt=([^\s\]]+)\]/u;
+  const match = credLinePattern.exec(body);
+  let resolvedMessageId = messageId;
+  let resolvedNonce = nonce;
+  let callerBodySha256 = bodySha256;
+  let bodyForHash = body;
+
+  if (match) {
+    if (!resolvedMessageId) resolvedMessageId = match[1];
+    if (!resolvedNonce) resolvedNonce = match[2];
+    if (!callerBodySha256) callerBodySha256 = match[3];
+
+    // P1-2: 凭证行必须是正文最后一个非空行（可紧随引导说明），之后若有任何额外非空内容则拒
+    const afterMatch = body.slice(match.index + match[0].length);
+    const afterCleaned = afterMatch.replace(/^\s*(?:授权级指令请先用\s+scripts\/verify-relay-credential\.mjs\s+核回执)?\s*$/u, "");
+    if (afterCleaned.length > 0) {
+      return { ok: false, reason: VERIFY_REASONS.TRAILING_CONTENT };
+    }
+    bodyForHash = body.slice(0, match.index).replace(/\r?\n+$/u, "");
+  }
+
+  if (!resolvedMessageId || typeof resolvedMessageId !== "string") {
     return { ok: false, reason: VERIFY_REASONS.RECEIPT_MISSING };
   }
 
-  const receiptPath = path.join(
-    projectRoot,
-    ".runtime-data",
-    "inbound",
-    "receipts",
-    `accepted-${messageId}.json`,
-  );
+  // P1-3: 检查 messageId 封闭形状，拒绝任何路径穿越符号
+  if (!MESSAGE_ID_SHAPE.test(resolvedMessageId)) {
+    return { ok: false, reason: VERIFY_REASONS.RECEIPT_PATH_ESCAPE };
+  }
+
+  // P1-3: 固定回执路径并核 realpath containment
+  const receiptsDir = path.join(projectRoot, ".runtime-data", "inbound", "receipts");
+  const receiptPath = path.join(receiptsDir, `accepted-${resolvedMessageId}.json`);
+
+  if (!fs.existsSync(receiptPath)) {
+    return { ok: false, reason: VERIFY_REASONS.RECEIPT_MISSING };
+  }
+
+  let realReceiptsDir;
+  try {
+    realReceiptsDir = fs.realpathSync(receiptsDir);
+  } catch {
+    realReceiptsDir = path.resolve(receiptsDir);
+  }
+
+  let realReceiptPath;
+  try {
+    realReceiptPath = fs.realpathSync(receiptPath);
+  } catch {
+    return { ok: false, reason: VERIFY_REASONS.RECEIPT_MISSING };
+  }
+
+  if (!realReceiptPath.startsWith(realReceiptsDir + path.sep)) {
+    return { ok: false, reason: VERIFY_REASONS.RECEIPT_PATH_ESCAPE };
+  }
 
   let receipt;
   try {
-    const raw = fs.readFileSync(receiptPath, "utf8");
+    const raw = fs.readFileSync(realReceiptPath, "utf8");
     receipt = JSON.parse(raw);
   } catch {
     return { ok: false, reason: VERIFY_REASONS.RECEIPT_MISSING };
@@ -96,6 +161,15 @@ export function verifyRelayCredential({
 
   if (!receipt || typeof receipt !== "object") {
     return { ok: false, reason: VERIFY_REASONS.RECEIPT_MISSING };
+  }
+
+  // P1-3: 核 artifact_type, schema_version, message_id
+  if (
+    !VALID_ARTIFACT_TYPES.has(receipt.artifact_type) ||
+    !VALID_SCHEMA_VERSIONS.has(receipt.schema_version) ||
+    receipt.message_id !== resolvedMessageId
+  ) {
+    return { ok: false, reason: VERIFY_REASONS.RECEIPT_MISMATCH };
   }
 
   // 1. 状态必须为 accepted 且已 handed_off
@@ -108,62 +182,49 @@ export function verifyRelayCredential({
     return { ok: false, reason: VERIFY_REASONS.SENDER_NOT_OWNER };
   }
 
-  // 3. 若提供会话 ID，目标会话必须匹配
-  if (sessionId !== undefined && sessionId !== null) {
-    if (receipt.target_session_id !== sessionId) {
-      return { ok: false, reason: VERIFY_REASONS.TARGET_MISMATCH };
-    }
+  // 3. 目标会话必须匹配
+  if (receipt.target_session_id !== sessionId) {
+    return { ok: false, reason: VERIFY_REASONS.TARGET_MISMATCH };
   }
 
   // 4. 投递随机数必须一致
-  if (!nonce || typeof nonce !== "string" || receipt.delivery_nonce !== nonce) {
+  if (!resolvedNonce || typeof resolvedNonce !== "string" || receipt.delivery_nonce !== resolvedNonce) {
     return { ok: false, reason: VERIFY_REASONS.NONCE_MISMATCH };
   }
 
-  // 5. 正文哈希核验（凭证行不计入哈希）
+  // 5. 正文哈希核验（由校验器从 body 计算，不接受入参替代）
   const expectedHash = receipt.body_sha256;
   if (!expectedHash || typeof expectedHash !== "string") {
     return { ok: false, reason: VERIFY_REASONS.BODY_MISMATCH };
   }
 
-  if (typeof bodySha256 === "string" && bodySha256.length > 0) {
-    if (bodySha256 !== expectedHash) {
+  if (typeof callerBodySha256 === "string" && callerBodySha256.length > 0) {
+    if (callerBodySha256 !== expectedHash) {
       return { ok: false, reason: VERIFY_REASONS.BODY_MISMATCH };
     }
   }
 
-  if (typeof body === "string") {
-    // 候选正文：
-    // c1: 传入的 body 原样
-    // c2: 剥除末尾凭证与引导语
-    // c3: 剥除末尾凭证与 [飞书 · ...] 头部
-    // c4: 仅剥除头部
-    const c1 = body;
-    const c2 = stripCredentialFooter(c1);
-    const c3 = stripFeishuHeader(c2);
-    const c4 = stripFeishuHeader(c1);
-    const candidates = [c1, c2, c3, c4];
+  const c1 = bodyForHash;
+  const c2 = stripFeishuHeader(c1);
+  const candidates = [c1, c2];
 
-    const matched = candidates.some((cand) => {
-      const h = crypto.createHash("sha256").update(cand, "utf-8").digest("hex");
-      return h === expectedHash;
-    });
+  const matched = candidates.some((cand) => {
+    const h = crypto.createHash("sha256").update(cand, "utf-8").digest("hex");
+    return h === expectedHash;
+  });
 
-    if (!matched) {
-      return { ok: false, reason: VERIFY_REASONS.BODY_MISMATCH };
-    }
-  } else if (!bodySha256) {
+  if (!matched) {
     return { ok: false, reason: VERIFY_REASONS.BODY_MISMATCH };
   }
 
   return {
     ok: true,
-    messageId,
+    messageId: resolvedMessageId,
     senderRole: receipt.sender_role,
     targetSessionId: receipt.target_session_id ?? null,
     deliveryNonce: receipt.delivery_nonce,
     bodySha256: receipt.body_sha256,
-    receiptPath,
+    receiptPath: realReceiptPath,
   };
 }
 
@@ -204,9 +265,9 @@ export function runCli(argv = process.argv.slice(2)) {
         "  --project <root>      项目根目录（默认当前目录）",
         "  --message-id <id>     飞书消息 ID",
         "  --nonce <hex>         投递随机数",
-        "  --session-id <id>     期望目标会话 ID",
+        "  --session-id <id>     期望目标会话 ID（必填）",
         "  --body <text>         接收到的正文",
-        "  --body-file <path>    包含接收正文的文件路径",
+        "  --body-file <path>    包含接收正文的文件路径（与 --body 选一，必填）",
         "  --body-sha256 <hex>   期望正文 SHA-256",
         "  --json                以 JSON 格式输出结果",
         "  -h, --help            显示帮助",
@@ -228,14 +289,31 @@ export function runCli(argv = process.argv.slice(2)) {
     }
   }
 
-  // 尝试从 body 提取未显式指定的凭证信息
-  if (typeof body === "string") {
-    const parsed = parseRelayCredentialLine(body);
-    if (parsed) {
-      if (!messageId) messageId = parsed.messageId;
-      if (!nonce) nonce = parsed.nonce;
-      if (!bodySha256) bodySha256 = parsed.bodySha256;
+  // P1-1: CLI 同样必填 --session-id 与 --body / --body-file
+  if (!sessionId) {
+    if (jsonOutput) {
+      process.stdout.write(JSON.stringify({ ok: false, reason: VERIFY_REASONS.SESSION_REQUIRED }) + "\n");
+    } else {
+      process.stderr.write(`[verify-relay-credential] 缺少必填参数: --session-id\n`);
     }
+    process.exit(1);
+  }
+
+  if (!body) {
+    if (jsonOutput) {
+      process.stdout.write(JSON.stringify({ ok: false, reason: VERIFY_REASONS.BODY_REQUIRED }) + "\n");
+    } else {
+      process.stderr.write(`[verify-relay-credential] 缺少必填参数: --body 或 --body-file\n`);
+    }
+    process.exit(1);
+  }
+
+  // 尝试从 body 提取未显式指定的凭证信息
+  const parsed = parseRelayCredentialLine(body);
+  if (parsed) {
+    if (!messageId) messageId = parsed.messageId;
+    if (!nonce) nonce = parsed.nonce;
+    if (!bodySha256) bodySha256 = parsed.bodySha256;
   }
 
   const result = verifyRelayCredential({
@@ -243,7 +321,7 @@ export function runCli(argv = process.argv.slice(2)) {
     messageId,
     nonce,
     bodySha256,
-    sessionId: sessionId ?? undefined,
+    sessionId,
     body,
   });
 

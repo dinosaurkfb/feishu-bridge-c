@@ -409,7 +409,7 @@ if (!routed.ok) {
     // 措辞（如「没有真实 @ M5Codex」），按 promotion 标出的 off_template_hint 把 hint 接上。
     const reasonText = (REASON_TEXT[promotion.reason] ?? promotion.reason) +
       (promotion.off_template_hint ? OFF_TEMPLATE_HINT : "");
-    const unroutedSenderRole = senderRole({ frank_sender_id: template?.frank_sender_id, senders: template?.senders }, event?.sender_id);
+    const unroutedSenderRole = senderRole({ frank_sender_id: template?.template?.frank_sender_id, senders: template?.template?.senders }, event?.sender_id);
     writeReceipt("unrouted-" + (event.message_id ?? Date.now()), {
       status: "rejected", reason: promotion.reason, claim_acquired: false, handed_off: false,
       message_id: event.message_id ?? null,
@@ -559,8 +559,8 @@ if (dryRun) {
 if (verdict.decision === "reject") {
   const policyOutcome = handlePolicy();
   const rejectSenderRole = senderRole({
-    frank_sender_id: routed.mapping?.frank_sender_id ?? template?.frank_sender_id,
-    senders: routed.config?.senders ?? template?.senders,
+    frank_sender_id: routed.mapping?.frank_sender_id ?? template?.template?.frank_sender_id,
+    senders: routed.config?.senders ?? template?.template?.senders,
   }, event?.sender_id);
   writeReceipt("reject-" + (event.message_id ?? Date.now()), {
     status: "rejected", reason: verdict.reason, message_id: event.message_id,

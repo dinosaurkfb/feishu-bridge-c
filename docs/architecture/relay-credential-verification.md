@@ -36,17 +36,22 @@
 ### 2.2 谁核凭证
 
 由目标会话或接收方智能体（如 `my-herdr`）在执行不可逆/敏感的**授权级指令**之前调用只读校验器：
-- 纯函数调用：`verifyRelayCredential({ projectRoot, messageId, nonce, bodySha256, sessionId, body })`
-- 命令行 CLI：`node scripts/verify-relay-credential.mjs --project <root> --message-id <id> --nonce <hex> --body-file <path> [--session-id <id>]`
+- 纯函数调用：`verifyRelayCredential({ projectRoot, messageId, nonce, bodySha256, sessionId, body })`（`sessionId` 与 `body` 必填）
+- 命令行 CLI：`node scripts/verify-relay-credential.mjs --project <root> --session-id <id> (--body-file <path> | --body <text>) [--message-id <id>] [--nonce <hex>]`
 
 校验器为纯只读操作，零磁盘写入，退出码严格为 0（通过）或 1（失败）。
-失败时返回 6 种确定性原因之一：
-1. `receipt_missing`：回执文件不存在或格式损坏；
-2. `not_handed_off`：回执状态不是 `accepted` 或未成功 `handed_off`；
-3. `sender_not_owner`：`sender_role` 不是 `owner`；
-4. `target_mismatch`：回执中的 `target_session_id` 与当前会话 ID 不符；
-5. `nonce_mismatch`：投递随机数与回执记录不匹配；
-6. `body_mismatch`：正文 SHA-256 与回执记录不匹配（正文被篡改或截断）。
+失败时返回确定性原因之一：
+1. `session_required`：调用方未提供接收方会话 ID；
+2. `body_required`：调用方未提供接收到的消息正文；
+3. `receipt_missing`：回执文件不存在或格式损坏；
+4. `receipt_path_escape`：`message_id` 非封闭形状或回执路径穿越/逃逸出回执目录；
+5. `receipt_mismatch`：回执 `artifact_type`、`schema_version` 非法或内部 `message_id` 不符；
+6. `not_handed_off`：回执状态不是 `accepted` 或未成功 `handed_off`；
+7. `sender_not_owner`：`sender_role` 不是 `owner`；
+8. `target_mismatch`：回执中的 `target_session_id` 与当前会话 ID 不符；
+9. `nonce_mismatch`：投递随机数与回执记录不匹配；
+10. `body_mismatch`：正文 SHA-256 与回执记录不匹配（正文被篡改或截断）；
+11. `trailing_content`：凭证行后存在追加的额外内容（防止在合法凭证后拼接恶意攻击载荷）。
 
 ## 3. 防护边界（能挡什么、挡不了什么）
 

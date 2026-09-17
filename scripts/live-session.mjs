@@ -378,7 +378,8 @@ export function deliverToLiveSession({
   const child = spawn(
     process.execPath,
     [FORWARD_RUNNER_SCRIPT, JSON.stringify({ key, runsDir, projectRoot, targetName: target.name, prompt,
-      outboxDir, messageId, originGenerationId })],
+      outboxDir, messageId, originGenerationId,
+      receiptPath: receiptRelPath ? path.resolve(projectRoot, receiptRelPath) : undefined })],
     {
       cwd: projectRoot, detached: true, stdio: "ignore",
       env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },

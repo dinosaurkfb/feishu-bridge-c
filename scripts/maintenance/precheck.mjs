@@ -7,7 +7,7 @@
  * 逐项：
  *   receipt         收据 valid、有这条链、版本 == verifyRuntime 的版本、逐制品 sha 对账通过
  *   hooks           settings.json / hooks.json 里：桥拥有的条目各恰好一条；任何提到运行时根的 hook 命令都必须是桥拥有的（多一个 shell 动作 / 第二个 node → 拒）
- *   timer           plist 字节 == 投影，launchd 三态 ∈ {loaded, installed_not_loaded, absent}
+ *   timer           plist/unit 字节 == 投影，原始三态 ∈ {loaded, installed_not_loaded, absent}（按平台：darwin launchd / linux systemd --user / 其它按 absent）
  *   routes          有效默认路由的处理器在 runtime/current 之下（或没有路由表）；非默认外部处理器只记账
  *   scripts         收据引用的每个脚本：在桩清单里、是 current/scripts 下解析得到的普通文件
  *   manifest        桩清单 missing 为空

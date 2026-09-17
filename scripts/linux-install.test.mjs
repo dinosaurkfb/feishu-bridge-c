@@ -511,15 +511,19 @@ test("PK3-L3 timerPhase(linux)：钉 loaded / installed_not_loaded / absent / or
   assert.ok(loaded.plistBytes instanceof Buffer, "loaded 必须带 unit 字节备份供 journal 使用");
   assert.equal(loaded.why, null);
 
-  // ② installed_not_loaded：单元在，但未 active（或未 enabled）
-  const inactiveCtl = fakeSystemctl({ active: "inactive" });
+  // ② installed_not_loaded：单元在且匹配，明确稳定的不运行状态（inactive 或 failed，且 enabled 或 disabled）
+  const inactiveCtl = fakeSystemctl({ enabled: "enabled", active: "inactive" });
   const notLoaded = timerPhase({ ...facts.timer, systemctl: inactiveCtl.fn });
   assert.equal(notLoaded.phase, "installed_not_loaded");
   assert.ok(notLoaded.plistBytes instanceof Buffer);
 
-  const disabledCtl = fakeSystemctl({ enabled: "disabled", active: "active" });
-  const notLoaded2 = timerPhase({ ...facts.timer, systemctl: disabledCtl.fn });
+  const disabledInactiveCtl = fakeSystemctl({ enabled: "disabled", active: "inactive" });
+  const notLoaded2 = timerPhase({ ...facts.timer, systemctl: disabledInactiveCtl.fn });
   assert.equal(notLoaded2.phase, "installed_not_loaded");
+
+  const failedCtl = fakeSystemctl({ enabled: "enabled", active: "failed" });
+  const notLoaded3 = timerPhase({ ...facts.timer, systemctl: failedCtl.fn });
+  assert.equal(notLoaded3.phase, "installed_not_loaded");
 
   // ③ absent：两份 unit 都不在，且 systemd 里未启用也未运行
   const emptyBase = tmpBase("pk3-timer-absent-");
@@ -531,19 +535,19 @@ test("PK3-L3 timerPhase(linux)：钉 loaded / installed_not_loaded / absent / or
   assert.equal(absent.plistBytes, null);
 
   // ④ orphan：
-  //   情况 A：磁盘上无单元，但 manager 里仍 enabled 或 active
+  //   只留给「磁盘上无单元，但 manager 里仍 enabled 或 active」
   const orphanCtlA = fakeSystemctl({ enabled: "enabled", active: "active", show: fx.projectedShow });
   const orphanA = timerPhase({ ...absentFacts.timer, systemctl: orphanCtlA.fn });
   assert.equal(orphanA.phase, "orphan");
   assert.match(orphanA.why, /磁盘上无 unit 文件/u);
 
-  //   情况 B：单元在且 enabled+active，但已加载的 ExecStart 与当前投影不符
-  const orphanCtlB = fakeSystemctl({ show: fx.oldShow });
-  const orphanB = timerPhase({ ...facts.timer, systemctl: orphanCtlB.fn });
-  assert.equal(orphanB.phase, "orphan");
-  assert.match(orphanB.why, /ExecStart 与当前投影不一致/u);
+  // ⑤ P2-1 loaded_other：单元在且 enabled+active，但已加载的 ExecStart 与当前投影不符
+  const staleExecCtl = fakeSystemctl({ show: fx.oldShow });
+  const otherExec = timerPhase({ ...facts.timer, systemctl: staleExecCtl.fn });
+  assert.equal(otherExec.phase, "loaded_other");
+  assert.match(otherExec.why, /ExecStart 与当前投影不一致/u);
 
-  // ⑤ unverifiable：
+  // ⑥ unverifiable：
   //   情况 A：连不上 manager（is-enabled / is-active 查不清）
   const brokenCtl = (args) => ({ ok: false, out: "", err: "Failed to connect to bus: Connection refused" });
   const unvA = timerPhase({ ...facts.timer, systemctl: brokenCtl });
@@ -559,12 +563,74 @@ test("PK3-L3 timerPhase(linux)：钉 loaded / installed_not_loaded / absent / or
   assert.equal(unvB.phase, "unverifiable");
   assert.match(unvB.why, /show 查不了/u);
 
-  // ⑥ other 平台（win32/freebsd 等）：明说无定时器实现，按 absent 处理
+  // ⑦ other 平台（win32/freebsd 等）：明说无定时器实现，按 absent 处理
   const winFacts = chainFacts({ chain: "claude", home: fx.home, platform: "win32", node: fx.node });
   assert.equal(winFacts.timer.kind, null);
   const winTimer = timerPhase({ ...winFacts.timer });
   assert.equal(winTimer.phase, "absent");
   assert.equal(winTimer.plistBytes, null);
+});
+
+test("PK3-L3-fix1 P1-1 active+disabled 与过渡态拒绝进门：disabled+active 拒、activating 拒，只有明确稳定不运行态归 installed_not_loaded", () => {
+  const fx = linuxDoctorFixture();
+  const facts = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+
+  // ① disabled + active：实际在跑但未托管 → 拒（phase running_unmanaged，非原始三态）
+  const disabledActive = fakeSystemctl({ enabled: "disabled", active: "active" });
+  const r1 = timerPhase({ ...facts.timer, systemctl: disabledActive.fn });
+  assert.notEqual(r1.phase, "installed_not_loaded", "active+disabled 绝不许归 installed_not_loaded 从而被预检放行！");
+  assert.equal(r1.phase, "running_unmanaged");
+  assert.match(r1.why, /active.*未 enabled/u);
+
+  // ② activating 等过渡态 → 拒（phase transitional，非原始三态）
+  const activating = fakeSystemctl({ enabled: "enabled", active: "activating" });
+  const r2 = timerPhase({ ...facts.timer, systemctl: activating.fn });
+  assert.notEqual(r2.phase, "installed_not_loaded", "activating 过渡态不许归 installed_not_loaded！");
+  assert.equal(r2.phase, "transitional");
+  assert.match(r2.why, /过渡态/u);
+
+  // ③ reloading 过渡态 → 拒
+  const reloading = fakeSystemctl({ enabled: "enabled", active: "reloading" });
+  const r3 = timerPhase({ ...facts.timer, systemctl: reloading.fn });
+  assert.equal(r3.phase, "transitional");
+
+  // ④ enabled+inactive 与 disabled+inactive：明确稳定的不运行状态 → installed_not_loaded
+  const enIn = timerPhase({ ...facts.timer, systemctl: fakeSystemctl({ enabled: "enabled", active: "inactive" }).fn });
+  assert.equal(enIn.phase, "installed_not_loaded");
+  const disIn = timerPhase({ ...facts.timer, systemctl: fakeSystemctl({ enabled: "disabled", active: "inactive" }).fn });
+  assert.equal(disIn.phase, "installed_not_loaded");
+});
+
+test("PK3-L3-fix1 P1-2 两份 unit 齐全与字节投影无条件先核：stale+inactive 归 stale，只缺一份 unit 归 partial_unit 拒进门", () => {
+  const fx = linuxDoctorFixture();
+  const paths = claudeDrainSystemdPaths(fx.home);
+
+  // ① 两份 unit 在盘但字节被篡改（stale）+ inactive：
+  // 即使处于 inactive 态，也必须优先判出 stale 并拒进门，绝不许被判定为 installed_not_loaded 放行！
+  fs.writeFileSync(paths.service, "[Service]\n# 篡改内容\n");
+  const factsStale = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  const inactiveCtl = fakeSystemctl({ enabled: "enabled", active: "inactive" });
+  const rStale = timerPhase({ ...factsStale.timer, systemctl: inactiveCtl.fn });
+  assert.equal(rStale.phase, "stale", "即使 inactive，字节不匹配也必须是 stale（修前被判定为 installed_not_loaded 放行）");
+  assert.match(rStale.why, /与当前投影不一致/u);
+
+  // ② 缺失 service 单元（只有 timer 单元）：
+  fs.unlinkSync(paths.service);
+  const factsMissingService = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  const rMiss = timerPhase({ ...factsMissingService.timer, systemctl: inactiveCtl.fn });
+  assert.notEqual(rMiss.phase, "installed_not_loaded", "只缺一份 unit 绝不许判为 installed_not_loaded");
+  assert.equal(rMiss.phase, "partial_unit");
+  assert.match(rMiss.why, /feishu-bridge-cc-drain\.service/u);
+
+  // ③ 缺失 timer 单元（只有 service 单元）：
+  const units = claudeDrainSystemdUnits({ home: fx.home, node: fx.node });
+  fs.writeFileSync(paths.service, units.service);
+  fs.unlinkSync(paths.timer);
+  const factsMissingTimer = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  const rMissTimer = timerPhase({ ...factsMissingTimer.timer, systemctl: inactiveCtl.fn });
+  assert.notEqual(rMissTimer.phase, "installed_not_loaded");
+  assert.equal(rMissTimer.phase, "partial_unit");
+  assert.match(rMissTimer.why, /feishu-bridge-cc-drain\.timer/u);
 });
 
 test("PK3-L3 沙箱隔离：沙箱 HOME 不碰真实 systemctl --user；未注入时返回 unverifiable", () => {

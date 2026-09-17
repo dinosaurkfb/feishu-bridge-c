@@ -118,10 +118,64 @@ export function timerPhase({
       return { phase: "plist_unreadable", plistBytes: null, why: (timerRes.why || serviceRes.why) };
     }
 
+    const timerAbsent = timerRes.status === "absent";
+    const serviceAbsent = serviceRes.status === "absent";
+
     const systemctlFn = systemctlRunner(systemctl);
     const timerUnitName = unit.endsWith(".timer") ? unit : unit + ".timer";
     const serviceUnitName = service ?? (unit.endsWith(".timer") ? unit.slice(0, -6) + ".service" : unit + ".service");
 
+    // 两份 unit 都不在
+    if (timerAbsent && serviceAbsent) {
+      const enabled = systemctlFn(["is-enabled", timerUnitName]);
+      const active = systemctlFn(["is-active", timerUnitName]);
+
+      if (!readableSystemctl(enabled) || !readableSystemctl(active)) {
+        const errDetail = say(!readableSystemctl(enabled) ? enabled : active);
+        return { phase: "unverifiable", plistBytes: null, why: "systemctl --user 查不了（" + errDetail.slice(0, 120) + "）—— 查不清，不等于没在跑" };
+      }
+
+      const enabledWord = String(enabled?.out ?? "").trim().split(/\s+/u)[0] || "";
+      const activeWord = String(active?.out ?? "").trim().split(/\s+/u)[0] || "";
+      const isEnabled = enabledWord === "enabled";
+      const isActive = activeWord === "active";
+      const hasInstance = isEnabled || isActive ||
+        (activeWord && !["inactive", "failed", "unknown"].includes(activeWord) && !systemdUnitAbsent(say(active))) ||
+        (enabledWord && !["disabled", "unknown"].includes(enabledWord) && !systemdUnitAbsent(say(enabled)));
+
+      if (hasInstance) {
+        return {
+          phase: "orphan",
+          plistBytes: null,
+          why: "磁盘上无 unit 文件，但 systemd manager 里仍有同名 timer 在跑或启用",
+        };
+      }
+      return { phase: "absent", plistBytes: null, why: null };
+    }
+
+    // 只有 timer 没 service（或反之）：非三态并拒（点名缺哪份）
+    if (timerAbsent || serviceAbsent) {
+      const missingFile = timerAbsent ? timerFile : serviceFile;
+      const missingName = path.basename(missingFile);
+      return {
+        phase: "partial_unit",
+        plistBytes: timerRes.status === "read" ? timerRes.buf : null,
+        why: "systemd 单元文件不完整：缺失 " + missingName,
+      };
+    }
+
+    // 两份都在磁盘：无条件先核字节与投影匹配
+    const timerMatches = typeof wantedTimer === "string" ? timerRes.buf.toString("utf-8") === wantedTimer : true;
+    const serviceMatches = typeof wantedService === "string" ? serviceRes.buf.toString("utf-8") === wantedService : true;
+    if (!timerMatches || !serviceMatches) {
+      return {
+        phase: "stale",
+        plistBytes: timerRes.buf,
+        why: "磁盘上的 systemd 单元与当前投影不一致",
+      };
+    }
+
+    // 两份 unit 齐全且字节匹配的前提下，再核 manager 状态
     const enabled = systemctlFn(["is-enabled", timerUnitName]);
     const active = systemctlFn(["is-active", timerUnitName]);
 
@@ -130,61 +184,61 @@ export function timerPhase({
       return { phase: "unverifiable", plistBytes: null, why: "systemctl --user 查不了（" + errDetail.slice(0, 120) + "）—— 查不清，不等于没在跑" };
     }
 
-    const hasFiles = timerRes.status === "read" || serviceRes.status === "read";
-    const isEnabled = String(enabled?.out ?? "").trim() === "enabled";
-    const isActive = String(active?.out ?? "").trim() === "active";
+    const enabledWord = String(enabled?.out ?? "").trim().split(/\s+/u)[0] || "";
+    const activeWord = String(active?.out ?? "").trim().split(/\s+/u)[0] || "";
 
-    if (!hasFiles) {
-      return {
-        phase: (isEnabled || isActive) ? "orphan" : "absent",
-        plistBytes: null,
-        why: (isEnabled || isActive) ? "磁盘上无 unit 文件，但 systemd manager 里仍有同名 timer 在跑或启用" : null,
-      };
+    // ① enabled + active：核已加载的 ExecStart
+    if (enabledWord === "enabled" && activeWord === "active") {
+      const show = systemctlFn(["show", serviceUnitName, "-p", "ExecStart", "--value"]);
+      if (!show?.ok) {
+        return {
+          phase: "unverifiable",
+          plistBytes: timerRes.buf,
+          why: "systemctl --user show 查不了（" + say(show).slice(0, 120) + "）—— 已加载的定义核不了，查不清",
+        };
+      }
+
+      const expectedArgs = expect?.args ?? [];
+      const loadedArgv = systemdShowExecArgv(String(show.out ?? ""));
+      const sameExec = loadedArgv !== null &&
+        (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
+      if (!sameExec) {
+        return {
+          phase: "loaded_other",
+          plistBytes: timerRes.buf,
+          why: "systemd manager 里已加载的 ExecStart 与当前投影不一致",
+        };
+      }
+
+      return { phase: "loaded", plistBytes: timerRes.buf, why: null };
     }
 
-    if (!isEnabled || !isActive) {
+    // ② 只有明确稳定的不运行状态（inactive 或 failed，且 enabled 或 disabled）才能归 installed_not_loaded
+    const isStableInactive = (activeWord === "inactive" || activeWord === "failed") &&
+      (enabledWord === "enabled" || enabledWord === "disabled");
+    if (isStableInactive) {
       return {
         phase: "installed_not_loaded",
-        plistBytes: timerRes.status === "read" ? timerRes.buf : null,
-        why: "systemd timer 未启用或未在跑",
-      };
-    }
-
-    // enabled && active: verify disk files match projection
-    const bothFilesValid = timerRes.status === "read" && serviceRes.status === "read";
-    const timerMatches = typeof wantedTimer === "string" ? (timerRes.status === "read" && timerRes.buf.toString("utf-8") === wantedTimer) : true;
-    const serviceMatches = typeof wantedService === "string" ? (serviceRes.status === "read" && serviceRes.buf.toString("utf-8") === wantedService) : true;
-    if (!bothFilesValid || !timerMatches || !serviceMatches) {
-      return {
-        phase: "stale",
-        plistBytes: timerRes.status === "read" ? timerRes.buf : null,
-        why: "磁盘上的 systemd 单元与当前投影不一致",
-      };
-    }
-
-    // query show ExecStart
-    const show = systemctlFn(["show", serviceUnitName, "-p", "ExecStart", "--value"]);
-    if (!show?.ok) {
-      return {
-        phase: "unverifiable",
         plistBytes: timerRes.buf,
-        why: "systemctl --user show 查不了（" + say(show).slice(0, 120) + "）—— 已加载的定义核不了，查不清",
+        why: "systemd timer 未在跑（" + activeWord + "，" + enabledWord + "）",
       };
     }
 
-    const expectedArgs = expect?.args ?? [];
-    const loadedArgv = systemdShowExecArgv(String(show.out ?? ""));
-    const sameExec = loadedArgv !== null &&
-      (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
-    if (!sameExec) {
+    // ③ active 但未 enabled
+    if (activeWord === "active") {
       return {
-        phase: "orphan",
+        phase: "running_unmanaged",
         plistBytes: timerRes.buf,
-        why: "systemd manager 里已加载的 ExecStart 与当前投影不一致",
+        why: "systemd timer 处于 active 运行态但未 enabled（" + enabledWord + "），属于非托管运行态",
       };
     }
 
-    return { phase: "loaded", plistBytes: timerRes.buf, why: null };
+    // ④ 一切过渡态（activating / deactivating / reloading / 未知词）
+    return {
+      phase: "transitional",
+      plistBytes: timerRes.buf,
+      why: "systemd timer 处于过渡态或非稳定态（active: " + activeWord + ", enabled: " + enabledWord + "）",
+    };
   }
 
   return { phase: "unverifiable", plistBytes: null, why: "未知定时器种类：" + kind };

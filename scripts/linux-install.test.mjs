@@ -17,6 +17,9 @@ import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, r
 import { claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan } from "./install-projection.mjs";
 import { runDoctor } from "./doctor.mjs";
 import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
+import { bootoutTimer, bootstrapTimer, timerPhase } from "./maintenance/timers.mjs";
+import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
+import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER = path.join(REPO, "scripts", "install-outbound.mjs");
@@ -494,4 +497,299 @@ test("fix4/P1 Darwin 安装 bootstrap argv 钉：bootstrap 收到真实 uid 且�
   assert.equal(bootstrapCall, "bootstrap gui/" + uid + " " + fx.plistFile + " | present",
     "bootstrap argv 钉：必须替换 <uid> 为真实 uid：" + bootstrapCall);
   assert.equal(bootstrapCall.includes("<uid>"), false, "不许带字面量 <uid>");
+});
+
+test("PK3-L3 timerPhase(linux)：钉 loaded / installed_not_loaded / absent / orphan 四相与 unverifiable", () => {
+  const fx = linuxDoctorFixture();
+  const facts = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  assert.equal(facts.timer.kind, "systemd");
+
+  // ① loaded：单元在、enabled+active、show ExecStart 符合当前投影
+  const goodCtl = fakeSystemctl({ show: fx.projectedShow });
+  const loaded = timerPhase({ ...facts.timer, systemctl: goodCtl.fn });
+  assert.equal(loaded.phase, "loaded");
+  assert.ok(loaded.plistBytes instanceof Buffer, "loaded 必须带 unit 字节备份供 journal 使用");
+  assert.equal(loaded.why, null);
+
+  // ② installed_not_loaded：单元在且匹配，明确稳定的不运行状态（inactive 或 failed，且 enabled 或 disabled）
+  const inactiveCtl = fakeSystemctl({ enabled: "enabled", active: "inactive" });
+  const notLoaded = timerPhase({ ...facts.timer, systemctl: inactiveCtl.fn });
+  assert.equal(notLoaded.phase, "installed_not_loaded");
+  assert.ok(notLoaded.plistBytes instanceof Buffer);
+
+  const disabledInactiveCtl = fakeSystemctl({ enabled: "disabled", active: "inactive" });
+  const notLoaded2 = timerPhase({ ...facts.timer, systemctl: disabledInactiveCtl.fn });
+  assert.equal(notLoaded2.phase, "installed_not_loaded");
+
+  const failedCtl = fakeSystemctl({ enabled: "enabled", active: "failed" });
+  const notLoaded3 = timerPhase({ ...facts.timer, systemctl: failedCtl.fn });
+  assert.equal(notLoaded3.phase, "installed_not_loaded");
+
+  // ③ absent：两份 unit 都不在，且 systemd 里未启用也未运行
+  const emptyBase = tmpBase("pk3-timer-absent-");
+  const emptyHome = path.join(emptyBase, "home");
+  const absentFacts = chainFacts({ chain: "claude", home: emptyHome, platform: "linux", node: fx.node });
+  const absentCtl = fakeSystemctl({ enabled: "disabled", active: "inactive" });
+  const absent = timerPhase({ ...absentFacts.timer, systemctl: absentCtl.fn });
+  assert.equal(absent.phase, "absent");
+  assert.equal(absent.plistBytes, null);
+
+  // ④ orphan：
+  //   只留给「磁盘上无单元，但 manager 里仍 enabled 或 active」
+  const orphanCtlA = fakeSystemctl({ enabled: "enabled", active: "active", show: fx.projectedShow });
+  const orphanA = timerPhase({ ...absentFacts.timer, systemctl: orphanCtlA.fn });
+  assert.equal(orphanA.phase, "orphan");
+  assert.match(orphanA.why, /磁盘上无 unit 文件/u);
+
+  // ⑤ P2-1 loaded_other：单元在且 enabled+active，但已加载的 ExecStart 与当前投影不符
+  const staleExecCtl = fakeSystemctl({ show: fx.oldShow });
+  const otherExec = timerPhase({ ...facts.timer, systemctl: staleExecCtl.fn });
+  assert.equal(otherExec.phase, "loaded_other");
+  assert.match(otherExec.why, /ExecStart 与当前投影不一致/u);
+
+  // ⑥ unverifiable：
+  //   情况 A：连不上 manager（is-enabled / is-active 查不清）
+  const brokenCtl = (args) => ({ ok: false, out: "", err: "Failed to connect to bus: Connection refused" });
+  const unvA = timerPhase({ ...facts.timer, systemctl: brokenCtl });
+  assert.equal(unvA.phase, "unverifiable");
+  assert.match(unvA.why, /Failed to connect to bus/u);
+
+  //   情况 B：show 查不了（show 失败）
+  const brokenShowCtl = (args) => {
+    if (args.includes("show")) return { ok: false, out: "", err: "show failed" };
+    return goodCtl.fn(args);
+  };
+  const unvB = timerPhase({ ...facts.timer, systemctl: brokenShowCtl });
+  assert.equal(unvB.phase, "unverifiable");
+  assert.match(unvB.why, /show 查不了/u);
+
+  // ⑦ other 平台（win32/freebsd 等）：明说无定时器实现，按 absent 处理
+  const winFacts = chainFacts({ chain: "claude", home: fx.home, platform: "win32", node: fx.node });
+  assert.equal(winFacts.timer.kind, null);
+  const winTimer = timerPhase({ ...winFacts.timer });
+  assert.equal(winTimer.phase, "absent");
+  assert.equal(winTimer.plistBytes, null);
+});
+
+test("PK3-L3-fix1 P1-1 active+disabled 与过渡态拒绝进门：disabled+active 拒、activating 拒，只有明确稳定不运行态归 installed_not_loaded", () => {
+  const fx = linuxDoctorFixture();
+  const facts = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+
+  // ① disabled + active：实际在跑但未托管 → 拒（phase running_unmanaged，非原始三态）
+  const disabledActive = fakeSystemctl({ enabled: "disabled", active: "active" });
+  const r1 = timerPhase({ ...facts.timer, systemctl: disabledActive.fn });
+  assert.notEqual(r1.phase, "installed_not_loaded", "active+disabled 绝不许归 installed_not_loaded 从而被预检放行！");
+  assert.equal(r1.phase, "running_unmanaged");
+  assert.match(r1.why, /active.*未 enabled/u);
+
+  // ② activating 等过渡态 → 拒（phase transitional，非原始三态）
+  const activating = fakeSystemctl({ enabled: "enabled", active: "activating" });
+  const r2 = timerPhase({ ...facts.timer, systemctl: activating.fn });
+  assert.notEqual(r2.phase, "installed_not_loaded", "activating 过渡态不许归 installed_not_loaded！");
+  assert.equal(r2.phase, "transitional");
+  assert.match(r2.why, /过渡态/u);
+
+  // ③ reloading 过渡态 → 拒
+  const reloading = fakeSystemctl({ enabled: "enabled", active: "reloading" });
+  const r3 = timerPhase({ ...facts.timer, systemctl: reloading.fn });
+  assert.equal(r3.phase, "transitional");
+
+  // ④ enabled+inactive 与 disabled+inactive：明确稳定的不运行状态 → installed_not_loaded
+  const enIn = timerPhase({ ...facts.timer, systemctl: fakeSystemctl({ enabled: "enabled", active: "inactive" }).fn });
+  assert.equal(enIn.phase, "installed_not_loaded");
+  const disIn = timerPhase({ ...facts.timer, systemctl: fakeSystemctl({ enabled: "disabled", active: "inactive" }).fn });
+  assert.equal(disIn.phase, "installed_not_loaded");
+});
+
+test("PK3-L3-fix1 P1-2 两份 unit 齐全与字节投影无条件先核：stale+inactive 归 stale，只缺一份 unit 归 partial_unit 拒进门", () => {
+  const fx = linuxDoctorFixture();
+  const paths = claudeDrainSystemdPaths(fx.home);
+
+  // ① 两份 unit 在盘但字节被篡改（stale）+ inactive：
+  // 即使处于 inactive 态，也必须优先判出 stale 并拒进门，绝不许被判定为 installed_not_loaded 放行！
+  fs.writeFileSync(paths.service, "[Service]\n# 篡改内容\n");
+  const factsStale = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  const inactiveCtl = fakeSystemctl({ enabled: "enabled", active: "inactive" });
+  const rStale = timerPhase({ ...factsStale.timer, systemctl: inactiveCtl.fn });
+  assert.equal(rStale.phase, "stale", "即使 inactive，字节不匹配也必须是 stale（修前被判定为 installed_not_loaded 放行）");
+  assert.match(rStale.why, /与当前投影不一致/u);
+
+  // ② 缺失 service 单元（只有 timer 单元）：
+  fs.unlinkSync(paths.service);
+  const factsMissingService = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  const rMiss = timerPhase({ ...factsMissingService.timer, systemctl: inactiveCtl.fn });
+  assert.notEqual(rMiss.phase, "installed_not_loaded", "只缺一份 unit 绝不许判为 installed_not_loaded");
+  assert.equal(rMiss.phase, "partial_unit");
+  assert.match(rMiss.why, /feishu-bridge-cc-drain\.service/u);
+
+  // ③ 缺失 timer 单元（只有 service 单元）：
+  const units = claudeDrainSystemdUnits({ home: fx.home, node: fx.node });
+  fs.writeFileSync(paths.service, units.service);
+  fs.unlinkSync(paths.timer);
+  const factsMissingTimer = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+  const rMissTimer = timerPhase({ ...factsMissingTimer.timer, systemctl: inactiveCtl.fn });
+  assert.notEqual(rMissTimer.phase, "installed_not_loaded");
+  assert.equal(rMissTimer.phase, "partial_unit");
+  assert.match(rMissTimer.why, /feishu-bridge-cc-drain\.timer/u);
+});
+
+test("PK3-L3 沙箱隔离：沙箱 HOME 不碰真实 systemctl --user；未注入时返回 unverifiable", () => {
+  const sandboxHome = path.join(tmpBase("pk3-sandbox-"), "home");
+  const facts = chainFacts({ chain: "claude", home: sandboxHome, platform: "linux" });
+  const prevEnv = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  try {
+    const unv = timerPhase({ ...facts.timer, home: sandboxHome });
+    assert.equal(unv.phase, "unverifiable");
+    assert.match(unv.why, /沙箱.*不碰真实 systemctl --user/u);
+  } finally {
+    if (prevEnv !== undefined) process.env.FEISHU_BRIDGE_SYSTEMCTL = prevEnv;
+  }
+});
+
+test("PK3-L3 Linux 维护门停与恢复：bootout 走 systemctl stop，bootstrap 走 reload + enable/start", () => {
+  const fx = linuxDoctorFixture();
+  const facts = chainFacts({ chain: "claude", home: fx.home, platform: "linux", node: fx.node });
+
+  // ① bootout 成功
+  const stopCalls = [];
+  const stopCtl = (args) => {
+    stopCalls.push(args);
+    if (args.includes("stop")) return { ok: true, out: "" };
+    return { ok: false, out: "", err: "unknown" };
+  };
+  const b1 = bootoutTimer({ ...facts.timer, systemctl: stopCtl });
+  assert.equal(b1.ok, true);
+  assert.equal(b1.absent, false);
+  assert.ok(stopCalls.some((a) => a.includes("stop") && a.includes("feishu-bridge-cc-drain.timer")),
+    "bootout 调了 systemctl stop 且针对 timer 单元：" + JSON.stringify(stopCalls));
+
+  // ② bootout absent（单元本来就不存在）
+  const absentCtl = (args) => ({ ok: false, out: "", err: "Unit feishu-bridge-cc-drain.timer not-found." });
+  const b2 = bootoutTimer({ ...facts.timer, systemctl: absentCtl });
+  assert.equal(b2.ok, true);
+  assert.equal(b2.absent, true);
+
+  // ③ bootout 真实失败
+  const failCtl = (args) => ({ ok: false, out: "", err: "Failed to stop unit: Permission denied" });
+  const b3 = bootoutTimer({ ...facts.timer, systemctl: failCtl });
+  assert.equal(b3.ok, false);
+  assert.match(b3.why, /Permission denied/u);
+
+  // ④ bootstrap 成功：daemon-reload → enable/start → loadedPhase 为 loaded
+  const bootCalls = [];
+  let timerActive = false;
+  const resumeCtl = (args) => {
+    bootCalls.push(args);
+    if (args.includes("daemon-reload")) return { ok: true, out: "" };
+    if (args.includes("enable") || args.includes("start")) {
+      timerActive = true;
+      return { ok: true, out: "" };
+    }
+    if (args.includes("is-enabled")) return { ok: true, out: "enabled\n" };
+    if (args.includes("is-active")) return timerActive ? { ok: true, out: "active\n" } : { ok: false, out: "inactive\n" };
+    if (args.includes("show")) return { ok: true, out: fx.projectedShow };
+    return { ok: false, out: "", err: "unknown" };
+  };
+  const bs = bootstrapTimer({ ...facts.timer, systemctl: resumeCtl });
+  assert.equal(bs.ok, true, bs.why);
+  assert.ok(bootCalls.some((a) => a.includes("daemon-reload")), "bootstrap 调了 daemon-reload：" + JSON.stringify(bootCalls));
+  assert.ok(bootCalls.some((a) => a.includes("enable") || a.includes("start")), "bootstrap 调了 enable/start：" + JSON.stringify(bootCalls));
+
+  // ⑤ bootstrap 失败（daemon-reload 失败外显）
+  const reloadFailCtl = (args) => {
+    if (args.includes("daemon-reload")) return { ok: false, out: "", err: "Access denied" };
+    return { ok: true, out: "" };
+  };
+  const bsFail = bootstrapTimer({ ...facts.timer, systemctl: reloadFailCtl });
+  assert.equal(bsFail.ok, false);
+  assert.match(bsFail.why, /daemon-reload 失败/u);
+});
+
+test("PK3-L3 预检与维护门：Linux + loaded 下正常进门，停定时器、切桩、建门全链路通过", () => {
+  const base = tmpBase("pk3-linux-gate-");
+  const home = path.join(base, "home");
+  const codexHome = path.join(base, "codex-home");
+  const codexBridge = path.join(base, "codex-bridge");
+  const dir = path.join(home, ".claude", "feishu-bridge", "maintenance");
+  const gateFile = path.join(home, ".claude", "feishu-bridge", "maintenance.gate");
+
+  // 准备环境与安装产物
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const node = stubNode(path.join(base, "installed", "node"));
+  const env = installerEnv(home, {
+    FEISHU_BRIDGE_NODE: node,
+    FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
+    CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: codexBridge,
+  });
+  // 安装 outbound / inbound / codex
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
+  execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+
+  // 假 systemctl：loaded 态
+  const expected = claudeDrainExpectedJob({ home, node }).args;
+  const projectedShow = "{ path=" + expected[0] + " ; argv[]=" + expected.join(" ") + " ; ignore_errors=no ; start_time=[n/a] ; status=0/0 }";
+  let isTimerActive = true;
+  const sysCalls = [];
+  const fakeSys = (args) => {
+    sysCalls.push(args);
+    if (args.includes("is-enabled")) return { ok: true, out: "enabled\n" };
+    if (args.includes("is-active")) return isTimerActive ? { ok: true, out: "active\n" } : { ok: false, out: "inactive\n" };
+    if (args.includes("show")) return { ok: true, out: projectedShow };
+    if (args.includes("stop")) { isTimerActive = false; return { ok: true, out: "" }; }
+    if (args.includes("daemon-reload") || args.includes("enable") || args.includes("start")) {
+      isTimerActive = true;
+      return { ok: true, out: "" };
+    }
+    return { ok: false, out: "", err: "unknown" };
+  };
+
+  // 1. precheckStartupSources: linux 平台全绿
+  const pre = precheckStartupSources({
+    home,
+    codexHome,
+    codexBridgeHome: codexBridge,
+    repoRoot: REPO,
+    node,
+    platform: "linux",
+    systemctl: fakeSys,
+  });
+  assert.equal(pre.ok, true, "预检在 Linux + loaded 下必须全绿：" + JSON.stringify(pre.items.filter((i) => !i.ok)));
+  assert.equal(pre.chains.claude.timer.phase, "loaded");
+  assert.equal(pre.chains.codex.timer.phase, "absent", "Codex 在 Linux 上无 timer，按 absent 绿");
+
+  // 2. maintenanceContext + enterMaintenance (dry-run & apply)
+  let clock = 1000000;
+  const ctx = maintenanceContext({
+    home,
+    codexHome,
+    codexBridgeHome: codexBridge,
+    repoRoot: REPO,
+    node,
+    ps: () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" }),
+    now: () => clock,
+    dir,
+    gateFile,
+    platform: "linux",
+    systemctl: fakeSys,
+  });
+
+  const dry = enterMaintenance(ctx, { reason: "测试 Linux 维护门", apply: false });
+  assert.equal(dry.ok, true, "dryRun 成功进门：" + JSON.stringify(dry));
+  assert.equal(dry.plan.chains.claude.timer, "loaded");
+  assert.equal(dry.plan.chains.codex.timer, "absent");
+
+  const enter = enterMaintenance(ctx, { reason: "测试 Linux 维护门", apply: true });
+  assert.equal(enter.ok, true, "apply 成功进门：" + JSON.stringify(enter));
+  assert.equal(enter.phase, "drained");
+  assert.ok(sysCalls.some((a) => a.includes("stop")), "进门停了定时器：" + JSON.stringify(sysCalls));
+
+  // 3. exitMaintenance 回退
+  const ex = exitMaintenance(ctx, { apply: true });
+  assert.equal(ex.ok, true, "成功出门：" + JSON.stringify(ex));
+  assert.equal(ex.phase, "rolled_back");
+  assert.ok(sysCalls.some((a) => a.includes("daemon-reload") || a.includes("start")), "出门恢复了定时器：" + JSON.stringify(sysCalls));
 });

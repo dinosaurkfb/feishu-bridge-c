@@ -44,11 +44,12 @@ export function maintenanceContext({
   home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), repoRoot,
   node = pickClaudeNode(), launchctl = spawnLaunchctl, ps = defaultPs, sleep = null, now = Date.now, afterStep = null,
   dir = maintenanceDir(), gateFile = maintenanceGatePath(), domain = guiDomain(), stepMs = 5000, gateOps = { createGate, removeGate },
+  platform = process.platform, systemctl = null,
 } = {}) {
-  return { home, codexHome, codexBridgeHome, repoRoot, node, launchctl, ps, sleep, now, afterStep, dir, gateFile, domain, stepMs, gateOps };
+  return { home, codexHome, codexBridgeHome, repoRoot, node, launchctl, ps, sleep, now, afterStep, dir, gateFile, domain, stepMs, gateOps, platform, systemctl };
 }
 
-const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
+const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node, platform: ctx.platform });
 
 /** 只读状态：门 / active / journal / 租约持有者 / 两链 current 与桩 / 定时器三态 / 没做完的重新开放。 */
 export function maintenanceStatus(ctx) {
@@ -63,7 +64,7 @@ export function maintenanceStatus(ctx) {
     let stubs = [];
     try { stubs = fs.readdirSync(path.join(facts.root, "versions")).filter((n) => n.startsWith("maintenance-")); } catch { stubs = []; }
     const stubManifest = current !== null && isStubTarget(current) ? readStubManifest(path.join(facts.root, current)) : null;
-    chains[chain] = { current, isStub: current !== null && isStubTarget(current), stubManifest, stubs, timer: timerPhase({ ...facts.timer, run: ctx.launchctl }).phase };
+    chains[chain] = { current, isStub: current !== null && isStubTarget(current), stubManifest, stubs, timer: timerPhase({ ...facts.timer, run: ctx.launchctl, systemctl: ctx.systemctl }).phase };
   }
   const phase = journal?.state === "valid" ? journal.doc.phase : null;
   const pendingReopening = phase !== null && FORWARD_ONLY_PHASES.includes(phase) && !TERMINAL_PHASES.includes(phase);
@@ -108,7 +109,7 @@ const withLeaseResidue = (result, rel) => (rel.ok ? result : { ...result, ok: fa
 export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, keepLease = false, operationKind = "maintenance_gate" } = {}) {
   if (typeof reason !== "string" || reason.trim().length === 0) return { ok: false, reason: "reason_required" };
   const normalized = normalizeGateReason(reason);
-  const pre = precheckStartupSources({ home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, repoRoot: ctx.repoRoot, node: ctx.node, launchctl: ctx.launchctl });
+  const pre = precheckStartupSources({ home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, repoRoot: ctx.repoRoot, node: ctx.node, launchctl: ctx.launchctl, systemctl: ctx.systemctl, platform: ctx.platform });
   if (!pre.ok) return { ok: false, reason: "startup_source_unverified", items: pre.items.filter((i) => !i.ok), precheck: pre };
   const gate = readGate({ file: ctx.gateFile, now: ctx.now() });
   if (gate.state !== "absent") return { ok: false, reason: "gate_" + gate.state, why: gate.why ?? (gate.payload ? "门已开着（token " + String(gate.payload.token).slice(0, 8) + "）" : null) };
@@ -134,7 +135,7 @@ export function enterMaintenance(ctx, { reason, waitMs = 60000, apply = false, k
       if (t.plistBytes !== null) { backup = path.join(ctx.dir, token + "." + chain + ".plist"); meta = writeBackup(backup, t.plistBytes); }
       J(addStepPrepared({ dir: ctx.dir, token, lease, now: ctx.now(), step: { id: "timer:" + chain, kind: "timer", target: facts.timer.label, before: { phase: t.phase, plist: facts.timer.plistFile }, backup, backup_sha256: meta.sha256, backup_bytes: meta.bytes, intended_after: { phase: t.phase === "loaded" ? "installed_not_loaded" : t.phase } } }), "记 timer");
       if (t.phase === "loaded") {
-        const r = bootoutTimer({ label: facts.timer.label, domain: ctx.domain, run: ctx.launchctl });
+        const r = bootoutTimer({ ...facts.timer, domain: ctx.domain, run: ctx.launchctl, systemctl: ctx.systemctl });
         if (!r.ok) throw Object.assign(new Error("停定时器（" + chain + "）：" + r.why), { opReason: "timer_stop_failed" });
       }
       J(markStepDone({ dir: ctx.dir, token, lease, now: ctx.now(), id: "timer:" + chain, after: { phase: t.phase === "loaded" ? "installed_not_loaded" : t.phase } }), "记 timer done");
@@ -364,9 +365,9 @@ export function reopening(ctx, token, lease, { mode }) {
         catch (err) { incomplete.push({ id: st.id, why: "plist 写回失败：" + errText(err) }); continue; }
       }
     }
-    const cur = timerPhase({ ...facts.timer, run: ctx.launchctl });
+    const cur = timerPhase({ ...facts.timer, run: ctx.launchctl, systemctl: ctx.systemctl });
     if (cur.phase === "loaded") continue;
-    const r = bootstrapTimer({ label: facts.timer.label, plistFile: facts.timer.plistFile, expect: facts.timer.expect, domain: ctx.domain, run: ctx.launchctl });
+    const r = bootstrapTimer({ ...facts.timer, domain: ctx.domain, run: ctx.launchctl, systemctl: ctx.systemctl });
     if (!r.ok) { incomplete.push({ id: st.id, why: "定时器恢复失败：" + r.why }); continue; }
     const f = noted("timer:" + chain + " 已恢复 loaded");
     if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: doc.phase };

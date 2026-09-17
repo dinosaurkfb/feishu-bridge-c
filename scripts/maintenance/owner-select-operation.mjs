@@ -47,7 +47,7 @@ const errText = (err) => String(err?.code ?? err?.message ?? err);
 const afterStep = (ctx, id) => { if (typeof ctx.afterStep === "function") ctx.afterStep(id); };
 const deepEq = (a, b) => { if (a === b) return true; if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => deepEq(x, b[i])); if (a && b && typeof a === "object" && typeof b === "object") return JSON.stringify(a) === JSON.stringify(b); return false; };
 const shaHex = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
-const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node });
+const factsOf = (ctx, chain) => chainFacts({ chain, home: ctx.home, codexHome: ctx.codexHome, codexBridgeHome: ctx.codexBridgeHome, node: ctx.node, platform: ctx.platform });
 const readlinkOrNull = (p) => { try { return { state: "value", value: fs.readlinkSync(p) }; } catch (err) { return err?.code === "ENOENT" ? { state: "absent", value: null } : { state: "unclear", value: null, why: errText(err) }; } };
 const releaseSurface = (surface) => {
   const rel = surface.release();
@@ -1310,9 +1310,9 @@ export function osmReopening(ctx, token, lease, env = process.env) {
         catch (err) { incomplete.push({ id: st.id, why: "plist 写回失败：" + errText(err) }); continue; }
       }
     }
-    const cur = timerPhase({ ...facts.timer, run: ctx.launchctl });
+    const cur = timerPhase({ ...facts.timer, run: ctx.launchctl, systemctl: ctx.systemctl });
     if (cur.phase === "loaded") continue;
-    const r = bootstrapTimer({ label: facts.timer.label, plistFile: facts.timer.plistFile, expect: facts.timer.expect, domain: ctx.domain, run: ctx.launchctl });
+    const r = bootstrapTimer({ ...facts.timer, domain: ctx.domain, run: ctx.launchctl, systemctl: ctx.systemctl });
     if (!r.ok) { incomplete.push({ id: st.id, why: "定时器恢复失败：" + r.why }); continue; }
     const f = noted("timer:" + chain + " 已恢复 loaded");
     if (f !== null) return { ok: false, reason: f.reason, why: f.why, path: f.path, phase: "ledger_reopening" };

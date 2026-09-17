@@ -7,7 +7,7 @@
  * 逐项：
  *   receipt         收据 valid、有这条链、版本 == verifyRuntime 的版本、逐制品 sha 对账通过
  *   hooks           settings.json / hooks.json 里：桥拥有的条目各恰好一条；任何提到运行时根的 hook 命令都必须是桥拥有的（多一个 shell 动作 / 第二个 node → 拒）
- *   timer           plist 字节 == 投影，launchd 三态 ∈ {loaded, installed_not_loaded, absent}
+ *   timer           plist/unit 字节 == 投影，原始三态 ∈ {loaded, installed_not_loaded, absent}（按平台：darwin launchd / linux systemd --user / 其它按 absent）
  *   routes          有效默认路由的处理器在 runtime/current 之下（或没有路由表）；非默认外部处理器只记账
  *   scripts         收据引用的每个脚本：在桩清单里、是 current/scripts 下解析得到的普通文件
  *   manifest        桩清单 missing 为空
@@ -17,8 +17,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries } from "../install-projection.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "../drain-schedule.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, claudeDrainPlist, claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, claudeSettingsOwnedEntries } from "../install-projection.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor } from "../drain-schedule.mjs";
 import { compareInstalledSurface, installedSurfacePath, readInstalledSurface } from "../installed-surface.mjs";
 import { codexRuntimeRoot, runtimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { defaultRouteHandler } from "../inbound-routes.mjs";
@@ -35,27 +35,86 @@ const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return nu
 const readTextOrNull = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } };
 
 /** 一条链的固定事实（路径与投影），预检与 operation 共用。 */
-export function chainFacts({ chain, home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), node = pickClaudeNode() } = {}) {
+export function chainFacts({ chain, home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), node = pickClaudeNode(), platform = process.platform } = {}) {
   if (chain === "claude") {
     const root = runtimeRoot(home, "claude");
-    const plistFile = claudeDrainPlistPath(home);
+    const kind = timerKindFor(platform);
+    let timer;
+    if (kind === "launchd") {
+      const plistFile = claudeDrainPlistPath(home);
+      timer = {
+        kind,
+        label: CLAUDE_DRAIN_LAUNCH_LABEL,
+        plistFile,
+        wanted: claudeDrainPlist({ home, node }),
+        expect: claudeDrainExpectedJob({ home, node }),
+        home,
+      };
+    } else if (kind === "systemd") {
+      const paths = claudeDrainSystemdPaths(home);
+      const units = claudeDrainSystemdUnits({ home, node });
+      timer = {
+        kind,
+        label: CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer",
+        unit: CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer",
+        service: CLAUDE_DRAIN_SYSTEMD_UNIT + ".service",
+        plistFile: paths.timer,
+        serviceFile: paths.service,
+        timerFile: paths.timer,
+        wanted: units.timer,
+        wantedService: units.service,
+        wantedTimer: units.timer,
+        expect: claudeDrainExpectedJob({ home, node }),
+        home,
+      };
+    } else {
+      timer = {
+        kind: null,
+        label: "none",
+        plistFile: path.join(home, ".claude", "feishu-bridge", "no-timer"),
+        wanted: null,
+        expect: null,
+        home,
+      };
+    }
     return {
       chain, root, current: path.join(root, "current"),
       receiptFile: installedSurfacePath({ chain: "claude", home }),
       hooksFile: path.join(home, ".claude", "settings.json"),
       routesFile: path.join(home, ".claude", "feishu-bridge", "routes.json"), routeId: "self", inboundHandler: path.join(root, "current", "scripts", "inbound.mjs"),
-      timer: { label: CLAUDE_DRAIN_LAUNCH_LABEL, plistFile, wanted: claudeDrainPlist({ home, node }), expect: claudeDrainExpectedJob({ home, node }) },
+      timer,
       templateFile: templatePath(), extractors: {}, otherRoot: codexRuntimeRoot(codexHome),
       entryFilter: (n) => !n.startsWith("codex/"),
     };
   }
   const root = codexRuntimeRoot(codexHome);
+  const codexKind = platform === "darwin" ? "launchd" : null;
+  let timer;
+  if (codexKind === "launchd") {
+    timer = {
+      kind: "launchd",
+      label: CODEX_DRAIN_LABEL,
+      plistFile: codexPlistPath(home),
+      wanted: codexPlistBody({ home, codexHome }),
+      expect: codexExpectedJob({ home, codexHome }),
+      home,
+    };
+  } else {
+    timer = {
+      kind: null,
+      label: "none",
+      plistFile: path.join(codexBridgeHome, "no-timer"),
+      wanted: null,
+      expect: null,
+      home,
+    };
+  }
   return {
     chain, root, current: path.join(root, "current"),
     receiptFile: installedSurfacePath({ chain: "codex", codexBridgeHome }),
     hooksFile: path.join(codexHome, "hooks.json"),
     routesFile: path.join(codexBridgeHome, "routes.json"), routeId: "codex", inboundHandler: path.join(root, "current", "scripts", "codex", "inbound.mjs"),
-    timer: { label: CODEX_DRAIN_LABEL, plistFile: codexPlistPath(home), wanted: codexPlistBody({ home, codexHome }), expect: codexExpectedJob({ home, codexHome }) },
+    timer,
     templateFile: codexTemplateFile(codexBridgeHome), extractors: { "codex-hooks": codexHooksOwnedEntries }, otherRoot: runtimeRoot(home, "claude"),
     entryFilter: (n) => n.startsWith("codex/"),
   };
@@ -111,7 +170,7 @@ function foreignHookCommands({ chain, text, root, otherRoot, home, node }) {
 /**
  * 预检一条链。返回 { items:[{id, ok, why}], facts, receipt, runtime, timer, agentUid }。
  */
-export function precheckChain(facts, { home = os.homedir(), node = pickClaudeNode(), launchctl = spawnLaunchctl, manifest } = {}) {
+export function precheckChain(facts, { home = os.homedir(), node = pickClaudeNode(), launchctl = spawnLaunchctl, systemctl = null, manifest } = {}) {
   const items = [];
   const add = (id, ok, why = null) => items.push({ id: facts.chain + ":" + id, ok, why });
   const runtime = verifyRuntime({ root: facts.root });
@@ -130,7 +189,7 @@ export function precheckChain(facts, { home = os.homedir(), node = pickClaudeNod
   const hooks = foreignHookCommands({ chain: facts.chain, text: readTextOrNull(facts.hooksFile), root: facts.root, otherRoot: facts.otherRoot ?? null, home, node });
   add("hooks", hooks.ok, hooks.ok ? null : hooks.why);
   // 定时器
-  const timer = timerPhase({ ...facts.timer, run: launchctl });
+  const timer = timerPhase({ ...facts.timer, run: launchctl, systemctl });
   add("timer", ORIGINAL_THREE_STATE.includes(timer.phase), ORIGINAL_THREE_STATE.includes(timer.phase) ? null : "定时器不在原始三态里：" + timer.phase + (timer.why ? "（" + timer.why + "）" : ""));
   // 路由
   const route = defaultRouteHandler({ file: facts.routesFile, runtimeCurrent: facts.current, expectedHandler: facts.inboundHandler, expectedRouteId: facts.routeId });
@@ -153,13 +212,22 @@ export function precheckChain(facts, { home = os.homedir(), node = pickClaudeNod
 /**
  * 两条链一起预检 + 桩清单。ok = 全部项都过。
  */
-export function precheckStartupSources({ home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), repoRoot, node = pickClaudeNode(), launchctl = spawnLaunchctl } = {}) {
+export function precheckStartupSources({
+  home = os.homedir(),
+  codexHome = process.env.CODEX_HOME || path.join(home, ".codex"),
+  codexBridgeHome = codexBridgeHomeOf(),
+  repoRoot,
+  node = pickClaudeNode(),
+  launchctl = spawnLaunchctl,
+  systemctl = null,
+  platform = process.platform,
+} = {}) {
   const manifest = maintenanceEntryManifest({ repoRoot, home, codexHome, bridgeHome: codexBridgeHome });
   const chains = {};
   const items = [];
   for (const chain of ["claude", "codex"]) {
-    const facts = chainFacts({ chain, home, codexHome, codexBridgeHome, node });
-    const r = precheckChain(facts, { home, node, launchctl, manifest });
+    const facts = chainFacts({ chain, home, codexHome, codexBridgeHome, node, platform });
+    const r = precheckChain(facts, { home, node, launchctl, systemctl, manifest });
     chains[chain] = r;
     items.push(...r.items);
   }

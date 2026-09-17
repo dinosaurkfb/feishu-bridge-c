@@ -19,6 +19,7 @@
  */
 
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode } from "./drain-schedule.mjs";
+import { absentJob } from "./launchd-job.mjs";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -28,8 +29,8 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
-import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill, systemdUnitAbsent } from "./install-projection.mjs";
+import { artifactSha, installedSurfacePath, readInstalledSurface, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
 
@@ -50,8 +51,14 @@ const REGISTRY = path.join(os.homedir(), ".claude", "feishu-bridge", "registry.j
 
 /** 技能与 launchd 引用的「桥根目录」，同样是 runtime 而不是开发克隆。 */
 const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("stop-hook.mjs")));
-// node 的选择只有一份（drain-schedule.mjs）—— 定时器 plist 与 doctor 的期望 job 同源。
-const NODE_BIN = pickClaudeNode();
+/**
+ * 兜底定时器的**平台注入口**（测试隔离点，与 FEISHU_BRIDGE_SYSTEMCTL / FEISHU_BRIDGE_LAUNCHCTL 同一口径）：
+ * linux 分支的卸载顺序与失败处理只能在真 linux 上跑，而那正是 PK3-L1-fix2 要钉的路径。
+ * 不带它时行为与以前逐字相同（process.platform）。写文件仍只写在当前 HOME 下（沙箱判据照旧）。
+ */
+const TIMER_PLATFORM = process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform;
+// node 的选择只有一份（drain-schedule.mjs）—— 定时器 plist / unit 与 doctor 的期望 job 同源。
+// **具体在读到 settings 正文之后才算**（PK3-L1-fix2 P1-1）：要把「现有安装里那个 node」当 installed 传进去。
 // hook 命令模板、归属判定、settings 合并、plist、技能渲染都在 install-projection.mjs（维护门要在不写的情况下问"会写成什么"）。
 
 const apply = process.argv.includes("--apply");
@@ -72,6 +79,16 @@ if (runtimePlan && !runtimePlan.ok) {
 // ---------- settings.json（投影在 install-projection.mjs：只动自己的 hook 与预览放行规则）----------
 
 const settingsBefore = fs.readFileSync(SETTINGS, "utf-8");
+/**
+ * **现有安装里那个 node**（PK3-L1-fix2 P1-1）：收据里的 claude 链 + settings.json 里我们自己的 hook
+ * 命令 + 现有 plist / unit → installed；它仍然可执行（X_OK）就沿用，不再按当前偏好顺序改写现网。
+ * 接线的唯一一份在 install-projection.installedClaudeNode（收据读在这里，避免模块成环）。
+ */
+const installedReceipt = (() => {
+  const r = readInstalledSurface({ file: installedSurfacePath({ chain: "claude", home: os.homedir() }) });
+  return r.state === "valid" ? r.doc : null;
+})();
+const NODE_BIN = pickClaudeNode({ installed: installedClaudeNode({ home: os.homedir(), platform: TIMER_PLATFORM, receipt: installedReceipt }) });
 const rendered = renderClaudeSettings({ baseText: settingsBefore, home: os.homedir(), node: NODE_BIN, uninstall });
 const settings = rendered.settings;
 const stop = settings.hooks.Stop;
@@ -171,9 +188,18 @@ const plistBody = claudeDrainPlist({ home: os.homedir(), node: NODE_BIN });
 
 // PK3-L1：兜底定时器按平台 —— darwin launchd / linux systemd --user / 其它明说没实现。
 // 计划是**纯函数**（install-projection.drainTimerPlan），安装器照它执行、测试照它断言。
-const TIMER_PLAN = drainTimerPlan({ home: os.homedir(), node: NODE_BIN, uninstall });
+const TIMER_PLAN = drainTimerPlan({ home: os.homedir(), node: NODE_BIN, platform: TIMER_PLATFORM, uninstall });
 const TIMER_FILES = TIMER_PLAN.files;
 const TIMER_REMOVE = TIMER_PLAN.remove ?? [];
+
+/** 预览要按**实际执行顺序**列出步骤：`commands` → 删掉的文件 → `commandsAfterRemove`。 */
+function timerStepLines(plan, remove) {
+  return [
+    ...plan.commands.map((c) => c.join(" ")),
+    ...(remove.length > 0 ? ["删除 " + remove.join("  ")] : []),
+    ...(plan.commandsAfterRemove ?? []).map((c) => c.join(" ")),
+  ];
+}
 
 // ---------- 落盘 ----------
 
@@ -187,6 +213,9 @@ if (runtimePlan) {
     " @ " + runtimePlan.sourceRoot);
 }
 console.log("settings : " + SETTINGS + "  → " + action);
+// 把选中的 node 打出来：它决定三条 hook 与定时器跑哪个二进制，而"选了哪个"以前只藏在命令文本里 ——
+// 「保留已安装路径」这件事得能在预览里看见（产品级用例也拿它当断言点）。
+console.log("node     : " + NODE_BIN + "（三条 hook 与兜底定时器都用它）");
 console.log("Stop 钩子 : " + stop.length + " 条（.orca 的那条必须还在）  → " + action);
 console.log("/init 钩子: " + initAction + "        （UserPromptSubmit 共 " + prompts.length + " 条）");
 console.log("入站钩子 : " + inboundHookAction + "        （Aily 回合强制进运输层）");
@@ -205,7 +234,8 @@ for (const sk of skillPlan) console.log("           /" + sk.dst.padEnd(26) + sk.
 console.log("兜底定时 : " + (TIMER_PLAN.kind === null ? "（无可写）" : (uninstall ? "卸载 " : "") +
   (TIMER_PLAN.files.length ? TIMER_PLAN.files.map((f) => f.path).join("  ") : TIMER_REMOVE.join("  "))) +
   "  → " + TIMER_PLAN.action + (TIMER_PLAN.kind === null ? "（" + TIMER_PLAN.note + "）" : "（每 30 分钟排空全部登记项目）"));
-for (const cmd of TIMER_PLAN.commands) console.log("            " + cmd.join(" ") + (String(cmd[0]).includes("launchctl") || cmd[0] === "systemctl" ? "" : ""));
+// 按**实际执行顺序**打印（P1-2：卸载是 enable 反向的三步，顺序就是行为）：命令 → 删文件 → 命令。
+for (const step of timerStepLines(TIMER_PLAN, TIMER_REMOVE)) console.log("            " + step);
 
 if (skillAction === "source-missing") {
   for (const sk of skillPlan.filter((x) => x.action === "source-missing")) {
@@ -339,8 +369,10 @@ const launchctl = (args, { tolerate = false } = {}) => {
     execFileSync("/bin/launchctl", args, { stdio: "pipe", timeout: 15_000 });
     return { ok: true };
   } catch (err) {
-    if (!tolerate) console.error("  launchctl " + args.join(" ") + " 失败：" + String(err.message).split("\n")[0]);
-    return { ok: false };
+    // 失败要把**它说的话**带回来：卸载那一步要区分「本来就没有这个 job」与「真失败」。
+    const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
+    if (!tolerate) console.error("  launchctl " + args.join(" ") + " 失败：" + text);
+    return { ok: false, text, absent: absentJob(text) };
   }
 };
 
@@ -348,28 +380,60 @@ const launchctl = (args, { tolerate = false } = {}) => {
 // 逐字相同：systemctl --user 操作的是当前登录用户的实例，跟 HOME 一点关系都没有。
 // FEISHU_BRIDGE_SYSTEMCTL 是测试隔离点（与 FEISHU_BRIDGE_LAUNCHCTL 同一口径）。
 const systemctl = (args, { tolerate = false } = {}) => {
-  if (SANDBOXED) return { ok: false, skipped: true };
-  const bin = process.env.FEISHU_BRIDGE_SYSTEMCTL || "systemctl";
+  // 沙箱 HOME 默认不碰真实 systemd --user；**显式注入 FEISHU_BRIDGE_SYSTEMCTL 时例外** ——
+  // 与 doctor 的 `sandboxed && !injected` 同一口径：注入点本来就是"换掉二进制"，
+  // 而 linux 分支的卸载顺序只能在注入下做产品级验证（本机是 macOS）。
+  const injected = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  if (SANDBOXED && !injected) return { ok: false, skipped: true };
+  const bin = injected || "systemctl";
   try {
     execFileSync(bin, args, { stdio: "pipe", timeout: 15_000 });
     return { ok: true };
   } catch (err) {
-    if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + String(err.message).split("\n")[0]);
-    return { ok: false };
+    const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
+    if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + text);
+    // `absent`："本来就没有这个单元" —— 干净卸载的常见形态，不箿成失败（判据与 doctor 共用一份）。
+    return { ok: false, text, absent: systemdUnitAbsent(text) };
   }
 };
 
 const domain = "gui/" + process.getuid();
+/**
+ * 跑计划里的一条命令。计划里的 `commands` 是**给人看的命令行**（首项是程序名，launchd 那条还带 `gui/<uid>`
+ * 占位符），直接拿去 execFileSync 会变成 `systemctl systemctl --user disable --now …` /
+ * `launchctl launchctl bootout gui/<uid>/…` —— 两件都是静默失败（fix1 的卸载就是这么写的，所以那句
+ * "已卸载"从来没真卸过）。执行只能走这里：去掉程序名、补齐真实 uid，二进制用本脚本自己的
+ * （可以被 FEISHU_BRIDGE_SYSTEMCTL 注入替换）。
+ */
+const timerCmd = (argv) => {
+  const [program, ...rest] = argv;
+  if (program !== "launchctl" && program !== "systemctl") throw new Error("兜底定时器计划里不认识的程序：" + program);
+  const args = rest.map((a) => (a === "gui/<uid>" ? domain : a));
+  return program === "launchctl" ? launchctl(args, { tolerate: true }) : systemctl(args, { tolerate: true });
+};
 let launchNote;
 if (uninstall) {
   // PK3-L1-fix1 P1-2：卸载**也按平台计划**。旧版无条件调 launchctl、只删 plist ——
   // linux 上 unit 与已启用的 timer 会继续跑（安装能写、卸载不管，是最难发现的那类残留）。
+  // PK3-L1-fix2 P1-2：三步顺序 = `disable --now` → 删两份 unit → `daemon-reload`；
+  // 且**停不下来就不删**（旧版 disable 失败也照删、照报"已卸载"，留下一个还在跑的 timer）。
   if (TIMER_PLAN.kind === null) { launchNote = TIMER_PLAN.note; }
   else {
-    const ran = TIMER_PLAN.commands.map((args) =>
-      (TIMER_PLAN.kind === "launchd" ? launchctl(args, { tolerate: true }) : systemctl(args, { tolerate: true })));
-    const skipped = ran.some((r) => r.skipped);
+    const ran = TIMER_PLAN.commands.map(timerCmd);
+    const failedAt = ran.findIndex((r) => !r.ok && !r.skipped && !r.absent);
+    if (failedAt >= 0) {
+      const failed = ran[failedAt];
+      console.error("卸载中止：" + TIMER_PLAN.commands[failedAt].join(" ") + " 失败（" +
+        String(failed.text ?? "说不清") + "）。\n" +
+        "  " + (String(TIMER_PLAN.commands[failedAt][0]) === "launchctl" ? "launchd" : "systemd") +
+        " 那边没停掉，所以**一个文件都没删**（删了就等于把一个还在跑的定时器变成孤儿）—— 请先看它的状态再重试。\n" +
+        "  settings 与技能已经卸掉；恢复：node scripts/install-outbound.mjs（预览后自行加 --apply）");
+      process.exit(1);
+    }
     for (const path0 of TIMER_REMOVE) fs.rmSync(path0, { force: true });
+    // 删完之后才 reload：manager 里那份定义要跟着盘上一起更新（顺序反了就是"文件删了、它还在"）。
+    for (const args of TIMER_PLAN.commandsAfterRemove ?? []) timerCmd(args);
+    const skipped = ran.some((r) => r.skipped);
     const what = TIMER_PLAN.kind === "launchd" ? "plist" : "systemd 单元";
     const live = TIMER_PLAN.kind === "launchd" ? "launchd" : "systemd --user";
     // 沙箱卸载只删得掉这个 HOME 下的文件，真实域里那个 job/timer 还在跑。
@@ -396,8 +460,9 @@ if (uninstall) {
         ? "已加载"
         : "**plist 已写入但 launchctl 加载失败 —— 兜底重试目前不生效**";
   } else {
-    const reloaded = systemctl(["daemon-reload"], { tolerate: true });
-    const enabled = reloaded.skipped ? { skipped: true } : systemctl(["enable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"]);
+    // 安装也是**计划驱动**（与实际执行同一份）：两条命令的顺序与内容都来自 drainTimerPlan。
+    const reloaded = timerCmd(TIMER_PLAN.commands[0]);
+    const enabled = reloaded.skipped ? { skipped: true } : timerCmd(TIMER_PLAN.commands[1]);
     launchNote = enabled.skipped
       ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）"
       : enabled.ok

@@ -50,7 +50,7 @@ import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor } from "./drain-schedule.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, claudeDrainSystemdPaths, claudeDrainSystemdUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
 import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -66,9 +66,18 @@ import { LAUNCHCTL_ENV, PHASE_TEXT, loadedPhase } from "./launchd-job.mjs";
 
 /** systemctl 的测试隔离点（与 FEISHU_BRIDGE_LAUNCHCTL 同一口径）。 */
 const SYSTEMCTL_ENV = "FEISHU_BRIDGE_SYSTEMCTL";
+
+/**
+ * `systemctl is-active / is-enabled` 的已知状态词（PK3-L1-fix2 P2）：非零退出 + 这些词 = **读到了**状态。
+ * `is-active` 对正常的 inactive 也是非零退出（stdout 就是状态词）—— 旧版把它折成"查不清"，诊断不准。
+ * "not-found" 不在这里：它走 systemdUnitAbsent（"本来就没有这个单元"），与安装侧卸载共用一份判据。
+ */
+const SYSTEMCTL_STATE_WORDS = new Set(["active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance",
+  "enabled", "enabled-runtime", "disabled", "static", "indirect", "linked", "linked-runtime",
+  "masked", "masked-runtime", "alias", "generated", "transient", "unknown"]);
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs";
-import { inspectInstalledSurface, installedSurfacePath } from "./installed-surface.mjs";
+import { inspectInstalledSurface, installedSurfacePath, readInstalledSurface } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
@@ -560,6 +569,14 @@ export function runDoctor({
     catch (err) { return { ok: false, out: String(err?.stdout ?? ""), err: String(err?.stderr ?? err?.message ?? err) }; }
   };
   const timerKind = timerKindFor(platform);
+  // 「现有安装里那个 node」（PK3-L1-fix2 P1-1）：与安装器同一份接线（收据 + 桥 hook + 现有 plist/unit）。
+  // doctor 要核的是**线上那份配置的参数**，不是"当前偏好顺序会写成什么"—— 后者会把一个本来在跑的 job
+  // 报成参数不符。拿不到（没装过 / 收据还没有）时回落到常规顺序，行为与以前相同。
+  const receiptDoc = (() => {
+    const r = readInstalledSurface({ file: installedSurfacePath({ chain: "claude", home }) });
+    return r.state === "valid" ? r.doc : null;
+  })();
+  const claudeNode = () => pickClaudeNode({ installed: installedClaudeNode({ home, platform, receipt: receiptDoc }) });
   let claudePhase = "unverifiable";
   let claudePhaseWhy = null;
   if (timerKind === null) {
@@ -569,40 +586,76 @@ export function runDoctor({
     claudePhaseWhy = "体检的 home 不是当前用户的家目录（沙箱），不碰真实 "
       + (timerKind === "launchd" ? "launchctl" : "systemctl --user");
   } else if (timerKind === "systemd") {
-    // PK3-L1-fix1 P1-3：**核投影**，不只看 is-enabled/is-active —— 同名 timer 跑错程序（旧 ExecStart /
+    // PK3-L1-fix1 P1-3 / fix2 P1-3：**核投影**，不只看 is-enabled/is-active —— 同名 timer 跑错程序（旧 ExecStart /
     // 旧 node）时只核状态会报「已加载」，那是假绿。判据与 launchd 分支同口径（loaded_other = 参数不符）。
     const unit = CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer";
+    const service = CLAUDE_DRAIN_SYSTEMD_UNIT + ".service";
     const enabled = systemctlFn(["is-enabled", unit]);
     const active = systemctlFn(["is-active", unit]);
-    const say = (r) => String(r?.out ?? "") + " " + String(r?.err ?? "");
-    // systemctl 自己不可用（命令不在、实例连不上、权限不行）≠ 没装 —— 那是「查不清」，必须与 not_installed 分开。
-    const looksNotInstalled = (r) => /not-found|not found|No such|not loaded|Failed to get unit file state|^disabled$/mu.test(say(r).trim());
-    const broken = (r) => r?.ok !== true && !looksNotInstalled(r);
+    const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
+    // P2（fix2）：已知状态词算"读到了"，不是"查不清"。只有命令不在 / 连不上 manager 才是查不清。
+    const stateWord = (r) => {
+      const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+      return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
+    };
+    // systemctl 自己不可用（命令不在、实例连不上、权限不行）≠ 没装 —— 必须与 not_installed 分开。
+    //「本来就没有这个单元」的判据与安装侧卸载**共用一份**（systemdUnitAbsent），不各写一遍。
+    const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
+    const broken = (r) => !readable(r);
     if (broken(enabled) || broken(active)) {
-      claudePhaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).trim().slice(0, 120) + "）—— 查不清，不等于没在跑";
+      claudePhaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).slice(0, 120) + "）—— 查不清，不等于没在跑";
     } else {
       const paths = claudeDrainSystemdPaths(home);
-      const units = claudeDrainSystemdUnits({ home, node: pickClaudeNode() });
+      const units = claudeDrainSystemdUnits({ home, node: claudeNode() });
       const readUnit = (f) => { try { return fs.readFileSync(f, "utf-8"); } catch { return null; } };
       const projected = readUnit(paths.service) === units.service && readUnit(paths.timer) === units.timer;
       const isEnabled = String(enabled.out ?? "").trim() === "enabled";
       const isActive = String(active.out ?? "").trim() === "active";
-      if ((isEnabled || isActive) && !projected) {
-        claudePhase = "loaded_other";
-        claudePhaseWhy = "磁盘上的 systemd 单元与当前投影不一致（ExecStart / OnUnitActiveSec / node 路径）";
-      } else if (isEnabled && isActive) claudePhase = "loaded";
-      else if (isEnabled || isActive) { claudePhase = "installed_not_loaded"; claudePhaseWhy = "systemd timer " + (isEnabled ? "已 enable 但未 active" : "在跑但没 enable"); }
-      else claudePhase = "not_installed";
+      if (isEnabled && isActive) {
+        if (!projected) {
+          claudePhase = "loaded_other";
+          claudePhaseWhy = "磁盘上的 systemd 单元与当前投影不一致（ExecStart / OnUnitActiveSec / node 路径）";
+        } else {
+          const show = systemctlFn(["show", service, "-p", "ExecStart", "--value"]);
+          const expectedArgs = claudeDrainExpectedJob({ home, node: claudeNode() }).args;
+          const loadedArgv = systemdShowExecArgv(String(show.out ?? ""));
+          const sameExec = show.ok === true && loadedArgv !== null &&
+            (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
+          if (show.ok !== true) {
+            claudePhase = "unverifiable";
+            claudePhaseWhy = "systemctl --user show 查不了（" + say(show).slice(0, 120) + "）—— 已加载的定义核不了，查不清";
+          } else if (!sameExec) {
+            claudePhase = "loaded_other";
+            claudePhaseWhy = "systemd manager 里**已加载**的 ExecStart 与当前投影不一致（磁盘改了但没 daemon-reload 成，或跑的是旧的那份）";
+          } else {
+            claudePhase = "loaded";
+          }
+        }
+      } else if (isEnabled || isActive) {
+        claudePhase = "installed_not_loaded";
+        claudePhaseWhy = "systemd timer " + (isEnabled ? "已 enable 但未 active" : "在跑但没 enable");
+      } else {
+        const hasFiles = readUnit(paths.service) !== null || readUnit(paths.timer) !== null;
+        claudePhase = hasFiles ? "installed_not_loaded" : "absent";
+        if (hasFiles) claudePhaseWhy = "systemd timer 未启用且未在跑";
+      }
     }
   } else {
     // 核**完整 ProgramArguments**，不只看同名 job 在不在（评审探针：同名 job 跑 /bin/echo 也曾被说成在发）。
-    try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: pickClaudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
+    try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: claudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
     catch (err) { claudePhaseWhy = String(err?.message ?? err).slice(0, 120); }
   }
   const publisherRunning = claudePhase === "loaded" ? true
-    : (claudePhase === "installed_not_loaded" || claudePhase === "loaded_other") ? false : null;
-  const publisherText = claudePhaseWhy ? "兜底定时器状态查不清（" + claudePhaseWhy + "）"
-    : "兜底定时器 " + (timerKind === "systemd" ? "（systemd --user）" : "") + (PHASE_TEXT[claudePhase] ?? claudePhase);
+    : (claudePhase === "installed_not_loaded" || claudePhase === "loaded_other" || claudePhase === "absent") ? false : null;
+  /** systemd 分支上阶段文案的替换：launchd 版措辞（plist / launchd 加载）对着 systemd timer 说是错的。 */
+  const timerPhaseText = (timerKind === "systemd"
+    ? { ...PHASE_TEXT, installed_not_loaded: "**单元已写入但没被 systemd --user 加载 —— 定时器不会跑**" }
+    : PHASE_TEXT)[claudePhase] ?? claudePhase;
+  // 查不清是"不知道"；已知故障（参数不符 / 没加载）必须按**已知**说，不能一律套上"查不清"（PK3-L1-fix2 P2 口径同源）。
+  const publisherText = claudePhase === "unverifiable"
+    ? "兜底定时器状态查不清（" + String(claudePhaseWhy ?? "说不清") + "）"
+    : "兜底定时器 " + (timerKind === "systemd" ? "（systemd --user）" : "") + timerPhaseText +
+      (claudePhaseWhy ? "：" + claudePhaseWhy : "");
   const backlogText = (backlog > 0 ? "积压 " + backlog + " 条" : "无积压") +
     (backlogProblems > 0 ? "，账本说不清 " + backlogProblems + " 处" : "") +
     (backlogWhere.length ? "：" + backlogWhere.join("、") : "");

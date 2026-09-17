@@ -16,7 +16,7 @@ import path from "node:path";
 
 import { runtimeScript } from "./runtime-install.mjs";
 import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, pickClaudeNode, timerKindFor } from "./drain-schedule.mjs";
 
 /** 埋进命令里的显式归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
 export const HOOK_TAG = "FEISHU_BRIDGE_HOOK:";
@@ -233,6 +233,81 @@ WantedBy=timers.target
   return { service, timer };
 }
 
+// ── 「现有安装里那个 node」的读取（PK3-L1-fix2 P1-1）──────────────────────────────────────
+// 生产入口（安装器 / doctor）原先裸调 pickClaudeNode()：`installed` 这条分支只有纯函数测试走过。
+// 下面三个函数是**唯一一份**接线，装在 install-projection 里是因为归属判定（ownsHook）与定时器路径都在这儿。
+
+const readTextOrNull = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } };
+
+/**
+ * settings.json 里**我们自己的** hook 命令文本（`installedNodeFrom` 的来源②）。纯函数。
+ * 只收三条桥 hook（Stop / UserPromptSubmit 两条）：别的工具的命令就算恰好含 `[ -x '…' ]` 也不是我们的。
+ */
+export function bridgeHookCommands(text) {
+  let settings = null;
+  try { settings = JSON.parse(text); } catch { return []; }
+  const names = ["stop-hook.mjs", "inbound-hook.mjs", "init-hook.mjs"];
+  const out = [];
+  for (const list of [settings?.hooks?.Stop, settings?.hooks?.UserPromptSubmit]) {
+    for (const entry of list ?? []) {
+      for (const hook of entry?.hooks ?? []) {
+        if (typeof hook?.command !== "string") continue;
+        if (names.some((n) => ownsHook(hook, n))) out.push(hook.command);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 现有兜底定时器文件的正文（`installedNodeFrom` 的来源③）：按平台读该位置，缺席跳过。
+ * read 可注入（与 drainTimerPlan 同一口径）—— 这条路径要能在测试里不碰真机文件。
+ */
+export function existingTimerTexts({ home = os.homedir(), platform = process.platform, read = readTextOrNull } = {}) {
+  const files = timerKindFor(platform) === "launchd" ? [claudeDrainPlistPath(home)]
+    : timerKindFor(platform) === "systemd" ? [claudeDrainSystemdPaths(home).service, claudeDrainSystemdPaths(home).timer]
+      : [];
+  return files.map((f) => read(f)).filter((t) => typeof t === "string" && t.length > 0);
+}
+
+/**
+ * 生产入口的**唯一一份**接线：把「现有安装里那个 node」读出来（安装收据 + settings.json 的桥 hook
+ * + 现有 plist / unit），交给纯函数 `installedNodeFrom` 定优先级。
+ * 收据由调用方读进来（install-projection 不 import installed-surface：那边 import 这里的 ownsHook，
+ * 反过来会成环）。拿不到 → null，调用方照旧走常规顺序。
+ */
+export function installedClaudeNode({ home = os.homedir(), platform = process.platform, receipt = null, read = readTextOrNull } = {}) {
+  return installedNodeFrom({
+    receipt,
+    settingsHooks: bridgeHookCommands(read(path.join(home, ".claude", "settings.json"))),
+    timerExec: existingTimerTexts({ home, platform, read }),
+  });
+}
+
+/** 「这个单元本来就没有」的 systemctl 说法 —— **安装侧卸载与 doctor 的 not-installed 判据共用这一份**
+ * （各写一份就会漂：同一个错误串在两处得到不同结论，这仓库栽过）。只在「本来就没有」这一侧共用；
+ * 「查不清」那一侧不许宽。
+ * **不把 `No such file` 当判据**：连不上 manager 那句正是 `Failed to connect to bus: No such file or directory` ——
+ * 它会被缩成"没装"，而那正是"查不清"要拦的（is-enabled 对缺失单元说的是
+ * `Failed to get unit file state …`，那条已在下面）。 */
+export const systemdUnitAbsent = (text) =>
+  /(unit file .* does not exist|unit .* not loaded|could not be found|not-found|not found|failed to get unit file state)/iu.test(String(text ?? ""));
+
+/** 单元里 ExecStart 那一行的值：与 `claudeDrainSystemdUnits` 同源（引用规则只写一处）。 */
+export const systemdExecStartValue = (args) => args.map(systemdQuote).join(" ");
+
+/**
+ * `systemctl --user show <service> -p ExecStart --value` 里的 argv[] 原文（trim 过）。
+ * 没有 argv[]（旧版 / 空定义）→ 退回 path=（只核 node，核不了后面的参数）。
+ */
+export function systemdShowExecArgv(text) {
+  const s = String(text ?? "");
+  const argv = /argv\[\]=([^;]*);?/u.exec(s);
+  if (argv !== null) return argv[1].trim();
+  const pathOnly = /(?:^|[{;\s])path=([^;]*);?/u.exec(s);
+  return pathOnly === null ? null : pathOnly[1].trim();
+}
+
 /** 出站安装器装的 8 个技能：仓库源目录名 → ~/.claude/skills 目录名。 */
 /**
  * 兜底定时器的**安装计划**（PK3-L1）：纯函数，平台可注入。安装器照它执行、测试照它断言。
@@ -241,6 +316,9 @@ WantedBy=timers.target
  *   linux  → systemd --user：写 .service + .timer，`systemctl --user daemon-reload` + `enable --now <timer>`
  *   其它   → kind:null、unsupported：**明说本平台没有实现，未装**（不假装装好，安装继续）
  *
+ * 卸载（uninstall:true）也走同一份计划，linux 是三步：`disable --now` → 删两份 unit → `daemon-reload`
+ * （`commands` 在删之前、`commandsAfterRemove` 在删之后）。
+ *
  * `read` 注入的是「现在盘上是什么」（返回 null = 文件不在）：只用来判 will-install / will-update / unchanged。
  */
 export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), platform = process.platform,
@@ -248,7 +326,7 @@ export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), p
   uninstall = false } = {}) {
   const kind = timerKindFor(platform);
   if (kind === null) {
-    return { kind: null, action: "unsupported", files: [], remove: [], commands: [],
+    return { kind: null, action: "unsupported", files: [], remove: [], commands: [], commandsAfterRemove: [],
       note: "本平台（" + platform + "）没有兜底定时器实现，"
         + (uninstall ? "没有东西可卸" : "未装 —— 事件驱动的发布照常，只是没有 30 分钟兜底重试") };
   }
@@ -261,10 +339,11 @@ export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), p
     const text = claudeDrainPlist({ home, node });
     if (uninstall) {
       return { kind, action: "will-remove", files: [], remove: [path],
-        commands: [["launchctl", "bootout", "gui/<uid>/" + CLAUDE_DRAIN_LAUNCH_LABEL]], note: null };
+        commands: [["launchctl", "bootout", "gui/<uid>/" + CLAUDE_DRAIN_LAUNCH_LABEL]], commandsAfterRemove: [], note: null };
     }
     return { kind, action: actionOf(path, text), files: [{ path, text }], remove: [],
       commands: [["launchctl", "bootout", "gui/<uid>/" + CLAUDE_DRAIN_LAUNCH_LABEL], ["launchctl", "bootstrap", "gui/<uid>", path]],
+      commandsAfterRemove: [],
       note: null };
   }
   // linux / systemd --user（PK3-L1-fix1 P1-2：卸载也走同一份计划 —— 否则安装能写、卸载只删 plist，
@@ -272,9 +351,12 @@ export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), p
   const paths = claudeDrainSystemdPaths(home);
   const units = claudeDrainSystemdUnits({ home, node });
   if (uninstall) {
+    // 顺序（PK3-L1-fix2 P1-2）：先 disable --now（把 timer 停下、禁掉）→ 再删两份 unit → **最后**
+    // daemon-reload。旧版把 daemon-reload 排在删除之前：manager 里记住的还是删掉之前那份，删除本身
+    // 也要等下一次 reload 才生效。`commandsAfterRemove` 就是为这一步存在的（删文件在两步之间）。
     return { kind, action: "will-remove", files: [], remove: [paths.service, paths.timer],
-      commands: [["systemctl", "--user", "disable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"],
-        ["systemctl", "--user", "daemon-reload"]],
+      commands: [["systemctl", "--user", "disable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"]],
+      commandsAfterRemove: [["systemctl", "--user", "daemon-reload"]],
       note: null };
   }
   const serviceAction = actionOf(paths.service, units.service);
@@ -282,7 +364,7 @@ export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), p
   const action = serviceAction === "unchanged" && timerAction === "unchanged" ? "unchanged"
     : (serviceAction === "will-update" || timerAction === "will-update") ? "will-update" : "will-install";
   return { kind, action, files: [{ path: paths.service, text: units.service }, { path: paths.timer, text: units.timer }],
-    remove: [],
+    remove: [], commandsAfterRemove: [],
     commands: [["systemctl", "--user", "daemon-reload"],
       ["systemctl", "--user", "enable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"]],
     // 没登录也想让定时器跑，需要 linger —— 那条要 sudo，安装器只打印提示，不执行。

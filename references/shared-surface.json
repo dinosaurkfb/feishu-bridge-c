@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-17T04:54:52.646Z",
+  "generated_at": "2026-09-17T07:25:57.080Z",
   "modules": {
     "authorize.mjs": [
       "AUTHORIZATION_TABLE",
@@ -350,6 +350,7 @@
       "CLAUDE_SKILLS",
       "HOOK_TAG",
       "LEGACY_PREVIEW_RULE",
+      "bridgeHookCommands",
       "claimSingleHook",
       "claudeDrainPlist",
       "claudeDrainPlistPath",
@@ -361,11 +362,16 @@
       "claudeSkillFiles",
       "countHooks",
       "drainTimerPlan",
+      "existingTimerTexts",
+      "installedClaudeNode",
       "legacyOwnsHook",
       "ownsHook",
       "referencedRuntimeScripts",
       "renderClaudeSettings",
-      "renderClaudeSkill"
+      "renderClaudeSkill",
+      "systemdExecStartValue",
+      "systemdShowExecArgv",
+      "systemdUnitAbsent"
     ],
     "install-surface-lock.mjs": [
       "INSTALL_SURFACE_LOCK_ENV",

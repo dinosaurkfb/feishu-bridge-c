@@ -77,6 +77,68 @@ export function pickClaudeNode(opts = {}) {
   return resolveNodeForHooks(opts);
 }
 
+// ── 「现有安装里那个 node」的读取（PK3-L1-fix2 P1-1）──────────────────────────────────────
+// 我们生成的 hook 命令里 node 出现在 guard 的第一段：`[ -x '<node>' ] && [ -r '<script>' ]`。
+const HOOK_GUARD = /\[ -x '([^']+)' \]/u;
+
+/** plist 的 ProgramArguments 首项（没有这一段 → null）。 */
+function plistFirstArg(text) {
+  const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/u.exec(String(text ?? ""));
+  if (block === null) return null;
+  const first = /<string>([^<]*)<\/string>/u.exec(block[1]);
+  return first === null ? null : first[1];
+}
+
+/** systemd 单元里 ExecStart 的首段：裸词，或我们写的引用形式（JSON 字符串）。引号没闭合 → null。 */
+function unitFirstArg(text) {
+  const line = /^ExecStart=(.*)$/mu.exec(String(text ?? ""));
+  if (line === null) return null;
+  const value = line[1].trim();
+  if (!value.startsWith('"')) return value.split(/\s+/u)[0] || null;
+  let out = "";
+  for (let i = 1; i < value.length; i += 1) {
+    const ch = value[i];
+    if (ch === "\\") { const next = value[i + 1]; if (next === undefined) return null; out += next === "n" ? "\n" : next; i += 1; continue; }
+    if (ch === '"') return out;
+    out += ch;
+  }
+  return null;
+}
+
+/**
+ * 「现有安装里那个 node」—— 生产入口接线的**纯函数**（PK3-L1-fix2 P1-1）。
+ *
+ * 为什么需要它：`resolveNodeForHooks` 的 `installed` 参数 fix1 就加了，但**没有生产调用方传**——
+ * 本机重装保持 /opt/homebrew/bin/node 只是 Darwin 固定顺序碰巧命中。在「偏好顺序变了」的机器上
+ * （先装 /usr/local/bin/node、后来才有 homebrew；或者 PATH 里的 node 换地方了），重装会把线上
+ * hook / 定时器仍在用的那个 node **换掉**，而它们原本都还能跑。
+ *
+ * 来源按优先级：
+ *   ① `receipt`：安装收据。**收据本身不记 node** —— 它的字段集是封闭的（artifacts / at / scripts / version），
+ *      加字段会让已经写下的老收据变成「形状不对」，安装器从此拒绝覆盖它。所以这一层给的是另一层判据：
+ *      收据里**没有 claude 链** = 线上那两个制品不是本桥装的，不许从它们的命令里认 node。
+ *      收据缺席（更早的安装、收据还没引入）时，只凭制品自身的归属标记认。
+ *   ② `settingsHooks`：settings.json 里**我们自己的** hook 命令，取 guard 里那一段。
+ *   ③ `timerExec`：现有 plist 的 ProgramArguments 首项 / systemd 单元的 ExecStart 首段。
+ *
+ * 只判形状（绝对路径）；**能不能执行交给 `resolveNodeForHooks` 的 X_OK 那一关**——这里拿不到文件系统，
+ * 也不该拿。都没有 → null，调用方照旧走常规顺序。
+ */
+export function installedNodeFrom({ receipt = null, settingsHooks = [], timerExec = [] } = {}) {
+  if (receipt !== null && receipt?.chains?.claude == null) return null;
+  const absolute = (p) => (typeof p === "string" && p.length > 0 && path.isAbsolute(p) ? p : null);
+  for (const command of settingsHooks) {
+    const m = typeof command === "string" ? HOOK_GUARD.exec(command) : null;
+    const node = m === null ? null : absolute(m[1]);
+    if (node !== null) return node;
+  }
+  for (const text of timerExec) {
+    const node = absolute(plistFirstArg(text) ?? unitFirstArg(text));
+    if (node !== null) return node;
+  }
+  return null;
+}
+
 /**
  * 兜底定时器按平台选实现（PK3-L1）：darwin → launchd，linux → systemd --user，其它 → 没有实现。
  * 返回值是**种类名或 null**，调用方据此决定写什么、以及要不要打印「本平台没有实现」。

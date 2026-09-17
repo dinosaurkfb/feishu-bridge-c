@@ -244,11 +244,13 @@ WantedBy=timers.target
  * `read` 注入的是「现在盘上是什么」（返回 null = 文件不在）：只用来判 will-install / will-update / unchanged。
  */
 export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), platform = process.platform,
-  read = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } } } = {}) {
+  read = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } },
+  uninstall = false } = {}) {
   const kind = timerKindFor(platform);
   if (kind === null) {
-    return { kind: null, action: "unsupported", files: [], commands: [],
-      note: "本平台（" + platform + "）没有兜底定时器实现，未装 —— 事件驱动的发布照常，只是没有 30 分钟兜底重试" };
+    return { kind: null, action: "unsupported", files: [], remove: [], commands: [],
+      note: "本平台（" + platform + "）没有兜底定时器实现，"
+        + (uninstall ? "没有东西可卸" : "未装 —— 事件驱动的发布照常，只是没有 30 分钟兜底重试") };
   }
   const actionOf = (path, text) => {
     const current = read(path);
@@ -257,18 +259,30 @@ export function drainTimerPlan({ home = os.homedir(), node = pickClaudeNode(), p
   if (kind === "launchd") {
     const path = claudeDrainPlistPath(home);
     const text = claudeDrainPlist({ home, node });
-    return { kind, action: actionOf(path, text), files: [{ path, text }],
+    if (uninstall) {
+      return { kind, action: "will-remove", files: [], remove: [path],
+        commands: [["launchctl", "bootout", "gui/<uid>/" + CLAUDE_DRAIN_LAUNCH_LABEL]], note: null };
+    }
+    return { kind, action: actionOf(path, text), files: [{ path, text }], remove: [],
       commands: [["launchctl", "bootout", "gui/<uid>/" + CLAUDE_DRAIN_LAUNCH_LABEL], ["launchctl", "bootstrap", "gui/<uid>", path]],
       note: null };
   }
+  // linux / systemd --user（PK3-L1-fix1 P1-2：卸载也走同一份计划 —— 否则安装能写、卸载只删 plist，
+  // 单元与已启用的 timer 会继续跑）
   const paths = claudeDrainSystemdPaths(home);
   const units = claudeDrainSystemdUnits({ home, node });
+  if (uninstall) {
+    return { kind, action: "will-remove", files: [], remove: [paths.service, paths.timer],
+      commands: [["systemctl", "--user", "disable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"],
+        ["systemctl", "--user", "daemon-reload"]],
+      note: null };
+  }
   const serviceAction = actionOf(paths.service, units.service);
   const timerAction = actionOf(paths.timer, units.timer);
   const action = serviceAction === "unchanged" && timerAction === "unchanged" ? "unchanged"
     : (serviceAction === "will-update" || timerAction === "will-update") ? "will-update" : "will-install";
-  return { kind, action,
-    files: [{ path: paths.service, text: units.service }, { path: paths.timer, text: units.timer }],
+  return { kind, action, files: [{ path: paths.service, text: units.service }, { path: paths.timer, text: units.timer }],
+    remove: [],
     commands: [["systemctl", "--user", "daemon-reload"],
       ["systemctl", "--user", "enable", "--now", CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer"]],
     // 没登录也想让定时器跑，需要 linger —— 那条要 sudo，安装器只打印提示，不执行。

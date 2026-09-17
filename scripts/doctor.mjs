@@ -569,15 +569,31 @@ export function runDoctor({
     claudePhaseWhy = "体检的 home 不是当前用户的家目录（沙箱），不碰真实 "
       + (timerKind === "launchd" ? "launchctl" : "systemctl --user");
   } else if (timerKind === "systemd") {
-    // systemd user timer：enabled（开机/登录就起）+ active（现在在跑）两件都要看。
+    // PK3-L1-fix1 P1-3：**核投影**，不只看 is-enabled/is-active —— 同名 timer 跑错程序（旧 ExecStart /
+    // 旧 node）时只核状态会报「已加载」，那是假绿。判据与 launchd 分支同口径（loaded_other = 参数不符）。
     const unit = CLAUDE_DRAIN_SYSTEMD_UNIT + ".timer";
     const enabled = systemctlFn(["is-enabled", unit]);
     const active = systemctlFn(["is-active", unit]);
-    const isEnabled = String(enabled.out ?? "").trim() === "enabled";
-    const isActive = String(active.out ?? "").trim() === "active";
-    if (isEnabled && isActive) claudePhase = "loaded";
-    else if (isEnabled || isActive) { claudePhase = "installed_not_loaded"; claudePhaseWhy = "systemd timer " + (isEnabled ? "已 enable 但未 active" : "在跑但没 enable"); }
-    else claudePhase = "not_installed";
+    const say = (r) => String(r?.out ?? "") + " " + String(r?.err ?? "");
+    // systemctl 自己不可用（命令不在、实例连不上、权限不行）≠ 没装 —— 那是「查不清」，必须与 not_installed 分开。
+    const looksNotInstalled = (r) => /not-found|not found|No such|not loaded|Failed to get unit file state|^disabled$/mu.test(say(r).trim());
+    const broken = (r) => r?.ok !== true && !looksNotInstalled(r);
+    if (broken(enabled) || broken(active)) {
+      claudePhaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).trim().slice(0, 120) + "）—— 查不清，不等于没在跑";
+    } else {
+      const paths = claudeDrainSystemdPaths(home);
+      const units = claudeDrainSystemdUnits({ home, node: pickClaudeNode() });
+      const readUnit = (f) => { try { return fs.readFileSync(f, "utf-8"); } catch { return null; } };
+      const projected = readUnit(paths.service) === units.service && readUnit(paths.timer) === units.timer;
+      const isEnabled = String(enabled.out ?? "").trim() === "enabled";
+      const isActive = String(active.out ?? "").trim() === "active";
+      if ((isEnabled || isActive) && !projected) {
+        claudePhase = "loaded_other";
+        claudePhaseWhy = "磁盘上的 systemd 单元与当前投影不一致（ExecStart / OnUnitActiveSec / node 路径）";
+      } else if (isEnabled && isActive) claudePhase = "loaded";
+      else if (isEnabled || isActive) { claudePhase = "installed_not_loaded"; claudePhaseWhy = "systemd timer " + (isEnabled ? "已 enable 但未 active" : "在跑但没 enable"); }
+      else claudePhase = "not_installed";
+    }
   } else {
     // 核**完整 ProgramArguments**，不只看同名 job 在不在（评审探针：同名 job 跑 /bin/echo 也曾被说成在发）。
     try { claudePhase = loadedPhase(launchctl, claudeDrainExpectedJob({ home, node: pickClaudeNode() }), CLAUDE_DRAIN_LAUNCH_LABEL); }
@@ -605,7 +621,9 @@ export function runDoctor({
   // 改用文件加密库，默认根是 ~/.local/share/lark-cli/ —— 桥给它设 LARKSUITE_CLI_DATA_DIR=<configDir>/data
   // 之后它才去 aily 写的地方找。**两边各自都成功、就是没对上** 是最难查的一类，所以两个目录都打印。
   {
-    const tpl = loadChainTemplate();
+    // PK3-L1-fix1 P2-1：模板路径从**本次体检的上下文**派生（home + env，与其它项同一份 claudeSources）——
+    // 旧版 loadChainTemplate() 用进程真实 HOME 的默认路径：runDoctor({home}) 传隔离 home 时会读到真机模板。
+    const tpl = loadChainTemplate(claudeSources(process.env, path.join(ctx.home, ".claude", "feishu-bridge")).templateFile);
     const template = tpl?.ok === true ? tpl.template : null;
     const appId = template ? (template.outbound_app_id ?? template.transport_app_id) : null;
     const configDir = template ? (resolveLarkIdentity(template)?.configDir ?? null) : null;

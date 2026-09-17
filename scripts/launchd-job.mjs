@@ -1,5 +1,6 @@
 /**
- * launchd job 的只读探测 —— **共用层**：Codex 的兜底排空服务与 Claude 的机器级体检都用这一份判据，
+ * launchd job 的只读探测 —— **共用层**（**只覆盖 darwin**；linux 的 systemd --user 判据在 doctor ⑥ 里，
+ * 维护门尚未支持 systemd —— issue #81 的边界，见 docs/architecture/maintenance-gate.md）：Codex 的兜底排空服务与 Claude 的机器级体检都用这一份判据，
  * 各写一份就会漂（同一个错误串在两处得到不同结论，这仓库栽过）。
  *
  * 只有 `launchctl list <label>`（只读）；bootout / bootstrap 那些有损动作不在这里。

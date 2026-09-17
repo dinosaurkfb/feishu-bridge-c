@@ -26,7 +26,7 @@ Claude 侧那两份实现，Codex 侧两份从没进过任何一轮的视野。�
 围绕这四份实现，另有三类东西**不许混进"策略实现"里数**：
 
 - **触发包装**（复用上面某份实现，不另写策略）：
-  Claude 侧 CLI / Stop / launchd 定时 → `drainProject`；
+  Claude 侧 CLI / Stop / 兜底定时（darwin launchd、linux systemd --user）→ `drainProject`；
   Codex 侧 Stop / watch-run / drain-all → `publishEligibleTaskEvents`。
 - **只读观察者**：`codex/feishu-outbox.mjs` 全景。它消费同样的判据
   （`isPermanentlyRejected` / `pauseKindOf`），但**不改接发布事务** ——

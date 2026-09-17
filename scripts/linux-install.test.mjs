@@ -14,6 +14,7 @@ import { drainTimerPlan } from "./install-projection.mjs";
 import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
 
 const existsOnly = (paths) => (p) => paths.includes(p);
+const alwaysExec = () => {};   // 候选要过 X_OK：注入 access，测试不必造真文件
 
 test("timerKindFor：darwin launchd / linux systemd / 其它 null（明说没实现）", () => {
   assert.equal(timerKindFor("darwin"), "launchd");
@@ -27,19 +28,19 @@ test("resolveNodeForHooks：FEISHU_BRIDGE_NODE → PATH → /opt/homebrew → /u
   const shim = "/home/dinosak/.local/share/mise/shims/node";
   // ① 显式指定优先
   assert.equal(resolveNodeForHooks({ env: { FEISHU_BRIDGE_NODE: "/opt/x/node", PATH: "/usr/bin" },
-    exists: existsOnly(["/opt/x/node", "/usr/bin/node"]), homedir: home }), "/opt/x/node");
+    exists: existsOnly(["/opt/x/node", "/usr/bin/node"]), access: alwaysExec, homedir: home }), "/opt/x/node");
   // ② PATH 逐段（mise shim 就是这条：拿到 shim 比拿真身稳）
-  assert.equal(resolveNodeForHooks({ env: { PATH: "/a:/b" }, exists: existsOnly(["/b/node"]), homedir: home }), "/b/node");
-  assert.equal(resolveNodeForHooks({ env: { PATH: "/usr/bin:" + path.dirname(shim) }, exists: existsOnly([shim]), homedir: home }), shim);
+  assert.equal(resolveNodeForHooks({ env: { PATH: "/a:/b" }, exists: existsOnly(["/b/node"]), access: alwaysExec, homedir: home }), "/b/node");
+  assert.equal(resolveNodeForHooks({ env: { PATH: "/usr/bin:" + path.dirname(shim) }, exists: existsOnly([shim]), access: alwaysExec, homedir: home }), shim);
   // ③/④/⑤ 三个兜底候选按序
-  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/opt/homebrew/bin/node"]), homedir: home }), "/opt/homebrew/bin/node");
-  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/usr/local/bin/node"]), homedir: home }), "/usr/local/bin/node");
-  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly([path.join(home, ".local", "bin", "node")]), homedir: home }), path.join(home, ".local", "bin", "node"));
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/opt/homebrew/bin/node"]), access: alwaysExec, homedir: home }), "/opt/homebrew/bin/node");
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/usr/local/bin/node"]), access: alwaysExec, homedir: home }), "/usr/local/bin/node");
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly([path.join(home, ".local", "bin", "node")]), access: alwaysExec, homedir: home }), path.join(home, ".local", "bin", "node"));
   // 显式指定但不存在 → 抛（不静默换成别的）
-  assert.throws(() => resolveNodeForHooks({ env: { FEISHU_BRIDGE_NODE: "/nope/node" }, exists: existsOnly([]), homedir: home }), /FEISHU_BRIDGE_NODE 指的路径不存在/);
+  assert.throws(() => resolveNodeForHooks({ env: { FEISHU_BRIDGE_NODE: "/nope/node" }, exists: existsOnly([]), access: () => {}, homedir: home }), /FEISHU_BRIDGE_NODE 指的路径/);
   // 都没有 → 抛并把找过的列出来；**绝不退回 process.execPath**（钩子契约：Claude Code 自带的 node 不许当外部路径）
   let err = null;
-  try { resolveNodeForHooks({ env: { PATH: "/a:/b" }, exists: existsOnly([]), homedir: home }); } catch (e) { err = e; }
+  try { resolveNodeForHooks({ env: { PATH: "/a:/b" }, exists: existsOnly([]), access: alwaysExec, homedir: home }); } catch (e) { err = e; }
   assert.ok(err, "找不到必须抛");
   assert.match(err.message, /找不到 node/);
   assert.match(err.message, /\/a\/node/);
@@ -95,4 +96,60 @@ test("larkCliEnv：linux 才补 LARKSUITE_CLI_DATA_DIR=<configDir>/data（指向
   assert.equal(larkProvisionedSecretPath({ configDir, appId: "cli_x" }),
     path.join(configDir, "data", "lark-cli", "appsecret_cli_x.enc"));
   assert.equal(larkProvisionedSecretPath({ configDir: null, appId: "cli_x" }), null);
+});
+
+// ── PK3-L1-fix1（Codex 一轮 3 P1 + 2 P2）──────────────────────────────────────────────────
+// 修前红：下面几条都是「按修后的契约写的」，旧实现会红。
+
+test("fix1/P1-1 已安装路径优先（Mac 现网不漂移）：PATH 先命中 ~/.local/bin/node，但已安装的是 /opt/homebrew/bin/node → 选已安装", () => {
+  const home = "/Users/dk";
+  const installed = "/opt/homebrew/bin/node";
+  const pathNode = "/Users/dk/.local/bin/node";
+  const exists = (p) => [installed, pathNode].includes(p);
+  // 修前：PATH 在 installed 之前 → 选 pathNode（现网三条 hook 的 node 会被改写）→ 红
+  assert.equal(resolveNodeForHooks({ env: { PATH: "/Users/dk/.local/bin:/usr/bin" }, exists, access: alwaysExec,
+    homedir: home, installed, platform: "darwin" }), installed, "已安装路径仍有效 → 不许改写");
+  // installed 不存在 → darwin 退回 /opt/homebrew
+  assert.equal(resolveNodeForHooks({ env: { PATH: "/Users/dk/.local/bin" }, exists: (p) => p === pathNode,
+    access: alwaysExec, homedir: home, installed, platform: "darwin" }), pathNode, "installed 没了才轮到 PATH");
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: (p) => p === "/opt/homebrew/bin/node",
+    access: alwaysExec, homedir: home, installed: null, platform: "darwin" }), "/opt/homebrew/bin/node");
+  // linux：PATH shim 优先（mise 切版本后 shim 不变）
+  const shim = "/home/dinosak/.local/share/mise/shims/node";
+  assert.equal(resolveNodeForHooks({ env: { PATH: "/usr/bin:" + path.dirname(shim) }, exists: (p) => p === shim,
+    access: alwaysExec, homedir: "/home/dinosak", installed: "/usr/local/bin/node", platform: "linux" }), shim,
+    "linux 上 PATH 在 installed 之后，但仍先于 /usr/local");
+});
+
+test("fix1/P1-1 候选必须绝对路径 + X_OK：PATH 里的相对/空段跳过，不可执行的候选跳过", () => {
+  const exec = new Set(["/usr/local/bin/node"]);
+  const access = (p) => { if (!exec.has(p)) { const e = new Error("EACCES"); e.code = "EACCES"; throw e; } };
+  const got = resolveNodeForHooks({ env: { PATH: "relative/dir::/usr/bin" }, access, exists: () => true,
+    homedir: "/home/x", installed: "relative/installed", platform: "linux" });
+  assert.equal(got, "/usr/local/bin/node", "相对段不产生候选、不可执行的不算（access 注入）");
+});
+
+test("fix1/P1-2 卸载按平台：darwin 删 plist + bootout；linux disable --now + 删两份 unit + daemon-reload；其它明说无", () => {
+  const home = "/h";
+  const darwin = drainTimerPlan({ home, node: "/opt/homebrew/bin/node", platform: "darwin", uninstall: true });
+  assert.equal(darwin.kind, "launchd");
+  assert.deepEqual(darwin.files, [], "卸载不写文件");
+  assert.deepEqual(darwin.remove, [darwin.remove[0]]);
+  assert.match(darwin.remove[0], /Library\/LaunchAgents\/.*\.plist$/u);
+  assert.deepEqual(darwin.commands[0].slice(0, 2), ["launchctl", "bootout"]);
+  const linux = drainTimerPlan({ home, node: "/usr/bin/node", platform: "linux", uninstall: true });
+  assert.equal(linux.kind, "systemd");
+  assert.deepEqual(linux.remove.map((p) => path.basename(p)).sort(),
+    ["feishu-bridge-cc-drain.service", "feishu-bridge-cc-drain.timer"]);
+  assert.deepEqual(linux.commands, [["systemctl", "--user", "disable", "--now", "feishu-bridge-cc-drain.timer"],
+    ["systemctl", "--user", "daemon-reload"]]);
+  const other = drainTimerPlan({ home, node: "/usr/bin/node", platform: "win32", uninstall: true });
+  assert.deepEqual([other.kind, other.action, other.remove ?? []], [null, "unsupported", []]);
+});
+
+test("fix1/P1-2 linux 计划的路径里绝不出现 LaunchAgents（预览与实际写入同一份计划）", () => {
+  const p = drainTimerPlan({ home: "/h", node: "/usr/bin/node", platform: "linux", read: () => null });
+  const all = [...p.files.map((f) => f.path), ...(p.remove ?? [])];
+  assert.equal(all.some((x) => x.includes("LaunchAgents")), false, JSON.stringify(all));
+  assert.ok(p.files.every((f) => f.path.includes(".config/systemd/user")), JSON.stringify(p.files.map((f) => f.path)));
 });

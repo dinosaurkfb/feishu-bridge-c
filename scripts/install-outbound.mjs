@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * 把出站装成机制：Stop 钩子 + 项目登记表 + 全局技能 + launchd 兜底定时器。
+ * 把出站装成机制：Stop 钩子 + 项目登记表 + 全局技能 + 兜底定时器。
+ * 兜底定时器按平台（PK3-L1）：darwin launchd / linux systemd --user / 其它平台明说没有实现、不假装装好。
  *
  * 出站原来只是本项目 CLAUDE.md 里手写的一段约定 —— 只有读到那段文字的会话才守。
  * 这四样各管一段：技能让任何会话都知道该怎么记，钩子让任何会话结束时都会发，
@@ -170,15 +171,9 @@ const plistBody = claudeDrainPlist({ home: os.homedir(), node: NODE_BIN });
 
 // PK3-L1：兜底定时器按平台 —— darwin launchd / linux systemd --user / 其它明说没实现。
 // 计划是**纯函数**（install-projection.drainTimerPlan），安装器照它执行、测试照它断言。
-const TIMER_PLAN = drainTimerPlan({ home: os.homedir(), node: NODE_BIN });
+const TIMER_PLAN = drainTimerPlan({ home: os.homedir(), node: NODE_BIN, uninstall });
 const TIMER_FILES = TIMER_PLAN.files;
-
-let plistAction = "unchanged";
-if (uninstall) {
-  if (TIMER_FILES.some((f) => fs.existsSync(f.path))) TIMER_PLAN.action = "will-remove";
-} else {
-  plistAction = TIMER_PLAN.action;
-}
+const TIMER_REMOVE = TIMER_PLAN.remove ?? [];
 
 // ---------- 落盘 ----------
 
@@ -205,7 +200,12 @@ if (!uninstall && !selfBound) {
 }
 console.log("技能     : " + SKILLS.length + " 个（装进 ~/.claude/skills/）  → " + skillAction);
 for (const sk of skillPlan) console.log("           /" + sk.dst.padEnd(26) + sk.action);
-console.log("兜底定时 : " + PLIST + "  → " + plistAction + "（每 30 分钟排空全部登记项目）");
+// PK3-L1-fix1 P1-2：预览与**实际写入**同一份计划 —— linux 上这里必须打印两份 unit 与 systemctl 命令，
+// 不许再出现 ~/Library/LaunchAgents（旧版就是那么打印的，与实际写入不符）。
+console.log("兜底定时 : " + (TIMER_PLAN.kind === null ? "（无可写）" : (uninstall ? "卸载 " : "") +
+  (TIMER_PLAN.files.length ? TIMER_PLAN.files.map((f) => f.path).join("  ") : TIMER_REMOVE.join("  "))) +
+  "  → " + TIMER_PLAN.action + (TIMER_PLAN.kind === null ? "（" + TIMER_PLAN.note + "）" : "（每 30 分钟排空全部登记项目）"));
+for (const cmd of TIMER_PLAN.commands) console.log("            " + cmd.join(" ") + (String(cmd[0]).includes("launchctl") || cmd[0] === "systemctl" ? "" : ""));
 
 if (skillAction === "source-missing") {
   for (const sk of skillPlan.filter((x) => x.action === "source-missing")) {
@@ -362,13 +362,22 @@ const systemctl = (args, { tolerate = false } = {}) => {
 const domain = "gui/" + process.getuid();
 let launchNote;
 if (uninstall) {
-  const booted = launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true });
-  fs.rmSync(PLIST, { force: true });
-  // 沙箱卸载只删得掉这个 HOME 下的 plist 文件，真实 launchd 里那个 job 还在跑。
-  // 报"已卸载"会让人以为清干净了 —— 跟安装那侧同一个不对称，说法要对称。
-  launchNote = booted.skipped
-    ? "plist 已删，但真实 launchd 未动（HOME 被重定向到 " + os.homedir() + "）"
-    : "已卸载";
+  // PK3-L1-fix1 P1-2：卸载**也按平台计划**。旧版无条件调 launchctl、只删 plist ——
+  // linux 上 unit 与已启用的 timer 会继续跑（安装能写、卸载不管，是最难发现的那类残留）。
+  if (TIMER_PLAN.kind === null) { launchNote = TIMER_PLAN.note; }
+  else {
+    const ran = TIMER_PLAN.commands.map((args) =>
+      (TIMER_PLAN.kind === "launchd" ? launchctl(args, { tolerate: true }) : systemctl(args, { tolerate: true })));
+    const skipped = ran.some((r) => r.skipped);
+    for (const path0 of TIMER_REMOVE) fs.rmSync(path0, { force: true });
+    const what = TIMER_PLAN.kind === "launchd" ? "plist" : "systemd 单元";
+    const live = TIMER_PLAN.kind === "launchd" ? "launchd" : "systemd --user";
+    // 沙箱卸载只删得掉这个 HOME 下的文件，真实域里那个 job/timer 还在跑。
+    // 报"已卸载"会让人以为清干净了 —— 跟安装那侧同一个不对称，说法要对称。
+    launchNote = skipped
+      ? what + " 已删，但真实 " + live + " 未动（HOME 被重定向到 " + os.homedir() + "）"
+      : "已卸载";
+  }
 } else if (TIMER_PLAN.kind === null) {
   // 其它平台：**明说没装**，安装继续（不假装装好）。计划里已经带了这句话。
   launchNote = TIMER_PLAN.note;
@@ -379,7 +388,7 @@ if (uninstall) {
   }
   if (TIMER_PLAN.kind === "launchd") {
     launchctl(["bootout", domain + "/" + LAUNCH_LABEL], { tolerate: true }); // 没装过时必然失败，正常
-    const loaded = launchctl(["bootstrap", domain, PLIST]);
+    const loaded = launchctl(["bootstrap", domain, TIMER_FILES[0].path]);
     launchNote = loaded.skipped
       // 说出来，别让人以为兜底装好了。沙箱安装不碰真实 launchd 是有意的，见 launchctl 处的说明。
       ? "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 launchd）"

@@ -1,5 +1,7 @@
 /**
- * Claude 侧兜底定时器（launchd）的身份与期望形状 —— **只有这一份定义**。
+ * Claude 侧兜底定时器的身份与期望形状 —— **只有这一份定义**。
+ * 启动源按平台（PK3-L1）：darwin launchd / linux systemd --user / 其它平台没有实现；
+ * 维护门（issue #81）目前只覆盖 launchd，systemd 未支持（详情见 docs/architecture/maintenance-gate.md）。
  * 安装器写 plist 用它，doctor 查 launchd 核 ProgramArguments 也用它；各写一份就会漂
  * （评审探针：同名 job 实际跑 /bin/echo，只看 label 存在就被说成"积压有人发"）。
  */
@@ -27,23 +29,46 @@ export const CLAUDE_DRAIN_LAUNCH_LABEL = "com.frank.feishu-bridge-cc.drain";
  * PATH 优先也是为了 mise/nvm 这类版本管理器：拿到的是 shim（切版本后 shim 路径不变，真身会变）。
  * 显式指定但不存在 → 直接抛（不静默换成别的二进制）。
  */
-export function resolveNodeForHooks({ env = process.env, exists = fs.existsSync, homedir = os.homedir() } = {}) {
+export function resolveNodeForHooks({
+  env = process.env, exists = fs.existsSync,
+  access = (candidate) => fs.accessSync(candidate, fs.constants.X_OK),
+  homedir = os.homedir(), installed = null, platform = process.platform,
+} = {}) {
   const tried = [];
+  // 候选一律**绝对路径 + X_OK**：只 existsSync 会把目录、坏权限、相对路径（相对于 cwd，钩子跑在别的 cwd 上
+  // 就换了一个文件）都算“找到了”。access 可注入（测试不必造真文件）。
+  const usable = (candidate) => {
+    if (typeof candidate !== "string" || candidate.length === 0) return false;
+    if (!path.isAbsolute(candidate)) { tried.push(candidate + "（不是绝对路径）"); return false; }
+    if (!exists(candidate)) { tried.push(candidate); return false; }
+    try { access(candidate); return true; } catch { tried.push(candidate + "（不可执行）"); return false; }
+  };
   const explicit = env?.FEISHU_BRIDGE_NODE;
   if (typeof explicit === "string" && explicit.length > 0) {
-    if (exists(explicit)) return explicit;
-    throw new Error("FEISHU_BRIDGE_NODE 指的路径不存在：" + explicit);
+    if (usable(explicit)) return explicit;
+    throw new Error("FEISHU_BRIDGE_NODE 指的路径不可用（要绝对路径且可执行）：" + explicit);
   }
-  for (const dir of String(env?.PATH ?? "").split(path.delimiter)) {
-    const candidate = dir === "" ? "node" : path.join(dir, "node");
-    if (exists(candidate)) return candidate;
-    tried.push(candidate);
+  const fromPath = () => {
+    const out = [];
+    for (const dir of String(env?.PATH ?? "").split(path.delimiter)) {
+      if (dir === "" || !path.isAbsolute(dir)) continue;   // 相对段 / 空段（= cwd）不产生候选
+      out.push(path.join(dir, "node"));
+    }
+    return out;
+  };
+  // 顺序（PK3-L1-fix1 P1-1）：显式 → **仍有效的已安装路径** → 平台惯用位置 → PATH → ~/.local/bin。
+  // 为什么 installed 排在 PATH 前面：Mac 现网 PATH 先命中 ~/.local/bin/node（第三方装的），
+  //   而三条已安装 hook 用的是 /opt/homebrew/bin/node —— 按 PATH 优先会**改写现网**，还会让
+  //   doctor / 维护预检把原本正确的 job 报成“参数不符”。linux 才让 PATH shim 优先（mise 切版本后 shim 不变）。
+  const candidates = [];
+  if (typeof installed === "string" && installed.length > 0) candidates.push(installed);
+  if (platform === "linux") {
+    candidates.push(...fromPath(), "/usr/local/bin/node", path.join(homedir, ".local", "bin", "node"));
+  } else {
+    candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", ...fromPath(),
+      path.join(homedir, ".local", "bin", "node"));
   }
-  for (const candidate of ["/opt/homebrew/bin/node", "/usr/local/bin/node",
-    path.join(homedir, ".local", "bin", "node")]) {
-    if (exists(candidate)) return candidate;
-    tried.push(candidate);
-  }
+  for (const candidate of candidates) if (usable(candidate)) return candidate;
   throw new Error("找不到 node（hooks / 兜底定时器都要一个绝对路径），找过：\n  " + tried.join("\n  "));
 }
 

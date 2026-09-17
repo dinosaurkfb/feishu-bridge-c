@@ -17783,16 +17783,26 @@ test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允�
   // ready 需要 ② 也 pass —— 显式 --probe-providers（这里的 provider 只打印）。
   const r = m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }, ["--json", "--probe-providers"]);
   const report = doctorReport(r);
-  // PK3-L5：「好机器」的判据是**没有 fail**。Codex 侧兜底定时器只在 darwin 有 launchd 实现
-  //   （PK3-L2：非 darwin 启停入口与状态入口就报「本平台尚未实现」，状态记 null）—— 按三态约定
-  //   unknown 既不算通过也不算故障，所以那一项在非 darwin 上允许 null，结论跟着落到 incomplete。
-  //   **放宽的只是 null：有 fail 仍然 blocked**（本用例末尾 r3 就是那一条反例）。
+  // PK3-L5：「好机器」的判据是**没有 fail**（三态约定：unknown 既不算通过也不算故障）。
+  // PK3-L5-fix1（Codex 一轮 P1）：**期望值按平台钉死，不许由实际观测值反推** ——
+  //   上一版写 `expectOverall = codexDrain.ok === null ? "incomplete" : "ready"`，于是 darwin 上
+  //   Codex 侧从 true 退化成 null 时，用例会顺势期待 incomplete/2 并继续绿（同义反复，什么都拦不住）。
+  //   现在：darwin = 真跑 Codex launchd 判据 → 必须 pass / 全绿 / 无 unknown 项；
+  //         非 darwin = Codex 侧只在 darwin 有 launchd 实现（PK3-L2 报「本平台尚未实现」）→
+  //         恰为 null，且**别的项都必须有明确结论**（null 集恰为 {codex_drain}）。
+  //   unknown 的判据与 `summarizeDoctorChecks` 逐字同一条：ok !== true && ok !== false。
   const codexDrain = checkOf(report, "codex_drain");
-  assert.ok(codexDrain.ok === true || codexDrain.ok === null,
-    "Codex 侧只许 pass 或 unknown（本平台不适用），不许 fail：" + codexDrain.detail);
   const failedChecks = report.checks.filter((c) => c.ok === false);
+  const unknownIds = report.checks.filter((c) => c.ok !== true && c.ok !== false).map((c) => c.id).sort();
   assert.deepEqual(failedChecks, [], "好机器不许有 fail 项：" + JSON.stringify(failedChecks));
-  const expectOverall = codexDrain.ok === null ? "incomplete" : "ready";
+  const expectOverall = process.platform === "darwin" ? "ready" : "incomplete";
+  if (process.platform === "darwin") {
+    assert.equal(codexDrain.ok, true, "darwin 上 Codex 侧兜底定时器必须 pass（假 launchctl 报告的就是我们那份）：" + codexDrain.detail);
+    assert.deepEqual(unknownIds, [], "darwin 上不该有任何 unknown 项：" + JSON.stringify(report.checks.filter((c) => c.ok !== true)));
+  } else {
+    assert.equal(codexDrain.ok, null, "非 darwin 上 Codex 侧必须是不适用（null）——不许 pass 也不许 fail：" + codexDrain.detail);
+    assert.deepEqual(unknownIds, ["codex_drain"], "非 darwin 上 unknown 项有且只有 Codex 侧那一项（别的项都得有明确结论）：" + JSON.stringify(unknownIds));
+  }
   assert.equal(report.overall, expectOverall, JSON.stringify(report.checks.filter((c) => c.ok !== true)));
   assert.equal(r.status, expectOverall === "ready" ? 0 : 2, "退出码跟着结论（0 ready / 2 incomplete）：" + r.stderr);
   assert.match(checkOf(report, "backlog_vs_publisher").detail, /已加载/u);

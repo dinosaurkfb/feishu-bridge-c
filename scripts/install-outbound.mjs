@@ -56,8 +56,9 @@ const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("stop-hook.m
  * linux 分支的卸载顺序与失败处理只能在真 linux 上跑，而那正是 PK3-L1-fix2 要钉的路径。
  * 不带它时行为与以前逐字相同（process.platform）。写文件仍只写在当前 HOME 下（沙箱判据照旧）。
  * PK3-L4：读到的是**唯一来源**（drain-schedule.timerPlatform）—— 同一个口维护门 / doctor 也在读。
+ * PK3-L4-fix1：这个变量**只在沙箱 HOME 下生效**（真 HOME 一律 process.platform + 提示已忽略）。
  */
-const TIMER_PLATFORM = timerPlatform();
+const TIMER_PLATFORM = timerPlatform({ home: os.homedir() });
 // node 的选择只有一份（drain-schedule.mjs）—— 定时器 plist / unit 与 doctor 的期望 job 同源。
 // **具体在读到 settings 正文之后才算**（PK3-L1-fix2 P1-1）：要把「现有安装里那个 node」当 installed 传进去。
 // hook 命令模板、归属判定、settings 合并、plist、技能渲染都在 install-projection.mjs（维护门要在不写的情况下问"会写成什么"）。

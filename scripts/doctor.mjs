@@ -304,9 +304,10 @@ export function runDoctor({
   launchctl = undefined,
   // PK3-L1：兜底定时器按平台（darwin launchd / linux systemd --user / 其它没有实现）。
   // systemctl 注入口径与 launchctl 一致（沙箱里不碰真 systemctl）。
-  // PK3-L4：默认值走**唯一来源** `timerPlatform()`（可被 FEISHU_BRIDGE_TIMER_PLATFORM 覆盖）——
-  //   夹具里的子进程只能从环境拿平台，这一处不再自己拼一遍 `env || process.platform`。
-  platform = timerPlatform(),
+  // PK3-L4：默认值走**唯一来源** `timerPlatform()`（夹具里的子进程只能从环境拿平台）。
+  // PK3-L4-fix1：传**当下体检的 home** —— 那个隔离点只在沙箱 HOME 下生效，真 HOME 下一律
+  //   process.platform，并由 timerPlatform 打到 stderr 一条「已忽略」提示（不静默）。
+  platform = timerPlatform({ home }),
   systemctl = undefined,
   // **默认不执行状态入口脚本**：它们是外部代码，可能写盘 —— 只有显式要求才跑，副作用属于登记入口自己的信任边界。
   probeProviders = false,

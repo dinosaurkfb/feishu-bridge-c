@@ -44,8 +44,9 @@ export function maintenanceContext({
   home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), repoRoot,
   node = pickClaudeNode(), launchctl = spawnLaunchctl, ps = defaultPs, sleep = null, now = Date.now, afterStep = null,
   dir = maintenanceDir(), gateFile = maintenanceGatePath(), domain = guiDomain(), stepMs = 5000, gateOps = { createGate, removeGate },
-  // PK3-L4：平台走唯一来源（FEISHU_BRIDGE_TIMER_PLATFORM 可覆盖）——维护门的 CLI 与夹具子进程只能从环境拿。
-  platform = timerPlatform(), systemctl = null,
+  // PK3-L4：平台走唯一来源（维护门的 CLI 与夹具子进程只能从环境拿）。
+  // PK3-L4-fix1：传**当下维护的 home** —— 隔离点只在沙箱 HOME 下生效；真 HOME 下一律 process.platform。
+  platform = timerPlatform({ home }), systemctl = null,
 } = {}) {
   return { home, codexHome, codexBridgeHome, repoRoot, node, launchctl, ps, sleep, now, afterStep, dir, gateFile, domain, stepMs, gateOps, platform, systemctl };
 }

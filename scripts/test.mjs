@@ -17543,6 +17543,8 @@ const gateContext = (fields) => maintenanceContext({ platform: GATE_FIXTURE_PLAT
  * 夹具里的**子进程** env（安装器 / maintenance-gate CLI / doctor）：平台只能从环境进（它们没有
  * --platform 参数），所以在这里补上——安装器照 darwin 写 plist，后续 launchd 判据才看得到同一份。
  * 键名用产品导出的那一份（TIMER_PLATFORM_ENV），不在这里另写字面量：钉子与读取方不许漂。
+ * **只在沙箱 HOME 下生效**（PK3-L4-fix1）：夹具必须继续用夹具 HOME；指向真 HOME 的话这个变量会失效
+ * （产品改回 process.platform 并打一条「已忽略」提示）—— 那才是对的，生产不该被它改判据。
  * 调用方给的字段优先（想验别的平台就在字段里自己写这个键）。
  */
 const gateChildEnv = (fields = {}) => ({ ...process.env, [TIMER_PLATFORM_ENV]: GATE_FIXTURE_PLATFORM, ...fields });

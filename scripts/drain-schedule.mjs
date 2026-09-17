@@ -149,17 +149,63 @@ export function timerKindFor(platform = process.platform) {
   return null;
 }
 
-/**
- * 「定时器平台」的**唯一来源**（PK3-L4）。生产 = `process.platform`；`FEISHU_BRIDGE_TIMER_PLATFORM`
- * 是测试隔离点（与 FEISHU_BRIDGE_SYSTEMCTL / FEISHU_BRIDGE_LAUNCHCTL 同一口径）：换掉它就能在 macOS 上
- * 走 linux 分支（或反过来，让与平台无关的夹具在 linux 宿主上仍然走 darwin —— PK3-L4 钉的就是这个）。
- *
- * 为什么要有它：平台会决定**判据**（launchd 的 plist 字节 vs systemd 的两份 unit + `systemctl show`），
- * 而这些入口里有几个只能从环境拿（安装器与 maintenance-gate 的 CLI 都没有 --platform）。夹具自己的
- * `platform` 参数仍然是首选；这里只保证「拿不到参数时读到的是同一份、可注入的平台」。
- */
+/** 这个隔离点的**名字**（唯一一份：夹具不许另写字面量）。 */
 export const TIMER_PLATFORM_ENV = "FEISHU_BRIDGE_TIMER_PLATFORM";
-export const timerPlatform = (env = process.env) => env[TIMER_PLATFORM_ENV] || process.platform;
+/** 它只认这两个值（别的值在沙箱里抛，见 resolveTimerPlatform）。 */
+export const TIMER_PLATFORM_VALUES = Object.freeze(["darwin", "linux"]);
+
+/**
+ * 默认提示出口：stderr（不许混进 `--json` 的 stdout），**一个进程只打一次** ——
+ * `chainFacts` 在一次维护里会被调用十来次，每次都打会变成刷屏。测试可注入 warn 收走它。
+ */
+let timerPlatformWarned = false;
+export const timerPlatformWarn = (message) => {
+  if (timerPlatformWarned) return;
+  timerPlatformWarned = true;
+  process.stderr.write(message + "\n");
+};
+
+/**
+ * 真实用户家目录（密码库，不受 HOME 环境变量影响）——**与 launchctl / systemctl 注入的沙箱判据同一套**。
+ * 读不出来（极少数容器/无 passwd 条目的系统）就回落到 os.homedir()：那等于「按真 HOME 处理」，
+ * 宁可不认隔离点也不把入口弄崩（fail-safe 方向：生产不会因此变宽）。
+ */
+const realUserHome = () => { try { return os.userInfo().homedir; } catch { return os.homedir(); } };
+
+/**
+ * 「定时器平台」的**唯一来源**（PK3-L4 / fix1）：生产恒 `process.platform`。
+ *
+ * `FEISHU_BRIDGE_TIMER_PLATFORM` 是**测试沙箱**隔离点，只在 `home` ≠ 真实家目录时生效 ——
+ * 判据与 launchctl / systemctl 注入**同一套**（`os.userInfo().homedir` 走密码库，不受 HOME 环境变量影响）：
+ * 那些注入命中时操作的本来就不是真机的域，所以沙箱是唯一说得通的场景。
+ *
+ * 为什么要在真 HOME 下一律忽略（Codex 一轮 P1）：这个变量改的不是「用哪个二进制」而是
+ * **协议、路径与落盘对象**（launchd plist ↔ systemd 两份 unit、各一套判据）—— 残留 darwin 能让 Linux
+ * 去写/查 LaunchAgents，残留 linux 能让 Mac 改走 systemd，而四个面共享同一个错值只会让错误彼此「对得上」。
+ * 所以：真 HOME → 不用它、且**明说已忽略**（`warn` 默认打到 stderr，一个进程只打一次）；
+ * 沙箱 → 值必须 ∈ darwin|linux，**不封闭就抛**（非法值静默折成 timerKind=null = 安静地不装定时器）。
+ * 真 HOME 下的值不校验也不抛：**生产不许被这个变量弄崩**，它本来就不该被读。
+ *
+ * @returns {{ platform: string, injected: boolean, ignored: boolean, why: string|null }}
+ */
+export function resolveTimerPlatform({ env = process.env, home = os.homedir(), realHome = realUserHome(), warn = timerPlatformWarn } = {}) {
+  const raw = env?.[TIMER_PLATFORM_ENV];
+  if (typeof raw !== "string" || raw.length === 0) return { platform: process.platform, injected: false, ignored: false, why: null };
+  if (path.resolve(home) === path.resolve(realHome)) {
+    const why = "环境里的 " + TIMER_PLATFORM_ENV + "=" + JSON.stringify(raw) +
+      " 已忽略：它只在测试沙箱（HOME ≠ 真家目录）下生效，生产恒 process.platform";
+    if (typeof warn === "function") warn("提示：" + why);
+    return { platform: process.platform, injected: false, ignored: true, why };
+  }
+  if (!TIMER_PLATFORM_VALUES.includes(raw)) {
+    throw new Error(TIMER_PLATFORM_ENV + " 只认 " + TIMER_PLATFORM_VALUES.join(" / ") +
+      "（沙箱里值不封闭 = 夹具写错了；静默回落会让它变成假绿），收到 " + JSON.stringify(raw));
+  }
+  return { platform: raw, injected: true, ignored: false, why: null };
+}
+
+/** 只要平台字符串的薄壳（默认值用）。 */
+export const timerPlatform = (opts) => resolveTimerPlatform(opts).platform;
 
 /** launchd 里**应该**跑的东西：node + runtime/current 的 drain-outbox.mjs --all。跟 plist 同源。 */
 export function claudeDrainExpectedJob({ home = os.homedir(), node = pickClaudeNode() } = {}) {

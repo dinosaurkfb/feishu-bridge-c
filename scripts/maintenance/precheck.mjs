@@ -35,7 +35,7 @@ const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return nu
 const readTextOrNull = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } };
 
 /** 一条链的固定事实（路径与投影），预检与 operation 共用。 */
-export function chainFacts({ chain, home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), node = pickClaudeNode(), platform = timerPlatform() } = {}) {
+export function chainFacts({ chain, home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), node = pickClaudeNode(), platform = timerPlatform({ home }) } = {}) {
   if (chain === "claude") {
     const root = runtimeRoot(home, "claude");
     const kind = timerKindFor(platform);
@@ -220,7 +220,8 @@ export function precheckStartupSources({
   node = pickClaudeNode(),
   launchctl = spawnLaunchctl,
   systemctl = null,
-  platform = timerPlatform(),
+  // PK3-L4-fix1：传当下预检的 home（隔离点只在沙箱 HOME 下生效，真 HOME 下一律 process.platform）。
+  platform = timerPlatform({ home }),
 } = {}) {
   const manifest = maintenanceEntryManifest({ repoRoot, home, codexHome, bridgeHome: codexBridgeHome });
   const chains = {};

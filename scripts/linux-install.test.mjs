@@ -34,7 +34,7 @@ test("timerKindFor：darwin launchd / linux systemd / 其它 null（明说没实
   assert.equal(timerKindFor("freebsd"), null);
 });
 
-test("resolveNodeForHooks：FEISHU_BRIDGE_NODE → PATH → /opt/homebrew → /usr/local → ~/.local/bin；都不用 execPath", () => {
+test("resolveNodeForHooks 平台化顺序：darwin 显式→已安装→/opt/homebrew→/usr/local→PATH→~/.local/bin；linux 显式→已安装→mise shim→PATH→/usr/local→~/.local/bin；都不用 execPath", () => {
   const home = "/home/dinosak";
   const shim = "/home/dinosak/.local/share/mise/shims/node";
   // ① 显式指定优先
@@ -43,10 +43,29 @@ test("resolveNodeForHooks：FEISHU_BRIDGE_NODE → PATH → /opt/homebrew → /u
   // ② PATH 逐段（mise shim 就是这条：拿到 shim 比拿真身稳）
   assert.equal(resolveNodeForHooks({ env: { PATH: "/a:/b" }, exists: existsOnly(["/b/node"]), access: alwaysExec, homedir: home }), "/b/node");
   assert.equal(resolveNodeForHooks({ env: { PATH: "/usr/bin:" + path.dirname(shim) }, exists: existsOnly([shim]), access: alwaysExec, homedir: home }), shim);
-  // ③/④/⑤ 三个兜底候选按序
-  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/opt/homebrew/bin/node"]), access: alwaysExec, homedir: home }), "/opt/homebrew/bin/node");
-  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/usr/local/bin/node"]), access: alwaysExec, homedir: home }), "/usr/local/bin/node");
-  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly([path.join(home, ".local", "bin", "node")]), access: alwaysExec, homedir: home }), path.join(home, ".local", "bin", "node"));
+  // ③/④/⑤ darwin 三个兜底候选按序（PK3-L2：平台分支的断言**显式注入 platform**，不靠 process.platform 默认）
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/opt/homebrew/bin/node"]), access: alwaysExec, homedir: home, platform: "darwin" }), "/opt/homebrew/bin/node");
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly(["/usr/local/bin/node"]), access: alwaysExec, homedir: home, platform: "darwin" }), "/usr/local/bin/node");
+  assert.equal(resolveNodeForHooks({ env: { PATH: "" }, exists: existsOnly([path.join(home, ".local", "bin", "node")]), access: alwaysExec, homedir: home, platform: "darwin" }), path.join(home, ".local", "bin", "node"));
+  // ⑥ linux 分支（PK3-L2）：mise shim 优先 —— shim 存在时，PATH 先命中 installs 真身也要返回 shim；
+  //   shim 不存在 → 走 PATH。XDG_DATA_HOME / ~/.local/share 都认。
+  const instNode = "/home/dinosak/.local/share/mise/installs/node/26/bin/node";
+  const shimP = "/home/dinosak/.local/share/mise/shims/node";
+  assert.equal(resolveNodeForHooks({ env: { PATH: path.dirname(instNode) + ":/usr/bin" },
+    exists: existsOnly([instNode, shimP]), access: alwaysExec, homedir: home, platform: "linux" }), shimP,
+    "shim 在 → 优先 shim（mise 会重写子进程 PATH 把 installs 真身排前）");
+  assert.equal(resolveNodeForHooks({ env: { PATH: path.dirname(instNode) + ":/usr/bin" },
+    exists: existsOnly([instNode]), access: alwaysExec, homedir: home, platform: "linux" }), instNode,
+    "shim 不在 → 走 PATH");
+  const xdgHome = "/home/dinosak/xdg";
+  const xdgShim = path.join(xdgHome, "mise/shims/node");
+  assert.equal(resolveNodeForHooks({ env: { XDG_DATA_HOME: xdgHome, PATH: "" },
+    exists: existsOnly([xdgShim]), access: alwaysExec, homedir: home, platform: "linux" }), xdgShim,
+    "XDG_DATA_HOME 下的 shim 也认");
+  // darwin 上 shim 不优待：installs 真身在 PATH 上就返回它（顺序不变）
+  assert.equal(resolveNodeForHooks({ env: { PATH: path.dirname(instNode) },
+    exists: existsOnly([instNode, shimP]), access: alwaysExec, homedir: home, platform: "darwin" }), instNode,
+    "darwin 顺序不变（shim 不优待）");
   // 显式指定但不存在 → 抛（不静默换成别的）
   assert.throws(() => resolveNodeForHooks({ env: { FEISHU_BRIDGE_NODE: "/nope/node" }, exists: existsOnly([]), access: () => {}, homedir: home }), /FEISHU_BRIDGE_NODE 指的路径/);
   // 都没有 → 抛并把找过的列出来；**绝不退回 process.execPath**（钩子契约：Claude Code 自带的 node 不许当外部路径）

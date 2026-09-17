@@ -19,14 +19,15 @@ export const CLAUDE_DRAIN_LAUNCH_LABEL = "com.frank.feishu-bridge-cc.drain";
  * 而钩子的失败又是安静的）。优先取 brew 那个不带版本的稳定软链。
  */
 /**
- * 给 hooks / 定时器解析 node 的**唯一**入口（PK3-L1）。
+ * 给 hooks / 定时器解析 node 的**唯一**入口（PK3-L1，PK3-L2 校准）。
  *
- * 顺序：env.FEISHU_BRIDGE_NODE → PATH 逐段找 node → /opt/homebrew/bin/node → /usr/local/bin/node
- *       → ~/.local/bin/node；都没有 → 抛（把找过的路径全列出来）。
+ * 顺序（按平台化实际顺序）：
+ *   darwin：显式 env.FEISHU_BRIDGE_NODE → 已安装（installed）→ /opt/homebrew/bin/node → /usr/local/bin/node → PATH → ~/.local/bin/node
+ *   linux ：显式 env.FEISHU_BRIDGE_NODE → 已安装（installed）→ mise shim → PATH → /usr/local/bin/node → ~/.local/bin/node
+ *   都没有 → 抛（把找过的路径全列出来）。
  *
  * **不用 process.execPath**：Stop 钩子契约里写着 Claude Code 自带的那个 node 不能当外部路径用
  * （钩子是 Claude Code 派生出来的，它的 node 不保证在别处可用）。
- * PATH 优先也是为了 mise/nvm 这类版本管理器：拿到的是 shim（切版本后 shim 路径不变，真身会变）。
  * 显式指定但不存在 → 直接抛（不静默换成别的二进制）。
  */
 export function resolveNodeForHooks({
@@ -56,14 +57,25 @@ export function resolveNodeForHooks({
     }
     return out;
   };
-  // 顺序（PK3-L1-fix1 P1-1）：显式 → **仍有效的已安装路径** → 平台惯用位置 → PATH → ~/.local/bin。
+  // 顺序（PK3-L1-fix1 P1-1，PK3-L2-fix1 P2-1 按实际平台化顺序校准）：
+  //   darwin：显式 env → 已安装 → /opt/homebrew → /usr/local → PATH → ~/.local/bin
+  //   linux ：显式 env → 已安装 → mise shim → PATH → /usr/local → ~/.local/bin
   // 为什么 installed 排在 PATH 前面：Mac 现网 PATH 先命中 ~/.local/bin/node（第三方装的），
   //   而三条已安装 hook 用的是 /opt/homebrew/bin/node —— 按 PATH 优先会**改写现网**，还会让
-  //   doctor / 维护预检把原本正确的 job 报成“参数不符”。linux 才让 PATH shim 优先（mise 切版本后 shim 不变）。
+  //   doctor / 维护预检把原本正确的 job 报成“参数不符”。linux 让 mise shim 优先于 PATH
+  //   （mise 重写子进程 PATH，先命中的是 installs 真身；shim 不随版本变）。
   const candidates = [];
   if (typeof installed === "string" && installed.length > 0) candidates.push(installed);
   if (platform === "linux") {
-    candidates.push(...fromPath(), "/usr/local/bin/node", path.join(homedir, ".local", "bin", "node"));
+    // PK3-L2：mise shim **先于 PATH** —— mise 会重写子进程的 PATH，把 installs/<版本>/bin 插到
+    //   shims 前面，扫 PATH 先命中的是版本真身（omm 实测解析到 …/installs/node/26/bin/node）。
+    //   危害：mise use -g 换版本后旧线可能被清掉，hook 指向空路径；shim 不随版本变，拿到它才稳。
+    //   位置：${XDG_DATA_HOME:-~/.local/share}/mise/shims/node（路径存在且可执行即用，
+    //   不依赖 __MISE_SHIM / __MISE_DIFF 之类线索 —— omm 的 node 进程里有它们，但别把正确性押在别的工具的私有变量上）。
+    const dataHome = typeof env?.XDG_DATA_HOME === "string" && env.XDG_DATA_HOME.length > 0
+      ? env.XDG_DATA_HOME : path.join(homedir, ".local", "share");
+    candidates.push(path.join(dataHome, "mise", "shims", "node"),
+      ...fromPath(), "/usr/local/bin/node", path.join(homedir, ".local", "bin", "node"));
   } else {
     candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", ...fromPath(),
       path.join(homedir, ".local", "bin", "node"));

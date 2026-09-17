@@ -18,6 +18,7 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
+import { drainTimerCheck, drainTimerText, runDrainService } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台 / PK3-L2-fix3：模块函数入参测入口
 import {
   classifyOutboxRecord, codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
@@ -10512,6 +10513,152 @@ test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext �
   const drift = dispatchControlRepair({ control: "select", handle: h, handle_kind: "osh" }, {}, { claim: mkClaim(), ownerContext: { frankSenderId: "12345", senders: [], chatId: "oc_test", endpoint: "endpoint_" + "9".repeat(24) } });
   assert.equal(drift.ok, false, "② endpoint 漂移必须拒：" + JSON.stringify(drift));
   assert.equal(drift.reason, "select_endpoint_mismatch", "② " + drift.reason);
+});
+
+// ── PK3-L2：Codex 侧兜底定时器文案按平台（注入 platform 钉）──
+test("PK3-L2-fix1 兜底排空文案按平台：非 darwin 一律「尚未实现」（不说 systemd、无 launchd 状态词）；darwin 说 launchd", () => {
+  const linux = drainTimerText({ platform: "linux" });
+  assert.match(linux, /尚未实现/u, linux);
+  assert.doesNotMatch(linux, /systemd/u, "不许声称 systemd（那是 Claude 侧能力）：" + linux);
+  assert.doesNotMatch(linux, /launchd 状态/u, "不用 launchd 状态词：" + linux);
+  const darwin = drainTimerText({ platform: "darwin" });
+  assert.match(darwin, /launchd/u, darwin);
+  const other = drainTimerText({ platform: "win32" });
+  assert.match(other, /尚未实现/u, other);
+});
+
+test("PK3-L2-fix1 P1：linux 不探 launchd、报尚未实现（launchctl 调用次数 0）；darwin 照旧探测", () => {
+  let calls = 0;
+  const countingServiceState = () => { calls += 1; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
+  const linux = drainTimerCheck({ platform: "linux", serviceStateFn: countingServiceState });
+  assert.equal(calls, 0, "linux 下 launchd 探测（注入的 serviceStateFn）从未被调用：" + JSON.stringify(linux));
+  assert.match(linux.detail, /尚未实现/u, linux.detail);
+  assert.doesNotMatch(linux.detail, /systemd/u, "不许声称 systemd：" + linux.detail);
+  assert.doesNotMatch(linux.detail, /launchd 状态/u, "不许用 launchd 状态词：" + linux.detail);
+  // darwin 照旧：探测一次、四态映射不变
+  calls = 0;
+  const darwin = drainTimerCheck({ platform: "darwin", serviceStateFn: countingServiceState });
+  assert.equal(calls, 1, "darwin 照旧探测一次");
+  assert.equal(darwin.ok, null, "unverifiable → null（照旧）：" + JSON.stringify(darwin));
+  assert.match(darwin.detail, /launchd 状态查不出来/u, darwin.detail);
+});
+
+test("PK3-L2-fix2 P1-1 / fix3 P2-1：非 Darwin 下无参运行 drain-service 报「尚未实现」且 launchctl 调用 0 次，输出不含自相矛盾指引", () => {
+  let launchctlCalls = 0;
+  const countingLaunchctl = () => { launchctlCalls++; return { ok: false, detail: "fake launchctl" }; };
+  const countingServiceState = () => { launchctlCalls++; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
+
+  let stdout = "";
+  let exitCode = null;
+  runDrainService([], {
+    platform: "linux",
+    serviceStateFn: countingServiceState,
+    spawnLaunchctlFn: countingLaunchctl,
+    log: (msg) => { stdout += msg + "\n"; },
+    error: (msg) => { stdout += msg + "\n"; },
+    exit: (code) => { exitCode = code; },
+  });
+
+  assert.equal(exitCode, 0, "无参运行正常退出 0");
+  assert.equal(launchctlCalls, 0, "Linux 下无参运行不得调用 launchctl 或 serviceState");
+  assert.match(stdout, /尚未实现/u, "无参运行输出必须含「尚未实现」：" + stdout);
+  assert.match(stdout, /本平台没有启停实现（只在 darwin 有 launchd 实现）。/u, "必须说明本平台没有启停实现：" + stdout);
+  assert.doesNotMatch(stdout, /--enable --apply/u, "非 darwin 无参输出不得包含自相矛盾的启用指引：" + stdout);
+  assert.doesNotMatch(stdout, /launchd 状态查不出来/u, "不许出现 launchd 状态查不出来：" + stdout);
+});
+
+test("PK3-L2-fix3 P1-1：真实 env 残留 FEISHU_BRIDGE_PLATFORM=darwin + 显式 platform linux → 不探 launchctl（计数 0）", () => {
+  const saved = process.env.FEISHU_BRIDGE_PLATFORM;
+  const savedTimer = process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
+  process.env.FEISHU_BRIDGE_PLATFORM = "darwin";
+  process.env.FEISHU_BRIDGE_TIMER_PLATFORM = "darwin";
+  try {
+    let launchctlCalls = 0;
+    const countingLaunchctl = () => {
+      launchctlCalls++;
+      return { ok: false, detail: "should not be called" };
+    };
+    const countingServiceState = () => {
+      launchctlCalls++;
+      return { phase: "loaded", backlog: { ok: true, total: 0 } };
+    };
+
+    // 1. drainTimerCheck 显式 platform: "linux" 必须不探 launchd，不能被 env 残留 darwin 污染
+    const check = drainTimerCheck({ platform: "linux", serviceStateFn: countingServiceState });
+    assert.equal(launchctlCalls, 0, "drainTimerCheck 显式 platform linux 不得探测 launchd（哪怕 env 残留 darwin）");
+    assert.equal(check.ok, null);
+    assert.match(check.detail, /尚未实现/u);
+
+    // 2. drainTimerText 显式 platform: "linux" 必须返回尚未实现
+    const text = drainTimerText({ platform: "linux" });
+    assert.match(text, /尚未实现/u);
+    assert.doesNotMatch(text, /launchd 状态查不出来/u);
+
+    // 3. runDrainService 显式 platform: "linux" 无参入口：不探 launchctl，计数 0
+    let stdout = "";
+    let exitCode = null;
+    runDrainService([], {
+      platform: "linux",
+      serviceStateFn: countingServiceState,
+      spawnLaunchctlFn: countingLaunchctl,
+      log: (msg) => { stdout += msg + "\n"; },
+      error: (msg) => { stdout += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 0, "无参入口退出 0");
+    assert.equal(launchctlCalls, 0, "无参入口在显式 platform linux 下不得调用 launchctl 或 serviceState");
+    assert.match(stdout, /尚未实现/u);
+    assert.match(stdout, /本平台没有启停实现/u);
+    assert.doesNotMatch(stdout, /--enable --apply/u, "P2-1：无参输出不得包含 --enable --apply 指引");
+
+    // 4. runDrainService 显式 platform: "linux" 带 --enable 或 --disable：直接拒绝，不探 launchctl，计数 0
+    let stderr = "";
+    exitCode = null;
+    runDrainService(["--enable"], {
+      platform: "linux",
+      serviceStateFn: countingServiceState,
+      spawnLaunchctlFn: countingLaunchctl,
+      log: (msg) => { stderr += msg + "\n"; },
+      error: (msg) => { stderr += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 1, "--enable 在非 darwin 退出 1");
+    assert.equal(launchctlCalls, 0, "--enable 不得调用 launchctl");
+    assert.match(stderr, /尚未实现/u);
+  } finally {
+    if (saved === undefined) delete process.env.FEISHU_BRIDGE_PLATFORM;
+    else process.env.FEISHU_BRIDGE_PLATFORM = saved;
+    if (savedTimer === undefined) delete process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
+    else process.env.FEISHU_BRIDGE_TIMER_PLATFORM = savedTimer;
+  }
+});
+
+test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {
+  const throwingServiceState = () => {
+    const err = new Error("disk I/O error (EIO)");
+    err.code = "EIO";
+    throw err;
+  };
+  const res = drainTimerCheck({ platform: "darwin", serviceStateFn: throwingServiceState });
+  assert.equal(res.ok, null, "抛错必须收口为 ok: null");
+  assert.equal(res.phase, "unverifiable", "抛错归为 unverifiable 相位");
+  assert.match(res.detail, /状态读不出来：disk I\/O error \(EIO\)/u, "detail 必须包含错误信息：" + res.detail);
+});
+
+test("PK3-L2-fix2 P2-3：darwin absent 且有积压时保留「还有 N 条历史积压未分类」诊断后缀", () => {
+  const withBacklog = drainTimerCheck({
+    platform: "darwin",
+    serviceStateFn: () => ({ phase: "absent", backlog: { ok: true, total: 3 } }),
+  });
+  assert.equal(withBacklog.ok, null);
+  assert.match(withBacklog.detail, /；还有 3 条历史积压未分类$/u, "有积压时保留诊断后缀：" + withBacklog.detail);
+
+  const withoutBacklog = drainTimerCheck({
+    platform: "darwin",
+    serviceStateFn: () => ({ phase: "absent", backlog: { ok: true, total: 0 } }),
+  });
+  assert.equal(withoutBacklog.ok, null);
+  assert.doesNotMatch(withoutBacklog.detail, /历史积压未分类/u, "无积压时不带后缀：" + withoutBacklog.detail);
 });
 
 sealSummary();

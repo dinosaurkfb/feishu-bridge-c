@@ -18,7 +18,7 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
-import { drainTimerCheck, drainTimerText } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台
+import { drainTimerCheck, drainTimerText, runDrainService } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台 / PK3-L2-fix3：模块函数入参测入口
 import {
   classifyOutboxRecord, codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
@@ -10534,28 +10534,94 @@ test("PK3-L2-fix1 P1：linux 不探 launchd、报尚未实现（launchctl 调用
   assert.match(darwin.detail, /launchd 状态查不出来/u, darwin.detail);
 });
 
-test("PK3-L2-fix2 P1-1：Linux 下无参运行 drain-service 报「尚未实现」且 launchctl 调用 0 次", () => {
-  const dir = temp();
-  const marker = path.join(dir, "CALLED");
-  const f = path.join(dir, "launchctl");
-  fs.writeFileSync(f, '#!/bin/sh\necho called >> ' + JSON.stringify(marker) + '\nexit 0\n', { mode: 0o755 });
-  const bridge = path.join(dir, "bridge");
-  fs.mkdirSync(bridge, { recursive: true });
-  writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
+test("PK3-L2-fix2 P1-1 / fix3 P2-1：非 Darwin 下无参运行 drain-service 报「尚未实现」且 launchctl 调用 0 次，输出不含自相矛盾指引", () => {
+  let launchctlCalls = 0;
+  const countingLaunchctl = () => { launchctlCalls++; return { ok: false, detail: "fake launchctl" }; };
+  const countingServiceState = () => { launchctlCalls++; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
 
-  const r = spawnSync(process.execPath,
-    [path.join(ROOT, "scripts", "codex", "drain-service.mjs")],
-    { encoding: "utf-8", env: isolatedEnv({
-      HOME: path.join(dir, "home"),
-      CODEX_HOME: path.join(dir, "codex"),
-      FEISHU_CODEX_BRIDGE_HOME: bridge,
-      FEISHU_BRIDGE_PLATFORM: "linux",
-      FEISHU_BRIDGE_LAUNCHCTL: f,
-    }) });
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /尚未实现/u, "无参运行输出必须含「尚未实现」：" + r.stdout);
-  assert.doesNotMatch(r.stdout, /launchd 状态查不出来/u, "不许出现 launchd 状态查不出来：" + r.stdout);
-  assert.equal(fs.existsSync(marker), false, "Linux 下无参运行不得调用 launchctl");
+  let stdout = "";
+  let exitCode = null;
+  runDrainService([], {
+    platform: "linux",
+    serviceStateFn: countingServiceState,
+    spawnLaunchctlFn: countingLaunchctl,
+    log: (msg) => { stdout += msg + "\n"; },
+    error: (msg) => { stdout += msg + "\n"; },
+    exit: (code) => { exitCode = code; },
+  });
+
+  assert.equal(exitCode, 0, "无参运行正常退出 0");
+  assert.equal(launchctlCalls, 0, "Linux 下无参运行不得调用 launchctl 或 serviceState");
+  assert.match(stdout, /尚未实现/u, "无参运行输出必须含「尚未实现」：" + stdout);
+  assert.match(stdout, /本平台没有启停实现（只在 darwin 有 launchd 实现）。/u, "必须说明本平台没有启停实现：" + stdout);
+  assert.doesNotMatch(stdout, /--enable --apply/u, "非 darwin 无参输出不得包含自相矛盾的启用指引：" + stdout);
+  assert.doesNotMatch(stdout, /launchd 状态查不出来/u, "不许出现 launchd 状态查不出来：" + stdout);
+});
+
+test("PK3-L2-fix3 P1-1：真实 env 残留 FEISHU_BRIDGE_PLATFORM=darwin + 显式 platform linux → 不探 launchctl（计数 0）", () => {
+  const saved = process.env.FEISHU_BRIDGE_PLATFORM;
+  const savedTimer = process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
+  process.env.FEISHU_BRIDGE_PLATFORM = "darwin";
+  process.env.FEISHU_BRIDGE_TIMER_PLATFORM = "darwin";
+  try {
+    let launchctlCalls = 0;
+    const countingLaunchctl = () => {
+      launchctlCalls++;
+      return { ok: false, detail: "should not be called" };
+    };
+    const countingServiceState = () => {
+      launchctlCalls++;
+      return { phase: "loaded", backlog: { ok: true, total: 0 } };
+    };
+
+    // 1. drainTimerCheck 显式 platform: "linux" 必须不探 launchd，不能被 env 残留 darwin 污染
+    const check = drainTimerCheck({ platform: "linux", serviceStateFn: countingServiceState });
+    assert.equal(launchctlCalls, 0, "drainTimerCheck 显式 platform linux 不得探测 launchd（哪怕 env 残留 darwin）");
+    assert.equal(check.ok, null);
+    assert.match(check.detail, /尚未实现/u);
+
+    // 2. drainTimerText 显式 platform: "linux" 必须返回尚未实现
+    const text = drainTimerText({ platform: "linux" });
+    assert.match(text, /尚未实现/u);
+    assert.doesNotMatch(text, /launchd 状态查不出来/u);
+
+    // 3. runDrainService 显式 platform: "linux" 无参入口：不探 launchctl，计数 0
+    let stdout = "";
+    let exitCode = null;
+    runDrainService([], {
+      platform: "linux",
+      serviceStateFn: countingServiceState,
+      spawnLaunchctlFn: countingLaunchctl,
+      log: (msg) => { stdout += msg + "\n"; },
+      error: (msg) => { stdout += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 0, "无参入口退出 0");
+    assert.equal(launchctlCalls, 0, "无参入口在显式 platform linux 下不得调用 launchctl 或 serviceState");
+    assert.match(stdout, /尚未实现/u);
+    assert.match(stdout, /本平台没有启停实现/u);
+    assert.doesNotMatch(stdout, /--enable --apply/u, "P2-1：无参输出不得包含 --enable --apply 指引");
+
+    // 4. runDrainService 显式 platform: "linux" 带 --enable 或 --disable：直接拒绝，不探 launchctl，计数 0
+    let stderr = "";
+    exitCode = null;
+    runDrainService(["--enable"], {
+      platform: "linux",
+      serviceStateFn: countingServiceState,
+      spawnLaunchctlFn: countingLaunchctl,
+      log: (msg) => { stderr += msg + "\n"; },
+      error: (msg) => { stderr += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 1, "--enable 在非 darwin 退出 1");
+    assert.equal(launchctlCalls, 0, "--enable 不得调用 launchctl");
+    assert.match(stderr, /尚未实现/u);
+  } finally {
+    if (saved === undefined) delete process.env.FEISHU_BRIDGE_PLATFORM;
+    else process.env.FEISHU_BRIDGE_PLATFORM = saved;
+    if (savedTimer === undefined) delete process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
+    else process.env.FEISHU_BRIDGE_TIMER_PLATFORM = savedTimer;
+  }
 });
 
 test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {

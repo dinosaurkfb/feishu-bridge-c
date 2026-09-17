@@ -256,7 +256,7 @@ const PHASE_BLOCKS = {
  *  **非 darwin 不探测**：不读 LaunchAgents、不 spawn launchctl、不核 plist —— Codex 侧目前
  *  只有 darwin launchd 实现，直接报「尚未实现」（不是未启用、不是查不清），状态记 null。
  *  启停入口与无参状态入口同样在非 darwin 走 drainTimerCheck / 拒绝，不探 launchctl。 */
-export function drainTimerCheck({ platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform, serviceStateFn = serviceState } = {}) {
+export function drainTimerCheck({ platform = process.platform, serviceStateFn = serviceState } = {}) {
   if (platform !== "darwin") {
     return { name: "兜底排空", ok: null, phase: "unverifiable", detail: drainTimerText({ platform }), next: null };
   }
@@ -277,7 +277,7 @@ export function drainTimerCheck({ platform = process.env.FEISHU_BRIDGE_PLATFORM 
   return { name: "兜底排空", ok, phase: svc.phase, detail: (PHASE_TEXT[svc.phase] ?? svc.phase) + backlogSuffix, next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
 }
 
-export function drainTimerText({ platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform } = {}) {
+export function drainTimerText({ platform = process.platform } = {}) {
   // PK3-L2-fix1 P1：**只在 darwin 有 launchd 实现** —— 非 darwin 不许声称 systemd（那是 Claude 侧
   //  的能力，Codex 侧没有），也不许探 launchd。Codex systemd 定时器另单实现。
   if (platform !== "darwin") {
@@ -310,142 +310,148 @@ export function enableBlockers(state) {
   return blockers;
 }
 
-function main() {
-  const argv = process.argv.slice(2);
+export function runDrainService(argv = process.argv.slice(2), {
+  platform = process.platform,
+  home = os.homedir(),
+  serviceStateFn = serviceState,
+  spawnLaunchctlFn = spawnLaunchctl,
+  log = console.log,
+  error = console.error,
+  exit = process.exit,
+} = {}) {
   const known = new Set(["--enable", "--disable", "--apply"]);
   const bad = argv.filter((a) => !known.has(a));
   if (bad.length > 0) {
-    console.error("认不出的参数：" + bad.join(" "));
-    console.error("  只接受 --enable / --disable / --apply");
-    process.exit(1);
+    error("认不出的参数：" + bad.join(" "));
+    error("  只接受 --enable / --disable / --apply");
+    return exit(1);
   }
   const enable = argv.includes("--enable");
   const disable = argv.includes("--disable");
   const apply = argv.includes("--apply");
   if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   if (enable && disable) {
-    console.error("--enable 和 --disable 只能给一个。");
-    process.exit(1);
+    error("--enable 和 --disable 只能给一个。");
+    return exit(1);
   }
 
-  const platform = process.env.FEISHU_BRIDGE_PLATFORM || process.env.FEISHU_BRIDGE_TIMER_PLATFORM || process.platform;
-
-  // PK3-L2-fix1 P1 / fix2 P1-1：非 darwin 在探测 launchd 之前短路 ——
+  // PK3-L2-fix1 P1 / fix2 P1-1 / fix3 P1-1 / P2-1：非 darwin 在探测 launchd 之前短路 ——
   //   Codex 侧没有 systemd 实现，启停在 Linux 上不可用；无参状态入口走 drainTimerCheck，不探 launchd。
+  //   平台只认显式入参，否则 process.platform（删掉对 FEISHU_BRIDGE_PLATFORM / FEISHU_BRIDGE_TIMER_PLATFORM 的读取）。
+  //   非 darwin 无参输出只说本平台没有启停实现，不再打印 --enable/--disable 指引（自相矛盾）。
   if (platform !== "darwin") {
     if (enable || disable) {
-      console.error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— enable / disable 在这里不可用。");
-      process.exit(1);
+      error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— enable / disable 在这里不可用。");
+      return exit(1);
     }
     const check = drainTimerCheck({ platform });
-    console.log("状态      " + check.detail);
-    console.log("\n只报状态。要动它加 --enable --apply 或 --disable --apply。");
-    process.exit(0);
+    log("状态      " + check.detail);
+    log("\n本平台没有启停实现（只在 darwin 有 launchd 实现）。");
+    return exit(0);
   }
 
-  const home = os.homedir();
-  const st = serviceState({ home });
+  const st = serviceStateFn({ home });
 
-  console.log("调度器    " + st.plist);
-  console.log("状态      " + (PHASE_TEXT[st.phase] ?? st.phase));
-  console.log("运行时    " + (st.runtimeOk
+  log("调度器    " + st.plist);
+  log("状态      " + (PHASE_TEXT[st.phase] ?? st.phase));
+  log("运行时    " + (st.runtimeOk
     ? "校验通过" : "**校验不过**（" + st.runtimeReason + "）"));
-  console.log("排空脚本  " + drainScriptPath(home));
+  log("排空脚本  " + drainScriptPath(home));
   if (st.backlog.ok && (st.backlog.unreadable ?? 0) > 0) {
-    console.log("损坏文件  **" + st.backlog.unreadable + " 个读不出来**（不计入待发数）");
+    log("损坏文件  **" + st.backlog.unreadable + " 个读不出来**（不计入待发数）");
   }
-  console.log("链路预检  " + (st.scan.ok
+  log("链路预检  " + (st.scan.ok
     ? "通过（" + st.scan.tasks + " 个 task 走真实发布前置检查）"
     : "**跑不通**（" + st.scan.reason + "）"));
   if (st.backlog.ok) {
-    console.log("历史积压  " + st.backlog.total + " 条" +
+    log("历史积压  " + st.backlog.total + " 条" +
       (st.backlog.total > 0 ? "（分布在 " + st.backlog.tasks.length + " 个 task）" : ""));
   } else {
-    console.log("历史积压  读不出来（" + st.backlog.reason + "）");
+    log("历史积压  读不出来（" + st.backlog.reason + "）");
   }
 
   if (!enable && !disable) {
-    console.log("\n只报状态。要动它加 --enable --apply 或 --disable --apply。");
-    process.exit(0);
+    log("\n只报状态。要动它加 --enable --apply 或 --disable --apply。");
+    return exit(0);
   }
 
   if (enable) {
     const blockers = enableBlockers(st);
     if (blockers.length > 0) {
-      console.error("\n不能启用，什么都没写：");
+      error("\n不能启用，什么都没写：");
       for (const b of blockers) {
         if (b.code === "backlog_unclassified") {
-          console.error("  · 还有 " + b.detail + " 没处理。**定时器一启用它们就会被发出去** ——");
-          console.error("    先决定这批内容是发还是停（scripts/codex/suppress-outbox.mjs），");
-          console.error("    再回来启用。这一步不许省：省掉它就是替人做了一个不可逆的决定。");
+          error("  · 还有 " + b.detail + " 没处理。**定时器一启用它们就会被发出去** ——");
+          error("    先决定这批内容是发还是停（scripts/codex/suppress-outbox.mjs），");
+          error("    再回来启用。这一步不许省：省掉它就是替人做了一个不可逆的决定。");
         } else if (b.code === "phase_blocks") {
-          console.error("  · " + b.detail + " —— **什么都没动**（没有 bootout、没有写盘）。");
-          console.error("    先把它查清楚：动过控制面之后再失败，比现在难收拾。");
+          error("  · " + b.detail + " —— **什么都没动**（没有 bootout、没有写盘）。");
+          error("    先把它查清楚：动过控制面之后再失败，比现在难收拾。");
         } else if (b.code === "backlog_corrupt") {
-          console.error("  · outbox 里有 " + b.detail + "。**读不出来不等于没有** ——");
-          console.error("    这些文件是什么内容谁也不知道，不能当成「没有积压」放行。");
+          error("  · outbox 里有 " + b.detail + "。**读不出来不等于没有** ——");
+          error("    这些文件是什么内容谁也不知道，不能当成「没有积压」放行。");
         } else if (b.code === "scan_failed") {
-          console.error("  · eligible-only 扫描跑不通（" + b.detail + "）——");
-          console.error("    定时器要跑的就是它，跑不通就不能装。");
+          error("  · eligible-only 扫描跑不通（" + b.detail + "）——");
+          error("    定时器要跑的就是它，跑不通就不能装。");
         } else if (b.code === "runtime_unverified") {
-          console.error("  · 运行时校验不过（" + b.detail + "）—— 先跑 scripts/codex/install.mjs --apply。");
+          error("  · 运行时校验不过（" + b.detail + "）—— 先跑 scripts/codex/install.mjs --apply。");
         } else {
-          console.error("  · " + b.code + "（" + b.detail + "）");
+          error("  · " + b.code + "（" + b.detail + "）");
         }
       }
-      process.exit(1);
+      return exit(1);
     }
   }
 
   if (!apply) {
-    console.log("\n[dry-run] 什么都没写。加 --apply 才生效。");
-    process.exit(0);
+    log("\n[dry-run] 什么都没写。加 --apply 才生效。");
+    return exit(0);
   }
 
   if (disable) {
     // **"没有 plist"不等于"没在跑"。**orphan 就是 plist 没了、job 还在 ——
     // 那种情况下直接说"本来就没启用"，等于把一个还在跑的定时器当成不存在。
     if (st.phase === "absent") {
-      console.log("\n本来就没启用，什么都没做。");
-      process.exit(0);
+      log("\n本来就没启用，什么都没做。");
+      return exit(0);
     }
     if (st.phase === "plist_unreadable") {
-      console.error("\nplist 读不出来（" + st.plistUnreadable + "），**不知道它是什么状态**。");
-      console.error("什么都没动 —— 先把那个文件处理掉再来。");
-      process.exit(1);
+      error("\nplist 读不出来（" + st.plistUnreadable + "），**不知道它是什么状态**。");
+      error("什么都没动 —— 先把那个文件处理掉再来。");
+      return exit(1);
     }
     if (st.phase === "unverifiable") {
-      console.error("\nlaunchd 状态查不出来，**不敢说它有没有在跑**。");
-      console.error("什么都没动 —— 先把 launchctl 能不能用查清楚。");
-      process.exit(1);
+      error("\nlaunchd 状态查不出来，**不敢说它有没有在跑**。");
+      error("什么都没动 —— 先把 launchctl 能不能用查清楚。");
+      return exit(1);
     }
-    const out = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
+    const out = spawnLaunchctlFn(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
     // **只有"确实没有这个服务"可以忽略。**
     //
     // 上一版是"卸载失败也照删 plist"，后果有两层：旧 job 可能还在跑，
     // 而 plist 一删，下一次状态查询就报 absent —— **一个还在跑的定时器
     // 被显示成"未启用"**，比报错更糟。
     if (!out.ok && !absentJob(out.detail)) {
-      console.error("\n卸载失败：" + out.detail);
-      console.error("**plist 没有删。**删了的话，下次查状态会把一个可能还在跑的");
-      console.error("定时器报成「未启用」—— 先把它卸掉再来。");
-      process.exit(1);
+      error("\n卸载失败：" + out.detail);
+      error("**plist 没有删。**删了的话，下次查状态会把一个可能还在跑的");
+      error("定时器报成「未启用」—— 先把它卸掉再来。");
+      return exit(1);
     }
     // **顺序：卸载 → 核验确实没了 → 才删 plist。**
     //
     // 上一版是先删 plist 再核验：bootout 返回成功但 job 仍在时，命令确实非零退出了，
     // **可现场已经被改成 orphan** —— plist 没了、job 还在，比动手之前更糟。
     // 核验没过就一个字节都不动，把现场留在原样。
-    const after = loadedPhase(spawnLaunchctl, null);
+    const after = loadedPhase(spawnLaunchctlFn, null);
     if (after !== "installed_not_loaded") {
-      console.error("\nbootout 返回成功，但 launchd 里仍能查到（" + after + "）。");
-      console.error("**plist 一个字节没动。**删了的话现场会变成「没有 plist、job 还在」，");
-      console.error("比现在更难收拾。先把那个 job 处理掉再来。");
-      process.exit(1);
+      error("\nbootout 返回成功，但 launchd 里仍能查到（" + after + "）。");
+      error("**plist 一个字节没动。**删了的话现场会变成「没有 plist、job 还在」，");
+      error("比现在更难收拾。先把那个 job 处理掉再来。");
+      return exit(1);
     }
     fs.rmSync(st.plist, { force: true });
-    console.log("\n已停用。launchd 里确认没有它了，plist 也已删除。");
-    process.exit(0);
+    log("\n已停用。launchd 里确认没有它了，plist 也已删除。");
+    return exit(0);
   }
 
   // **已经是健康的 loaded 就什么都不做。**
@@ -454,40 +460,41 @@ function main() {
   // 幂等重跑是常见操作（比如脚本里顺手带一句），不该有副作用；
   // 真要重启的话，先 --disable 再 --enable，那是个明确的意图。
   if (st.phase === "loaded") {
-    console.log("\n已经在跑，而且参数就是当前这份 —— 什么都没做。");
-    console.log("要重启的话：先 --disable --apply，再 --enable --apply。");
-    process.exit(0);
+    log("\n已经在跑，而且参数就是当前这份 —— 什么都没做。");
+    log("要重启的话：先 --disable --apply，再 --enable --apply。");
+    return exit(0);
   }
 
   fs.mkdirSync(path.dirname(st.plist), { recursive: true });
   // **先把同名的旧 job 卸掉。**不卸的话 bootstrap 会因"已存在"失败，
   // 而旧 job 继续按旧配置跑 —— 那正是"报了错却仍显示已加载"的来源。
-  const out = spawnLaunchctl(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
+  const out = spawnLaunchctlFn(["bootout", "gui/" + process.getuid() + "/" + LAUNCH_LABEL]);
   // **只有"本来就没有"可以忽略。**其他失败意味着旧 job 还在，
   // 接着 bootstrap 只会失败或让旧配置继续跑 —— 那正是假绿的来源。
   if (!out.ok && !absentJob(out.detail)) {
-    console.error("\n卸载旧的同名 job 失败：" + out.detail);
-    console.error("**没有动 plist。**旧 job 可能还在按旧配置跑，先处理它再来。");
-    process.exit(1);
+    error("\n卸载旧的同名 job 失败：" + out.detail);
+    error("**没有动 plist。**旧 job 可能还在按旧配置跑，先处理它再来。");
+    return exit(1);
   }
   fs.writeFileSync(st.plist, plistBody({ home }), { mode: 0o644 });
-  const loaded = spawnLaunchctl(["bootstrap", "gui/" + process.getuid(), st.plist]);
+  const loaded = spawnLaunchctlFn(["bootstrap", "gui/" + process.getuid(), st.plist]);
   if (!loaded.ok) {
     // **加载失败必须非零退出。**报成功而定时器没在跑，就是"界面说正常、实际不工作"——
     // 兜底本来就是最后一道，它悄悄不工作的话没有第二处会发现。
-    console.error("\nplist 已写入，但 launchd 加载失败：" + loaded.detail);
-    console.error("**定时器现在不会跑。**修好后重跑本命令。");
-    process.exit(1);
+    error("\nplist 已写入，但 launchd 加载失败：" + loaded.detail);
+    error("**定时器现在不会跑。**修好后重跑本命令。");
+    return exit(1);
   }
   // **bootstrap 返回 0 不等于跑的是我们这份。**重新读一次，核验实际参数。
-  const after = loadedPhase(spawnLaunchctl, expectedJob({ home }));
+  const after = loadedPhase(spawnLaunchctlFn, expectedJob({ home }));
   if (after !== "loaded") {
-    console.error("\nbootstrap 报成功，但核验实际 job 得到：" + (PHASE_TEXT[after] ?? after));
-    console.error("**不当作已启用。**");
-    process.exit(1);
+    error("\nbootstrap 报成功，但核验实际 job 得到：" + (PHASE_TEXT[after] ?? after));
+    error("**不当作已启用。**");
+    return exit(1);
   }
-  console.log("\n已启用，定时器已加载（实际参数已核验）。");
-  console.log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
+  log("\n已启用，定时器已加载（实际参数已核验）。");
+  log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
+  return exit(0);
 }
 
 /**
@@ -501,5 +508,8 @@ function main() {
  * 根因照例不是"某条测试忘了造假"，是**隔离点没接到实现里**。
  */
 
+function main() {
+  runDrainService();
+}
 
 if (isDirectRun(import.meta.url)) main();

@@ -244,7 +244,7 @@ import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, cla
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
-import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB } from "./drain-schedule.mjs";
+import { pickClaudeNode as pickClaudeNodeB, claudeDrainExpectedJob as claudeDrainExpectedJobB, TIMER_PLATFORM_ENV } from "./drain-schedule.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext, maintenanceStatus, renderStatus, rollbackOperation, stagedDirPath } from "./maintenance/operation.mjs";
 import { osmEnter as osmEnter52, osmExit as osmExit52, osmForward as osmForward52, removeMintPlans as removeMintPlans52, mintPlanBytes as mintPlanBytes52, stepCommitCheck as stepCommitCheck52, __sealCallCount as sealCallCount52, __resetSealCalls as resetSealCalls52 } from "./maintenance/owner-select-operation.mjs";
 import * as MOS from "./maintenance-owner-select.mjs";
@@ -17524,6 +17524,31 @@ test("真实 feishu-status：第五区报 run 通道的待发 / 卡住 / 账本�
   assert.match(leaked.stdout, /prefix_cccccccc….jsonl/u);
 });
 
+// ── PK3-L4：夹具的平台钉死（维护门/预检/体检）─────────────────────────────────────────────
+// **这些用例验的是维护门语义，不是平台。**
+//
+// 为什么必须显式钉：夹具造的假二进制是 launchctl（darwin 判据），而在 linux 宿主上
+// `timerKindFor(process.platform)` 会换成 systemd → `timers.mjs` 的沙箱守卫（home ≠ 真家目录
+// 且没注入 systemctl）当场把 `claude:timer` 判成 unverifiable → **预检拒进门**，整批用例在 Linux
+// 上红（my-herdr 在 omm 上实测：维护门 5/3、预检 1/4）。
+// systemd 那一路的语义由 `scripts/linux-install.test.mjs` 那组用例专门验（那里显式注入 platform:"linux"
+// + 假 systemctl）—— 两边不重复，也不靠"宿主恰好是哪个平台"。
+// 与 cc2cd 那批注入 platform 的写法同一纪律（PK3-L4）。
+const GATE_FIXTURE_PLATFORM = "darwin";
+
+/** 维护门夹具的 ctx：默认钉 darwin，调用方仍可显式覆盖 platform（要验别的平台就在这里给）。 */
+const gateContext = (fields) => maintenanceContext({ platform: GATE_FIXTURE_PLATFORM, ...fields });
+
+/**
+ * 夹具里的**子进程** env（安装器 / maintenance-gate CLI / doctor）：平台只能从环境进（它们没有
+ * --platform 参数），所以在这里补上——安装器照 darwin 写 plist，后续 launchd 判据才看得到同一份。
+ * 键名用产品导出的那一份（TIMER_PLATFORM_ENV），不在这里另写字面量：钉子与读取方不许漂。
+ * **只在沙箱 HOME 下生效**（PK3-L4-fix1）：夹具必须继续用夹具 HOME；指向真 HOME 的话这个变量会失效
+ * （产品改回 process.platform 并打一条「已忽略」提示）—— 那才是对的，生产不该被它改判据。
+ * 调用方给的字段优先（想验别的平台就在字段里自己写这个键）。
+ */
+const gateChildEnv = (fields = {}) => ({ ...process.env, [TIMER_PLATFORM_ENV]: GATE_FIXTURE_PLATFORM, ...fields });
+
 /**
  * 机器级体检的夹具：一台"机器"= 隔离 HOME + 三张表 + 若干项目目录。provider 脚本只打印，不写盘。
  * 返回 run()（真实入口子进程）与 snapshot()（整棵 HOME 的字节快照，钉只读）。
@@ -17595,7 +17620,9 @@ function doctorMachine({ installRuntime = false } = {}) {
   };
   const run = (extraEnv = {}, args = ["--json"]) => spawnSync(process.execPath, [path.resolve("scripts", "doctor.mjs"), ...args], {
     encoding: "utf-8", timeout: 120_000,
-    env: { ...process.env, HOME: home, FEISHU_BRIDGE_REGISTRY: files.registry, FEISHU_BRIDGE_ROUTES: files.routes,
+    // PK3-L4：体检夹具同样是 darwin 假 launchctl 的机器（假 job 用预期 ProgramArguments 报告自己）——
+    // 平台显式钉住，否则 linux 宿主上 ⑥ 走 systemd 分支、沙箱守卫把结论染成 incomplete。
+    env: { ...process.env, HOME: home, [TIMER_PLATFORM_ENV]: GATE_FIXTURE_PLATFORM, FEISHU_BRIDGE_REGISTRY: files.registry, FEISHU_BRIDGE_ROUTES: files.routes,
       FEISHU_BRIDGE_STATUS_PROVIDERS: files.providers, CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".codex", "feishu-bridge"),
       FEISHU_BRIDGE_MAINTENANCE_DIR: maintDir, FEISHU_BRIDGE_LEDGER_DIR: ledgerDir, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile,
       // R49-返修一（P1）：fixture 基础 env 显式置空 doctor 消费的另两个隔离点（空串 → 产品函数按 fake home 派生），
@@ -25699,7 +25726,7 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   assert.deepEqual(manifest.missing, []);
   for (const n of ["stop-hook.mjs", "inbound-hook.mjs", "init-hook.mjs", "bind-preview.mjs", "feishu-rotate.mjs", "drain-outbox.mjs", "watch-and-publish.mjs", "aily-inbound.mjs", "codex/prompt-hook.mjs", "codex/stop-hook.mjs", "codex/bind-task.mjs", "codex/drain-all.mjs", "doctor.mjs", "codex/doctor.mjs"]) assert.ok(manifest.entries.includes(n), "清单缺 " + n);
   // ── 沙箱真装（含空格 HOME）：收据在沙箱里、装完立刻对账通过、线上引用的脚本 ⊆ 清单；无关设置变化不挡，我们的 hook 变了才挡
-  const env = { ...process.env, HOME: home };
+  const env = gateChildEnv({ HOME: home });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
   const receipt = readInstalledSurface({ file: surface });
@@ -25741,7 +25768,7 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-c-"));
   const home = path.join(base, "home 带空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
@@ -25765,7 +25792,7 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-30T10:00:00.000Z");
   const crashAt = { id: null };
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   try {
     // ── 预检：干净沙箱通过；五种漂移各自点名拒绝、零改动
@@ -26120,7 +26147,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-d-"));
   const home = path.join(base, "home 带空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
@@ -26140,7 +26167,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T10:00:00.000Z");
   const crashAt = { id: null };
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const origVersion = verifyRuntimeB({ root: claudeRoot }).version;
   const claudeReceiptFile = path.join(home, ".claude", "feishu-bridge", "installed-surface.json");
@@ -28842,7 +28869,7 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -28862,7 +28889,7 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
   const crashAt = { id: null };
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ledgerop-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -29107,7 +29134,7 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -29126,7 +29153,7 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ledgercli-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -29373,7 +29400,7 @@ test("账本维护 R20 二轮：P1-4 阶段矩阵、P1-5 收据聚合、P1-1 顶
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -29392,7 +29419,7 @@ test("账本维护 R20 二轮：P1-4 阶段矩阵、P1-5 收据聚合、P1-1 顶
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r20-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -29552,7 +29579,7 @@ test("账本维护 R21 三轮：P1-1 gate 出口吞租约释放失败仍报已�
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -29571,7 +29598,7 @@ test("账本维护 R21 三轮：P1-1 gate 出口吞租约释放失败仍报已�
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r21-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -29703,7 +29730,7 @@ test("账本维护 R22 四轮：P1-1 回退保留完整 rb（active 清不掉不
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -29722,7 +29749,7 @@ test("账本维护 R22 四轮：P1-1 回退保留完整 rb（active 清不掉不
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r22-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -29851,7 +29878,7 @@ test("账本维护 R23 五轮：P1-1 聚合漂移（进行中 WAL 被滤掉仍�
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -29870,7 +29897,7 @@ test("账本维护 R23 五轮：P1-1 聚合漂移（进行中 WAL 被滤掉仍�
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r23-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -30007,7 +30034,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -30026,7 +30053,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r25-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -30690,7 +30717,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -30707,7 +30734,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
     const gateFile = path.join(base, "maintenance.gate"); const dir = path.join(base, "maintenance");
     let clock = Date.parse("2026-08-31T12:00:00.000Z");
-    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node,
+    const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node,
       launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000 });
     const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m1a-doctor-ledger-")));
     const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
@@ -30990,7 +31017,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -31006,7 +31033,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
     const gateFile = path.join(base, "maintenance.gate"); const dir = path.join(base, "maintenance");
     let clock = Date.parse("2026-08-31T12:00:00.000Z");
-    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node,
+    const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node,
       launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000 });
     const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "m1a-doctor-tpl-ledger-")));
     const savedTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE;
@@ -33147,7 +33174,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -33177,7 +33204,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
     let clock = Date.parse("2026-09-01T12:00:00.000Z");
     const crashAt = { id: null };
-    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+    const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
     const ledgerTmp45 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r45-ledger-")));
     const ledgerRoot = path.join(ledgerTmp45, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 }); // target "ledger/<ep>/…" 相对 bridgeHome = 账本根的父，根目录名固定叫 ledger；validateLedgerRoot 要 0700
     const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -33421,7 +33448,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -33450,7 +33477,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const EPb45 = legacyEndpointId({ runtime: "claude", agentUid: "r45_blockers" });
     const retired45 = () => [{ root: projR45, id: "p1", claude_session_id: "ps_" + "a".repeat(32), root_message_id: "om_" + "b".repeat(20), status: "retired" }];
     const flipTo = { retired: false }; // afterStep 钩子：expiry 写完后把 registry 换成 retired 现场（模拟 staging 后冒出新待修项）
-    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (flipTo.retired === true && id === "written:sidecar:expiry:" + EPb45) { flipTo.retired = "done"; writeRegistry45(retired45()); } } });
+    const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (flipTo.retired === true && id === "written:sidecar:expiry:" + EPb45) { flipTo.retired = "done"; writeRegistry45(retired45()); } } });
     const ledgerTmp45 = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r45-blockers-")));
     const ledgerRoot = path.join(ledgerTmp45, "ledger"); fs.mkdirSync(ledgerRoot, { mode: 0o700 });
     const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -33506,7 +33533,7 @@ test("R46：init 门内自建 0700 账本根（父净、根缺席）→ 建根�
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -33524,7 +33551,7 @@ test("R46：init 门内自建 0700 账本根（父净、根缺席）→ 建根�
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = path.join(fs.realpathSync(path.join(home, ".claude", "feishu-bridge")), "ledger"); // 生产路径：父净、根缺席（realpath 父目录，避 /var→/private/var）
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -33652,7 +33679,7 @@ test("R46 返修 P1-1/P2：已初始化重跑不留空根（P2）；ledger_reope
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -33670,7 +33697,7 @@ test("R46 返修 P1-1/P2：已初始化重跑不留空根（P2）；ledger_reope
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND\n" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const ledgerRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p11-ledger-")));
   const savedLedgerDir = process.env.FEISHU_BRIDGE_LEDGER_DIR; process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot;
@@ -33746,7 +33773,7 @@ test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -33763,7 +33790,7 @@ test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 
   const fakePs = () => ({ ok: true, stdout: "  PID  PPID COMMAND" });
   const gateFile = path.join(base, "maintenance.gate"), dir = path.join(base, "maintenance");
   let clock = Date.parse("2026-08-31T12:00:00.000Z");
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: () => {} });
   const prevTpl = process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE; process.env.FEISHU_BRIDGE_CHAIN_TEMPLATE = path.join(base, "no-template.json");
   const lrootBase = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r46p12w-ledger-")));
   const lroot = path.join(lrootBase, "ledger"); // 父在场、根缺席 → 走建根路径
@@ -38900,7 +38927,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r52-")));
     const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const ienv = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+    const ienv = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
     execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
     execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
@@ -38920,7 +38947,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     let clock = Date.parse(T052);
     const problems = [];
     let crashSeen = 0, crashHit = false;
-    const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => {
+    const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => {
       // ⑦ 每个提交点断言 journalProblem === null（不只终态）
       const act = readActive({ dir });
       if (act.state === "active") {
@@ -50944,7 +50971,7 @@ const r69Fixture = (tag, { inHome = false } = {}) => {
   const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge };
+  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -50985,7 +51012,7 @@ const r69Fixture = (tag, { inHome = false } = {}) => {
   env.FEISHU_BRIDGE_LEDGER_DIR = ledgerRoot; env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile; env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
   const savedGateEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_GATE; process.env.FEISHU_BRIDGE_MAINTENANCE_GATE = gateFile;
   const savedMaintDirEnv = process.env.FEISHU_BRIDGE_MAINTENANCE_DIR; process.env.FEISHU_BRIDGE_MAINTENANCE_DIR = dir;
-  const ctx = maintenanceContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
+  const ctx = gateContext({ home, codexHome, codexBridgeHome: codexBridge, repoRoot: path.resolve("."), node, launchctl: fakeLaunchctl, ps: fakePs, sleep: () => { clock += 5000; }, now: () => clock, dir, gateFile, domain: "gui/501", stepMs: 5000, afterStep: (id) => { if (crashAt.id === id) throw Object.assign(new Error("crash"), { simulatedCrash: true }); } });
   const journalOf = (token) => readJournal({ dir, token }).doc;
   const settle = (token) => {
     fs.rmSync(gateFile, { force: true });

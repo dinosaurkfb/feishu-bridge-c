@@ -13,7 +13,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, timerKindFor } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, resolveTimerPlatform, timerKindFor, timerPlatform, TIMER_PLATFORM_ENV } from "./drain-schedule.mjs";
 import { claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan } from "./install-projection.mjs";
 import { runDoctor } from "./doctor.mjs";
 import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
@@ -792,4 +792,74 @@ test("PK3-L3 预检与维护门：Linux + loaded 下正常进门，停定时器�
   assert.equal(ex.ok, true, "成功出门：" + JSON.stringify(ex));
   assert.equal(ex.phase, "rolled_back");
   assert.ok(sysCalls.some((a) => a.includes("daemon-reload") || a.includes("start")), "出门恢复了定时器：" + JSON.stringify(sysCalls));
+});
+
+// ── PK3-L4-fix1（Codex 一轮 P1）：平台隔离点只在受验测试沙箱里生效 ──────────────────────────
+// 修前：`timerPlatform(env)` 无条件读 env → 生产入口（安装器 / doctor / 维护门 / 预检）里
+// 留一个 `FEISHU_BRIDGE_TIMER_PLATFORM=linux` 就能让 Mac 改走 systemd（反之亦然），而它改的是
+// **协议、路径与落盘对象**，不只是「用哪个二进制」——四个面共享同一个错值只会让错误彼此「对得上」。
+
+test("fix1/P1-1 真 HOME 下一律 process.platform（env=linux 也忽略）并有提示；沙箱 HOME 才认它、值不封闭则抛", () => {
+  const realHome = os.userInfo().homedir;
+  const sandbox = path.join(os.tmpdir(), "pk3-l4-fix1-sandbox");
+  const warns = [];
+  const warn = (m) => warns.push(m);
+
+  // ① 真 HOME + env=linux → 仍 process.platform（Mac 上就是 darwin）。
+  //    **修前红**：旧实现返回 "linux"，于是同一台 Mac 会去写/查 systemd 单元。
+  const real = resolveTimerPlatform({ env: { [TIMER_PLATFORM_ENV]: "linux" }, home: realHome, warn });
+  assert.equal(real.platform, process.platform, "真 HOME 下这个变量不许改判据：" + JSON.stringify(real));
+  assert.deepEqual([real.injected, real.ignored], [false, true], JSON.stringify(real));
+  assert.equal(warns.length, 1, "忽略必须说出来（不静默）：" + JSON.stringify(warns));
+  assert.match(warns[0], /已忽略/u);
+  assert.match(warns[0], new RegExp(TIMER_PLATFORM_ENV, "u"));
+  assert.match(warns[0], /linux/u, "提示要点名忽略了什么值");
+
+  // ② 沙箱 HOME（与 launchctl / systemctl 注入同一判据）才认它，值封闭内照用
+  const boxed = resolveTimerPlatform({ env: { [TIMER_PLATFORM_ENV]: "linux" }, home: sandbox, realHome, warn });
+  assert.deepEqual([boxed.platform, boxed.injected, boxed.ignored], ["linux", true, false], JSON.stringify(boxed));
+  assert.equal(resolveTimerPlatform({ env: { [TIMER_PLATFORM_ENV]: "darwin" }, home: sandbox, realHome, warn }).platform, "darwin");
+  assert.equal(warns.length, 1, "生效时不再提示");
+
+  // ③ 沙箱 + 值不封闭 → **抛**（旧行为是原样接受 → timerKind=null → 安静地不装定时器）
+  assert.throws(() => resolveTimerPlatform({ env: { [TIMER_PLATFORM_ENV]: "win32" }, home: sandbox, realHome, warn }),
+    /darwin \/ linux/u, "沙箱里的非法值必须抛");
+  assert.throws(() => resolveTimerPlatform({ env: { [TIMER_PLATFORM_ENV]: "Darwin" }, home: sandbox, realHome, warn }), /darwin \/ linux/u);
+
+  // ④ 真 HOME + 值不封闭 → **不抛**（生产不许被这个变量弄崩：它本来就不该被读），只忽略
+  const junk = resolveTimerPlatform({ env: { [TIMER_PLATFORM_ENV]: "win32" }, home: realHome, warn });
+  assert.deepEqual([junk.platform, junk.ignored], [process.platform, true], JSON.stringify(junk));
+
+  // ⑤ 未设 / 空串 → process.platform，且不提示
+  assert.deepEqual([
+    timerPlatform({ env: {}, home: sandbox, realHome, warn }),
+    timerPlatform({ env: { [TIMER_PLATFORM_ENV]: "" }, home: sandbox, realHome, warn }),
+  ], [process.platform, process.platform]);
+  assert.equal(warns.length, 2, "只有那两条真-HOME 提示：" + JSON.stringify(warns));
+});
+
+test("fix1/P1-1 四个调用点传的是**当下 home**：沙箱 home 下 env 生效、把 home 丢掉就红（产品入口）", () => {
+  // 这条钉的是接线：调用点若只写 `timerPlatform()`（默认 home = 真家目录），夹具的沙箱 home 就白给了
+  // —— 下面的 "linux" 会变成 process.platform。
+  const realHome = os.userInfo().homedir;
+  const sandbox = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "pk3l4fix1-"));
+  const saved = process.env[TIMER_PLATFORM_ENV];
+  process.env[TIMER_PLATFORM_ENV] = "linux";
+  try {
+    // 维护门 ctx（operation.maintenanceContext）
+    assert.equal(maintenanceContext({ home: sandbox }).platform, "linux", "维护门要走当下 home 判沙箱");
+    // precheck 的两处（chainFacts / precheckStartupSources）
+    assert.equal(chainFacts({ chain: "claude", home: sandbox }).timer.kind, "systemd", "chainFacts 要按当下 home 判沙箱");
+    assert.equal(precheckStartupSources({ home: sandbox, codexHome: path.join(sandbox, ".codex"), repoRoot: REPO, launchctl: () => ({ ok: false, detail: "Could not find service" }) }).chains.claude.facts.timer.kind,
+      "systemd", "precheckStartupSources 要按当下 home 判沙箱");
+    // doctor：不传 platform 参数、只给 env（走的就是 env 那条路）
+    const fx = linuxDoctorFixture();
+    const six = runDoctor({ home: fx.home, systemctl: fakeSystemctl({ show: fx.projectedShow }).fn, registryFile: fx.registryFile })
+      .checks.find((c) => c.id === "backlog_vs_publisher");
+    assert.match(six.detail, /systemd --user/u, "doctor 要按当下 home 读 env：" + six.detail);
+  } finally {
+    if (saved === undefined) delete process.env[TIMER_PLATFORM_ENV]; else process.env[TIMER_PLATFORM_ENV] = saved;
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+  assert.equal(realHome, os.userInfo().homedir, "没动真家目录");
 });

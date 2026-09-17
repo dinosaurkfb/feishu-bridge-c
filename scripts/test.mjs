@@ -17740,7 +17740,7 @@ test("doctor：runDoctor({home}) 的三张表路径与 Codex 子进程环境都�
   assert.deepEqual(machineContext({ home: m.home }).codexEnv.CODEX_HOME, path.join(m.home, ".codex"), "Codex 子进程环境同样从 home 派生");
 });
 
-test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 launchctl 则 incomplete、退出码 2（真实进程）", () => {
+test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允许 → incomplete/2，darwin 上 ready/0）；沙箱里不注入 launchctl 则 incomplete、退出码 2（真实进程）", () => {
   const m = doctorMachine({ installRuntime: true });
   const good = m.project("good", { expiresAt: "2099-01-01T00:00:00.000Z" });
   m.writeTables({
@@ -17783,13 +17783,33 @@ test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 l
   // ready 需要 ② 也 pass —— 显式 --probe-providers（这里的 provider 只打印）。
   const r = m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }, ["--json", "--probe-providers"]);
   const report = doctorReport(r);
-  assert.equal(report.overall, "ready", JSON.stringify(report.checks.filter((c) => c.ok !== true)));
-  assert.equal(r.status, 0);
-  assert.equal(checkOf(report, "codex_drain").ok, true, checkOf(report, "codex_drain").detail);
+  // PK3-L5：「好机器」的判据是**没有 fail**（三态约定：unknown 既不算通过也不算故障）。
+  // PK3-L5-fix1（Codex 一轮 P1）：**期望值按平台钉死，不许由实际观测值反推** ——
+  //   上一版写 `expectOverall = codexDrain.ok === null ? "incomplete" : "ready"`，于是 darwin 上
+  //   Codex 侧从 true 退化成 null 时，用例会顺势期待 incomplete/2 并继续绿（同义反复，什么都拦不住）。
+  //   现在：darwin = 真跑 Codex launchd 判据 → 必须 pass / 全绿 / 无 unknown 项；
+  //         非 darwin = Codex 侧只在 darwin 有 launchd 实现（PK3-L2 报「本平台尚未实现」）→
+  //         恰为 null，且**别的项都必须有明确结论**（null 集恰为 {codex_drain}）。
+  //   unknown 的判据与 `summarizeDoctorChecks` 逐字同一条：ok !== true && ok !== false。
+  const codexDrain = checkOf(report, "codex_drain");
+  const failedChecks = report.checks.filter((c) => c.ok === false);
+  const unknownIds = report.checks.filter((c) => c.ok !== true && c.ok !== false).map((c) => c.id).sort();
+  assert.deepEqual(failedChecks, [], "好机器不许有 fail 项：" + JSON.stringify(failedChecks));
+  const expectOverall = process.platform === "darwin" ? "ready" : "incomplete";
+  if (process.platform === "darwin") {
+    assert.equal(codexDrain.ok, true, "darwin 上 Codex 侧兜底定时器必须 pass（假 launchctl 报告的就是我们那份）：" + codexDrain.detail);
+    assert.deepEqual(unknownIds, [], "darwin 上不该有任何 unknown 项：" + JSON.stringify(report.checks.filter((c) => c.ok !== true)));
+  } else {
+    assert.equal(codexDrain.ok, null, "非 darwin 上 Codex 侧必须是不适用（null）——不许 pass 也不许 fail：" + codexDrain.detail);
+    assert.deepEqual(unknownIds, ["codex_drain"], "非 darwin 上 unknown 项有且只有 Codex 侧那一项（别的项都得有明确结论）：" + JSON.stringify(unknownIds));
+  }
+  assert.equal(report.overall, expectOverall, JSON.stringify(report.checks.filter((c) => c.ok !== true)));
+  assert.equal(r.status, expectOverall === "ready" ? 0 : 2, "退出码跟着结论（0 ready / 2 incomplete）：" + r.stderr);
   assert.match(checkOf(report, "backlog_vs_publisher").detail, /已加载/u);
   assert.deepEqual(report.next, []);
   assert.equal(m.snapshot(), before, "只读");
-  assert.match(m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }, ["--probe-providers"]).stdout, /结论：ready/u);
+  assert.match(m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }, ["--probe-providers"]).stdout,
+    new RegExp("结论：" + expectOverall, "u"));
   // 注入了 launchctl，但 Codex 侧 plist 不在、launchd 也没它 → Codex 体检说"未启用"（ok null）→ 这里必须也是 unknown，不许折成 pass。
   fs.rmSync(JSON.parse(gen.stdout).expect ? path.join(m.home, "Library", "LaunchAgents", label + ".plist") : "", { force: true });
   fs.writeFileSync(fake, fs.readFileSync(fake, "utf-8").replace("if (label === " + JSON.stringify(label) + ")", "if (false)"));
@@ -17812,10 +17832,15 @@ test("doctor：好机器 —— 全部 pass、退出码 0；沙箱里不注入 l
   assert.match(checkOf(rOther, "backlog_vs_publisher").detail, /参数不是当前这份/u);
   // 明确没有这个 job（plist 写了没加载）→ ⑥ fail。
   fs.writeFileSync(fake, fs.readFileSync(fake, "utf-8").split("\n").filter((l) => !l.includes(JSON.stringify(CLAUDE_DRAIN_LAUNCH_LABEL))).join("\n"));
-  const r3 = doctorReport(m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper }));
+  const r3Proc = m.run({ FEISHU_BRIDGE_LAUNCHCTL: wrapper });
+  const r3 = doctorReport(r3Proc);
   assert.equal(checkOf(r3, "backlog_vs_publisher").ok, false, checkOf(r3, "backlog_vs_publisher").detail);
   assert.match(checkOf(r3, "backlog_vs_publisher").detail, /积压 1 条：late（outbox 1 条）；兜底定时器 .*没被 launchd 加载/u);
   assert.equal(r3.overall, "blocked");
+  // PK3-L5 反例：**放宽的只是 null** —— 同一台机器上出现一个 ok:false 就必须 blocked / 退出码 1。
+  const r3Fails = r3.checks.filter((c) => c.ok === false);
+  assert.ok(r3Fails.length > 0, "blocked 的成因必须是 fail 项（不许是不适用/unknown 项）：" + JSON.stringify(r3.checks.filter((c) => c.ok !== true)));
+  assert.equal(r3Proc.status, 1, "blocked → 退出码 1：" + r3Proc.stderr);
 });
 
 test("doctor：⑫ 订阅对账 —— store/审计三态 × 对账；未启用段自身绿、不把整体染红；待补记指路；只读；不泄 locator（真实进程）", () => {

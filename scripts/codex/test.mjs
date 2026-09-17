@@ -185,6 +185,28 @@ const SUITE_HOME = installTestHomeIsolation();
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "feishu-codex-adapter-test-"));
 
 /**
+ * **darwin/launchd 语义用例的守卫**（PK3-L5）：非 darwin 上打印跳过原因并 return true（用例开头 `if (skipDarwinSemantics("…")) return;`）。
+ *
+ * 哪些用例要它：验的是 launchd 的**语义**的那些 —— 假 launchctl 脚本、plist 三种未知态、
+ * bootout/bootstrap 的实参、以及"控制面只许通过注入口被碰"。Codex 侧**只在 darwin 有 launchd 实现**
+ * （PK3-L2：非 darwin 启停入口与状态入口当场短路成「本平台尚未实现」，不探 launchd），
+ * 所以非 darwin 上跑这些用例，测到的不是产品行为，而是"假 launchctl 没被调用"这件事本身 —— 没有意义。
+ *
+ * 为什么是守卫而不是给 CLI 加 `--platform` 入参：这 8 条**都 spawn 真 CLI**
+ * （argv 解析、退出码、注入口"测试不许读真实控制面"只能这样验），而 PK3-L2 是**有意**删掉
+ * `FEISHU_BRIDGE_PLATFORM / FEISHU_BRIDGE_TIMER_PLATFORM` 读取的（平台只认显式入参）——
+ * 为了跑测试把这个口子加回去，等于把刚拆掉的生产可达覆盖装回来。
+ * 进程内的 `runDrainService(argv, { platform })` / `drainTimerCheck({ platform })` 入参仍然可用，
+ * 平台无关的那部分由 PK3-L2 的用例覆盖；darwin 语义只在 darwin 宿主上跑（本项目的 Codex 侧
+ * 本来就只跑在 Mac 上）。
+ */
+const skipDarwinSemantics = (what) => {
+  if (process.platform === "darwin") return false;
+  console.log("  跳过：darwin 语义用例（" + what + "；Codex 侧只在 darwin 有 launchd 实现，本平台无此行为可验）");
+  return true;
+};
+
+/**
  * 一条**真实形状**的 outbox 记录。
  *
  * 以前各处夹具写的是 `{ kind, text, published_at: null }` —— 而真实记录
@@ -3887,6 +3909,7 @@ test("三态要校验字段类型 —— 畸形 published_at 不许被当成已�
 });
 
 test("停用：卸载失败不许删 plist —— 还在跑的定时器不能被显示成「未启用」", () => {
+  if (skipDarwinSemantics("卸载失败不删 plist")) return;
   // 评审实测：上一版是"卸载失败也照删 plist"。后果有两层 ——
   // 旧 job 可能还在跑，而 plist 一删，下次查状态就报 absent。
   // **一个还在跑的定时器被显示成「未启用」，比报错更糟。**
@@ -3945,6 +3968,7 @@ test("时间串走规范校验 —— 纯空白和乱写的都不算合法状态
 });
 
 test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 list", () => {
+  if (skipDarwinSemantics("launchd 查不出来时只许一次只读 list")) return;
   // 评审指出：unverifiable 那道门槛**没有测试钉着** —— 单独删掉它，
   // 整套仍然 135/135 全绿。产品行为当时是对的，但"对"没有守卫就守不住。
   //
@@ -3997,6 +4021,7 @@ test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 li
 });
 
 test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打断正在进行的排空", () => {
+  if (skipDarwinSemantics("健康运行时 --enable 是无操作")) return;
   // 评审的非阻断建议，我当成安全问题做了：无条件 bootout → bootstrap
   // **可能打断一次正在进行的排空**。幂等重跑不该有副作用。
   const dir = temp();
@@ -4048,6 +4073,7 @@ test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打�
 });
 
 test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不许被调用", () => {
+  if (skipDarwinSemantics("plist 读不出来时零调用")) return;
   // 评审实测：上一版启用路径先 bootout、再写盘才抛 EISDIR ——
   // **退出码是 1，可 launchd 控制面已经被动过**。
   // 报错报对了、事情办坏了，跟停用那条是同一种病。
@@ -4099,6 +4125,7 @@ test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不�
 });
 
 test("plist 读不出来不许当成「未启用」", () => {
+  if (skipDarwinSemantics("plist 读不出来 ≠ 未启用")) return;
   // 评审实测：把 plist 路径做成目录，状态仍显示"未启用"，
   // 停用命令还会说"本来就没启用"。**读不出来不等于没有** ——
   // 这条道理我在登记表、outbox 上都写过，这是第三处。
@@ -5496,6 +5523,7 @@ test("loadedPhase 与 absentJob 必须共用同一份缺席判据", () => {
 });
 
 test("没有 plist 时的三种可能：absent / orphan / unverifiable，查不清不许报 orphan", () => {
+  if (skipDarwinSemantics("plist 缺席三态")) return;
   // 评审：查不清就报 orphan，等于声称一件没查过的事 —— 而 orphan 是"还在跑"，
   // 会把人引去做一次不必要的卸载。
   const dir = temp();
@@ -5534,6 +5562,7 @@ test("没有 plist 时的三种可能：absent / orphan / unverifiable，查不�
 });
 
 test("launchctl 必须走注入口 —— 测试不许读真实控制面", () => {
+  if (skipDarwinSemantics("注入口不被绕过")) return;
   // 评审实测：同一份代码在我这里 127/127、在他那里 125/127，
   // 因为两条回归隔离了 HOME 却没隔离 launchd 域。
   // **这条钉的是注入口本身存在且被尊重。**
@@ -5905,6 +5934,7 @@ test("plist 里的路径必须 XML 转义", () => {
 });
 
 test("launchd 加载失败必须非零退出 —— 不许报成「已启用」", () => {
+  if (skipDarwinSemantics("bootstrap 失败非零退出")) return;
   // **兜底是最后一道，它悄悄不工作没有第二处会发现。**
   // plist 写了但 bootstrap 失败时报成功，就是"界面说正常、实际不跑"。
   const dir = temp();

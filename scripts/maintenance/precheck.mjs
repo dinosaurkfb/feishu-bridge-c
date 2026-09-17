@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { CLAUDE_DRAIN_SYSTEMD_UNIT, claudeDrainPlist, claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, claudeSettingsOwnedEntries } from "../install-projection.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor } from "../drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor, timerPlatform } from "../drain-schedule.mjs";
 import { compareInstalledSurface, installedSurfacePath, readInstalledSurface } from "../installed-surface.mjs";
 import { codexRuntimeRoot, runtimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { defaultRouteHandler } from "../inbound-routes.mjs";
@@ -35,7 +35,7 @@ const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return nu
 const readTextOrNull = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } };
 
 /** 一条链的固定事实（路径与投影），预检与 operation 共用。 */
-export function chainFacts({ chain, home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), node = pickClaudeNode(), platform = process.platform } = {}) {
+export function chainFacts({ chain, home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, ".codex"), codexBridgeHome = codexBridgeHomeOf(), node = pickClaudeNode(), platform = timerPlatform() } = {}) {
   if (chain === "claude") {
     const root = runtimeRoot(home, "claude");
     const kind = timerKindFor(platform);
@@ -220,7 +220,7 @@ export function precheckStartupSources({
   node = pickClaudeNode(),
   launchctl = spawnLaunchctl,
   systemctl = null,
-  platform = process.platform,
+  platform = timerPlatform(),
 } = {}) {
   const manifest = maintenanceEntryManifest({ repoRoot, home, codexHome, bridgeHome: codexBridgeHome });
   const chains = {};

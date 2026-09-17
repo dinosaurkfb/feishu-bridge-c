@@ -149,6 +149,18 @@ export function timerKindFor(platform = process.platform) {
   return null;
 }
 
+/**
+ * 「定时器平台」的**唯一来源**（PK3-L4）。生产 = `process.platform`；`FEISHU_BRIDGE_TIMER_PLATFORM`
+ * 是测试隔离点（与 FEISHU_BRIDGE_SYSTEMCTL / FEISHU_BRIDGE_LAUNCHCTL 同一口径）：换掉它就能在 macOS 上
+ * 走 linux 分支（或反过来，让与平台无关的夹具在 linux 宿主上仍然走 darwin —— PK3-L4 钉的就是这个）。
+ *
+ * 为什么要有它：平台会决定**判据**（launchd 的 plist 字节 vs systemd 的两份 unit + `systemctl show`），
+ * 而这些入口里有几个只能从环境拿（安装器与 maintenance-gate 的 CLI 都没有 --platform）。夹具自己的
+ * `platform` 参数仍然是首选；这里只保证「拿不到参数时读到的是同一份、可注入的平台」。
+ */
+export const TIMER_PLATFORM_ENV = "FEISHU_BRIDGE_TIMER_PLATFORM";
+export const timerPlatform = (env = process.env) => env[TIMER_PLATFORM_ENV] || process.platform;
+
 /** launchd 里**应该**跑的东西：node + runtime/current 的 drain-outbox.mjs --all。跟 plist 同源。 */
 export function claudeDrainExpectedJob({ home = os.homedir(), node = pickClaudeNode() } = {}) {
   return { node, args: [node, runtimeScript("drain-outbox.mjs", home, "claude"), "--all"] };

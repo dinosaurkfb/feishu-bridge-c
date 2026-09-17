@@ -56,10 +56,13 @@ export function resolveNodeForHooks({
     }
     return out;
   };
-  // 顺序（PK3-L1-fix1 P1-1）：显式 → **仍有效的已安装路径** → 平台惯用位置 → PATH → ~/.local/bin。
+  // 顺序（PK3-L1-fix1 P1-1，PK3-L2-fix1 P2-1 按实际平台化顺序校准）：
+  //   darwin：显式 env → 已安装 → /opt/homebrew → /usr/local → PATH → ~/.local/bin
+  //   linux ：显式 env → 已安装 → mise shim → PATH → /usr/local → ~/.local/bin
   // 为什么 installed 排在 PATH 前面：Mac 现网 PATH 先命中 ~/.local/bin/node（第三方装的），
   //   而三条已安装 hook 用的是 /opt/homebrew/bin/node —— 按 PATH 优先会**改写现网**，还会让
-  //   doctor / 维护预检把原本正确的 job 报成“参数不符”。linux 才让 PATH shim 优先（mise 切版本后 shim 不变）。
+  //   doctor / 维护预检把原本正确的 job 报成“参数不符”。linux 让 mise shim 优先于 PATH
+  //   （mise 重写子进程 PATH，先命中的是 installs 真身；shim 不随版本变）。
   const candidates = [];
   if (typeof installed === "string" && installed.length > 0) candidates.push(installed);
   if (platform === "linux") {

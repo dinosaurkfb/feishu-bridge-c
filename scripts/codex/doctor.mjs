@@ -11,7 +11,7 @@ import { defaultRouteHandler } from "../inbound-routes.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { acceptsHookCommand, ownsHookCommand, pickNode } from "./hook-command.mjs";
 import { SKILL_NAMES, auditSkills } from "./skill-content.mjs";
-import { PHASE_TEXT, drainTimerText, serviceState } from "./drain-service.mjs"; // drainTimerText：PK3-L2 文案按平台
+import { drainTimerCheck } from "./drain-service.mjs"; // PK3-L2-fix1：兜底排空检查（平台化，非 darwin 不探测）
 
 import {
   bridgeHome, loadCodexTemplate, loadRegistry, registryFile,
@@ -211,24 +211,12 @@ add("task 登记表", registry.ok,
 const failed = (check) => check.ok === false;
 // 调度器状态单独报，而且**未启用不算故障** —— 那是安装后的默认态。
 // 把它报成故障，人就会去"修"一件本来就该这样的事。
-try {
-  const svc = serviceState();
-  // 四态各自的判定：**只有真的被 launchd 加载了才算通过**。
-  // plist 写了没加载是故障（定时器不会跑）；未启用和查不出来都是 null。
-  const ok = svc.phase === "loaded" ? true
-    : (svc.phase === "stale" || svc.phase === "installed_not_loaded" ||
-       svc.phase === "loaded_other" || svc.phase === "orphan" ||
-       svc.phase === "plist_unreadable") ? false
-    : null;
-  // PK3-L2：文案按平台出 —— linux 上不再出现「launchd 状态查不出来」这种误导。
-  const kindLine = drainTimerText() + "。";   // PK3-L2：文案按平台，同一处派生（drain-service 库）
-  add("兜底排空", ok,
-    kindLine + (PHASE_TEXT[svc.phase] ?? svc.phase) +
-      (svc.phase === "absent" && svc.backlog.ok && svc.backlog.total > 0
-        ? "；还有 " + svc.backlog.total + " 条历史积压未分类" : ""),
-    ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null);
-} catch (err) {
-  add("兜底排空", null, drainTimerText() + "；状态读不出来（" + err.message + "）");
+// PK3-L2-fix1 P1：兜底排空检查收进 drain-service 的 drainTimerCheck（可注入 platform 与
+//   launchd 探测）—— **非 darwin 不探测 launchd**（不读 LaunchAgents、不 spawn launchctl），
+//   直接报「尚未实现」；darwin 四态映射照旧。诊断里不再出现「launchd 状态查不出来」的 Linux 误导。
+{
+  const c = drainTimerCheck({ platform: process.platform });
+  add(c.name, c.ok, c.detail, c.next);
 }
 
 /**

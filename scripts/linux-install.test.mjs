@@ -31,7 +31,7 @@ test("timerKindFor：darwin launchd / linux systemd / 其它 null（明说没实
   assert.equal(timerKindFor("freebsd"), null);
 });
 
-test("resolveNodeForHooks：FEISHU_BRIDGE_NODE → PATH → /opt/homebrew → /usr/local → ~/.local/bin；都不用 execPath", () => {
+test("resolveNodeForHooks 平台化顺序：darwin 显式→已安装→/opt/homebrew→/usr/local→PATH→~/.local/bin；linux 显式→已安装→mise shim→PATH→/usr/local→~/.local/bin；都不用 execPath", () => {
   const home = "/home/dinosak";
   const shim = "/home/dinosak/.local/share/mise/shims/node";
   // ① 显式指定优先

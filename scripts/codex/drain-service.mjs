@@ -257,11 +257,31 @@ const PHASE_BLOCKS = {
  *  其它说未实现。omm 实测：linux 上 Claude 侧 ⑥ 文案已正确，Codex 侧这行仍是
  *  「launchd 状态查不出来」—— Linux 上误导。kind 由 drain-schedule.timerKindFor 同一份派生。
  *  住库不放 doctor：doctor 是顶层执行脚本，import 它会把整份体检（含 process.exitCode=1）带进测试。 */
+/** PK3-L2-fix1 P1：兜底排空检查（可注入 platform 与 launchd 探测函数，doctor 与用例共用）。
+ *  **非 darwin 不探测**：不读 LaunchAgents、不 spawn launchctl、不核 plist —— Codex 侧没有
+ *  systemd 实现，`timerKindFor("linux")` 描述的是 Claude 侧定时器能力，不能拿来声称 systemd；
+ *  直接报「尚未实现」（不是未启用、不是查不清），状态记 null。启停入口（main 的 enable/disable）
+ *  同样在非 darwin 明确拒绝。 */
+export function drainTimerCheck({ platform = process.platform, serviceStateFn = serviceState } = {}) {
+  if (platform !== "darwin") {
+    return { name: "兜底排空", ok: null, detail: drainTimerText({ platform }), next: null };
+  }
+  const svc = serviceStateFn();
+  const ok = svc.phase === "loaded" ? true
+    : (svc.phase === "stale" || svc.phase === "installed_not_loaded" ||
+       svc.phase === "loaded_other" || svc.phase === "orphan" ||
+       svc.phase === "plist_unreadable") ? false
+    : null;
+  return { name: "兜底排空", ok, detail: (PHASE_TEXT[svc.phase] ?? svc.phase), next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
+}
+
 export function drainTimerText({ platform = process.platform } = {}) {
-  const kind = timerKindFor(platform);
-  if (kind === "systemd") return "兜底定时器（systemd --user）—— 与 Claude 侧同一套按平台判定";
-  if (kind === "launchd") return "兜底定时器（launchd）—— " + PHASE_TEXT.unverifiable;
-  return "兜底定时器在本平台没有实现（timerKind=null）";
+  // PK3-L2-fix1 P1：**只在 darwin 有 launchd 实现** —— 非 darwin 不许声称 systemd（那是 Claude 侧
+  //  的能力，Codex 侧没有），也不许探 launchd。Codex systemd 定时器另单实现。
+  if (platform !== "darwin") {
+    return "Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— 启停入口也已拒绝，不会去探 launchd";
+  }
+  return "兜底定时器（launchd）—— " + PHASE_TEXT.unverifiable;
 }
 
 export function enableBlockers(state) {
@@ -303,6 +323,13 @@ function main() {
   if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
   if (enable && disable) {
     console.error("--enable 和 --disable 只能给一个。");
+    process.exit(1);
+  }
+
+  // PK3-L2-fix1 P1：非 darwin 直接拒（在 serviceState 探测 launchd **之前**）——
+  //   Codex 侧没有 systemd 实现，启停在 Linux 上既不可用也不该去探 launchd。
+  if (process.platform !== "darwin" && (enable || disable)) {
+    console.error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— enable / disable 在这里不可用。");
     process.exit(1);
   }
 

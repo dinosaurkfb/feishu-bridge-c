@@ -18,7 +18,7 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
 } from "./drain-service.mjs";
-import { drainTimerText } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台
+import { drainTimerCheck, drainTimerText } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台
 import {
   classifyOutboxRecord, codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
@@ -10507,14 +10507,31 @@ test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext �
 });
 
 // ── PK3-L2：Codex 侧兜底定时器文案按平台（注入 platform 钉）──
-test("PK3-L2 兜底排空文案按平台：linux 说 systemd --user（不说 launchd）、darwin 说 launchd、其它说未实现", () => {
+test("PK3-L2-fix1 兜底排空文案按平台：非 darwin 一律「尚未实现」（不说 systemd、无 launchd 状态词）；darwin 说 launchd", () => {
   const linux = drainTimerText({ platform: "linux" });
-  assert.match(linux, /systemd --user/u, linux);
-  assert.doesNotMatch(linux, /launchd/u, linux);
+  assert.match(linux, /尚未实现/u, linux);
+  assert.doesNotMatch(linux, /systemd/u, "不许声称 systemd（那是 Claude 侧能力）：" + linux);
+  assert.doesNotMatch(linux, /launchd 状态/u, "不用 launchd 状态词：" + linux);
   const darwin = drainTimerText({ platform: "darwin" });
   assert.match(darwin, /launchd/u, darwin);
   const other = drainTimerText({ platform: "win32" });
-  assert.match(other, /没有实现|未实现/u, other);
+  assert.match(other, /尚未实现/u, other);
+});
+
+test("PK3-L2-fix1 P1：linux 不探 launchd、报尚未实现（launchctl 调用次数 0）；darwin 照旧探测", () => {
+  let calls = 0;
+  const countingServiceState = () => { calls += 1; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
+  const linux = drainTimerCheck({ platform: "linux", serviceStateFn: countingServiceState });
+  assert.equal(calls, 0, "linux 下 launchd 探测（注入的 serviceStateFn）从未被调用：" + JSON.stringify(linux));
+  assert.match(linux.detail, /尚未实现/u, linux.detail);
+  assert.doesNotMatch(linux.detail, /systemd/u, "不许声称 systemd：" + linux.detail);
+  assert.doesNotMatch(linux.detail, /launchd 状态/u, "不许用 launchd 状态词：" + linux.detail);
+  // darwin 照旧：探测一次、四态映射不变
+  calls = 0;
+  const darwin = drainTimerCheck({ platform: "darwin", serviceStateFn: countingServiceState });
+  assert.equal(calls, 1, "darwin 照旧探测一次");
+  assert.equal(darwin.ok, null, "unverifiable → null（照旧）：" + JSON.stringify(darwin));
+  assert.match(darwin.detail, /launchd 状态查不出来/u, darwin.detail);
 });
 
 sealSummary();

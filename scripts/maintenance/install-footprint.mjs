@@ -26,6 +26,7 @@ import { timerKindFor } from "../drain-schedule.mjs";
 import { codexRuntimeRoot, runtimeRoot } from "../runtime-install.mjs";
 import { SKILLS as CODEX_SKILLS } from "../codex/skill-content.mjs";
 import { codexHooksOwnedEntries } from "../codex/hook-command.mjs";
+import { bridgeHome, codexHomeOf as codexHomeOfValidated } from "../codex/state.mjs";
 import { plistPath as codexDrainPlistPath } from "../codex/drain-service.mjs";
 
 /** 存在性判据一律用 lstat：**断链的符号链接（dangling symlink）也算在**（fix1 P1-1：existsSync 会漏）。 */
@@ -39,23 +40,47 @@ const defaultRead = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch {
  */
 export const claudeBridgeRoot = ({ home = os.homedir() } = {}) => path.join(home, ".claude", "feishu-bridge");
 
-/** Codex 的**家目录**（CODEX_HOME 或 `<home>/.codex`）：`hooks.json` 与 `skills/` 在这里。 */
-export const codexHomeOf = ({ home = os.homedir(), env = process.env } = {}) => {
-  const explicit = env.CODEX_HOME;
-  return typeof explicit === "string" && explicit.length > 0 ? explicit : path.join(home, ".codex");
-};
+/** Codex 的**家目录**：**受验派生只有一份**（codex/state.mjs 的 codexHomeOf，相对路径直接抛）。 */
+export const codexHomeOf = ({ home = os.homedir(), env = process.env } = {}) => codexHomeOfValidated({ home, env });
 
 /**
  * Codex 侧**状态根**（FEISHU_CODEX_BRIDGE_HOME → codexHome/feishu-bridge）：登记表 / tasks / 收据在这里。
  * **与 codexHome 分开派生**（fix2 P1-3）：拿状态根的父目录当 CODEX_HOME 是错的 —— 自定义状态根时
  * hooks.json 与 skills/ 仍然在 CODEX_HOME，runtime/current 也仍然在 `codexRuntimeRoot(codexHome)` 下，
  * 于是足迹会漏掉它们、卸载会误报「未安装，跳过」。
+ * 派生复用 `bridgeHome` 那一份受验实现（fix3 P1-2）：**显式值不是绝对路径时直接抛**，
+ * 不再静默忽略、转而去删默认状态根。
  */
-export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {}) => {
-  const explicit = env.FEISHU_CODEX_BRIDGE_HOME;
-  if (typeof explicit === "string" && explicit.length > 0 && path.isAbsolute(explicit)) return explicit;
-  return path.join(codexHomeOf({ home, env }), "feishu-bridge");
-};
+export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {}) =>
+  bridgeHome({ ...env, CODEX_HOME: codexHomeOf({ home, env }) });
+
+/**
+ * `--purge` 删除目标的**形状校验**（fix3 P1-2，fail-closed）：任何写入前必须过。
+ * 只允许三类桥根及其下（`<home>/.claude/feishu-bridge` / `<codexHome>/feishu-bridge` / 显式
+ * `FEISHU_CODEX_BRIDGE_HOME`）；覆盖点文件必须是绝对路径。拒绝：非绝对、文件系统根、`<home>` 本身、
+ * `<home>/.claude` 与 `<home>/.codex` 这类父层，以及**任何桥根的严格祖先**（`/` 与 home 都属于这一类）。
+ */
+export function purgeTargetProblems({ candidates = [], roots = [], home = os.homedir() } = {}) {
+  const problems = [];
+  const homeNorm = path.resolve(home);
+  const fsRoot = path.parse(homeNorm).root;
+  const rootsNorm = roots.map((r) => path.resolve(r));
+  const parents = new Set([homeNorm, path.join(homeNorm, ".claude"), path.join(homeNorm, ".codex")].map((p) => path.resolve(p)));
+  for (const c of candidates) {
+    const v = c?.path;
+    if (typeof v !== "string" || v.length === 0) continue;
+    const push = (why) => problems.push({ varName: c.varName ?? "（派生）", value: v, why });
+    if (!path.isAbsolute(v)) { push("不是绝对路径（相对路径会被静默当成别的东西）"); continue; }
+    const n = path.resolve(v);
+    if (n === fsRoot) { push("是文件系统根 —— 递归删它等于删整台机器"); continue; }
+    if (parents.has(n)) { push("是 home 或 home 下的父层（桥根在它下面，删它会带走无关内容）"); continue; }
+    if (rootsNorm.some((r) => r !== n && r.startsWith(n + path.sep))) {
+      push("是某个桥根的父目录（只允许桥根本身及其下）");
+      continue;
+    }
+  }
+  return problems;
+}
 
 /**
  * `--purge` 的删除清单（fix1 P1-3）：**按产品派生函数取**，不手写文件名清单 ——
@@ -71,17 +96,24 @@ export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {})
  * **项目里的东西不在这里**：`<项目>/.runtime-data/` 与飞书话题历史不归机器级卸载管。
  */
 export function machinePurgeTargets({ home = os.homedir(), env = process.env } = {}) {
-  const roots = [...new Set([claudeBridgeRoot({ home }), codexBridgeRoot({ home, env })])];
-  const rootsSet = new Set(roots);
+  const codexHome = codexHomeOf({ home, env });        // 受验：相对路径直接抛
+  const claudeRoot = claudeBridgeRoot({ home });
+  const codexRoot = codexBridgeRoot({ home, env });    // 受验：FEISHU_CODEX_BRIDGE_HOME 相对直接抛
+  const roots = [...new Set([claudeRoot, codexRoot])];
+  const explicitBridge = typeof env.FEISHU_CODEX_BRIDGE_HOME === "string" && env.FEISHU_CODEX_BRIDGE_HOME.length > 0;
+  const candidates = [
+    { path: claudeRoot, varName: "HOME（.claude/feishu-bridge）" },
+    { path: codexRoot, varName: explicitBridge ? "FEISHU_CODEX_BRIDGE_HOME" : "CODEX_HOME" },
+  ];
   const files = [];
   for (const key of ["FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_ROUTES", "FEISHU_BRIDGE_STATUS_PROVIDERS", "FEISHU_BRIDGE_CHAIN_TEMPLATE"]) {
     const v = env[key];
-    if (typeof v !== "string" || v.length === 0 || !path.isAbsolute(v)) continue;
-    // 覆盖点正好落在桥根里 → 已经被整棵删覆盖了，不重复列
-    if (roots.some((r) => v === r || v.startsWith(r + path.sep))) continue;
-    files.push(v);
+    if (typeof v !== "string" || v.length === 0) continue;
+    // 覆盖点正好落在桥根里 → 已经被整棵删覆盖了，不重复列（但**形状校验仍然要过**）
+    if (!roots.some((r) => v === r || v.startsWith(r + path.sep))) files.push(v);
+    candidates.push({ path: v, varName: key });
   }
-  return { roots, files };
+  return { roots, files, problems: purgeTargetProblems({ candidates, roots, home }) };
 }
 
 /**

@@ -8375,6 +8375,121 @@ test("PK3-U1-fix2 P2-2：只剩定时器 / Codex drain 而 current 不在 → �
   assert.deepEqual([fb.orphans.codex, fb.orphans.codexDrain, fb.partial], [false, true, true], JSON.stringify(fb.orphans));
 });
 
+// ── PK3-U1-fix3：Codex 三轮的三条 P1 的常驻反例 ────────────────────────────────────
+
+// 拿掉哪行会红：把「锁内重查维护门」挪回取锁之前（fix2 的顺序）→ ① 会红在 status（期望 2、实得 0）；
+//   把「锁内重算现场」去掉（继续用预览那份快照执行）→ ② 会红在「新装的 Codex 技能必须被卸掉」。
+test("PK3-U1-fix3 P1-1：--apply 是取锁→锁内重查门→锁内重算（两条确定性交错反例）", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f3-interleave-"));
+  const hook = (name, lines) => {
+    const p = path.join(base, name);
+    fs.writeFileSync(p, lines.join("\n") + "\n");
+    return p;
+  };
+  const gateFile = path.join(base, "maint.gate");
+
+  // ① 「查门之后、取锁之前，维护流程建门」—— 锁内复核必须拦住（exit 2 零写）
+  const homeA = u1Home();
+  const hookGate = hook("hook-gate.mjs", [
+    "import { createGate } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "maintenance-gate-core.mjs")).href) + ";",
+    "createGate({ file: " + JSON.stringify(gateFile) + ", reason: \"交错反例：查门后建门\" });",
+  ]);
+  const beforeA = u1Snapshot(homeA);
+  const a = u1Run(homeA, "uninstall.mjs", ["--apply"],
+    u1Env(homeA, { FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile, FEISHU_BRIDGE_UNINSTALL_BEFORE_LOCK: hookGate }));
+  assert.equal(a.status, 2, a.stdout + a.stderr);
+  assert.match(a.stderr, /维护门/u, a.stderr);
+  assert.match(a.stderr, /锁内复核/u, "要说明是锁内复核发现的：" + a.stderr);
+  assert.equal(u1Snapshot(homeA), beforeA, "① 拒了就零写");
+  fs.rmSync(gateFile, { force: true });
+
+  // ② 「足迹快照之后另装一个 Codex 技能」—— 锁内重算必须看见它并真卸掉（不许「未安装，跳过」）
+  const homeB = u1Home();
+  const skillDir = path.join(homeB, ".codex", "skills", "m5codex-inbound-router");
+  const hookSkill = hook("hook-skill.mjs", [
+    "import fs from \"node:fs\";",
+    "fs.mkdirSync(" + JSON.stringify(skillDir) + ", { recursive: true });",
+    "fs.writeFileSync(" + JSON.stringify(path.join(skillDir, "SKILL.md")) + ", \"# skill\\n\");",
+  ]);
+  const b = u1Run(homeB, "uninstall.mjs", ["--apply"], u1Env(homeB, { FEISHU_BRIDGE_UNINSTALL_BEFORE_LOCK: hookSkill }));
+  assert.equal(b.status, 0, b.stdout + b.stderr);
+  assert.equal(fs.existsSync(skillDir), false, "② 交错装上来的技能必须被卸掉：" + b.stdout);
+  // 预览那一段（锁外算的）当然还是「未安装，跳过」—— 要钉的是**执行段**（锁内重算的结果）
+  const execPart = b.stdout.slice(b.stdout.indexOf("开始按序卸载"));
+  assert.equal(/3\. Codex 链：hooks \+ 技能 \+ 兜底排空服务：未安装，跳过/u.test(execPart), false,
+    "不许拿旧快照说未安装跳过：" + execPart);
+
+  // 对照：不注入时行为不变（同一台机器再跑一次也正常收尾）
+  const c = u1Run(homeB, "uninstall.mjs", ["--apply"], u1Env(homeB));
+  assert.equal(c.status, 0, c.stdout + c.stderr);
+  assert.match(c.stdout, /卸载完成/u, c.stdout);
+});
+
+// 拿掉哪行会红：把 purgeTargetProblems 的校验去掉 → 前五条会红在 status（期望 2、实得 0）与“零写”上；
+//   让 codexBridgeRoot 重新“相对路径静默忽略” → 第二/三条会红（相对值被当成没设，转而去删默认根）。
+test("PK3-U1-fix3 P1-2：purge 删除目标 fail-closed（相对路径 / 文件系统根 / home 父层一律 exit 2 零写）", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f3-purge-"));
+  const outside = path.join(base, "outside-sentinel.txt");
+  const cases = [
+    { name: "FEISHU_CODEX_BRIDGE_HOME=/", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "/" }), want: /文件系统根/u },
+    { name: "CODEX_HOME=relative-codex", env: () => ({ CODEX_HOME: "relative-codex" }), want: /CODEX_HOME 必须是绝对路径/u },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=relative/bridge", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "relative/bridge" }), want: /FEISHU_CODEX_BRIDGE_HOME 必须是绝对路径/u },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=<home>", env: (home) => ({ FEISHU_CODEX_BRIDGE_HOME: home }), want: /home 或 home 下的父层/u },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=<home>/.claude", env: (home) => ({ FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".claude") }), want: /home 或 home 下的父层/u },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=<base>（桥根的父层）", env: (home) => ({ FEISHU_CODEX_BRIDGE_HOME: path.dirname(home) }), want: /父目录/u },
+    { name: "FEISHU_BRIDGE_REGISTRY=relative/registry.json", env: () => ({ FEISHU_BRIDGE_REGISTRY: "relative/registry.json" }), want: /FEISHU_BRIDGE_REGISTRY.*不是绝对路径|不是绝对路径/u },
+  ];
+  for (const c of cases) {
+    const home = u1Home();
+    // 哨兵：夹具里的数据（默认保留）与 base 下的无关文件，被拒时一个字节都不许动
+    const sentinel = path.join(home, ".claude", "feishu-bridge", "routes.json");
+    fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+    fs.writeFileSync(sentinel, JSON.stringify({ routes: [], sessions: {} }));
+    fs.writeFileSync(outside, "keep");
+    const env = u1Env(home, c.env(home));
+    const before = u1Snapshot(home);
+    const dry = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data"], env);
+    assert.equal(dry.status, 2, c.name + "（预览也要拒）：" + dry.stdout + dry.stderr);
+    assert.match(dry.stderr, c.want, c.name + "：" + dry.stderr);
+    const applied = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
+    assert.equal(applied.status, 2, c.name + "（--apply 也要拒）：" + applied.stdout + applied.stderr);
+    assert.match(applied.stderr, c.want, c.name + "：" + applied.stderr);
+    assert.equal(u1Snapshot(home), before, c.name + "：拒了就零写");
+    assert.equal(fs.existsSync(sentinel), true, c.name + "：夹具数据不许被删");
+    assert.equal(fs.existsSync(outside), true, c.name + "：base 下的无关文件不许被删");
+    assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge")), true, c.name);
+  }
+  // 对照：合法的绝对路径（包括 home 之外的显式桥根）照常
+  const okHome = u1Home();
+  const okEnv = u1Env(okHome, { FEISHU_CODEX_BRIDGE_HOME: path.join(base, "elsewhere", "feishu-bridge") });
+  const okRun = u1Run(okHome, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], okEnv);
+  assert.equal(okRun.status, 0, okRun.stdout + okRun.stderr);
+  assert.equal(fs.existsSync(path.join(okHome, ".claude", "feishu-bridge")), false, "合法目标照常删：" + okRun.stdout);
+  assert.equal(fs.existsSync(outside), true, "对照：无关文件仍然不动");
+});
+
+// 拿掉哪行会红：把 aily 的 stateOk 里 `absent ? false` 改回 `absent ? true`（fix2 的行为）→
+//   本用例前半会红（ok 期望 false、实得 true，且文案变成“已启用且在跑”）。
+test("PK3-U1-fix3 P1-3：磁盘单元在、收据一致，但 manager 报 not-found → ✗（没被加载），不是 ✓", () => {
+  const home = u1Home();
+  const unit = path.join(home, ".config", "systemd", "user", "feishu-bridge-aily.service");
+  fs.mkdirSync(path.dirname(unit), { recursive: true });
+  fs.writeFileSync(unit, ailyDaemonUnit({ home, ailyCli: "/x/aily-cli", node: process.execPath }));
+  const receiptFile = path.join(home, ".claude", "feishu-bridge", "installed-surface.json");
+  fs.mkdirSync(path.dirname(receiptFile), { recursive: true });
+  const rec = recordInstalledSurface({ chain: "claude", version: "0".repeat(16), file: receiptFile,
+    artifacts: [{ path: unit, kind: "file", sha256: artifactSha({ kind: "file", text: fs.readFileSync(unit, "utf-8") }) }], scripts: [] });
+  assert.equal(rec.ok, true, JSON.stringify(rec));
+  // ① manager 不认它（not-found）→ ✗ 且文案说“没被 systemd --user 加载”
+  const notFound = () => ({ ok: false, out: "", err: "Failed to get unit file state for feishu-bridge-aily.service: No such file or directory" });
+  const c = runDoctor({ home, platform: "linux", systemctl: notFound }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([c.ok, /没被 systemd --user 加载/u.test(c.detail), c.next !== null], [false, true, true], JSON.stringify(c));
+  // ② 对照：manager 认它、且在跑 → ✓
+  const active = (args) => (args.includes("is-enabled") ? { ok: true, out: "enabled\n" } : { ok: true, out: "active\n" });
+  const okc = runDoctor({ home, platform: "linux", systemctl: active }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([okc.ok, /已启用且在跑/u.test(okc.detail)], [true, true], JSON.stringify(okc));
+});
+
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {
   const home = u1Home();
   assert.equal(u1Footprint(home).clean, true);

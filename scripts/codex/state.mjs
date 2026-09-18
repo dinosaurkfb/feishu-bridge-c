@@ -37,17 +37,28 @@ export const PENDING_WINDOW_MS = null;
 export const ACTIVE_LEASE_MAX_MS = 12 * 60 * 60 * 1000;
 export const DEFAULT_INBOUND_PREFIX = null;
 
+/**
+ * Codex 的**家目录**（`CODEX_HOME` 或 `<home>/.codex`）—— **受验**：相对路径直接抛，不静默换成别的。
+ * `home` 是显式入参（沙箱体检 / 卸载要能指定家），env 里没有 CODEX_HOME 时才用它。
+ * PK3-U1-fix3 P1-2：卸载的 purge 清单也走这一份（不另抄一套校验）——
+ * 旧版在足迹模块里自己推，相对路径会被静默忽略、转而去删**默认**的 Codex 状态根。
+ */
+export function codexHomeOf({ env = process.env, home = os.homedir() } = {}) {
+  const explicit = env.CODEX_HOME;
+  if (typeof explicit === "string" && explicit.length > 0) {
+    if (!path.isAbsolute(explicit)) throw new Error("CODEX_HOME 必须是绝对路径：" + explicit);
+    return explicit;
+  }
+  return path.join(home, ".codex");
+}
+
 export function bridgeHome(env = process.env) {
   const explicit = env.FEISHU_CODEX_BRIDGE_HOME;
   if (typeof explicit === "string" && explicit.length > 0) {
-    if (!path.isAbsolute(explicit)) throw new Error("FEISHU_CODEX_BRIDGE_HOME 必须是绝对路径");
+    if (!path.isAbsolute(explicit)) throw new Error("FEISHU_CODEX_BRIDGE_HOME 必须是绝对路径：" + explicit);
     return explicit;
   }
-  const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.length > 0
-    ? env.CODEX_HOME
-    : path.join(os.homedir(), ".codex");
-  if (!path.isAbsolute(codexHome)) throw new Error("CODEX_HOME 必须是绝对路径");
-  return path.join(codexHome, "feishu-bridge");
+  return path.join(codexHomeOf({ env }), "feishu-bridge");
 }
 
 export const registryFile = (home = bridgeHome()) => path.join(home, "registry.json");

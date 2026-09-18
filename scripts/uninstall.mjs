@@ -55,8 +55,15 @@ import { gateBlocks, gateInboundText } from "./maintenance-gate-core.mjs";
 const ROOT = moduleRoot(import.meta.url, "..");
 const HOME = os.homedir();
 // 两类根分开派生（fix2 P1-3）：codexHome（hooks.json / skills）与 codexBridgeRoot（状态）不是一个东西，
-// 派生函数只有一份（maintenance/install-footprint.mjs）—— 不在这里镜像第二套。
-const CODEX_HOME = codexHomeOf({ home: HOME });
+// 派生函数只有一份（maintenance/install-footprint.mjs，最终落到 codex/state.mjs 的受验实现）。
+// **fix3 P1-2**：派生是受验的（相对路径直接抛）—— 在这里就收口成"拒绝 + exit 2 零写"，
+// 不让栈字符串穿到人面前（旧版还会把相对的 FEISHU_CODEX_BRIDGE_HOME 静默忽略、转而去删默认根）。
+let CODEX_HOME = null;
+try { CODEX_HOME = codexHomeOf({ home: HOME }); }
+catch (err) {
+  console.error("拒绝：Codex 家目录派生失败（" + String(err?.message ?? err) + "）—— 环境变量里的路径必须是绝对路径。什么都没做。");
+  process.exit(2);
+}
 
 const USAGE = "用法：node scripts/uninstall.mjs [--apply] [--purge --yes-delete-data]\n" +
   "      默认只预览；--apply 才动；--purge 连机器级数据一起删（必须同时给 --yes-delete-data）。";
@@ -76,13 +83,26 @@ const exists = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
 const readText = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } };
 const list = (p) => { try { return fs.readdirSync(p); } catch { return []; } };
 
-// ---------- 现状盘点：只读，决定每一步「有东西可卸」还是「未安装，跳过」 ----------
+// ---------- 现状盘点：**每次算一遍**（fix3 P1-1：预览算一次、持锁后再算一次） ----------
+//
+// 为什么不在这里冻结成模块级常量：那是两个真实窗口 —— ① 查门之后、取锁之前，维护流程可以建门；
+// ② 足迹快照之后、真正开写之前，另一个安装器可以装完。冻结的快照会让卸载"照旧跳过新制品"，
+// 最后误报完成。所以 `--apply` 是 **取锁 → 锁内重查门 → 锁内重算现场与计划 → 执行**。
 
 const BRIDGE = claudeBridgeRoot({ home: HOME });
 // Codex 链的两类根：状态根（数据）与运行时根 —— 自定义 FEISHU_CODEX_BRIDGE_HOME 时它们**不在一棵树上**。
-const CODEX_BRIDGE = codexBridgeRoot({ home: HOME });
+// 派生是**受验的**（codex/state.mjs：相对路径直接抛）—— fix3 P1-2：在这里就收口成"拒绝 + exit 2 零写"，
+// 不让栈字符串穿到人面前，也不让相对值被静默忽略。
+let CODEX_BRIDGE = null;
+try { CODEX_BRIDGE = codexBridgeRoot({ home: HOME }); }
+catch (err) {
+  console.error("拒绝：Codex 状态根派生失败（" + String(err?.message ?? err) + "）—— 环境变量里的路径必须是绝对路径。什么都没做。");
+  process.exit(2);
+}
 const CODEX_RUNTIME = codexRuntimeRoot(CODEX_HOME);
 const SKILLS_ROOT = path.join(HOME, ".claude", "skills");
+// 入站技能目录（只算路径形状；"在不在"由 footprint 判 —— 一处判据）
+const inboundSkillDir = path.join(SKILLS_ROOT, CLAUDE_INBOUND_SKILL.name);
 
 /** 两链的 runtime/current（「已安装」标记）：`versions/` 不在这一步的删除范围里。 */
 const RUNTIME_CURRENTS = [
@@ -92,20 +112,35 @@ const RUNTIME_CURRENTS = [
 /** `--purge` 时连 runtime/ 整棵一起删的两个目录（由产品派生函数取，不靠桥根拼路径）。 */
 const RUNTIME_DIRS = [runtimeRoot(HOME, "claude"), CODEX_RUNTIME];
 
+/** 数据覆盖点的四个环境变量（`--purge` 的 files 来源）：相对路径也要点出来，不许静默忽略。 */
+const OVERRIDE_KEYS = ["FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_ROUTES", "FEISHU_BRIDGE_STATUS_PROVIDERS", "FEISHU_BRIDGE_CHAIN_TEMPLATE"];
+
 /**
- * 装机足迹：判据只有一份（install-projection.installFootprint）—— doctor 的未安装态用的是同一份，
- * 所以"uninstall 说卸干净了、doctor 说还有残留"这种自相矛盾在结构上就不可能出现。
+ * 现场：足迹 + `--purge` 清单。**纯读**，可以被算任意多次。
+ * 派生函数是受验的（codex/state.mjs 那份）：相对路径直接抛 → 调用方接住并 exit 2（不静默改删默认根）。
  */
-// 注意：**不**给 codexSkills（Codex 的技能清单住在 scripts/codex/，底座不许反向依赖它 —— 有守卫盯着）。
-// 少列那一项不影响判断：Codex 那边的"在不在"由钩子与 runtime/current 决定，而**删**由 codex 安装器自己负责。
-const FOOT = installFootprint({ home: HOME, platform: timerPlatform({ home: HOME }) });
-const hooksWhich = [...FOOT.present.claudeHooks];
-const codexHooksWhich = [...FOOT.present.codexHooks];
-const timerPresent = [...FOOT.present.timer, ...FOOT.present.codexDrain];
-const claudeSkillsPresent = [...FOOT.present.claudeSkills, ...FOOT.present.codexSkills];
-const PURGE = machinePurgeTargets({ home: HOME });
-// 入站技能目录与两链技能目录（只算路径形状；"在不在"由 footprint 判 —— 一处判据）
-const inboundSkillDir = path.join(SKILLS_ROOT, CLAUDE_INBOUND_SKILL.name);
+function sceneFor() {
+  const purge = machinePurgeTargets({ home: HOME });
+  // 装机足迹：判据只有一份（maintenance/install-footprint.installFootprint）—— doctor 的未安装态用的是同一份，
+  // 所以"uninstall 说卸干净了、doctor 说还有残留"这种自相矛盾在结构上就不可能出现。
+  // 注意：**不**给 codexSkills（Codex 的技能清单住在 scripts/codex/，底座不许反向依赖它 —— 有守卫盯着）。
+  const foot = installFootprint({ home: HOME, platform: timerPlatform({ home: HOME }) });
+  const data = [
+    ...purge.roots.map((p) => ({ path: p, kind: "root", why: "机器级桥根（登记表 / 模板 / 路由 / 订阅 / 回执 / 账本 / 收据 / runtime）" })),
+    // **覆盖点只删文件**（fix2 P1-2）：它的父目录是人给的，可能是共享目录 —— 递归删它会带走无关的兄弟文件。
+    ...purge.files.map((p) => ({ path: p, kind: "file", why: "已知数据文件的覆盖点（只删这个文件，不碰它的父目录）" })),
+  ];
+  return { purge, foot, data, steps: buildSteps({ foot, data }) };
+}
+
+/** 清单形状不合格 → 一句话说清哪个变量哪个值（**任何写入前**拒绝）。 */
+function sceneProblem({ purge }) {
+  if (purge.problems.length === 0) return null;
+  return "拒绝：删除清单里有不合格的目标（值来自环境变量）：\n" +
+    purge.problems.map((p) => "  · " + p.varName + "=" + p.value + " —— " + p.why).join("\n") + "\n" +
+    "  只允许三类桥根及其下：<home>/.claude/feishu-bridge、<codexHome>/feishu-bridge、显式 FEISHU_CODEX_BRIDGE_HOME；\n" +
+    "  覆盖点文件必须是绝对路径且不是危险宽根。**什么都没做。**";
+}
 
 
 /**
@@ -117,13 +152,10 @@ const inboundSkillDir = path.join(SKILLS_ROOT, CLAUDE_INBOUND_SKILL.name);
  * tasks/<key>/inbound 与 outbound），所以这里不写清单。
  * 项目里的 `<项目>/.runtime-data/` 与飞书话题历史**不在这里**（不归机器级卸载管）。
  */
-const DATA = [
-  ...PURGE.roots.map((p) => ({ path: p, kind: "root", why: "机器级桥根（登记表 / 模板 / 路由 / 订阅 / 回执 / 账本 / 收据 / runtime）" })),
-  // **覆盖点只删文件**（fix2 P1-2）：它的父目录是人给的，可能是共享目录 —— 递归删它会带走无关的兄弟文件。
-  ...PURGE.files.map((p) => ({ path: p, kind: "file", why: "已知数据文件的覆盖点（只删这个文件，不碰它的父目录）" })),
-];
-
 // ---------- 步骤表：顺序写死，理由写在每一条上 ----------
+//
+// `buildSteps` 是**函数**（fix3 P1-1）：持锁后要按重新算出来的足迹重建一遍，
+// 否则「快照之后装了新制品」会被旧快照跳过。
 
 const stepEnv = { ...process.env, HOME };
 const runNode = (rel, args) => {
@@ -132,7 +164,12 @@ const runNode = (rel, args) => {
   return { ok: r.status === 0, status: r.status, out: String(r.stdout ?? "") + String(r.stderr ?? "") };
 };
 
-const STEPS = [
+function buildSteps({ foot, data }) {
+  const hooksWhich = [...foot.present.claudeHooks];
+  const codexHooksWhich = [...foot.present.codexHooks];
+  const timerPresent = [...foot.present.timer, ...foot.present.codexDrain];
+  const claudeSkillsPresent = [...foot.present.claudeSkills, ...foot.present.codexSkills];
+  const STEPS = [
   {
     id: "inbound",
     title: "入站技能（Claude 链）",
@@ -146,12 +183,12 @@ const STEPS = [
     title: "出站（Claude 链）：hooks + 技能 + 兜底定时器 +（linux）aily daemon 服务",
     why: "入站停掉之后再拆出站；定时器与 daemon 服务先停再删 plist/unit（安装器自己按这个顺序做，停不下来就不删）",
     present: () => hooksWhich.length > 0 || timerPresent.length > 0 || claudeSkillsPresent.length > 0
-      || FOOT.present.ailyUnit !== null,
+      || foot.present.ailyUnit !== null,
     detail: () => [
       ...hooksWhich.map((n) => path.join(HOME, ".claude", "settings.json") + " 里的 " + n),
       ...claudeSkillsPresent,
       ...timerPresent,
-      ...[FOOT.present.ailyUnit].filter(Boolean),
+      ...[foot.present.ailyUnit].filter(Boolean),
     ],
     run: () => runNode("install-outbound.mjs", ["--uninstall", "--apply"]),
   },
@@ -159,13 +196,13 @@ const STEPS = [
     id: "codex",
     title: "Codex 链：hooks + 技能 + 兜底排空服务",
     why: "与 Claude 链同源机制，放在它之后 —— 两条链互不依赖，但按同一条纪律收口（服务是独立命令，卸载也走它自己的反向口）",
-    present: () => codexHooksWhich.length > 0 || FOOT.present.codexSkills.length > 0
-      || FOOT.present.codexDrain.length > 0 || FOOT.present.codexCurrent !== null,
+    present: () => codexHooksWhich.length > 0 || foot.present.codexSkills.length > 0
+      || foot.present.codexDrain.length > 0 || foot.present.codexCurrent !== null,
     detail: () => [
       ...codexHooksWhich.map((n) => path.join(CODEX_HOME, "hooks.json") + " 里的 " + n),
-      ...FOOT.present.codexSkills,
-      ...FOOT.present.codexDrain,
-      ...[FOOT.present.codexCurrent].filter(Boolean),
+      ...foot.present.codexSkills,
+      ...foot.present.codexDrain,
+      ...[foot.present.codexCurrent].filter(Boolean),
     ],
     run: () => {
       const first = runNode(path.join("codex", "install.mjs"), ["--uninstall", "--apply"]);
@@ -178,8 +215,8 @@ const STEPS = [
     id: "runtime-current",
     title: "runtime/current（两条链的「已安装」标记）",
     why: "最后才动它：上面每一步都要靠 current 里的脚本干活（钩子 / 定时器）；提前摘掉会让卸载自己跑不起来",
-    present: () => FOOT.present.claudeCurrent !== null || FOOT.present.codexCurrent !== null,
-    detail: () => [FOOT.present.claudeCurrent, FOOT.present.codexCurrent].filter(Boolean),
+    present: () => foot.present.claudeCurrent !== null || foot.present.codexCurrent !== null,
+    detail: () => [foot.present.claudeCurrent, foot.present.codexCurrent].filter(Boolean),
     // 只删 symlink：versions/ 是内容寻址缓存（重装快、可复用），删它是 --purge 的事。
     run: () => {
       const gone = [];
@@ -192,7 +229,7 @@ const STEPS = [
   },
 ];
 
-const PURGE_STEPS = [
+  const PURGE_STEPS = [
   {
     id: "runtime-versions",
     title: "runtime/ 整棵（含 versions/ 代码缓存）",
@@ -212,11 +249,11 @@ const PURGE_STEPS = [
     id: "data",
     title: "机器级数据根（两链的全部机器级状态：登记表 / 路由表 / 话题映射 / 回执 / 账本 / 收据 / 模板 / 订阅）",
     why: "--purge --yes-delete-data 才走：这些是历史与绑定，删了就没了。清单从产品派生函数取（machinePurgeTargets），不是手写文件名清单 —— 手写会漏",
-    present: () => DATA.some((d) => exists(d.path)),
-    detail: () => DATA.filter((d) => exists(d.path)).map((d) => d.path + "（" + d.why + "）"),
+    present: () => data.some((d) => exists(d.path)),
+    detail: () => data.filter((d) => exists(d.path)).map((d) => d.path + "（" + d.why + "）"),
     run: () => {
       const gone = [];
-      for (const d of DATA) {
+      for (const d of data) {
         if (!exists(d.path)) continue;
         try {
           // 根：整棵删；覆盖点文件：只删那个文件（目录递归=越界）
@@ -230,7 +267,9 @@ const PURGE_STEPS = [
       return { ok: true, status: 0, out: gone.length > 0 ? "已删 " + gone.join("、") : "没有可删的" };
     },
   },
-];
+  ];
+  return purge ? [...STEPS, ...PURGE_STEPS] : STEPS;
+}
 
 // ---------- 参数校验：破坏性动作要两次点头 ----------
 
@@ -241,9 +280,21 @@ if (purge && !yesDeleteData) {
   process.exit(2);
 }
 
-const steps = purge ? [...STEPS, ...PURGE_STEPS] : STEPS;
+// ---------- 预览（只读、锁外；fix3 P1-1：预览不必持锁） ----------
+//
+// 拒绝要发生在任何写入之前：清单形状不合格（或派生函数抛：相对路径）就先 exit 2。
+// --apply 会在**锁内重算一遍**（下面），所以这里的快照只用于"给人看"，不用来执行。
 
-// ---------- 预览 ----------
+let scene = null;
+try { scene = sceneFor(); }
+catch (err) {
+  console.error("拒绝：根路径派生失败（" + String(err?.message ?? err) + "）—— 环境变量里的路径必须是绝对路径。什么都没做。");
+  process.exit(2);
+}
+{
+  const problem = sceneProblem(scene);
+  if (problem !== null) { console.error(problem); process.exit(2); }
+}
 
 console.log("本桥卸载" + (apply ? "（--apply：真的动）" : "（预览，什么都没动）") +
   (purge ? "  ·  --purge（连数据一起删）" : ""));
@@ -257,7 +308,7 @@ console.log("HOME     " + HOME);
     "；维护门：" + (gateBlocks().blocked ? "开着（--apply 会被拒）" : "没开"));
 }
 console.log("");
-for (const [i, s] of steps.entries()) {
+for (const [i, s] of scene.steps.entries()) {
   const present = s.present();
   console.log((i + 1) + ". " + s.title + "  → " + (present ? "将停 / 将删" : "未安装，跳过"));
   console.log("   为什么在这个位置：" + s.why);
@@ -265,7 +316,7 @@ for (const [i, s] of steps.entries()) {
 }
 console.log("");
 if (!purge) {
-  const kept = DATA.filter((d) => exists(d.path));
+  const kept = scene.data.filter((d) => exists(d.path));
   console.log("将保留（默认不删）：");
   for (const d of kept) console.log("  · " + d.path + "（" + d.why + "）");
   if (kept.length === 0) console.log("  · （没有机器级数据文件）");
@@ -280,15 +331,21 @@ if (!apply) {
   process.exit(0);
 }
 
-// ---------- 执行：全程锁 + 维护门，然后逐个核退出码，失败即停并说清到哪一步 ----------
-
-// fix1 P1-2：**整段编排**在一把受验的安装面锁里（不是"开头检查一下"）——
+// ---------- 执行：**取锁 → 锁内重查门 → 锁内重算现场与计划 → 执行** ----------
+//
+// fix1 P1-2：整段编排在一把受验的安装面锁里（不是"开头检查一下"）。
+// fix3 P1-1：**取锁之前的查门不算数** —— 查门到取锁之间维护流程可以建门；**取锁之前的足迹快照也不算数** ——
+//   快照之后另一个安装器可以装完，旧的会"照旧跳过新制品"并误报完成。所以顺序改成下面这样。
 // 子安装器各自还会取锁，所以把"父进程已持有"这件事通过环境变量交给它们（否则自重入死锁）。
-const gate = gateBlocks();
-if (gate.blocked) {
-  console.error("拒绝：维护门开着（" + gateInboundText(gate) + "）—— 卸载会在维护窗口里写安装面，什么都没有做。");
-  process.exit(2);
+
+// 测试注入点（**只给用例用**，生产不设就是空转）：取锁前跑一段外部脚本，
+// 用来**确定性地**复现上面那两个交错窗口（不靠 sleep 竞速）。
+const beforeLockHook = process.env.FEISHU_BRIDGE_UNINSTALL_BEFORE_LOCK;
+if (typeof beforeLockHook === "string" && beforeLockHook.length > 0) {
+  try { spawnSync(process.execPath, [beforeLockHook], { encoding: "utf-8", env: process.env, timeout: 60_000 }); }
+  catch (err) { console.error("（取锁前的注入脚本跑不动：" + String(err?.message ?? err) + "）"); }
 }
+
 const surface = acquireInstallSurfaceLock({ home: HOME });
 if (!surface.ok) {
   console.error("拒绝：安装面锁拿不到（" + surface.reason + "：" + String(surface.why) + "，" + surface.path + "）—— 什么都没有做。" +
@@ -318,8 +375,29 @@ process.on("exit", () => {
 stepEnv[INSTALL_SURFACE_HELD_ENV] = surface.path;
 stepEnv[INSTALL_SURFACE_HELD_TOKEN_ENV] = surface.token;
 
+// **锁内重查维护门**（fix3 P1-1）：门是"窗口内不许写安装面"的裁决，取锁前的检查只是礼貌。
+{
+  const gate = gateBlocks();
+  if (gate.blocked) {
+    console.error("拒绝：维护门开着（" + gateInboundText(gate) + "）—— 锁内复核发现的（查门到取锁之间的窗口已经关掉）；" +
+      "什么都没有做。");
+    process.exit(2);
+  }
+}
+// **锁内重算**（fix3 P1-1）：足迹与删除清单都按此刻的盘重新算 —— 上面那份只给人看。
+try { scene = sceneFor(); }
+catch (err) {
+  console.error("拒绝：根路径派生失败（" + String(err?.message ?? err) + "）—— 什么都没做。");
+  process.exit(2);
+}
+{
+  const problem = sceneProblem(scene);
+  if (problem !== null) { console.error(problem); process.exit(2); }
+}
+
+
 console.log("\n开始按序卸载（已持安装面锁 " + surface.path + "）：");
-for (const [i, s] of steps.entries()) {
+for (const [i, s] of scene.steps.entries()) {
   if (!s.present()) { console.log("  " + (i + 1) + ". " + s.title + "：未安装，跳过"); continue; }
   console.log("  " + (i + 1) + ". " + s.title + " …");
   const r = s.run();

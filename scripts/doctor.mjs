@@ -734,15 +734,19 @@ export function runDoctor({
         : shaOk === false ? "磁盘单元与安装收据的摘要不一致（内容漂移：ExecStart / Environment 被改过，或 aily-cli 换了路径）"
           : null;
       const unaudited = artifact === null;
+      // PK3-U1-fix3 P1-3：**磁盘有、manager 不认 = 没加载**（installed_not_loaded），不是 ✓。
+      // 旧版把 systemdUnitAbsent(...) 折成 stateOk=true —— 只要磁盘 unit 与收据哈希一致，
+      // 即使 manager 报 not-found 也会显示「已启用且在跑」。那正是「界面说正常、实际不工作」。
       const stateOk = enabledText.startsWith("enabled") && activeText === "active" ? true
-        : absent ? true : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
+        : absent ? false : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
       // false 优先（真有故障就报），其次才是“收据里没有”→ unknown；只有对过账的才可能绿。
       const ok = contentProblem !== null ? false : stateOk === false ? false : unaudited ? null : stateOk;
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
         contentProblem !== null ? contentProblem + "（重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并 enable --now）" + foreignText
           : ok === true ? "已启用且在跑，内容与投影/收据一致（" + ailyPath + "）" + foreignText
             : unaudited && ok === null ? "单元在、ExecStart 形状对，但**安装收据里没有这条制品（或收据读不出来）** —— 只核了形状，无法与收据对账（判 ?）。重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并记收据" + foreignText
-              : absent ? "单元在本机 manager 里查不到（本来就未加载）" + foreignText
+              : absent ? "单元已写入但**没被 systemd --user 加载**（manager 报 absent / not-found）："
+                + "enable --now 没生效或没跑过（重跑 `node scripts/install-outbound.mjs --apply`）" + foreignText
                 : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
                   + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
                   : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,

@@ -147,7 +147,7 @@ import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
-import { ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute } from "./inbound-routes.mjs";
+import { ROUTE_REJECT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute } from "./inbound-routes.mjs";
 import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
@@ -6450,9 +6450,18 @@ test("没登记过就走默认路由 —— 待绑定认领由默认那家自己
   assert.equal(r.matchedBy, "default");
 });
 
-test("只有一条路由时它就是默认，不必显式标 default", () => {
+test("单条非默认路由不算默认：未登记话题拒收，已登记话题照常命中", () => {
+  // issue #222 追加：以前这里断言的是"只有一条路由时它就是默认，不必显式标 default"。
+  // 那条隐式规则在表里只有一条时把别人的话题投错（omm 实测：先登记 cc2cd 那一条就会成为全机兜底），
+  // 而且与写入口的守卫自相矛盾。改成：只认显式 default。
   const one = { id: "only", handler: "/x.mjs" };
-  assert.equal(selectRoute({ sessionId: "s", routes: [one], sessions: {} }).route.id, "only");
+  const rejected = selectRoute({ sessionId: "s", routes: [one], sessions: {} });
+  assert.deepEqual([rejected.ok, rejected.reason], [false, ROUTE_REJECT.NO_HANDLER]);
+  assert.equal(rejected.candidates, 1, "报得出有几条候选，便于排查");
+  // 已登记的话题不受影响：它本来就不靠默认路由。
+  assert.equal(selectRoute({ sessionId: "s", routes: [one], sessions: { s: "only" } }).route.id, "only");
+  // 标了 default 才有默认。
+  assert.equal(selectRoute({ sessionId: "s2", routes: [{ ...one, isDefault: true }], sessions: {} }).route.id, "only");
 });
 
 test("登记指向一条不存在的路由 → 拒绝，绝不悄悄回落到默认", () => {
@@ -6507,28 +6516,30 @@ test("登记路由：保住未知顶层字段与 enabled:false 的路由", () =>
   fs.writeFileSync(f, JSON.stringify({
     schema_version: "1.0",
     custom_marker: "KEEP_ME",
-    routes: [{ id: "off", handler: process.execPath, enabled: false }],
+    routes: [{ id: "dflt", handler: process.execPath, default: true }, { id: "off", handler: process.execPath, enabled: false }],
     sessions: {},
   }));
   assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).changed, true);
   const raw = JSON.parse(fs.readFileSync(f, "utf-8"));
   // 读取会过滤 enabled:false，重建则丢未知字段 —— 拿视图整体写回等于静默删数据
   assert.equal(raw.custom_marker, "KEEP_ME");
-  assert.deepEqual(raw.routes.map((r) => r.id), ["off", "n"]);
+  assert.deepEqual(raw.routes.map((r) => r.id), ["dflt", "off", "n"]);
   assert.equal(raw.routes.find((r) => r.id === "off").enabled, false);
 });
 
 test("登记路由：幂等，同 id 换 handler 要拒，且不设 default", () => {
   const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-rr2-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({ routes: [{ id: "dflt", handler: process.execPath, default: true }], sessions: {} }));
   assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).changed, true);
   assert.equal(registerRoute({ id: "n", handler: process.execPath, file: f }).changed, false);
   const repoint = registerRoute({ id: "n", handler: "/bin/ls", file: f });
   assert.equal(repoint.ok, false);
   assert.equal(repoint.reason, "route_id_owned_by_other_handler");
   assert.equal(repoint.owner, process.execPath);
-  assert.equal(JSON.parse(fs.readFileSync(f, "utf-8")).routes[0].handler, process.execPath);
+  const mine = () => JSON.parse(fs.readFileSync(f, "utf-8")).routes.find((r) => r.id === "n");
+  assert.equal(mine().handler, process.execPath);
   // 换默认路由是换权威路由，登记命令不做
-  assert.equal(JSON.parse(fs.readFileSync(f, "utf-8")).routes[0].default, undefined);
+  assert.equal(mine().default, undefined);
 });
 
 test("登记路由：handler 必须是存在、可读的普通文件", () => {
@@ -6538,6 +6549,114 @@ test("登记路由：handler 必须是存在、可读的普通文件", () => {
   assert.equal(registerRoute({ id: "n", handler: "/nope/nope.mjs", file: f }).reason, "handler_missing");
   // 目录也能通过 existsSync，但登记出来的路由投不进去。
   assert.equal(registerRoute({ id: "n", handler: dir, file: f }).reason, "handler_not_a_file");
+  assert.equal(fs.existsSync(f), false);
+});
+
+// ── issue #222：表里没有默认路由时新增路由 = 这台机器没有默认路由了 ──────────────────
+
+test("issue #222：表里没有默认路由时新增路由被拒，且不建表", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222-"));
+  const f = path.join(dir, "routes.json");
+  // 表不存在：registerRouteBinding 本来会自建一张空表再 push 那一条，于是机器停在
+  // "有路由、但没有默认" 上：未登记话题一律拒收（本链自己也接不到待绑定认领），且全程不报错。
+  // 现在这条路直接拒，空表也不再被自建。
+  const r = registerRoute({ id: "cc2cd", handler: process.execPath, file: f });
+  assert.deepEqual([r.ok, r.reason], [false, "no_default_route_yet"], JSON.stringify(r));
+  assert.equal(fs.existsSync(f), false, "拒绝时不许建表");
+  // 表存在但只有停用的路由：不算"有启用的默认路由"，照拒且零写入。
+  fs.writeFileSync(f, JSON.stringify({ routes: [{ id: "off", handler: process.execPath, enabled: false }], sessions: {} }));
+  const before = fs.readFileSync(f, "utf-8");
+  assert.equal(registerRoute({ id: "cc2cd", handler: process.execPath, file: f }).reason, "no_default_route_yet");
+  assert.equal(fs.readFileSync(f, "utf-8"), before);
+});
+
+test("issue #222：--init-default 播种默认路由后，新增外部路由与选路都对", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222i-")), "routes.json");
+  const h = process.execPath;
+  assert.deepEqual(initDefaultRoute({ file: f, id: "self", handler: h, note: "本链默认" }), { ok: true, id: "self", handler: h });
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600, "路由表落盘 0600");
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf-8")).routes, [{ id: "self", handler: h, default: true, note: "本链默认" }]);
+  const reg = registerRouteBinding({ id: "cc2cd", handler: h, sessionId: "s_cc", file: f });
+  assert.deepEqual([reg.ok, reg.routeChanged, reg.sessionChanged], [true, true, true], JSON.stringify(reg));
+  const t = loadRoutes(f);
+  const unregistered = selectRoute({ sessionId: "s_unknown", ...t });
+  assert.deepEqual([unregistered.route.id, unregistered.matchedBy], ["self", "default"]);
+  assert.equal(selectRoute({ sessionId: "s_cc", ...t }).route.id, "cc2cd");
+});
+
+test("issue #222：--init-default 对「已存在但一条路由都没有」的表也成立，且不丢别的字段", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222e-")), "routes.json");
+  const h = process.execPath;
+  fs.writeFileSync(f, JSON.stringify({ schema_version: "1.0", custom_marker: "KEEP_ME", routes: [], sessions: { s1: "self" } }));
+  assert.deepEqual(initDefaultRoute({ file: f, id: "self", handler: h }), { ok: true, id: "self", handler: h });
+  const raw = JSON.parse(fs.readFileSync(f, "utf-8"));
+  assert.deepEqual(raw.routes, [{ id: "self", handler: h, default: true }]);
+  // 空表也是表：拿视图整体写回会丢字段，这里必须原样保留
+  assert.equal(raw.custom_marker, "KEEP_ME");
+  assert.deepEqual(raw.sessions, { s1: "self" });
+});
+
+test("issue #222：--init-default 只在还没有路由的表上成立，已有路由一律拒且零写入", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222j-"));
+  const f = path.join(dir, "routes.json");
+  const h = process.execPath;
+  // 已有默认：不是首建，指路 --restore-default
+  fs.writeFileSync(f, JSON.stringify({ routes: [{ id: "self", handler: h, default: true }], sessions: {} }));
+  let before = fs.readFileSync(f, "utf-8");
+  assert.deepEqual(initDefaultRoute({ file: f, id: "self", handler: h }), { ok: false, reason: "default_route_exists", routes: 1 });
+  assert.equal(fs.readFileSync(f, "utf-8"), before);
+  // 有路由但没默认：这就是 #222 的坑本身，本命令不修（补默认 = 改未登记话题的去向）
+  fs.writeFileSync(f, JSON.stringify({ routes: [{ id: "cc2cd", handler: h }], sessions: {} }));
+  before = fs.readFileSync(f, "utf-8");
+  assert.deepEqual(initDefaultRoute({ file: f, id: "self", handler: h }), { ok: false, reason: "routes_without_default", routes: 1 });
+  assert.equal(fs.readFileSync(f, "utf-8"), before);
+  // 与普通登记同一套校验，且都不建表
+  const fresh = path.join(dir, "fresh.json");
+  assert.equal(initDefaultRoute({ file: fresh, id: "", handler: h }).reason, "no_route_id");
+  assert.equal(initDefaultRoute({ file: fresh, id: "self", handler: "relative.mjs" }).reason, "handler_not_absolute");
+  assert.equal(initDefaultRoute({ file: fresh, id: "self", handler: "/nope/nope.mjs" }).reason, "handler_missing");
+  assert.equal(initDefaultRoute({ file: fresh, id: "self", handler: dir }).reason, "handler_not_a_file");
+  assert.equal(fs.existsSync(fresh), false);
+});
+
+test("issue #222：无默认路由的表上，只把话题登记到已存在路由仍然成功（守卫不误伤）", () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222s-")), "routes.json");
+  fs.writeFileSync(f, JSON.stringify({ routes: [{ id: "cc2cd", handler: process.execPath }], sessions: {} }));
+  const r = registerRouteBinding({ id: "cc2cd", handler: process.execPath, sessionId: "s_new", file: f });
+  assert.deepEqual([r.ok, r.routeChanged, r.sessionChanged], [true, false, true], JSON.stringify(r));
+  assert.equal(loadRoutes(f).sessions.s_new, "cc2cd");
+});
+
+test("issue #222：CLI --init-default 预览不写、--apply 写且 0600；缺 --id / handler 非绝对都拒", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222cli-"));
+  const f = path.join(dir, "routes.json");
+  const h = process.execPath;
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), ...args], {
+    encoding: "utf-8", env: { ...process.env, HOME: dir, FEISHU_BRIDGE_ROUTES: f },
+  });
+  const dry = run(["--init-default", "--id", "self", "--handler", h]);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /\[dry-run\]/u);
+  assert.ok(dry.stdout.includes("路由表  ：" + f), dry.stdout);
+  assert.equal(fs.existsSync(f), false, "预览不建表");
+  const applied = run(["--init-default", "--id", "self", "--handler", h, "--apply"]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.equal(fs.statSync(f).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf-8")).routes, [{ id: "self", handler: h, default: true }]);
+  // 已经有路由 → 拒（同一个入口的第二次是"已有默认"那支）
+  const again = run(["--init-default", "--id", "self", "--handler", h, "--apply"]);
+  assert.equal(again.status, 1, again.stdout + again.stderr);
+  assert.match(again.stderr, /已经有默认路由/u, again.stderr);
+  assert.equal(run(["--init-default", "--handler", h]).status, 2, "缺 --id");
+  // 非绝对路径：预览不校验（与普通登记一致），--apply 才判 —— 断言那条路径真的拒
+  const rel = run(["--init-default", "--id", "self", "--handler", "relative.mjs", "--apply"]);
+  assert.equal(rel.status, 1, rel.stdout + rel.stderr);
+  assert.match(rel.stderr, /必须是绝对路径/u, rel.stderr);
+  // 没有默认路由的表上登记外部处理器：CLI 与库层同一结论，且不建表
+  fs.rmSync(f);
+  const reg = run(["--id", "cc2cd", "--handler", h, "--apply"]);
+  assert.equal(reg.status, 1, reg.stdout + reg.stderr);
+  assert.match(reg.stderr, /no_default_route_yet/u, reg.stderr);
   assert.equal(fs.existsSync(f), false);
 });
 
@@ -21028,7 +21147,10 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   assert.deepEqual([d.status, d.why], ["no_routes", "路由表里没有启用的路由"]);
   write({ routes: [{ id: "x", handler: outside, enabled: false }] });
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_routes");
+  // issue #222 追加：单条非默认不再算默认 —— 以前这里断言的是它算 runtime（唯一那条被当默认）
   write({ routes: [{ id: "only", handler: viaLink }] });
+  assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_default", "单条非默认不是默认路由");
+  write({ routes: [{ id: "only", handler: viaLink, default: true }] });
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "runtime");
   // 评审反例（第 3 轮）：默认路由必须是本链自己的 id —— cc2cd 被标默认时是 wrong_default，恢复入口零写入
   write({ routes: [{ id: "self", handler: viaLink }, { id: "cc2cd", handler: outside, default: true }], sessions: { s1: "cc2cd" } });
@@ -21045,10 +21167,13 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   write({ routes: [{ id: "self", handler: viaLink, default: true }, { id: "cc2cd", handler: path.join(runtimeCurrent, "scripts", "c2c-inbound.mjs") }, { id: "ext", handler: outside }] });
   d = defaultRouteHandler({ file, runtimeCurrent, expectedHandler: viaLink, expectedRouteId: "self" });
   assert.deepEqual([d.status, d.others.map((o) => o.id)], ["runtime", ["ext"]], JSON.stringify(d));
-  // 评审反例：唯一一条不标 default 且在运行时之外 —— 它就是有效默认，不再同时被列成"另有非默认"
+  // 评审反例（第 3 轮）：唯一一条不标 default —— **它不算默认**（issue #222 追加：去掉了"单条即兜底"）。
+  // 状态是 no_default，且它出现在 others 里 —— 那正是要人工核对的那条（未登记话题现在一律拒收）。
   write({ routes: [{ id: "only", handler: outside }] });
   d = defaultRouteHandler({ file, runtimeCurrent });
-  assert.deepEqual([d.status, d.id, d.others], ["outside", "only", []]);
+  assert.deepEqual([d.status, d.id, d.handler, d.others.map((o) => o.id)], ["no_default", undefined, null, ["only"]]);
+  // restore-default 也不再认单条：它不是"有默认路由"，先把那条标成 default 是切权威路由。
+  assert.equal(restoreDefaultRoute({ handler: viaLink, file, expectedRouteId: "self" }).reason, "no_default_route");
   write({ routes: [{ id: "a", handler: viaLink }, { id: "b", handler: outside }] });
   assert.equal(defaultRouteHandler({ file, runtimeCurrent }).status, "no_default");
   fs.writeFileSync(file, "{broken");
@@ -21135,6 +21260,33 @@ test("⑦ 入站默认处理器（issue #88）：分类五态不折叠；doctor 
   m.writeTables({ projects, routes: [], sessions: {}, providers: [] });
   c = checkOf(doctorReport(m.run()), "default_route_handler");
   assert.deepEqual([c.ok, /路由表里没有启用的路由，分发器用运行时自带的默认处理器/u.test(c.detail)], [true, true], "空表 = 运行时默认：" + c.detail);
+});
+
+test("issue #222：doctor「路由表」项在表里有路由但没默认时报 ✗，⾸建默认后转绿", () => {
+  const m = doctorMachine();
+  // 单条无默认（omm 首装那个坑的残留态）：现在不再当兜底，而是未登记话题一律拒收
+  m.writeTables({ projects: [], routes: [m.route("cc2cd")], sessions: {}, providers: [] });
+  const single = checkOf(doctorReport(m.run()), "routes");
+  assert.equal(single.ok, false, JSON.stringify(single));
+  assert.match(single.detail, /都没标 default（issue #222）/u, single.detail);
+  assert.match(single.detail, /未登记话题一律拒收，本链自己也就接不到待绑定认领/u, single.detail);
+  // next 指路 --init-default：新机器按「装机 → 首建默认路由 → 登记外部处理器」。
+  // 本项 ✗ 的态下它会被拒，所以 next 里也写清楚改默认要人工核对 —— 不给一条必败还看起来能跑的命令。
+  assert.match(single.next, /--init-default/u, String(single.next));
+  assert.match(single.next, /已经有路由，该命令会拒/u, String(single.next));
+  // 多条无默认：同样是拒收（两条都不投）
+  m.writeTables({ projects: [], routes: [m.route("a"), m.route("b")], sessions: {}, providers: [] });
+  const multi = checkOf(doctorReport(m.run()), "routes");
+  assert.deepEqual([multi.ok, /2 条启用路由都没标 default/u.test(multi.detail), /未登记话题一律拒收/u.test(multi.detail)], [false, true, true], multi.detail);
+  // 没有路由表照旧不是故障（内置默认是本链自己）
+  fs.rmSync(m.files.routes);
+  const none = checkOf(doctorReport(m.run()), "routes");
+  assert.deepEqual([none.ok, /没有路由表/u.test(none.detail), none.next], [true, true, null], JSON.stringify(none));
+  // ⾸建本链默认路由（真入口写那张表）→ 绿
+  const init = initDefaultRoute({ file: m.files.routes, id: "self", handler: m.route("self").handler });
+  assert.equal(init.ok, true, JSON.stringify(init));
+  const ok = checkOf(doctorReport(m.run()), "routes");
+  assert.deepEqual([ok.ok, ok.detail, ok.next], [true, "1 条启用路由，0 条话题登记", null], JSON.stringify(ok));
 });
 
 

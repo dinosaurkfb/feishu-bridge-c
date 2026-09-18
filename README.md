@@ -251,6 +251,10 @@ session 绑定。日常还可以使用：
 默认路由的 id 也要对（Claude `self` / Codex `codex`）：别的路由被标成默认是独立状态 `wrong_default`，不给自动恢复；
 改回用 `node scripts/register-route.mjs --restore-default --routes <该链的 routes.json> --handler <runtime/current 下的 inbound.mjs> --id <self|codex> [--apply]`
 （切权威路由，Frank 逐次授权；先备份整张表，只动默认那条）。
+**新机器的顺序（issue #222）**：装机 → `node scripts/register-route.mjs --init-default --id <self|codex> --handler <runtime/current 下的 inbound.mjs> [--apply]`（首建本链默认路由）→ 再登记外部处理器。
+表不存在、或表里没有默认路由时，新增路由会被 `no_default_route_yet` 拒掉（只往已有路由登记话题不受影响），`doctor` 的「路由表」项也会报 ✗。
+兜底只认显式 `default: true`：表里只有一条非默认路由**不再**被当默认（2026-09-18 之前在 omm 首装实测到的隐式规则会把那唯一一条变成全机兜底）；
+没有默认路由时未登记话题一律拒收（本链自己也接不到待绑定认领）。已经有路由的表想补默认不是首建，那是改未登记话题的去向（切权威路由），要人工核对 + Frank。
 账本按封闭形状分族盘点锁家族：主锁 control_lock_held（不要手删，协议会回收）、reap 段锁 control_reap_lock（残骸交 repair-publish-lock）、
 维护锁 control_maint_lock（人确认后手删）、.reaped-<uuid> / .reap.quarantine-<…> 残骸（可直接删）；别的后缀是 unrecognized_entry。
 

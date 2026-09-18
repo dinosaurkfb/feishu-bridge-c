@@ -151,7 +151,10 @@ export const ROUTE_REJECT_TEXT = {
  *
  * 规则，从确定到兜底：
  *   1. 这个 session 明确登记过 → 用它登记的那个路由
- *   2. 没登记 → 默认路由（通常是本仓库，它自己会处理待绑定认领）
+ *   2. 没登记 → **标了 default 的那条**（通常是本仓库，它自己会处理待绑定认领）
+ *
+ * 没有默认路由就拒收 —— **包括表里只有一条非默认路由的时候**（issue #222：以前"单条即兜底"，
+ * 于是先登记外部处理器的机器上所有未登记话题都投给它，而且不报错。
  *
  * 刻意**不做**「问每个 handler 这是不是你的」：那要为每条路由起一个进程，
  * 在秒级回执的预算里放不下，而且「谁先回答谁赢」会让结果依赖进程调度。
@@ -171,7 +174,10 @@ export function selectRoute({ sessionId, routes, sessions }) {
 
   if (list.length === 0) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER };
 
-  const fallback = list.find((r) => r.isDefault) ?? (list.length === 1 ? list[0] : null);
+  // 只认显式 default。以前这里有 `?? (list.length === 1 ? list[0] : null)` —— 那条隐式规则
+  // 把"只有一条路由"变成了"那一条就是全机兜底"，与写入口的守卫互相矛盾：一边拒绝新增路由，
+  // 一边又在读侧把唯一那条当默认。取消它后，判据只有一条：标了 default 才算默认。
+  const fallback = list.find((r) => r.isDefault) ?? null;
   if (!fallback) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER, candidates: list.length };
   return { ok: true, route: fallback, matchedBy: "default" };
 }
@@ -211,7 +217,11 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
   try {
     const read = readRoutesDoc(file);
     if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
-    const doc = read.doc ?? { schema_version: "1.0", routes: [], sessions: {} };
+    // issue #222 第 6 条：**表不存在时不合成空表**。以前这里 `?? {routes:[],sessions:{}}`
+    // 就是陷阱入口 —— 自建一张空表，再把外部处理器写进去，它就成了全机兜底。
+    // 表不存在 = 没有任何路由、也没有默认路由，新增路由一律拒（会话登记也不可能：没有路由可指向）。
+    if (read.doc === null) return { ok: false, reason: "no_default_route_yet" };
+    const doc = read.doc;
     if (!Array.isArray(doc.routes)) doc.routes = [];
     if (!isPlainObject(doc.sessions)) doc.sessions = {};
 
@@ -233,6 +243,13 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
     // ---- 单次原子写 ----
     const routeChanged = !existing;
     const sessionChanged = sessionId !== null && declared !== id;
+    // issue #222：新增一条路由，而表里没有任何启用的默认路由 —— 未登记话题就没有去处了
+    // （以前 selectRoute 会把表里唯一那条当兜底，现在只认显式 default），而写下去的那条很容易
+    // 被当成兜底来理解。播种默认路由走 initDefaultRoute。
+    // 只把话题登记到**已存在**的路由（routeChanged 假）与默认路由无关，不受这条守卫影响。
+    if (routeChanged && !doc.routes.some((r) => r.default === true && r.enabled !== false)) {
+      return { ok: false, reason: "no_default_route_yet" };
+    }
     if (routeChanged) doc.routes.push(note ? { id, handler, note } : { id, handler });
     if (sessionChanged) doc.sessions[sessionId] = id;
     if (routeChanged || sessionChanged) {
@@ -246,12 +263,61 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
 }
 
 /**
+ * 首建本链的默认路由（issue #222）。**只在表不存在、或表存在但一条路由都没有时**允许。
+ *
+ * 为什么要有它：一台还没有路由表的机器上，先登记外部处理器的那条路会把表停在
+ * 「有路由、但没有默认路由」这个状态：未登记话题一律拒收（本链自己也接不到待绑定认领），
+ * doctor 会报 ✗ —— 而以前那条路由还会被当成兜底（issue #222 的 omm 首装实测）。
+ * 先播种本链默认路由，这个缺口就不存在了。
+ *
+ * 给**已经有路由**的表补默认是另一件事：那会改变未登记话题的去向，等于切权威路由，
+ * 不能由「首建」命令暗中完成。有默认 → `default_route_exists`（指路 --restore-default）；
+ * 有路由但没默认 → `routes_without_default`（#222 描述的坑本身，交人核对 + Frank，本命令不修）。
+ */
+export function initDefaultRoute({ file = routesPath(), id, handler, note = null } = {}) {
+  if (typeof id !== "string" || !id) return { ok: false, reason: "no_route_id" };
+  if (typeof handler !== "string" || !path.isAbsolute(handler)) {
+    return { ok: false, reason: "handler_not_absolute" };
+  }
+  // 与普通登记同一套校验：目录、不可读的文件登记出来的路由都投不进去。
+  let stat;
+  try { stat = fs.statSync(handler); } catch { return { ok: false, reason: "handler_missing", handler }; }
+  if (!stat.isFile()) return { ok: false, reason: "handler_not_a_file", handler };
+  try { fs.accessSync(handler, fs.constants.R_OK); } catch {
+    return { ok: false, reason: "handler_not_readable", handler };
+  }
+
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const lockDir = routesLockDir(file);
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return { ok: false, reason: "routes_busy" };
+  try {
+    const read = readRoutesDoc(file);
+    if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
+    const doc = read.doc ?? { schema_version: "1.0", routes: [], sessions: {} };
+    if (!Array.isArray(doc.routes)) doc.routes = [];
+    if (!isPlainObject(doc.sessions)) doc.sessions = {};
+    if (doc.routes.length > 0) {
+      // 有默认还是没默认只影响理由与指路，两种都不写：这张表已经不是「首建」了。
+      const hasDefault = doc.routes.some((r) => isPlainObject(r) && r.default === true && r.enabled !== false);
+      return { ok: false, reason: hasDefault ? "default_route_exists" : "routes_without_default", routes: doc.routes.length };
+    }
+    doc.routes.push(note ? { id, handler, default: true, note } : { id, handler, default: true });
+    const wrote = writeRoutesDoc(doc, file);
+    if (!wrote.ok) return wrote;
+    return { ok: true, id, handler };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/**
  * 只登记路由。走同一把锁 —— 不加锁的读改写在并发下会丢更新。
  *
  * 幂等：同 id 同 handler 就什么都不做。同 id **换 handler** 会被拒 ——
  * 那是把别人的话题悄悄改判给另一个脚本。
  *
- * 刻意**不支持**设 default。默认路由是权威路由，换它要 Frank 逐次授权。
+ * 刻意**不支持**设 default：默认路由是权威路由，先播种用 initDefaultRoute，换它要 Frank 逐次授权。
  */
 export function registerRoute({ id, handler, note = null, file = routesPath() }) {
   const r = registerRouteBinding({ id, handler, note, sessionId: null, file });
@@ -303,7 +369,7 @@ export function registerSession({ sessionId, routeId, file = routesPath() }) {
  *   runtime        默认处理器解析成普通文件后的 realpath 在 runtimeCurrent 之下，且（给了 expectedHandler 时）就是这条链预期的那个
  *   outside        默认处理器不是装好的运行时 —— 缺失 / 断链 / 指向运行时之外 / 运行时里别的文件
  *   wrong_default  默认路由的 id 不是这条链自己的（Claude self / Codex codex）→ 未登记话题会被投给别的路由；不给自动恢复
- *   no_default     有路由但没有默认路由（多于一条且都没标 default）→ 未登记话题会被拒
+ *   no_default     有路由但没一条标 default（不管几条）→ 未登记话题会被拒
  *   unreadable     表读不出来
  * others 列出非默认路由里处理器在运行时之外的（只按"在不在运行时之内"判；cc2cd 那种可能是有意的，按备注分辨）。
  */
@@ -335,8 +401,9 @@ export function defaultRouteHandler({ file = routesPath(), runtimeCurrent, expec
     if (expectedHandler !== null && w.real !== expectedReal) return { under: false, why: "在运行时目录里但不是这条链预期的处理器（" + String(expectedHandler) + "）：" + w.real };
     return { under: true, why: null };
   };
-  // 先定"有效默认路由"（与 selectRoute 同一规则：标了 default 的，或唯一一条），再算 others —— 否则唯一那条会同时被列成默认和"另有非默认"。
-  const dflt = table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null);
+  // 先定"有效默认路由"（与 selectRoute 同一规则：**只认标了 default 的**，issue #222 去掉了"唯一一条也算默认"），
+  // 再算 others —— 否则唯一那条会同时被列成默认和"另有非默认"。
+  const dflt = table.routes.find((r) => r.isDefault) ?? null;
   const others = table.routes.filter((r) => r !== dflt && !withinRuntime(r.handler).under).map((r) => ({ id: r.id, handler: r.handler, note: r.note }));
   if (!dflt) return { status: "no_default", handler: null, others, why: table.routes.length + " 条路由都没标 default" };
   // 默认路由必须是这条链自己的那条（Claude self / Codex codex）：别的路由被标成默认，"把它的 handler 换成本链处理器"不是修复，是把别人的话题改判 ——
@@ -369,7 +436,9 @@ export function restoreDefaultRoute({ handler, note = null, file = routesPath(),
     if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
     if (read.doc === null) return { ok: false, reason: "no_routes" };
     const routes = Array.isArray(read.doc.routes) ? read.doc.routes.filter((r) => isPlainObject(r) && r.enabled !== false) : [];
-    const dflt = routes.find((r) => r.default === true) ?? (routes.length === 1 ? routes[0] : null);
+    // 只认 default: true（issue #222 去掉了"唯一一条也算默认"）：单条非默认的表不是"有默认路由"，
+    // 恢复它要先把那条标成 default，那是切权威路由，不能由 --restore-default 顺带做。
+    const dflt = routes.find((r) => r.default === true) ?? null;
     if (!dflt) return { ok: false, reason: "no_default_route" };
     // 只改本链自己的默认路由；默认行是别的 id → 零写入（评审探针：cc2cd 被标默认时，改它的 handler 会把登记到它的话题悄悄改送本链处理器）。
     if (dflt.id !== expectedRouteId) return { ok: false, reason: "default_route_id_mismatch", id: dflt.id, expectedRouteId };

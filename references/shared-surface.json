@@ -335,6 +335,7 @@
       "ROUTE_REJECT",
       "ROUTE_REJECT_TEXT",
       "defaultRouteHandler",
+      "initDefaultRoute",
       "loadRoutes",
       "registerRoute",
       "registerRouteBinding",

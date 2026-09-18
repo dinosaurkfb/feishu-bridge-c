@@ -97,6 +97,8 @@ const PREVIEW = {
   bindProject: "node scripts/bind-project.mjs（预览；确认后自行加 --apply）",
   // 这条命令控制权威路由：路径一律 shellQuote，不靠"本机路径恰好没空格"。命令与说明之间留一个空格，整段可复制、也可切出命令。
   restoreDefaultRoute: (routesFile, handler, id) => "node scripts/register-route.mjs --restore-default --routes " + shellQuote(routesFile) + " --handler " + shellQuote(handler) + " --id " + shellQuote(id) + " （预览；切权威路由，Frank 授权后自行加 --apply）",
+  // 不是必败命令的替代品：本项的 ✗ 态正是"表里已经有路由"（--init-default 会拒），所以这条只讲顺序与找谁。
+  initDefaultRoute: (handler) => "node scripts/register-route.mjs --init-default --id self --handler " + shellQuote(handler) + " （新机器按「装机 → --init-default 首建本链默认路由 → 登记外部处理器」；本机表里已经有路由，该命令会拒 —— 改默认路由的去向要人工核对 + Frank）",
   rotate: "/feishu-rotate（在对应项目的会话里）",
   drainCodex: "node scripts/codex/drain-service.mjs --enable（预览；确认后自行加 --apply）",
   feishuOutbox: "$feishu-outbox（Codex 侧只读积压视图）/ node scripts/drain-outbox.mjs --dry-run",
@@ -346,11 +348,24 @@ export function runDoctor({
   add("registry", "项目登记表", registry.ok,
     registry.ok ? "已登记 " + (registry.projects ?? []).length + " 个项目" : "读不出来（" + (registry.reason ?? "说不清") + "）",
     registry.ok ? null : PREVIEW.installOutbound);
+  // self 路由的判据派生（① 的特判、⑦ 与 routes 项的指路共用）：有效默认路由恰为 self 且
+  // handler 实指本桥 runtime/current 的 inbound。
+  const runtimeCurrent = path.join(runtimeRoot(home, "claude"), "current");
+  const expectedHandler = path.join(runtimeCurrent, "scripts", "inbound.mjs");
+
   const routes = loadRoutes(routesFile);
-  add("routes", "路由表", routes.ok,
-    routes.ok ? (routes.reason === "no_routes" ? "没有路由表（还没登记过入站路由）" : routes.routes.length + " 条启用路由，" + Object.keys(routes.sessions).length + " 条话题登记")
+  // issue #222：表里有启用路由但一条都没标 default —— 这台机器现在没有默认路由，未登记话题一律拒收
+  // （不再有"唯一一条即兜底"那条隐含规则）。表不存在、或空表不算故障（那时的内置默认是本链自己）。
+  const routesNoDefault = routes.ok && routes.reason !== "no_routes" && routes.routes.length >= 1 &&
+    !routes.routes.some((r) => r.isDefault);
+  add("routes", "路由表", routes.ok && !routesNoDefault,
+    routes.ok ? (routes.reason === "no_routes" ? "没有路由表（还没登记过入站路由）"
+      : routesNoDefault
+        ? routes.routes.length + " 条启用路由都没标 default（issue #222）：未登记话题一律拒收，"
+          + "本链自己也就接不到待绑定认领；" + Object.keys(routes.sessions).length + " 条话题登记"
+        : routes.routes.length + " 条启用路由，" + Object.keys(routes.sessions).length + " 条话题登记")
       : "读不出来（" + (routes.reason ?? "说不清") + (routes.problem ? "：" + routes.problem : "") + "）",
-    null);
+    routesNoDefault ? PREVIEW.initDefaultRoute(expectedHandler) : null);
   const providers = loadStatusProviders(providersFile);
   add("providers", "状态入口表", providers.ok,
     providers.ok ? (providers.providers ?? []).length + " 个状态入口" : "读不出来（" + (providers.reason ?? "说不清") + (providers.problem ? "：" + providers.problem : "") + "）",
@@ -358,8 +373,6 @@ export function runDoctor({
 
   // ── self 路由的判据派生（① 的特判与 ⑦ 共用，只写一处）：有效默认路由恰为 self 且
   // handler 实指本桥 runtime/current 的 inbound —— defaultRouteHandler 的现成判据。
-  const runtimeCurrent = path.join(runtimeRoot(home, "claude"), "current");
-  const expectedHandler = path.join(runtimeCurrent, "scripts", "inbound.mjs");
   const defaultSelf = defaultRouteHandler({ file: routesFile, runtimeCurrent, expectedHandler, expectedRouteId: "self" });
 
   // ── ① ② 路由 ↔ 状态入口（collectConnectivity 是唯一判据：unregistered / unavailable / disabled）

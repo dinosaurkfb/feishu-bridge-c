@@ -34,7 +34,7 @@ import {
 import { activeGeneration, pendingGeneration } from "../topic-generation.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 import {
-  bridgeHome, findTaskForCodexThread, loadRegistry, registryFile,
+  bridgeHome, findTaskForCodexThread, loadRegistry, registryFile, registryLockPath,
   resolveTask, resolveTaskOutboundGeneration, taskPaths, topicStateForTask,
 } from "./state.mjs";
 
@@ -334,7 +334,7 @@ function main() {
     outboxDir: paths.outbox,
     publishLockDir: paths.publishLock,
     // Codex 侧的代际状态住在 registry 里，跟轮转共用 registry.lock。
-    generationLockDir: path.join(home, "registry.lock"),
+    generationLockDir: registryLockPath(home),
     pending,
     // **只从命令行拿。**这里现算等于没有跨进程保护。
     previewDigest: parsed.seen.get("expect-digest") ?? null,

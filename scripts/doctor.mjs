@@ -713,12 +713,31 @@ export function runDoctor({
       ? "；已有不是本桥写的 aily daemon 单元：" + foreign.map((f) => f.path).join("、") + "（本桥不接管，也不覆盖）"
       : "";
     const readUnitText = (f) => { try { return fs.readFileSync(f, "utf-8"); } catch { return null; }; };
-    if (fs.existsSync(ailyPath)) {
-      const enabled = systemctlFn(["is-enabled", "feishu-bridge-aily.service"]);
-      const active = systemctlFn(["is-active", "feishu-bridge-aily.service"]);
-      const enabledText = String(enabled.ok ? enabled.out : enabled.err ?? enabled.out ?? "").trim();
-      const activeText = String(active.ok ? active.out : active.err ?? active.out ?? "").trim();
-      const absent = systemdUnitAbsent(enabledText + activeText);
+    // **磁盘态与 manager 态各自独立取得**（PK3-U1-fix4 P1-3）：旧版以「磁盘上有没有 unit」为前提才去问
+    // systemd —— 磁盘缺失那一条分支直接报 ok:true，于是「文件已不在、systemd 里还 loaded/active」这种
+    // 孤儿态完全看不见（探针：磁盘无 unit + manager enabled+active → ok === true、systemctl 调用 0 次）。
+    // 现在：只要这个平台有 systemd 就问一次 manager，四象限分开判。
+    // 唯一的例外是沙箱且没有注入点（体检的 home 不是真实家目录）—— 那时不去碰真实 systemd --user，
+    // 因为那台机器不是本次体检的对象（与上面的定时器分支同一套纪律）。
+    const canAskManager = !(sandboxed && !systemctlInjected);
+    const enabled = canAskManager ? systemctlFn(["is-enabled", "feishu-bridge-aily.service"]) : null;
+    const active = canAskManager ? systemctlFn(["is-active", "feishu-bridge-aily.service"]) : null;
+    const enabledText = enabled === null ? "" : String(enabled.ok ? enabled.out : enabled.err ?? enabled.out ?? "").trim();
+    const activeText = active === null ? "" : String(active.ok ? active.out : active.err ?? active.out ?? "").trim();
+    const absent = canAskManager ? systemdUnitAbsent(enabledText + activeText) : null;   // null = 没问
+    const diskPresent = fs.existsSync(ailyPath);
+    // 「manager 里还认它」：enabled 或 active 任一。只有**磁盘不在**时这一条才叫孤儿（下面是分开的两个分支）。
+    const knownToManager = absent === false && (enabledText.startsWith("enabled") || activeText === "active");
+    if (canAskManager && !diskPresent && knownToManager) {
+      // **磁盘缺失 + manager 还在**（fix4 P1-3 的第四象限）：单元文件被删了（一次失败的手工卸载、或只删了文件
+      // 没 disable），systemd --user 里却还留着它 —— 入站运输会由一个磁盘上已经没有的单元继续起。
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", false,
+        "**孤儿单元**：磁盘上的单元文件已经不在了（" + ailyPath + "），systemd --user 里却还是 " +
+        "enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + " —— 它会在下次开机 / 重启时" +
+        "去起一个已经不存在的单元（或继续跑旧定义）。先把它拆干净：" +
+        "`systemctl --user disable --now feishu-bridge-aily.service`，再跑 doctor 复核" + foreignText,
+        PREVIEW.uninstall);
+    } else if (diskPresent) {
       // 内容判据两道：① 形状（本桥写的 ExecStart 形状：绝对路径 + daemon start --foreground）
       //                ② 与安装收据的摘要对账（收据里有这个制品时）
       const diskText = readUnitText(ailyPath);
@@ -735,25 +754,27 @@ export function runDoctor({
           : null;
       const unaudited = artifact === null;
       // PK3-U1-fix3 P1-3：**磁盘有、manager 不认 = 没加载**（installed_not_loaded），不是 ✓。
-      // 旧版把 systemdUnitAbsent(...) 折成 stateOk=true —— 只要磁盘 unit 与收据哈希一致，
-      // 即使 manager 报 not-found 也会显示「已启用且在跑」。那正是「界面说正常、实际不工作」。
       const stateOk = enabledText.startsWith("enabled") && activeText === "active" ? true
-        : absent ? false : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
+        : absent === true ? false : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
       // false 优先（真有故障就报），其次才是“收据里没有”→ unknown；只有对过账的才可能绿。
       const ok = contentProblem !== null ? false : stateOk === false ? false : unaudited ? null : stateOk;
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
         contentProblem !== null ? contentProblem + "（重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并 enable --now）" + foreignText
           : ok === true ? "已启用且在跑，内容与投影/收据一致（" + ailyPath + "）" + foreignText
             : unaudited && ok === null ? "单元在、ExecStart 形状对，但**安装收据里没有这条制品（或收据读不出来）** —— 只核了形状，无法与收据对账（判 ?）。重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并记收据" + foreignText
-              : absent ? "单元已写入但**没被 systemd --user 加载**（manager 报 absent / not-found）："
+              : absent === true ? "单元已写入但**没被 systemd --user 加载**（manager 报 absent / not-found）："
                 + "enable --now 没生效或没跑过（重跑 `node scripts/install-outbound.mjs --apply`）" + foreignText
-                : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
-                  + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
+                : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") +
+                  "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
                   : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
         ok === false ? PREVIEW.installOutbound : null);
     } else {
-      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", true,
-        "没有本桥写的单元 —— 入站运输靠 aily-cli 自己起的 daemon（本桥不接管）" + foreignText, null);
+      // 磁盘不在。两边都不在（或沙箱里没问过 manager）→ **中性**：没装不是故障。
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", absent === null ? null : true,
+        "磁盘上没有本桥写的单元" + (absent === null
+          ? "；沙箱里不碰真实 systemd --user，manager 里有没有查不清（判 ?）"
+          : "，systemd --user 里也没有（manager 报 absent / not-found）") +
+        " —— 入站运输靠 aily-cli 自己起的 daemon（本桥不接管）" + foreignText, null);
     }
   }
 

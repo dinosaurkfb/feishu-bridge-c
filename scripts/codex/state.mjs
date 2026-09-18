@@ -64,6 +64,27 @@ export function bridgeHome(env = process.env) {
 export const registryFile = (home = bridgeHome()) => path.join(home, "registry.json");
 export const templateFile = (home = bridgeHome()) => path.join(home, "chain-config.json");
 export const hookLogFile = (home = bridgeHome()) => path.join(home, "hook.log");
+// ── 桥根下的其余位置派生（PK3-U1-fix4 P1-2）：**每个名字只有这一处**。
+//
+// 为什么把它们一个个导出来：卸载的 `--purge` 在显式 `FEISHU_CODEX_BRIDGE_HOME` 下**不再整棵递归删**
+// （人给的位置可能是共享目录 / 系统目录），改成只删桥根下**封闭的已知条目**。
+// 那份清单不能靠在删除现场手写文件名 —— 手写的迟早跟真正写文件的那处漂开，
+// 而漂开的后果是“以为删干净了、其实留下了登记表”。所以每个位置都在**写它的模块**里派生成一个函数，
+// 卸载清单从这些函数取（见 maintenance/install-footprint.mjs 的 codexBridgeKnownEntries）。
+/** `tasks/<key>/` 的父目录：每个 Codex task 的 inbound / outbound 状态都在它下面。 */
+export const tasksDir = (home = bridgeHome()) => path.join(home, "tasks");
+/** 未清回执目录（bind-task / feishu-rotate / feishu-unbind 写）。 */
+export const receiptsDir = (home = bridgeHome()) => path.join(home, "receipts");
+/** 线程活动租约目录（recordThreadActivity 写；每个 thread 一个 <hash>.json）。 */
+export const threadsDir = (home = bridgeHome()) => path.join(home, "threads");
+/** Codex 链的入站路由表（codex/doctor.mjs 与 codex/feishu-status.mjs 读）。 */
+export const routesFile = (home = bridgeHome()) => path.join(home, "routes.json");
+/** 入站分发日志（codex/feishu-status.mjs 读、dispatcher 写）。 */
+export const dispatcherLogFile = (home = bridgeHome()) => path.join(home, "dispatcher.log");
+/** 入站崩溃日志（codex/inbound.mjs 写）。 */
+export const inboundCrashLogFile = (home = bridgeHome()) => path.join(home, "inbound-crash.log");
+/** 登记表锁的位置（发布锁原语按这个名字建 symlink）。 */
+export const registryLockPath = (home = bridgeHome()) => path.join(home, "registry.lock");
 
 const safeKey = (value) => String(value ?? "").replace(/[^A-Za-z0-9_-]/g, "_");
 const threadFileKey = (threadId) => crypto.createHash("sha256").update(String(threadId)).digest("hex").slice(0, 24);
@@ -92,7 +113,7 @@ export function validateRegistryTasks(tasks) {
 export function taskStateDir(task, home = bridgeHome()) {
   const key = safeKey(task?.logical_task_key ?? task?.id);
   if (!key) throw new Error("task 缺 logical_task_key");
-  return path.join(home, "tasks", key);
+  return path.join(tasksDir(home), key);
 }
 
 export const taskPaths = (task, home = bridgeHome()) => {
@@ -419,7 +440,7 @@ export function writeRegistryFixtureUnvalidated(tasks, file = registryFile()) {
 }
 
 export function addTask(task, { home = bridgeHome() } = {}) {
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -576,7 +597,7 @@ export function setTaskConnectionStatus({
 } = {}) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   if (!new Set(["active", "paused"]).has(status)) return { ok: false, reason: "invalid_status" };
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -633,7 +654,7 @@ export function refreshPendingTaskBinding({
   threadId, home = bridgeHome(), now = Date.now(),
 } = {}) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -674,7 +695,7 @@ export function refreshPendingTaskBinding({
 export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {}) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
   if (typeof name !== "string" || !name.trim()) return { ok: false, reason: "invalid_name" };
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -703,7 +724,8 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
 /** 这次迁移的身份。写进持久回执，让"跑没跑过、跑的是哪一版"变成可回答的问题。 */
 export const AUTO_PUBLISH_MIGRATION_ID = "auto_publish_on_completion_v1";
 
-const migrationsFile = (home) => path.join(home, "migrations.json");
+/** 自动发布迁移的账本（enableAutoPublishForAllTasks 写）。 */
+export const migrationsFile = (home) => path.join(home, "migrations.json");
 
 /**
  * 读原始登记文档 —— **不用 loadRegistry**。
@@ -867,7 +889,7 @@ export function enableAutoPublishForAllTasks({ home = bridgeHome(), apply = fals
   }
 
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -1087,7 +1109,7 @@ export function promoteTask({
   logicalTaskKey, sessionId, generationId, operationId,
   home = bridgeHome(), now = Date.now(),
 }) {
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -1150,7 +1172,7 @@ function mutateTaskTopicState({
   mutate,
 } = {}) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return lockFailure(lock);
   try {
@@ -1277,7 +1299,7 @@ function mutateTaskInteractionPolicy({
   mutate,
 } = {}) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
-  const lockDir = path.join(home, "registry.lock");
+  const lockDir = registryLockPath(home);
   let lock;
   const wait = new Int32Array(new SharedArrayBuffer(4));
   for (let attempt = 0; attempt <= lockRetries; attempt += 1) {
@@ -1412,7 +1434,7 @@ export function makeTaskEntry({
 }
 
 const leaseFile = (threadId, home = bridgeHome()) =>
-  path.join(home, "threads", threadFileKey(threadId) + ".json");
+  path.join(threadsDir(home), threadFileKey(threadId) + ".json");
 
 export function recordThreadActivity({ threadId, turnId, cwd, active, eventName, home = bridgeHome(), now = Date.now() }) {
   if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
@@ -1449,7 +1471,7 @@ export function isThreadBusy(threadId, { home = bridgeHome(), now = Date.now(), 
 }
 
 export function findActiveThreadsForRoot(root, { home = bridgeHome(), now = Date.now() } = {}) {
-  const dir = path.join(home, "threads");
+  const dir = threadsDir(home);
   let files;
   try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")); } catch { return []; }
   const out = [];

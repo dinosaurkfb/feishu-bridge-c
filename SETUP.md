@@ -412,6 +412,14 @@ node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数
 **settings.json 的合同**：本桥的钩子条目与预览放行规则消失，**别人的条目逐字段不变**。
 不承诺"回到装前字节"——重新序列化会规范化格式（缩进 / 键序），只有原本是空 `{}` 的情形才恰好字节相等。
 
+**`--purge` 的删除边界**（2026-09-19，PK3-U1-fix4）：
+- **产品自己派生的两处桥根整棵删**：`<home>/.claude/feishu-bridge`、`<codexHome>/feishu-bridge`。
+- **显式 `FEISHU_CODEX_BRIDGE_HOME`（人给的位置）只删它下面的封闭已知条目**（登记表 / 模板 / 路由表 /
+  回执 / 账本 / 收据 / tasks / intents / threads / 日志 / 锁），**目录本身保留** —— 那可能是共享目录，
+  里面还可能有别人的文件。
+- 显式桥根必须落在 home 或系统临时目录下；指到 `/etc` 这类系统目录会被拒绝（exit 2、零写，并点名变量与值）。
+- 覆盖点环境变量（`FEISHU_BRIDGE_REGISTRY` 等）只删那个文件，**绝不删它的父目录**。
+
 **卸后怎么验**：
 
 ```bash

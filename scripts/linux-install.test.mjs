@@ -918,10 +918,15 @@ test("PK3-L6 doctor(linux)：每一次调用 systemctl 的 argv[0] 恒为 --user
   const doc = runDoctor({ home: fx.home, platform: "linux", systemctl: recordingSystemctl, registryFile: fx.registryFile });
   const check = doc.checks.find((c) => c.id === "backlog_vs_publisher");
   assert.equal(check.ok, true, check.detail);
-  assert.equal(recordedCalls.length, 3, "is-enabled / is-active / show 必须各调用一次");
-  assert.deepEqual(recordedCalls[0].slice(0, 2), ["--user", "is-enabled"]);
-  assert.deepEqual(recordedCalls[1].slice(0, 2), ["--user", "is-active"]);
-  assert.deepEqual(recordedCalls[2].slice(0, 2), ["--user", "show"]);
+  // PK3-U1-fix4 P1-3：aily daemon 项现在**磁盘不在也问一次 manager**（四象限），所以总调用数多了两次；
+  // 本用例管的是「定时器那三项问得对不对、每次 argv[0] 是不是 --user」，所以按 unit 名筛出定时器那三条。
+  const drainCalls = recordedCalls.filter((a) => !a.includes("feishu-bridge-aily.service"));
+  const ailyCalls = recordedCalls.filter((a) => a.includes("feishu-bridge-aily.service"));
+  assert.equal(drainCalls.length, 3, "定时器的 is-enabled / is-active / show 必须各调用一次：" + JSON.stringify(recordedCalls));
+  assert.equal(ailyCalls.length, 2, "aily 项要独立问一次 manager（is-enabled + is-active）：" + JSON.stringify(recordedCalls));
+  assert.deepEqual(drainCalls[0].slice(0, 2), ["--user", "is-enabled"]);
+  assert.deepEqual(drainCalls[1].slice(0, 2), ["--user", "is-active"]);
+  assert.deepEqual(drainCalls[2].slice(0, 2), ["--user", "show"]);
   for (const call of recordedCalls) {
     assert.equal(call[0], "--user", "注入函数路径每次调用 argv[0] 必须是 --user: " + JSON.stringify(call));
   }
@@ -940,7 +945,10 @@ test("PK3-L6 doctor(linux)：每一次调用 systemctl 的 argv[0] 恒为 --user
     assert.equal(checkBin.ok, true, checkBin.detail);
     assert.ok(fs.existsSync(log), "假二进制必须产生调用日志");
     const lines = fs.readFileSync(log, "utf-8").trim().split("\n").filter(Boolean);
-    assert.equal(lines.length, 3, "假二进制必须记录 3 次调用：" + JSON.stringify(lines));
+    // 同上：把 aily 项那两次（fix4 P1-3 新增）筛出去，本用例的断言对象是定时器那三条。
+    const drainLines = lines.filter((l) => !l.includes("feishu-bridge-aily.service"));
+    assert.equal(drainLines.length, 3, "假二进制必须记录定时器的 3 次调用：" + JSON.stringify(lines));
+    assert.equal(lines.length - drainLines.length, 2, "加 aily 的两次：" + JSON.stringify(lines));
     for (const line of lines) {
       assert.match(line, /^--user(\s|$)/, "文件里每行首项必须是 --user：" + line);
     }

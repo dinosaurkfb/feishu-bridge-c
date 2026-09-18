@@ -3,8 +3,8 @@
 
 import { validThreadId } from "./bind-compose.mjs";
 import {
-  bridgeHome, buildCodexSubscriptionProjection, findRegisteredTaskForCodexThread,
-  loadCodexTemplate, loadRegistry, registryFile,
+  bridgeHome, buildCodexSubscriptionProjection, dispatcherLogFile, findRegisteredTaskForCodexThread,
+  loadCodexTemplate, loadRegistry, registryFile, routesFile,
 } from "./state.mjs";
 import { collectProjectConnectivity, renderConnectivity } from "../status-providers.mjs";
 import {
@@ -107,7 +107,7 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     // runtimeDir 是运行时**根目录**（下面有 current / versions），不是 current 本身 —— 评审反例：传 current 会被再拼一次 current。
     runtimeDir: codexRuntimeRoot(codexHomeOf()),
     // 路由表也是 Claude 默认值 —— 同一类默认值，这次一起找。
-    routesFile: path.join(bridgeHome(), "routes.json"),
+    routesFile: routesFile(bridgeHome()),
     expectedHandler: path.join(codexRuntimeRoot(codexHomeOf()), "current", "scripts", "codex", "inbound.mjs"),
     expectedRouteId: "codex",
     verify: () => verifyRuntime({ root: codexRuntimeRoot(codexHomeOf()) }),
@@ -115,7 +115,7 @@ console.log(renderLayeredStatus(composeLayeredStatus({
     // 漏了这一个 —— 评审用反例证明：只写一条 Claude 的入站日志，
     // Codex 状态就会把它显示成自己的"最近入站"。
     // 同一类默认值有四个，我修了三个 —— **补一处、不找同类**，又一次。
-    inboundLog: path.join(home, "dispatcher.log"),
+    inboundLog: dispatcherLogFile(home),
     agentName: tpl?.transport_agent_name ?? null,
     // 端点自检：只读、限时、不修不启。模板读不出来时传 null ——
     // **没查就是没查**，不许因为代码存在就当成查过了。

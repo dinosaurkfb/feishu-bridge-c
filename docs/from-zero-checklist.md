@@ -448,6 +448,9 @@ node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数
   拿不到锁或维护门开着 → exit 2、零写；子安装器继承父进程的持有（`FEISHU_BRIDGE_INSTALL_SURFACE_HELD`）。
 - `settings.json` 的合同是「本桥条目消失 + 别人条目逐字段不变」，**不是**"回到装前字节"（重新序列化会规范化格式）。
 - `--purge` 的清单来自产品派生函数（两链桥根 + 已知数据文件的覆盖点），不手写文件名清单。
+- **删除边界**（PK3-U1-fix4）：产品派生的两处桥根（`<home>/.claude/feishu-bridge`、`<codexHome>/feishu-bridge`）
+  整棵删；**显式 `FEISHU_CODEX_BRIDGE_HOME` 只删其下的封闭已知条目、目录本身保留**，且它必须在 home 或系统
+  临时目录下（指到 `/etc` 这类位置直接 exit 2 零写）。覆盖点环境变量只删那个文件，不碰它的父目录。
 
 ### 8.2 卸载保留项（设计约束）
 卸载命令严格只移除非侵入性 hooks、技能目录与定时器，**绝不清理以下权威配置**：

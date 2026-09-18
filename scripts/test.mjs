@@ -257,6 +257,7 @@ import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscription
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
+import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -8051,25 +8052,44 @@ test("PK3-U1-fix1 P1-3：--purge 的清单来自产品派生函数（含自定�
   const env = { CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: custom,
     FEISHU_BRIDGE_REGISTRY: path.join(home, ".claude", "feishu-bridge", "registry.json") };
   // 三样实测漏过的制品：Claude receipts/、两链 installed-surface.json、Codex tasks/<key>/inbound|outbound
-  for (const rel of ["tasks/t1/inbound/x.json", "tasks/t1/outbound/y.json", "receipts/z.json", "installed-surface.json", "registry.json"]) {
+  for (const rel of ["tasks/t1/inbound/x.json", "tasks/t1/outbound/y.json", "receipts/z.json", "installed-surface.json", "registry.json", "chain-config.json", "intents/i1.json", "threads/t.json"]) {
     const p = path.join(custom, rel);
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, "{}\n");
   }
+  // PK3-U1-fix4 P1-2：显式 FEISHU_CODEX_BRIDGE_HOME 只删**封闭的已知条目** ——
+  // 人给的那个目录里可能有别人的东西，一个卸载命令没有理由连它一起带走。
+  const unrelated = path.join(custom, "NOT-OURS.txt");
+  fs.writeFileSync(unrelated, "keep\n");
   fs.mkdirSync(path.join(home, ".claude", "feishu-bridge", "inbound", "receipts"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "feishu-bridge", "inbound", "receipts", "r.json"), "{}\n");
   fs.writeFileSync(path.join(home, ".claude", "feishu-bridge", "installed-surface.json"), "{}\n");
 
   const dry = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data"], env);
   assert.equal(dry.status, 0, dry.stdout + dry.stderr);
-  assert.ok(dry.stdout.includes(custom), "清单里要出现自定义 CODEX 家目录：" + dry.stdout);
+  assert.ok(dry.stdout.includes(custom), "清单里要出现自定义 CODEX 家目录下的条目：" + dry.stdout);
   assert.equal(/将保留：无/u.test(dry.stdout), false, "不许说「将保留：无」而实际留下东西");
 
   const purged = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
   assert.equal(purged.status, 0, purged.stdout + purged.stderr);
-  assert.equal(fs.existsSync(custom), false, "自定义 CODEX 家目录整棵要没（含 tasks/receipts/installed-surface.json）");
+  // ① 已知条目（登记表 / 模板 / 收据 / tasks / intents / threads / installed-surface.json）全没
+  for (const rel of ["tasks", "receipts", "intents", "threads", "registry.json", "chain-config.json", "installed-surface.json"]) {
+    assert.equal(fs.existsSync(path.join(custom, rel)), false, "显式桥根下的已知条目要没：" + rel + "（" + purged.stdout + "）");
+  }
+  // ② 目录本身与别人的文件留下（fix4 P1-2 选的两种做法里的第一种：目录保留）
+  assert.equal(fs.existsSync(custom), true, "人给的目录本身保留（我们不该替他删目录）");
+  assert.equal(fs.readFileSync(unrelated, "utf-8"), "keep\n", "同一目录下的无关文件一个字节都不许动");
+  // ③ Claude 桥根是产品派生的 → 整棵没
   assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge")), false, "Claude 桥根整棵要没（含 receipts/ 与 installed-surface.json）");
-  assert.deepEqual(machinePurgeTargets({ home, env }).roots.filter((r) => fs.existsSync(r)), [], "两链桥根都不该还在");
+  // ④ 清单本身：派生根还在（已删，所以 exists 为假不代表清单少列）—— 字段形状要被如实报出来
+  const targets = machinePurgeTargets({ home, env });
+  assert.deepEqual(targets.roots, [path.join(home, ".claude", "feishu-bridge")],
+    "显式桥根不进 roots（不进的就是“整棵递归删”那一类）：" + JSON.stringify(targets.roots));
+  assert.ok(targets.entries.files.includes(path.join(custom, "registry.json")),
+    "登记表要在封闭条目清单里：" + JSON.stringify(targets.entries.files));
+  assert.deepEqual(targets.problems, [], JSON.stringify(targets.problems));
+  assert.equal(targets.roots.filter((r) => fs.existsSync(r)).join("|"), "",
+    "派生根都不该还在：" + JSON.stringify(targets.roots));
 });
 
 test("PK3-U1-fix1 P1-4：aily 单元的 doctor 不再假绿 —— 内容漂移（ExecStart=/bin/false）要报", () => {
@@ -8377,27 +8397,22 @@ test("PK3-U1-fix2 P2-2：只剩定时器 / Codex drain 而 current 不在 → �
 
 // ── PK3-U1-fix3：Codex 三轮的三条 P1 的常驻反例 ────────────────────────────────────
 
-// 拿掉哪行会红：把「锁内重查维护门」挪回取锁之前（fix2 的顺序）→ ① 会红在 status（期望 2、实得 0）；
+// 拿掉哪行会红：把「锁内重查维护门」挪回取锁之前（fix2 的顺序）→ ① 会红在 code（期望 2、实得 0）；
 //   把「锁内重算现场」去掉（继续用预览那份快照执行）→ ② 会红在「新装的 Codex 技能必须被卸掉」。
-test("PK3-U1-fix3 P1-1：--apply 是取锁→锁内重查门→锁内重算（两条确定性交错反例）", () => {
+// PK3-U1-fix4 P1-1：交错注入从环境变量改成**函数参数 hook**（直接 import runUninstallApply）——
+//   旧写法 `FEISHU_BRIDGE_UNINSTALL_BEFORE_LOCK=<任意 .mjs>` 是生产可达的（任何能设环境变量的人
+//   都能让卸载在**锁外**跑任意代码），它现在不存在了（下面的「死字母」用例行钉这一点）。
+test("PK3-U1-fix3 P1-1：--apply 是取锁→锁内重查门→锁内重算（两条确定性交错反例，走函数参数注入）", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f3-interleave-"));
-  const hook = (name, lines) => {
-    const p = path.join(base, name);
-    fs.writeFileSync(p, lines.join("\n") + "\n");
-    return p;
-  };
   const gateFile = path.join(base, "maint.gate");
 
   // ① 「查门之后、取锁之前，维护流程建门」—— 锁内复核必须拦住（exit 2 零写）
   const homeA = u1Home();
-  const hookGate = hook("hook-gate.mjs", [
-    "import { createGate } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "maintenance-gate-core.mjs")).href) + ";",
-    "createGate({ file: " + JSON.stringify(gateFile) + ", reason: \"交错反例：查门后建门\" });",
-  ]);
   const beforeA = u1Snapshot(homeA);
-  const a = u1Run(homeA, "uninstall.mjs", ["--apply"],
-    u1Env(homeA, { FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile, FEISHU_BRIDGE_UNINSTALL_BEFORE_LOCK: hookGate }));
-  assert.equal(a.status, 2, a.stdout + a.stderr);
+  const a = runUninstallApply({ home: homeA, purge: false,
+    env: { ...u1Env(homeA), FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile },
+    hooks: { beforeLock: () => { createGate({ file: gateFile, reason: "交错反例：查门后建门" }); } } });
+  assert.equal(a.code, 2, a.stdout + a.stderr);
   assert.match(a.stderr, /维护门/u, a.stderr);
   assert.match(a.stderr, /锁内复核/u, "要说明是锁内复核发现的：" + a.stderr);
   assert.equal(u1Snapshot(homeA), beforeA, "① 拒了就零写");
@@ -8406,15 +8421,13 @@ test("PK3-U1-fix3 P1-1：--apply 是取锁→锁内重查门→锁内重算（�
   // ② 「足迹快照之后另装一个 Codex 技能」—— 锁内重算必须看见它并真卸掉（不许「未安装，跳过」）
   const homeB = u1Home();
   const skillDir = path.join(homeB, ".codex", "skills", "m5codex-inbound-router");
-  const hookSkill = hook("hook-skill.mjs", [
-    "import fs from \"node:fs\";",
-    "fs.mkdirSync(" + JSON.stringify(skillDir) + ", { recursive: true });",
-    "fs.writeFileSync(" + JSON.stringify(path.join(skillDir, "SKILL.md")) + ", \"# skill\\n\");",
-  ]);
-  const b = u1Run(homeB, "uninstall.mjs", ["--apply"], u1Env(homeB, { FEISHU_BRIDGE_UNINSTALL_BEFORE_LOCK: hookSkill }));
-  assert.equal(b.status, 0, b.stdout + b.stderr);
+  const b = runUninstallApply({ home: homeB, env: u1Env(homeB), purge: false, hooks: { beforeLock: () => {
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, "SKILL.md"), "# skill\n");
+  } } });
+  assert.equal(b.code, 0, b.stdout + b.stderr);
   assert.equal(fs.existsSync(skillDir), false, "② 交错装上来的技能必须被卸掉：" + b.stdout);
-  // 预览那一段（锁外算的）当然还是「未安装，跳过」—— 要钉的是**执行段**（锁内重算的结果）
+  // 要钉的是**执行段**（锁内重算的结果）。
   const execPart = b.stdout.slice(b.stdout.indexOf("开始按序卸载"));
   assert.equal(/3\. Codex 链：hooks \+ 技能 \+ 兜底排空服务：未安装，跳过/u.test(execPart), false,
     "不许拿旧快照说未安装跳过：" + execPart);
@@ -8423,6 +8436,40 @@ test("PK3-U1-fix3 P1-1：--apply 是取锁→锁内重查门→锁内重算（�
   const c = u1Run(homeB, "uninstall.mjs", ["--apply"], u1Env(homeB));
   assert.equal(c.status, 0, c.stdout + c.stderr);
   assert.match(c.stdout, /卸载完成/u, c.stdout);
+});
+
+// 拿掉哪行会红：把 CLI 里的 `runUninstallApply({...})` 改回读环境变量注入点 → ③ 会红在「标记文件不该存在」
+//   （注入脚本真的被执行了）；把 runUninstallApply 的 hooks 参数改回读环境变量 → ④ 的结构断言红。
+test("PK3-U1-fix4 P1-1：测试注入点只剩函数参数 —— 旧环境变量是死字母（CLI 设了也不跑）", () => {
+  const OLD = "FEISHU_BRIDGE_UNINSTALL_" + "BEFORE_LOCK";   // 拼出来：否则本文件自己的这条断言会被结构扫描扫到
+  // ④ 结构：scripts/**（除测试）里 grep 不到那个环境变量名 —— 注入面不许以任何形式回潮。
+  const hits = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) { walk(full); continue; }
+      if (!e.name.endsWith(".mjs")) continue;
+      if (/^test.*\.mjs$/u.test(e.name) || /\.test\.mjs$/u.test(e.name)) continue;   // 测试自己会提到它（死字母用例）
+      if (fs.readFileSync(full, "utf-8").includes(OLD)) hits.push(path.relative(process.cwd(), full));
+    }
+  };
+  walk(path.resolve("scripts"));
+  assert.deepEqual(hits, [], "卸载的测试注入点不许回到环境变量上：" + JSON.stringify(hits));
+
+  // ③ 行为：设上与不设它退出码一致，而且干扰脚本**一次都没跑**（不靠注释声明"只给测试用"）
+  const home = u1Home();
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0);
+  const marker = path.join(home, "before-lock-ran.marker");
+  const hookFile = path.join(home, "before-lock-hook.mjs");
+  fs.writeFileSync(hookFile, ["import fs from \"node:fs\";",
+    "fs.writeFileSync(" + JSON.stringify(marker) + ", \"ran\");"].join("\n") + "\n");
+  const withVar = u1Run(home, "uninstall.mjs", ["--apply"], { [OLD]: hookFile });
+  assert.equal(withVar.status, 0, withVar.stdout + withVar.stderr);
+  assert.equal(fs.existsSync(marker), false, "旧环境变量是死字母：它指向的脚本一个字都不许跑");
+  assert.match(withVar.stdout, /卸载完成/u, withVar.stdout);
+  // 与不设时一致：同一台机器再跑一次（已卸干净）退出码相同、结论相同
+  const withoutVar = u1Run(home, "uninstall.mjs", ["--apply"]);
+  assert.equal(withoutVar.status, withVar.status, withoutVar.stdout + withoutVar.stderr);
 });
 
 // 拿掉哪行会红：把 purgeTargetProblems 的校验去掉 → 前五条会红在 status（期望 2、实得 0）与“零写”上；
@@ -8488,6 +8535,94 @@ test("PK3-U1-fix3 P1-3：磁盘单元在、收据一致，但 manager 报 not-fo
   const active = (args) => (args.includes("is-enabled") ? { ok: true, out: "enabled\n" } : { ok: true, out: "active\n" });
   const okc = runDoctor({ home, platform: "linux", systemctl: active }).checks.find((x) => x.id === "aily_daemon");
   assert.deepEqual([okc.ok, /已启用且在跑/u.test(okc.detail)], [true, true], JSON.stringify(okc));
+});
+
+// 拿掉哪行会红：把显式桥根重新放进 `roots`（fix3 的行为）→ ① 会红在「无关文件还在」与「目录还在」上
+//   （那个临时目录里的别的文件会被整棵带走）；把 boundary 那道校验去掉 → ② 会红在 status（期望 2、实得 0）。
+test("PK3-U1-fix4 P1-2：显式桥根只删封闭的已知条目（目录与别人的文件留下）；宽位置/系统目录直接拒", () => {
+  // ① 反例：显式桥根指向临时目录里的一个桥目录，里面除了我们的数据还有**别人的文件**
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f4-explicit-"));
+  const bridge = path.join(base, "elsewhere", "feishu-bridge");
+  const known = ["registry.json", "chain-config.json", path.join("tasks", "t1", "inbound", "x.json"),
+    path.join("receipts", "r.json"), "installed-surface.json", "hook.log"];
+  for (const rel of known) {
+    const p = path.join(bridge, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, "{}\n");
+  }
+  const unrelated = path.join(bridge, "NOT-OURS.txt");
+  fs.writeFileSync(unrelated, "keep\n");
+  const home = u1Home();
+  const env = { CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge };
+  const run = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  for (const rel of known) {
+    assert.equal(fs.existsSync(path.join(bridge, rel)), false, "已知条目要没：" + rel + "（" + run.stdout + "）");
+  }
+  assert.equal(fs.existsSync(unrelated), true, "同一目录下别人的文件不许动");
+  assert.equal(fs.existsSync(bridge), true, "人给的目录本身保留（我们不该替他删目录）");
+
+  // ② 反例：显式桥根指向系统目录 → 校验直接拒（exit 2 零写并点名哪个变量哪个值）
+  const homeB = u1Home();
+  const sentinel = path.join(homeB, ".claude", "feishu-bridge", "routes.json");
+  fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+  fs.writeFileSync(sentinel, JSON.stringify({ routes: [], sessions: {} }));
+  const before = u1Snapshot(homeB);
+  for (const [value, want] of [["/etc", /不在 home 也不在系统临时目录/u],
+    ["/usr/local/share", /不在 home 也不在系统临时目录/u]]) {
+    const envB = { CODEX_HOME: path.join(homeB, ".codex"), FEISHU_CODEX_BRIDGE_HOME: value };
+    const dry = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data"], envB);
+    assert.equal(dry.status, 2, value + "（预览也要拒）：" + dry.stdout + dry.stderr);
+    assert.match(dry.stderr, /FEISHU_CODEX_BRIDGE_HOME/u, value + "：要点名是哪个变量：" + dry.stderr);
+    assert.match(dry.stderr, want, value + "：" + dry.stderr);
+    const applied = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], envB);
+    assert.equal(applied.status, 2, value + "（--apply 也要拒）：" + applied.stdout + applied.stderr);
+  }
+  assert.equal(u1Snapshot(homeB), before, "拒了就零写");
+  assert.equal(fs.existsSync(sentinel), true, "拒了就不许动夹具数据");
+
+  // ③ 对照：临时目录的 **realpath 写法**也认（macOS 上 os.tmpdir() 给 /var/...、realpath 给 /private/var/...）——
+  //   只认一种写法会把合法目标误拒，所以判据两边都取。
+  const realBase = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "u1f4-real-"));
+  const realBridge = path.join(realBase, "feishu-bridge");
+  fs.mkdirSync(realBridge, { recursive: true });
+  fs.writeFileSync(path.join(realBridge, "registry.json"), "{}\n");
+  const homeC = u1Home();
+  const runC = u1Run(homeC, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeC, ".codex"), FEISHU_CODEX_BRIDGE_HOME: realBridge });
+  assert.equal(runC.status, 0, "realpath 写法要照常：" + runC.stdout + runC.stderr);
+  assert.equal(fs.existsSync(path.join(realBridge, "registry.json")), false, runC.stdout);
+
+  // ④ 对照：**默认派生的** Codex 桥根（不设 FEISHU_CODEX_BRIDGE_HOME）仍整棵删 —— 它的位置是产品定的。
+  //   注意空串 = 没设：套件在 process.env 里设了徒线（指到套件自己的目录），不抵消它就会把那条当“显式”。
+  const homeD = u1Home();
+  const derived = path.join(homeD, ".codex", "feishu-bridge");
+  fs.mkdirSync(derived, { recursive: true });
+  fs.writeFileSync(path.join(derived, "registry.json"), "{}\n");
+  fs.writeFileSync(path.join(derived, "NOT-OURS.txt"), "gone\n");   // 派生根是产品自己的目录：整棵带走（对照 ①）
+  const runD = u1Run(homeD, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeD, ".codex"), FEISHU_CODEX_BRIDGE_HOME: "" });
+  assert.equal(runD.status, 0, runD.stdout + runD.stderr);
+  assert.equal(fs.existsSync(derived), false, "派生根照旧整棵删：" + runD.stdout);
+});
+
+// 拿掉哪行会红：把 `const canAskManager` 那条“有 systemctl 就问一次”改回 fix3 的“磁盘在才问”
+//   → 第一条会红在 c.ok（期望 false、实得 true）与 calls.length（期望 ≥1、实得 0）。
+test("PK3-U1-fix4 P1-3：aily 磁盘态与 manager 态各自独立 —— 磁盘缺失 + manager 在 = 孤儿 ✗", () => {
+  const home = u1Home();   // 磁盘上**没有** unit
+  const calls = [];
+  const both = (args) => {
+    calls.push(args);
+    return args.includes("is-enabled") ? { ok: true, out: "enabled\n" } : { ok: true, out: "active\n" };
+  };
+  const c = runDoctor({ home, platform: "linux", systemctl: both }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([c.ok, /孤儿/u.test(c.detail), c.next !== null], [false, true, true], JSON.stringify(c));
+  assert.ok(calls.length >= 1, "磁盘不在也必须问一次 manager（旧版一次都没问）：" + JSON.stringify(calls));
+
+  // 对照：两边都不在 → 中性（不报 ✗，也不给卸载指引）
+  const notFound = () => ({ ok: false, out: "", err: "Failed to get unit file state for feishu-bridge-aily.service: No such file or directory" });
+  const c2 = runDoctor({ home, platform: "linux", systemctl: notFound }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([c2.ok, c2.next, /没有本桥写的单元/u.test(c2.detail)], [true, null, true], JSON.stringify(c2));
 });
 
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {
@@ -9820,7 +9955,9 @@ test("入站崩溃回执只出脱敏引用码，不把堆栈写进模型可见�
       rel + "：不得把异常对象写进 stderr");
     assert.doesNotMatch(tail, /stdout\.write\([^)]*err\?\.stack/u,
       rel + "：不得把堆栈写进 stdout");
-    assert.match(tail, /inbound-crash\.log/u, rel + "：堆栈要留给本机日志，不能丢");
+    // PK3-U1-fix4：崩溃日志的路径改成**派生函数**（inboundCrashLogFile，与 --purge 的删除清单同一份来源）——
+    // 判据是“这份日志的路径还在链上”，不是“那串字面量还在源文件里”。
+    assert.match(tail, /inboundCrashLogFile|inbound-crash\.log/u, rel + "：堆栈要留给本机日志，不能丢");
     assert.match(tail, /composeCrashReceipt\(/u,
       rel + "：回执由共用实现生成 —— 各写各的必然分叉");
   }

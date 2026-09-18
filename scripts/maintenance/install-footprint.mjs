@@ -26,8 +26,13 @@ import { timerKindFor } from "../drain-schedule.mjs";
 import { codexRuntimeRoot, runtimeRoot } from "../runtime-install.mjs";
 import { SKILLS as CODEX_SKILLS } from "../codex/skill-content.mjs";
 import { codexHooksOwnedEntries } from "../codex/hook-command.mjs";
-import { bridgeHome, codexHomeOf as codexHomeOfValidated } from "../codex/state.mjs";
-import { plistPath as codexDrainPlistPath } from "../codex/drain-service.mjs";
+import {
+  bridgeHome, codexHomeOf as codexHomeOfValidated, hookLogFile, inboundCrashLogFile, migrationsFile,
+  receiptsDir, registryFile, registryLockPath, routesFile, dispatcherLogFile, tasksDir, templateFile, threadsDir,
+} from "../codex/state.mjs";
+import { intentDir } from "../codex/intent.mjs";
+import { installedSurfacePath } from "../installed-surface.mjs";
+import { drainLogPath, plistPath as codexDrainPlistPath } from "../codex/drain-service.mjs";
 
 /** 存在性判据一律用 lstat：**断链的符号链接（dangling symlink）也算在**（fix1 P1-1：existsSync 会漏）。 */
 const defaultExists = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
@@ -55,10 +60,31 @@ export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {})
   bridgeHome({ ...env, CODEX_HOME: codexHomeOf({ home, env }) });
 
 /**
+ * “这个位置在用户自己的可写命名空间里”的判据（fix4 P1-2 的显式桥根边界）：home、系统临时目录、`/tmp`
+ * （macOS 上它是 `/private/tmp` 的符号链接）。两边都取**字符串形式与 realpath 两种写法**：
+ * 夹具路径常常是 `/var/...` 而 realpath 给 `/private/var/...`，只比一种会把合法目标误拒。
+ */
+const userSpaceBases = (homeNorm) => {
+  const out = new Set();
+  for (const base of [homeNorm, os.tmpdir(), "/tmp"]) {
+    out.add(path.resolve(base));
+    try { out.add(fs.realpathSync(base)); } catch { /* 取不到就不加这一种写法 */ }
+  }
+  return [...out];
+};
+export const isInUserSpace = (p, homeNorm) => {
+  const cands = new Set([path.resolve(p)]);
+  try { cands.add(fs.realpathSync(p)); } catch { /* 目标多半不存在：只有字符串形式 */ }
+  return [...cands].some((c) => userSpaceBases(homeNorm).some((b) => c === b || c.startsWith(b + path.sep)));
+};
+
+/**
  * `--purge` 删除目标的**形状校验**（fix3 P1-2，fail-closed）：任何写入前必须过。
  * 只允许三类桥根及其下（`<home>/.claude/feishu-bridge` / `<codexHome>/feishu-bridge` / 显式
  * `FEISHU_CODEX_BRIDGE_HOME`）；覆盖点文件必须是绝对路径。拒绝：非绝对、文件系统根、`<home>` 本身、
  * `<home>/.claude` 与 `<home>/.codex` 这类父层，以及**任何桥根的严格祖先**（`/` 与 home 都属于这一类）。
+ * **fix4 P1-2 新增**：标了 `boundary:"explicit-bridge-root"` 的候选（就是显式 `FEISHU_CODEX_BRIDGE_HOME`）
+ * 还必须在用户自己的命名空间里（home / 临时目录）—— 见 machinePurgeTargets 里的理由。
  */
 export function purgeTargetProblems({ candidates = [], roots = [], home = os.homedir() } = {}) {
   const problems = [];
@@ -78,8 +104,39 @@ export function purgeTargetProblems({ candidates = [], roots = [], home = os.hom
       push("是某个桥根的父目录（只允许桥根本身及其下）");
       continue;
     }
+    if (c.boundary === "explicit-bridge-root" && !isInUserSpace(n, homeNorm)) {
+      push("不在 home 也不在系统临时目录下 —— 显式桥根可能指向系统目录或共享挂载，无法从环境变量证明它是本桥的专用目录；" +
+        "要卸它请把它指回 home 下，或手工处置");
+      continue;
+    }
   }
   return problems;
+}
+
+/**
+ * 显式 `FEISHU_CODEX_BRIDGE_HOME` 下的**封闭已知条目**（PK3-U1-fix4 P1-2）：`--purge` 不再整棵递归删那个目录，
+ * 只删这些条目 —— 每个名字都从**写它的那个模块**的派生函数取（不在这里手写文件名，也不看目录里有什么）。
+ *
+ * 父目录（也就是人给的那个位置）**保留**，即使已经空了：那是他的目录，不是本桥建的，
+ * 一个卸载命令没有理由替他删掉它（而且“空目录”与“共享目录里的一个子目录”从外面看是一样的）。
+ *
+ * 不在这里的：`runtime/`（它在 `codexRuntimeRoot(codexHome)` 下，与状态根无关，由 uninstall 的 runtime 步删）、
+ * 覆盖点（`FEISHU_BRIDGE_REGISTRY` 这类环境变量指到别处时只删文件，单独一类）。
+ */
+export function codexBridgeKnownEntries({ codexBridgeHome } = {}) {
+  const root = codexBridgeHome;
+  const files = [
+    registryFile(root), templateFile(root), hookLogFile(root), migrationsFile(root),
+    routesFile(root), dispatcherLogFile(root), inboundCrashLogFile(root), drainLogPath(root),
+    registryLockPath(root),
+    // 登记表的 .prev 备份：mutateRegistryDocument 每写一次就留一份，内容就是上一版登记表 —— 它也是登记表数据。
+    registryFile(root) + ".prev",
+    // 安装收据的**规范位置**（不跟随 FEISHU_BRIDGE_INSTALLED_SURFACE 覆盖点：与其它覆盖点同一口径，
+    // 传空 env 拿默认位置）。
+    installedSurfacePath({ chain: "codex", codexBridgeHome: root, env: {} }),
+  ].filter((p) => typeof p === "string" && p.length > 0);
+  const dirs = [tasksDir(root), receiptsDir(root), intentDir(root), threadsDir(root)];
+  return { files: [...new Set(files)], dirs: [...new Set(dirs)] };
 }
 
 /**
@@ -87,9 +144,12 @@ export function purgeTargetProblems({ candidates = [], roots = [], home = os.hom
  * 清单会漏（实测漏过 receipts/、installed-surface.json、Codex 的 tasks/<key>/inbound 与 outbound、
  * 自定义 FEISHU_CODEX_BRIDGE_HOME 下的数据）。
  *
- * 两类目标：
- *   · roots：两链的机器级桥根目录（整棵删）—— 两链的全部机器级状态都在里面（登记表 / 模板 / 路由表 /
- *     订阅 / 回执 / 账本 / 收据 / runtime）；
+ * 三类目标：
+ *   · roots：**产品自己派生**的机器级桥根目录（整棵删）—— `<home>/.claude/feishu-bridge` 与
+ *     `<codexHome>/feishu-bridge`。它们的位置与名字都由产品定义，可以整棵删。
+ *   · entries：**显式 `FEISHU_CODEX_BRIDGE_HOME`**（人给的位置）下的封闭已知子项（逐个删，父目录保留）——
+ *     fix4 P1-2：整棵递归删一个人给的位置，就是把“环境变量指到哪儿”变成“递归删哪儿”（实测 `/private/tmp`、
+ *     `/etc` 都能通过旧校验），而双确认授权的是删**桥数据**，不是删那个目录。
  *   · files：**已知数据文件的覆盖点**（FEISHU_BRIDGE_REGISTRY / _ROUTES / _STATUS_PROVIDERS /
  *     _CHAIN_TEMPLATE 指向别处时）—— 只删那个文件本身，**绝不删它的父目录**（父目录是人给的，可能是别人的）。
  *
@@ -99,11 +159,18 @@ export function machinePurgeTargets({ home = os.homedir(), env = process.env } =
   const codexHome = codexHomeOf({ home, env });        // 受验：相对路径直接抛
   const claudeRoot = claudeBridgeRoot({ home });
   const codexRoot = codexBridgeRoot({ home, env });    // 受验：FEISHU_CODEX_BRIDGE_HOME 相对直接抛
-  const roots = [...new Set([claudeRoot, codexRoot])];
   const explicitBridge = typeof env.FEISHU_CODEX_BRIDGE_HOME === "string" && env.FEISHU_CODEX_BRIDGE_HOME.length > 0;
+  // 整棵递归删的只有产品派生的那两处；显式的那份改走 entries（fix4 P1-2）。
+  const roots = explicitBridge ? [claudeRoot] : [...new Set([claudeRoot, codexRoot])];
+  const entries = explicitBridge
+    ? codexBridgeKnownEntries({ codexBridgeHome: codexRoot })
+    : { files: [], dirs: [] };
   const candidates = [
     { path: claudeRoot, varName: "HOME（.claude/feishu-bridge）" },
-    { path: codexRoot, varName: explicitBridge ? "FEISHU_CODEX_BRIDGE_HOME" : "CODEX_HOME" },
+    // 显式桥根要额外过“在用户命名空间里”那道（boundary）—— 派生根不需要：它的位置是产品定的。
+    explicitBridge
+      ? { path: codexRoot, varName: "FEISHU_CODEX_BRIDGE_HOME", boundary: "explicit-bridge-root" }
+      : { path: codexRoot, varName: "CODEX_HOME" },
   ];
   const files = [];
   for (const key of ["FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_ROUTES", "FEISHU_BRIDGE_STATUS_PROVIDERS", "FEISHU_BRIDGE_CHAIN_TEMPLATE"]) {
@@ -113,7 +180,7 @@ export function machinePurgeTargets({ home = os.homedir(), env = process.env } =
     if (!roots.some((r) => v === r || v.startsWith(r + path.sep))) files.push(v);
     candidates.push({ path: v, varName: key });
   }
-  return { roots, files, problems: purgeTargetProblems({ candidates, roots, home }) };
+  return { roots, entries, files, problems: purgeTargetProblems({ candidates, roots, home }) };
 }
 
 /**

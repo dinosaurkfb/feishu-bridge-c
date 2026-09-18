@@ -40,6 +40,7 @@ import {
   appendConsumed, bridgeHome, buildCodexSubscriptionProjection, closeTaskTopicRotation,
   evaluatePromotion, findPendingTask,
   finalizeTaskDialogueTurn, findTaskForFeishuSession, interactionPolicyForTask,
+  inboundCrashLogFile,
   isThreadBusy, loadCodexTemplate, loadRegistry, promoteTask, registryFile, reserveTaskDialogueTurn, setTaskInteractionMode,
   topicStateForTask,
   shadowCodexFirstClaim, taskPaths,
@@ -1003,7 +1004,7 @@ if (isDirectRun(import.meta.url)) {
     // 完整堆栈只进机器级日志，对外只给一个可对照的引用码。
     // bridgeHome() 自己也可能因环境变量非法而抛，所以先兜住再算日志路径。
     let logFile = null;
-    try { logFile = path.join(bridgeHome(), "inbound-crash.log"); } catch { /* 下面按未落盘处理 */ }
+    try { logFile = inboundCrashLogFile(bridgeHome()); } catch { /* 下面按未落盘处理 */ }
     const receipt = composeCrashReceipt({ error: err, logFile });
     process.stdout.write(receipt.text);
     process.exit(1);

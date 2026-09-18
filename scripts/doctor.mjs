@@ -725,20 +725,27 @@ export function runDoctor({
       const shapeOk = /^ExecStart=:"\/[^"]+" "daemon" "start" "--foreground"(?: "[^"]*")*$/mu.test(String(diskText ?? ""));
       const artifact = (receiptDoc?.chains?.claude?.artifacts ?? []).find((a) => a.path === ailyPath) ?? null;
       const shaOk = artifact === null ? null : artifact.sha256 === artifactSha({ kind: "file", text: diskText });
+      // PK3-U1-fix2 P1-5：**收据缺席不能当“无问题”**。旧版把 shaOk=null 与“对上了”混为一谈，
+      // 只要 ExecStart 像个形状就报「内容与投影/收据一致」—— 那允许错误的 aily-cli 绝对路径绿灯。
+      // 三态收窄：形状不对 → ✗；收据里没这条制品（或收据读不出来）→ **?**（只核了形状，没对过账）；
+      // 收据有且 sha 相等 → 才允许绿。
       const contentProblem = !shapeOk
         ? "磁盘上的 ExecStart 不是本桥写的形状（要「冒号 + 绝对路径 + daemon start --foreground」那几个引号参数）—— 同名但内容漂移"
         : shaOk === false ? "磁盘单元与安装收据的摘要不一致（内容漂移：ExecStart / Environment 被改过，或 aily-cli 换了路径）"
           : null;
+      const unaudited = artifact === null;
       const stateOk = enabledText.startsWith("enabled") && activeText === "active" ? true
         : absent ? true : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
-      const ok = contentProblem !== null ? false : stateOk;
+      // false 优先（真有故障就报），其次才是“收据里没有”→ unknown；只有对过账的才可能绿。
+      const ok = contentProblem !== null ? false : stateOk === false ? false : unaudited ? null : stateOk;
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
         contentProblem !== null ? contentProblem + "（重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并 enable --now）" + foreignText
           : ok === true ? "已启用且在跑，内容与投影/收据一致（" + ailyPath + "）" + foreignText
-            : absent ? "单元在本机 manager 里查不到（本来就未加载）" + foreignText
-              : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
-                + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
-                : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
+            : unaudited && ok === null ? "单元在、ExecStart 形状对，但**安装收据里没有这条制品（或收据读不出来）** —— 只核了形状，无法与收据对账（判 ?）。重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并记收据" + foreignText
+              : absent ? "单元在本机 manager 里查不到（本来就未加载）" + foreignText
+                : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
+                  + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
+                  : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
         ok === false ? PREVIEW.installOutbound : null);
     } else {
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", true,

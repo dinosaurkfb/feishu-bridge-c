@@ -32,6 +32,14 @@ export const INSTALL_SURFACE_LOCK_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_LOCK";
  * 子进程据此跳过取锁（独占权由父进程保证持有到编排结束）。位置不对 / 值不对一律当没设，照常取锁。
  */
 export const INSTALL_SURFACE_HELD_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_HELD";
+/**
+ * 继承点**配套的 token**（PK3-U1-fix2 P1-1）：路径是可预测的（就在桥根下），光比路径等于把
+ * 「我持着锁」当成一句口头声明 —— 直接设上 HELD 就能无锁写安装面。改成两个变量：
+ *   FEISHU_BRIDGE_INSTALL_SURFACE_HELD=<锁路径>  且  FEISHU_BRIDGE_INSTALL_SURFACE_HELD_TOKEN=<锁里的 token>
+ * 子进程还要能核到**实际持有者**：锁文件在位、payload 形状受验、owner.pid === process.ppid（父进程就是持锁者）、
+ * token 逐字相等。任一不符 → 不认继承，按普通取锁走（父进程持着 → surface_install_busy → exit 2 零写）。
+ */
+export const INSTALL_SURFACE_HELD_TOKEN_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_HELD_TOKEN";
 
 export function installSurfaceLockPath({ home = os.homedir(), env = process.env } = {}) {
   const override = env[INSTALL_SURFACE_LOCK_ENV];
@@ -54,6 +62,8 @@ export function acquireInstallSurfaceLock({ home = os.homedir(), env = process.e
   if (r.ok) {
     return {
       ok: true, path: file,
+      // 取锁时的 token（registry 锁协议的归属凭据）：继承点要子进程拿着它才能证明“父进程真持着”（fix2 P1-1）
+      token: r.token,
       release: () => {
         try {
           const rel = releasePublishLock(file);
@@ -96,7 +106,20 @@ export function holdInstallSurfaceLockOrExit({ home = os.homedir(), env = proces
   // 编排继承（PK3-U1-fix1）：调用方在整段编排里持着这把锁时不重复取、也不假装"取到了"。
   const inherited = env[INSTALL_SURFACE_HELD_ENV];
   if (typeof inherited === "string" && inherited.length > 0 && inherited === installSurfaceLockPath({ home, env })) {
-    return { ok: true, path: inherited, inherited: true, release: () => ({ ok: true }) };
+    // fix2 P1-1：路径对只是第一关 —— 还要核到**实际持有者**。不成立就不认这次继承，
+    // 往下走普通取锁（父进程持着 → busy → exit 2 零写）；这样“设个环境变量就能无锁写”不成立。
+    const why = inheritedHolderProblem({ path: inherited, token: env[INSTALL_SURFACE_HELD_TOKEN_ENV] });
+    if (why === null) {
+      // 调用方在整段编排里持着这把锁（见 INSTALL_SURFACE_HELD_ENV 的说明）：不重复取、也不假装“取到了”。
+      return { ok: true, path: inherited, inherited: true, release: () => ({ ok: true }) };
+    }
+    // 声明了在锁里、却核不上持有者 → **拒绝**（fail-closed，不是“当没设、照常取锁”）。
+    // 为什么不往下走普通取锁：那把锁不在（被回收 / 压根没建）时普通取锁会**真的拿到锁并开写**，
+    // 而调用方的前提（“我在编排的锁里”）已经被证伪 —— 零写并说明比它现在安全。
+    // （路径本身就不对的 HELD 是另一回事：那把锁不是这一处的，当没设、照常取锁。）
+    err("安装面锁的 HELD 继承声明不成立（" + why + "）—— 拒绝，什么都没写。" +
+      "（这个变量只给 scripts/uninstall.mjs 编排里的子安装器用；不在编排里跑就 unset " + INSTALL_SURFACE_HELD_ENV + "）");
+    process.exit(2);
   }
   // 普通路径走受控返回的那一份（PK3-L7-fix6 抽出的）：拒绝文案与退出码只写在那里，两个调用面不会漂。
   const refused = acquireInstallSurfaceLockOrRefuse({ home, env, err });
@@ -125,7 +148,22 @@ function lockSiteState(p, now) {
   if (!shapeOk) return { state: "unknown", why: "payload 形状不对（owner 必须是 {pid, at, token} 逐字段受验）" };
   let alive = true;
   try { process.kill(o.pid, 0); } catch { alive = false; }
-  return { state: "held", pid: o.pid, alive, at: o.at, ageMs: Math.max(0, now - Date.parse(o.at)) };
+  // token 也带回去：HELD 继承要拿它跟子进程收到的逐字比（fix2 P1-1）。盘点投影不打印它（只取 pid/alive/at）
+  return { state: "held", pid: o.pid, alive, at: o.at, token: o.token, ageMs: Math.max(0, now - Date.parse(o.at)) };
+}
+
+/**
+ * HELD 继承能不能成立（fix2 P1-1）—— 返回 null 表示成立，否则返回为什么。
+ * 四道：① 有 token；② 锁文件在位且是本协议的 symlink（{pid, at, token} 形状受验）；
+ * ③ owner.pid === process.ppid（**父进程就是持锁者** —— 一个无关进程设上环境变量不成立）；④ token 逐字相等。
+ */
+export function inheritedHolderProblem({ path: p, token, ppid = process.ppid, now = Date.now() } = {}) {
+  if (typeof token !== "string" || token.length === 0) return "只有锁路径、没有 " + INSTALL_SURFACE_HELD_TOKEN_ENV + "";
+  const s = lockSiteState(p, now);
+  if (s.state !== "held") return "锁文件不在或不符协议（" + String(s.why ?? s.state) + "）：" + String(p);
+  if (s.pid !== ppid) return "锁的 owner pid " + s.pid + " ≠ 本进程的父进程 " + ppid + "（不是持锁者派生出来的）";
+  if (s.token !== token) return "token 与锁里的不相等";
+  return null;
 }
 /**
  * @returns {{ holder, residues: {path,kind,detail}[], inventory: "ok"|"unreadable", path }}

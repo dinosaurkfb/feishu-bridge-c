@@ -23,31 +23,38 @@ import {
   claudeSettingsOwnedEntries,
 } from "../install-projection.mjs";
 import { timerKindFor } from "../drain-schedule.mjs";
+import { codexRuntimeRoot, runtimeRoot } from "../runtime-install.mjs";
 import { SKILLS as CODEX_SKILLS } from "../codex/skill-content.mjs";
 import { codexHooksOwnedEntries } from "../codex/hook-command.mjs";
 import { plistPath as codexDrainPlistPath } from "../codex/drain-service.mjs";
-import { registryPath } from "../registry.mjs";
 
 /** 存在性判据一律用 lstat：**断链的符号链接（dangling symlink）也算在**（fix1 P1-1：existsSync 会漏）。 */
 const defaultExists = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
 const defaultRead = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } };
 
-/** Claude 侧桥根（机器级状态）：覆盖点 FEISHU_BRIDGE_REGISTRY 优先，其余按传进来的 home 派生。 */
-export const claudeBridgeRoot = ({ home = os.homedir(), env = process.env } = {}) => {
-  const reg = env.FEISHU_BRIDGE_REGISTRY;
-  if (typeof reg === "string" && reg.length > 0 && path.isAbsolute(reg)) return path.dirname(reg);
-  return path.join(home, ".claude", "feishu-bridge");
+/**
+ * Claude 侧桥根（机器级状态）：**固定 `<home>/.claude/feishu-bridge`**，不从覆盖点派生（PK3-U1-fix2 P1-2）。
+ * 之前用 `dirname(FEISHU_BRIDGE_REGISTRY)` 当整棵桥根 —— 覆盖点指到共享目录时 `--purge` 会把那个目录
+ * （连它的无关兄弟文件）整棵递归删掉。覆盖只允许进 `files`（只删文件）。
+ */
+export const claudeBridgeRoot = ({ home = os.homedir() } = {}) => path.join(home, ".claude", "feishu-bridge");
+
+/** Codex 的**家目录**（CODEX_HOME 或 `<home>/.codex`）：`hooks.json` 与 `skills/` 在这里。 */
+export const codexHomeOf = ({ home = os.homedir(), env = process.env } = {}) => {
+  const explicit = env.CODEX_HOME;
+  return typeof explicit === "string" && explicit.length > 0 ? explicit : path.join(home, ".codex");
 };
 
 /**
- * Codex 侧桥根：覆盖点优先（FEISHU_CODEX_BRIDGE_HOME → CODEX_HOME → <home>/.codex），
- * 与 codex/state.bridgeHome 同口径，但 home 从参数取 —— 否则 doctor 的沙箱 home 会被绕过去读真机的 Codex 桥目录。
+ * Codex 侧**状态根**（FEISHU_CODEX_BRIDGE_HOME → codexHome/feishu-bridge）：登记表 / tasks / 收据在这里。
+ * **与 codexHome 分开派生**（fix2 P1-3）：拿状态根的父目录当 CODEX_HOME 是错的 —— 自定义状态根时
+ * hooks.json 与 skills/ 仍然在 CODEX_HOME，runtime/current 也仍然在 `codexRuntimeRoot(codexHome)` 下，
+ * 于是足迹会漏掉它们、卸载会误报「未安装，跳过」。
  */
 export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {}) => {
   const explicit = env.FEISHU_CODEX_BRIDGE_HOME;
   if (typeof explicit === "string" && explicit.length > 0 && path.isAbsolute(explicit)) return explicit;
-  const codexHome = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : path.join(home, ".codex");
-  return path.join(codexHome, "feishu-bridge");
+  return path.join(codexHomeOf({ home, env }), "feishu-bridge");
 };
 
 /**
@@ -64,7 +71,7 @@ export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {})
  * **项目里的东西不在这里**：`<项目>/.runtime-data/` 与飞书话题历史不归机器级卸载管。
  */
 export function machinePurgeTargets({ home = os.homedir(), env = process.env } = {}) {
-  const roots = [...new Set([claudeBridgeRoot({ home, env }), codexBridgeRoot({ home, env })])];
+  const roots = [...new Set([claudeBridgeRoot({ home }), codexBridgeRoot({ home, env })])];
   const rootsSet = new Set(roots);
   const files = [];
   for (const key of ["FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_ROUTES", "FEISHU_BRIDGE_STATUS_PROVIDERS", "FEISHU_BRIDGE_CHAIN_TEMPLATE"]) {
@@ -89,8 +96,7 @@ export function machinePurgeTargets({ home = os.homedir(), env = process.env } =
 export function installFootprint({ home = os.homedir(), env = process.env, platform = process.platform,
   exists = defaultExists, read = defaultRead } = {}) {
   const kind = timerKindFor(platform);
-  const codexRoot = codexBridgeRoot({ home, env });
-  const codexHome = path.dirname(codexRoot);
+  const codexHome = codexHomeOf({ home, env });
 
   // ── Claude 侧：钩子按**严格归属**认领（不认子串）
   const settingsText = read(path.join(home, ".claude", "settings.json"));
@@ -120,7 +126,8 @@ export function installFootprint({ home = os.homedir(), env = process.env, platf
   }
   const codexSkillPaths = CODEX_SKILLS.map((sk) => path.join(codexHome, "skills", sk.name)).filter(exists);
   const codexDrain = kind === "launchd" ? [codexDrainPlistPath(home)].filter(exists) : [];
-  const codexCurrent = path.join(codexRoot, "runtime", "current");
+  // **runtime 不看状态根**（fix2 P1-3）：它由 codexRuntimeRoot(codexHome) 派生，与 FEISHU_CODEX_BRIDGE_HOME 无关。
+  const codexCurrent = path.join(codexRuntimeRoot(codexHome), "current");
 
   const present = {
     claudeHooks, claudeSkills: claudeSkillPaths, timer: timerPaths, ailyUnit,
@@ -149,9 +156,11 @@ export function installFootprint({ home = os.homedir(), env = process.env, platf
   // 状态不算故障 —— 它们仍然会出现在 residue 清单里（人有得看），但不判 ✗。
   const orphans = {
     hooks: claudeHooks.length > 0 && present.claudeCurrent === null,
-    timer: claudeHooks.length > 0 && timerPaths.length > 0 && present.claudeCurrent === null,
+    // 定时器 / Codex drain plist **不看钩子在不在了**（fix2 P2-2）：它们指向的 runtime/current 不在时
+    // 本身就是会出事的状态（每 30 分钟跑一次不存在的脚本），不该因为“钩子也被删了/从未装钩子”就说不是半装。
+    timer: timerPaths.length > 0 && present.claudeCurrent === null,
     codex: codexHookNames.length > 0 && present.codexCurrent === null,
-    codexDrain: codexHookNames.length > 0 && codexDrain.length > 0 && present.codexCurrent === null,
+    codexDrain: codexDrain.length > 0 && present.codexCurrent === null,
   };
   return {
     kind, present, residue, orphans,

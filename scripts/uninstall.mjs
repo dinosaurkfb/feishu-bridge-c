@@ -46,15 +46,17 @@ import { spawnSync } from "node:child_process";
 import { moduleRoot } from "./direct-run.mjs";
 import { parseArgvOptions } from "./argv-options.mjs";
 import { CLAUDE_INBOUND_SKILL, CLAUDE_SKILLS } from "./install-projection.mjs";
-import { describeFootprint, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
+import { claudeBridgeRoot, codexBridgeRoot, codexHomeOf, describeFootprint, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { codexRuntimeRoot, runtimeRoot } from "./runtime-install.mjs";
 import { timerPlatform } from "./drain-schedule.mjs";
-import { acquireInstallSurfaceLock, INSTALL_SURFACE_HELD_ENV, inspectInstallSurfaceLock, installSurfaceLockPath } from "./install-surface-lock.mjs";
+import { acquireInstallSurfaceLock, INSTALL_SURFACE_HELD_ENV, INSTALL_SURFACE_HELD_TOKEN_ENV, inspectInstallSurfaceLock, installSurfaceLockPath } from "./install-surface-lock.mjs";
 import { gateBlocks, gateInboundText } from "./maintenance-gate-core.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 const HOME = os.homedir();
-const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, ".codex");
+// 两类根分开派生（fix2 P1-3）：codexHome（hooks.json / skills）与 codexBridgeRoot（状态）不是一个东西，
+// 派生函数只有一份（maintenance/install-footprint.mjs）—— 不在这里镜像第二套。
+const CODEX_HOME = codexHomeOf({ home: HOME });
 
 const USAGE = "用法：node scripts/uninstall.mjs [--apply] [--purge --yes-delete-data]\n" +
   "      默认只预览；--apply 才动；--purge 连机器级数据一起删（必须同时给 --yes-delete-data）。";
@@ -76,16 +78,19 @@ const list = (p) => { try { return fs.readdirSync(p); } catch { return []; } };
 
 // ---------- 现状盘点：只读，决定每一步「有东西可卸」还是「未安装，跳过」 ----------
 
-const BRIDGE = path.join(HOME, ".claude", "feishu-bridge");
-// Codex 链的桥目录只有一份派生规则（codex/state.mjs 的 bridgeHome）：这里镜像它，不另写一套。
-const CODEX_BRIDGE = path.join(CODEX_HOME, "feishu-bridge");
+const BRIDGE = claudeBridgeRoot({ home: HOME });
+// Codex 链的两类根：状态根（数据）与运行时根 —— 自定义 FEISHU_CODEX_BRIDGE_HOME 时它们**不在一棵树上**。
+const CODEX_BRIDGE = codexBridgeRoot({ home: HOME });
+const CODEX_RUNTIME = codexRuntimeRoot(CODEX_HOME);
 const SKILLS_ROOT = path.join(HOME, ".claude", "skills");
 
 /** 两链的 runtime/current（「已安装」标记）：`versions/` 不在这一步的删除范围里。 */
 const RUNTIME_CURRENTS = [
   { chain: "claude", link: path.join(runtimeRoot(HOME, "claude"), "current") },
-  { chain: "codex", link: path.join(codexRuntimeRoot(CODEX_HOME), "current") },
+  { chain: "codex", link: path.join(CODEX_RUNTIME, "current") },
 ];
+/** `--purge` 时连 runtime/ 整棵一起删的两个目录（由产品派生函数取，不靠桥根拼路径）。 */
+const RUNTIME_DIRS = [runtimeRoot(HOME, "claude"), CODEX_RUNTIME];
 
 /**
  * 装机足迹：判据只有一份（install-projection.installFootprint）—— doctor 的未安装态用的是同一份，
@@ -113,8 +118,9 @@ const inboundSkillDir = path.join(SKILLS_ROOT, CLAUDE_INBOUND_SKILL.name);
  * 项目里的 `<项目>/.runtime-data/` 与飞书话题历史**不在这里**（不归机器级卸载管）。
  */
 const DATA = [
-  ...PURGE.roots.map((p) => ({ path: p, why: "机器级桥根（登记表 / 模板 / 路由 / 订阅 / 回执 / 账本 / 收据 / runtime）" })),
-  ...PURGE.files.map((p) => ({ path: p, why: "已知数据文件的覆盖点（只删这个文件）" })),
+  ...PURGE.roots.map((p) => ({ path: p, kind: "root", why: "机器级桥根（登记表 / 模板 / 路由 / 订阅 / 回执 / 账本 / 收据 / runtime）" })),
+  // **覆盖点只删文件**（fix2 P1-2）：它的父目录是人给的，可能是共享目录 —— 递归删它会带走无关的兄弟文件。
+  ...PURGE.files.map((p) => ({ path: p, kind: "file", why: "已知数据文件的覆盖点（只删这个文件，不碰它的父目录）" })),
 ];
 
 // ---------- 步骤表：顺序写死，理由写在每一条上 ----------
@@ -191,10 +197,12 @@ const PURGE_STEPS = [
     id: "runtime-versions",
     title: "runtime/ 整棵（含 versions/ 代码缓存）",
     why: "--purge 才删：它是代码不是数据，但留着就做不到「完全清空」",
-    present: () => exists(path.join(BRIDGE, "runtime")) || exists(path.join(CODEX_BRIDGE, "runtime")),
-    detail: () => [path.join(BRIDGE, "runtime"), path.join(CODEX_BRIDGE, "runtime")].filter(exists),
+    present: () => RUNTIME_DIRS.some((p) => exists(p)),
+    detail: () => RUNTIME_DIRS.filter(exists),
     run: () => {
-      for (const p of [path.join(BRIDGE, "runtime"), path.join(CODEX_BRIDGE, "runtime")]) {
+      // runtime/ 的路径从**产品派生函数**取（runtimeRoot / codexRuntimeRoot）：
+      // 自定义 FEISHU_CODEX_BRIDGE_HOME 时 Codex 的 runtime 不在状态根下，用桥根拼路径会漏（fix2 P1-3）。
+      for (const p of RUNTIME_DIRS) {
         try { fs.rmSync(p, { recursive: true, force: true }); } catch (err) { return { ok: false, status: 1, out: "删不掉 " + p + "：" + err.message }; }
       }
       return { ok: true, status: 0, out: "已删 runtime/（两条链）" };
@@ -210,7 +218,14 @@ const PURGE_STEPS = [
       const gone = [];
       for (const d of DATA) {
         if (!exists(d.path)) continue;
-        try { fs.rmSync(d.path, { recursive: true, force: true }); gone.push(d.path); } catch (err) { return { ok: false, status: 1, out: "删不掉 " + d.path + "：" + err.message }; }
+        try {
+          // 根：整棵删；覆盖点文件：只删那个文件（目录递归=越界）
+          fs.rmSync(d.path, d.kind === "root" ? { recursive: true, force: true } : { force: true });
+        } catch (err) { return { ok: false, status: 1, out: "删不掉 " + d.path + "：" + err.message }; }
+        gone.push(d.path);
+        // **只有真删掉了包含锁的那棵根，才允许豁免 lock_lost**（fix2 P1-4）：
+        // 记在集合里的是“本次确实删成功的根”，而不是“计划要删的根”。
+        if (d.kind === "root") PURGED_ROOTS.push(d.path);
       }
       return { ok: true, status: 0, out: gone.length > 0 ? "已删 " + gone.join("、") : "没有可删的" };
     },
@@ -281,15 +296,17 @@ if (!surface.ok) {
   process.exit(2);
 }
 // 锁就住在 `<桥根>/install-surface.lock`，而 `--purge` 的最后一个动作正是把那个桥根整棵删掉 ——
-// 于是"交不还"在这一条路径上是**预期的**（删了就是交不还）。受控放行只限这一种：purge 且锁在自己删掉的根里，
-// 别的 lock_lost / 残骸一律照旧非零（那是真丢了独占性，不是这次删的）。
-const PURGED_ROOTS = purge ? PURGE.roots : [];
+// 于是"交不还"在这一条路径上是**预期的**（删了就是交不还）。
+// **fix2 P1-4：豁免必须窄到“本次 purge 确实删掉了包含锁的那棵根”。**旧版只要 `--purge` 且锁路径落在
+// *计划要删*的根里就豁免 —— 前置安装器失败、purge 根本没跑时也会把真的 lock_lost 吞掉（本次写段的
+// 独占性没人核了）。所以 PURGED_ROOTS 只在**删除成功后** add，失败/没跑到就不在集合里。
+const PURGED_ROOTS = [];
 process.on("exit", () => {
   const rel = surface.release();
   if (rel.ok) return;
-  const deletedWithRoot = purge && String(rel.path).startsWith("lock_lost") === false
-    && PURGED_ROOTS.some((r) => String(rel.path ?? "").startsWith(r + path.sep))
-    && String(rel.why ?? "").startsWith("lock_lost");
+  const lockLost = String(rel.why ?? "").startsWith("lock_lost");
+  const deletedWithRoot = lockLost && String(rel.path ?? "") !== "" &&
+    PURGED_ROOTS.some((r) => String(rel.path).startsWith(r + path.sep));
   if (deletedWithRoot) {
     console.error("安装面锁随 --purge 的桥根一起删掉了（" + String(rel.path) + "）—— 这是 --purge 的预期结果，不算交还不还。");
     return;
@@ -297,7 +314,9 @@ process.on("exit", () => {
   console.error("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）。");
   process.exitCode = 3;
 });
+// 子安装器继承这把锁（fix2 P1-1：光给路径不够 —— 还得给它锁里的 token，子进程会核 owner pid + token）。
 stepEnv[INSTALL_SURFACE_HELD_ENV] = surface.path;
+stepEnv[INSTALL_SURFACE_HELD_TOKEN_ENV] = surface.token;
 
 console.log("\n开始按序卸载（已持安装面锁 " + surface.path + "）：");
 for (const [i, s] of steps.entries()) {

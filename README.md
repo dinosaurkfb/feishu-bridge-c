@@ -193,6 +193,11 @@ claim、长期任务续接与最终答复发布都由 bridge 管理。新接一�
 Claude Code 与 Codex 共用 envelope、selector、claim、outbox 和飞书发布器，但会话模型、hooks
 和续接方式不同。请只执行自己所用运行时的安装指南。
 
+**一键卸载**（2026-09-18 起，PK3-U1）：`node scripts/uninstall.mjs`（预览）→ `--apply`（按固定顺序
+卸三条链，**默认保留数据**）→ `node scripts/doctor.mjs` 应报「未安装」且无 ✗；
+要连机器级数据一起删才用 `--purge --yes-delete-data`。顺序、保留什么、再装注意见
+[SETUP.md「五点五、卸载」](SETUP.md)。
+
 | 运行时 | 飞书智能体 | 绑定单位 | 新用户入口 |
 |---|---|---|---|
 | Codex Desktop/CLI | Aily `codex-local` 第三方智能体，本文示例名 M5Codex | 精确 Codex task/thread | **[CODEX_SETUP.md](CODEX_SETUP.md)** |

@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { runtimeScript } from "./runtime-install.mjs";
+import { runtimeRoot, runtimeScript } from "./runtime-install.mjs";
 import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, pickClaudeNode, timerKindFor, timerPlatform, resolveNodeForHooks, unitFirstArg } from "./drain-schedule.mjs";
 export { timerKindFor, timerPlatform, resolveNodeForHooks, unitFirstArg };
@@ -140,6 +140,17 @@ export function renderClaudeSettings({ baseText, home = os.homedir(), node = pic
   actions.perm = uninstall
     ? (permBefore > 0 ? "removed" : "already-absent")
     : (permBefore === 0 ? "installed" : permSame ? "already-present" : permBefore === 1 ? "updated" : "deduped");
+  // PK3-U1：卸载要能让 settings.json **回到装前的样子**（而不是留下 `"hooks":{"Stop":[]}` 这种空壳）——
+  // 空数组/空对象在 JSON 里是"有过东西"的痕迹，而"卸干净了没有"要能用字节比出来（omm 的端到端验收就是这么比的）。
+  // 只清**空掉的容器**：非空的别人的钩子一个都不动。
+  if (uninstall) {
+    for (const k of ["Stop", "UserPromptSubmit"]) {
+      if (Array.isArray(settings.hooks?.[k]) && settings.hooks[k].length === 0) delete settings.hooks[k];
+    }
+    if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    if (Array.isArray(settings.permissions?.allow) && settings.permissions.allow.length === 0) delete settings.permissions.allow;
+    if (settings.permissions && Object.keys(settings.permissions).length === 0) delete settings.permissions;
+  }
   return { text: JSON.stringify(settings, null, 2) + "\n", settings, actions, counts: { stop: stop.length, prompts: prompts.length, allow: allow.length }, previewRule: cmds.previewRule };
 }
 
@@ -415,4 +426,198 @@ export function referencedRuntimeScripts(text) {
   const names = new Set();
   for (const m of String(text ?? "").matchAll(/runtime\/current\/scripts\/((?:codex\/)?[A-Za-z0-9_.-]+\.mjs)/gu)) names.add(m[1]);
   return [...names].sort();
+}
+
+// ── Linux：aily daemon 的 systemd --user 服务（PK3-U1）────────────────────────────────────
+/**
+ * aily daemon 是**入站运输层**（平台 → 本机 adapter），但这一份 unit 由 install-outbound.mjs 写：
+ * 平台/timer 的那套机器（timer-kind 判据、timerCmd 包装、沙箱 HOME 纪律、安装面锁、收据）都住在那边，
+ * 入站安装器里再造一份就是第二份会漂移的实现。名字前缀 feishu-bridge- 表明它归本桥管。
+ */
+export const AILY_DAEMON_UNIT = "feishu-bridge-aily";
+export const ailyDaemonUnitPath = (home = os.homedir()) => path.join(claudeDrainSystemdDir(home), AILY_DAEMON_UNIT + ".service");
+
+/** PATH 里找可执行文件（沙箱安全：不动 HOME，只看 PATH）。找不到返回 null。 */
+export function findExecutable(name, { env = process.env } = {}) {
+  for (const dir of String(env.PATH ?? "").split(":")) {
+    if (dir === "") continue;
+    const p = path.join(dir, name);
+    try { fs.accessSync(p, fs.constants.X_OK); return p; } catch { /* 下一个 */ }
+  }
+  return null;
+}
+
+/**
+ * aily-cli 的绝对路径：显式 env → 链路模板的 aily_cli_bin → PATH。
+ * 绝对路径是**必须**的：systemd --user 的 PATH 不含 mise / nvm / ~/.local/bin 那些用户级目录
+ * （omm 上 aily-cli 就在 ~/.aily-cli/bin），写裸 `aily-cli` 的 unit 会在开机后起不来。
+ */
+export function resolveAilyCli({ home = os.homedir(), env = process.env, template = null } = {}) {
+  const explicit = env.FEISHU_BRIDGE_AILY_CLI ?? template?.aily_cli_bin ?? null;
+  if (typeof explicit === "string" && explicit.length > 0) return path.isAbsolute(explicit) ? explicit : null;
+  return findExecutable("aily-cli", { env }) ?? findExecutable("aily-cli", { env: { PATH: path.join(home, ".aily-cli", "bin") + ":" + path.join(home, ".local", "bin") } });
+}
+
+/** unit 正文。**只有一种来源**（安装器照它写、doctor 照它比、用例照它断言）。 */
+export function ailyDaemonUnit({ home = os.homedir(), ailyCli, node = pickClaudeNode(), extraArgs = [] } = {}) {
+  const pathDirs = [...new Set([path.dirname(ailyCli), path.dirname(node), "/usr/local/bin", "/usr/bin", "/bin"])].join(":");
+  const args = ["daemon", "start", "--foreground", ...extraArgs.filter((a) => typeof a === "string" && a.length > 0)];
+  return [
+    "[Unit]",
+    "Description=Feishu bridge：aily daemon（Claude 链入站运输层，由 scripts/install-outbound.mjs 管）",
+    "# 不要手改这一份：单元正文只有一份来源（install-projection.mjs 的 ailyDaemonUnit），重跑安装器会覆盖。",
+    "# 已有的 aily-cli 自动生成的单元（aily-cli-daemon-*.service）在场时，本桥**不写**这一份（见安装器输出）。",
+    "StartLimitIntervalSec=300",
+    "StartLimitBurst=5",
+    "",
+    "[Service]",
+    "Type=simple",
+    "# 绝对路径：systemd --user 的 PATH 不含 mise / nvm / ~/.local/bin 那些用户级目录。",
+    "# 开头那个 `:` 让 systemd 不再对 argv 做 $VAR 展开（aily-cli 自己就是这么生成的）。",
+    "ExecStart=:" + [ailyCli, ...args].map((a) => '"' + a + '"').join(" "),
+    "# 只补 HOME / PATH。代理等其余环境由 systemd --user 从 ~/.config/environment.d/*.conf 继承",
+    "# （manager 启动时导入，写在这里反而会像 scripts/aily-daemon-restart.sh 记的那样：代理一变就静默失效）。",
+    "Environment=HOME=%h",
+    "Environment=PATH=" + pathDirs,
+    "Restart=on-failure",
+    "RestartSec=60",
+    "TimeoutStopSec=15",
+    "KillMode=control-group",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
+/** 别的单元里是不是已经有一个 aily daemon（不是本桥写的那一份）—— 有就不覆盖，交人定夺。 */
+export function foreignAilyDaemonUnits({ home = os.homedir(), readDir = (d) => { try { return fs.readdirSync(d); } catch { return []; } }, read = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } } } = {}) {
+  const dir = claudeDrainSystemdDir(home);
+  const mine = AILY_DAEMON_UNIT + ".service";
+  const out = [];
+  for (const name of readDir(dir)) {
+    if (!name.endsWith(".service") || name === mine) continue;
+    const text = read(path.join(dir, name));
+    if (text === null) continue;
+    // 认形状：ExecStart 里有 aily 相关可执行 + daemon 子命令（omm 上那份是 aily-cli-daemon-<hash>.service）。
+    if (!/^ExecStart=/mu.test(text)) continue;
+    if (!/aily[-_]?\w*["\s]/iu.test(text) || !/\bdaemon\b/u.test(text)) continue;
+    out.push({ path: path.join(dir, name), execStart: (text.match(/^ExecStart=.*$/mu) ?? [""])[0].trim() });
+  }
+  return out;
+}
+
+/**
+ * aily daemon 服务的计划（纯函数，安装器照它执行、doctor 照它比、用例照它断言）。
+ * 与 drainTimerPlan 同一纪律：darwin / 其它平台**明说不适用**，不假装装好。
+ */
+export function ailyDaemonPlan({ home = os.homedir(), platform = process.platform, ailyCli = null, node = pickClaudeNode(),
+  extraArgs = [], uninstall = false, foreign = [], read = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } } } = {}) {
+  const kind = timerKindFor(platform);
+  const file = ailyDaemonUnitPath(home);
+  // **只做 systemd（linux）**：darwin 上 aily-cli 自带 daemon 管理（也有 scripts/aily-daemon-restart.sh），
+  // 本桥不接管；别的平台更没有实现 —— 一律明说不适用，不假装装好。
+  if (kind !== "systemd") {
+    return { applicable: false, kind, action: "unsupported", file, files: [], remove: [], commands: [], commandsAfterRemove: [],
+      note: "本平台（" + platform + "）不写 aily daemon 服务：Linux 才由本桥用 systemd --user 管（" +
+        "darwin 上 aily-cli 自带 daemon 管理，脚本里另有 scripts/aily-daemon-restart.sh）" };
+  }
+  if (uninstall) {
+    return { applicable: true, kind, action: "will-remove", file, files: [], remove: [file],
+      commands: [["systemctl", "--user", "disable", "--now", AILY_DAEMON_UNIT + ".service"]],
+      commandsAfterRemove: [["systemctl", "--user", "daemon-reload"]], note: null, foreign: [] };
+  }
+  if (foreign.length > 0) {
+    return { applicable: true, kind, action: "skipped_foreign", file, files: [], remove: [], commands: [], commandsAfterRemove: [],
+      foreign,
+      note: "已有**不是本桥写的** aily daemon 单元：" + foreign.map((f) => f.path).join("、") +
+        " —— 不覆盖（覆盖等于把别人的服务接管掉）。要交给本桥管就人工确认后删掉它再重跑 --apply" };
+  }
+  if (typeof ailyCli !== "string" || !path.isAbsolute(ailyCli)) {
+    return { applicable: true, kind, action: "aily_cli_missing", file, files: [], remove: [], commands: [], commandsAfterRemove: [],
+      note: "PATH 里找不到 aily-cli（或模板 aily_cli_bin 不是绝对路径）：**不写** daemon 服务 —— " +
+        "装了 aily-cli（或在链路模板里给 aily_cli_bin）之后重跑 `node scripts/install-outbound.mjs --apply`；" +
+        "入站没有它收不到平台事件（出站不受影响）" };
+  }
+  const text = ailyDaemonUnit({ home, ailyCli, node, extraArgs });
+  const current = read(file);
+  return { applicable: true, kind, action: current === null ? "will-install" : (current === text ? "unchanged" : "will-update"),
+    file, files: [{ path: file, text }], remove: [],
+    commands: [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", AILY_DAEMON_UNIT + ".service"]],
+    commandsAfterRemove: [], note: null, foreign: [] };
+}
+
+// ── 「本机装了没有」的判据（PK3-U1）：doctor 的未安装态与 scripts/uninstall.mjs 共用 ────────────
+
+/**
+ * 装机足迹盘点（**纯读**，不写、不调控制面）：三处 hooks、两链技能、定时器与 aily 单元、runtime/current。
+ *
+ * doctor 用它的三态（干净 / 成套 / 残留），uninstall.mjs 用它的清单决定"这一步有东西可卸吗"。
+ * 判据只认产品自己声明过的那些名字（hook 脚本名来自 claudeHookCommands、技能来自两份 SKILLS 清单、
+ * 单元名来自本模块的常量）—— 不扫"看起来像本桥的东西"，所以别的工具的同名文件不会被算成残留。
+ */
+export function installFootprint({ home = os.homedir(), codexHome = null, platform = process.platform,
+  exists = (p) => fs.existsSync(p), read = (p) => { try { return fs.readFileSync(p, "utf-8"); } catch { return null; } },
+  claudeSkills = CLAUDE_SKILLS, inboundSkill = CLAUDE_INBOUND_SKILL, codexSkills = [] } = {}) {
+  const codexRoot = codexHome ?? (process.env.FEISHU_CODEX_BRIDGE_HOME
+    || path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "feishu-bridge"));
+
+  // ── Claude 链
+  const settingsText = read(path.join(home, ".claude", "settings.json")) ?? "";
+  const cmds = claudeHookCommands({ home, node: process.execPath });
+  const hookNames = [...cmds.entries.Stop.map(([n]) => n), ...cmds.entries.UserPromptSubmit.map(([n]) => n)];
+  const claudeHooks = hookNames.filter((n) => settingsText.includes(n));
+  const claudeSkillPaths = [...claudeSkills.map((sk) => path.join(home, ".claude", "skills", sk.dst)),
+    path.join(home, ".claude", "skills", inboundSkill.name)].filter(exists);
+  const kind = timerKindFor(platform);
+  const timerPaths = (kind === "launchd" ? [claudeDrainPlistPath(home)]
+    : kind === "systemd" ? [claudeDrainSystemdPaths(home).service, claudeDrainSystemdPaths(home).timer]
+      : []).filter(exists);
+  const ailyPath = kind === "systemd" ? ailyDaemonUnitPath(home) : null;
+  const ailyUnit = ailyPath !== null && exists(ailyPath) ? ailyPath : null;
+  const claudeCurrent = path.join(runtimeRoot(home, "claude"), "current");
+
+  // ── Codex 链
+  const codexHooksText = read(path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "hooks.json")) ?? "";
+  const codexHookNames = ["prompt-hook.mjs", "stop-hook.mjs"].filter((n) => codexHooksText.includes(n));
+  const codexSkillPaths = codexSkills.map((sk) => path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "skills", sk.name)).filter(exists);
+  const codexCurrent = path.join(codexRoot, "runtime", "current");
+
+  const present = {
+    claudeHooks, claudeSkills: claudeSkillPaths, timer: timerPaths, ailyUnit,
+    claudeCurrent: exists(claudeCurrent) ? claudeCurrent : null,
+    codexHooks: codexHookNames, codexSkills: codexSkillPaths,
+    codexCurrent: exists(codexCurrent) ? codexCurrent : null,
+  };
+  const residue = [
+    ...claudeHooks.map((n) => ({ area: "claude-hook", what: n })),
+    ...claudeSkillPaths.map((p) => ({ area: "claude-skill", what: p })),
+    ...timerPaths.map((p) => ({ area: "timer", what: p })),
+    ...(ailyUnit ? [{ area: "aily-unit", what: ailyUnit }] : []),
+    ...(present.claudeCurrent ? [{ area: "runtime-current", what: present.claudeCurrent }] : []),
+    ...codexHookNames.map((n) => ({ area: "codex-hook", what: n })),
+    ...codexSkillPaths.map((p) => ({ area: "codex-skill", what: p })),
+    ...(present.codexCurrent ? [{ area: "codex-runtime-current", what: present.codexCurrent }] : []),
+  ];
+  // 成套 = 这一链的"已装"标记（钩子 + runtime/current）都在。平台没有定时器实现的机器也不会因此判残留。
+  const claudeComplete = claudeHooks.length > 0 && present.claudeCurrent !== null;
+  const codexComplete = codexHookNames.length > 0 && present.codexCurrent !== null;
+  // **"半装"要判在会出事的地方**：钩子/定时器还在、而它们指向的 runtime/current 已经不在 ——
+  // 那才是真残留（每个 Stop / 每 30 分钟都会去跑一个不存在的脚本，且不报错）。
+  // 「只有 runtime 没钩子」「只装了出站没装入站」这类**不成套但不会出事**的状态不算故障，
+  // 所以不拿"缺什么"当判据（doctor 的夹具里就是只装 runtime 的机器）。
+  const orphanHooks = claudeHooks.length > 0 && present.claudeCurrent === null;
+  const orphanTimer = timerPaths.length > 0 && present.claudeCurrent === null;
+  const orphanCodex = codexHookNames.length > 0 && present.codexCurrent === null;
+  return {
+    kind, present, residue,
+    clean: residue.length === 0,
+    claudeComplete,
+    codexComplete,
+    orphans: { hooks: orphanHooks, timer: orphanTimer, codex: orphanCodex },
+    installed: claudeComplete || codexComplete,
+    partial: orphanHooks || orphanTimer || orphanCodex,
+    retainedNote: "保留的数据（卸载默认不删）：registry.json / routes.json / status-providers.json / subscriptions.json / chain-config.json / inbound/ 回执与账本",
+    dirsRead: { settings: path.join(home, ".claude", "settings.json"), codexHooks: path.join(process.env.CODEX_HOME || path.join(home, ".codex"), "hooks.json") },
+  };
 }

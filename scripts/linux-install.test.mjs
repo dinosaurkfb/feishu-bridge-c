@@ -296,11 +296,21 @@ test("fix2/P1-2 linux 卸载三步顺序：disable --now（文件还在）→ �
   assert.equal(fs.existsSync(fx.unitFile), false, "单元删掉了");
   assert.match(un.stdout, /已卸载/u);
   const calls = fx.readLog();
-  const tail = calls.slice(calls.findIndex((l) => l.includes("disable --now")));
-  assert.deepEqual(tail, [
-    "--user disable --now feishu-bridge-cc-drain.timer | present",
-    "--user daemon-reload | gone",
-  ], "三步顺序（修前：daemon-reload 在删文件之前）：" + JSON.stringify(calls));
+  // PK3-U1：卸载现在也管 aily daemon 单元 —— 每个单元各自都是"停（文件还在）→ 删 → reload（文件已不在）"三步。
+  // 逐单元切出来断言，别把另一条的步骤混进这条的期望里（混了就分不清是哪个单元的顺序坏了）。
+  const perUnit = (unit) => {
+    const at = calls.findIndex((l) => l.startsWith("--user disable --now " + unit + " |"));
+    assert.notEqual(at, -1, "没找到 " + unit + " 的 disable --now：" + JSON.stringify(calls));
+    return [calls[at], calls[at + 1]];
+  };
+  // 兜底定时器：disable --now 时它的单元文件还在（present），删完 reload 时已不在（gone）
+  assert.deepEqual(perUnit("feishu-bridge-cc-drain.timer"),
+    ["--user disable --now feishu-bridge-cc-drain.timer | present", "--user daemon-reload | gone"],
+    "兜底定时器三步顺序（修前：daemon-reload 在删文件之前）：" + JSON.stringify(calls));
+  // aily daemon 单元（PK3-U1）：同一条纪律 —— 先停（立刻跟着一次 reload，即"删完单元之后"）
+  const ailyPair = perUnit("feishu-bridge-aily.service");
+  assert.equal(ailyPair[0].startsWith("--user disable --now feishu-bridge-aily.service |"), true, JSON.stringify(calls));
+  assert.equal(ailyPair[1], "--user daemon-reload | gone", "aily 单元也要「停 → 删 → reload」：" + JSON.stringify(calls));
   // 执行用的是**argv**，不是计划里给人看的命令行（修前是 `systemctl systemctl --user …`，静默失败还报已卸载）。
   assert.equal(calls.some((l) => l.startsWith("systemctl systemctl")), false, JSON.stringify(calls));
 });

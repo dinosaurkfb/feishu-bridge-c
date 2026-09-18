@@ -50,7 +50,7 @@ import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor, timerPlatform } from "./drain-schedule.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT, claudeDrainSystemdPaths, claudeDrainSystemdUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, ailyDaemonUnitPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, foreignAilyDaemonUnits, installFootprint, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
 import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -103,6 +103,7 @@ const PREVIEW = {
   rotate: "/feishu-rotate（在对应项目的会话里）",
   drainCodex: "node scripts/codex/drain-service.mjs --enable（预览；确认后自行加 --apply）",
   feishuOutbox: "$feishu-outbox（Codex 侧只读积压视图）/ node scripts/drain-outbox.mjs --dry-run",
+  uninstall: "node scripts/uninstall.mjs（预览；确认后自行加 --apply）—— 三链按序卸、默认保留数据",
 };
 
 const short = (v) => (typeof v === "string" && v.length > 8 ? v.slice(0, 8) + "…" : String(v ?? ""));
@@ -337,12 +338,28 @@ export function runDoctor({
   //     · ⑤ 绑定到期：legacy `expires_at` 确已冻结 → 改由**权威 expiry.json** 接替（见下面那一段）。
   //     · ⑥/⑯ 用登记表枚举项目根、结论是积压/转发事实；⑭ 自己带 cutover 分支 —— 都不降。
 
-  // ── 运行时
+  // ── 装机足迹（PK3-U1）：干净 / 成套 / 残留 三态。判据与 scripts/uninstall.mjs 共用一份
+  //   （install-projection.installFootprint），所以"卸干净了"与"doctor 说还有残留"在结构上不可能矛盾。
+  const foot = installFootprint({ home, platform });
+  const installedState = foot.clean ? "uninstalled" : (foot.partial ? "partial" : "installed");
+  const footResidue = foot.residue.map((r) => r.area + "=" + String(r.what)).slice(0, 6).join("、");
+  add("install_state", "装机状态", installedState !== "partial",
+    installedState === "uninstalled" ? "未安装 —— 三处 hooks / 技能 / 定时器 / runtime/current 都不在（" + foot.retainedNote + "）"
+      : installedState === "installed" ? "已安装：" + (foot.claudeComplete ? "Claude 链成套（钩子 + runtime/current）" : "") +
+        (foot.present.codexCurrent ? "；Codex 链 runtime/current 在" : "") +
+        "；另有 " + foot.residue.length + " 项足迹（钩子 " + foot.present.claudeHooks.length + " / 技能 " +
+        foot.present.claudeSkills.length + " / 定时器 " + foot.present.timer.length + "）"
+      : "半装 / 残留（钩子或定时器还在、它们指的 runtime/current 已经不在了）：在的 —— " + footResidue + "；" +
+        "这种情况下每次 Stop / 每 30 分钟都会去跑一个不存在的脚本。重装或卸干净：node scripts/uninstall.mjs",
+    installedState === "partial" ? PREVIEW.uninstall : null);
+
+  // ── 运行时（未安装的机器上不适用：报 unknown，不报✗——没装不是故障）
   const runtime = verifyRuntime({ home, chain: "claude" });
-  add("runtime", "Claude 运行时", runtime.ok === true,
-    runtime.ok ? "current 指向 " + short(runtime.version) + "，清单与内容一致"
-      : "校验不过（" + (runtime.reason ?? "drift") + "）",
-    runtime.ok ? null : PREVIEW.installOutbound);
+  add("runtime", "Claude 运行时", foot.clean ? null : runtime.ok === true,
+    foot.clean ? "未安装（runtime/current 不在）—— 不适用"
+      : runtime.ok ? "current 指向 " + short(runtime.version) + "，清单与内容一致"
+        : "校验不过（" + (runtime.reason ?? "drift") + "）",
+    foot.clean || runtime.ok ? null : PREVIEW.installOutbound);
 
   // ── 三张表本身
   const registry = loadRegistryStrict(registryFile);
@@ -686,6 +703,36 @@ export function runDoctor({
   add("backlog_vs_publisher", "⑥ 积压有人发（Claude 侧）", backlogOk,
     (!registry.ok ? "登记表读不出来，查不清" : backlogText) + "；" + publisherText,
     backlogOk === false ? (backlogProblems > 0 ? PREVIEW.feishuOutbox : PREVIEW.installOutbound) : null);
+
+  // aily daemon 服务（PK3-U1，**仅在 linux 上**）：本桥自己写的那份 systemd --user 单元在不在、起没起来。
+  // darwin **不加这一项**（aily-cli 在 mac 上自带 daemon 管理）——加一个恒 unknown 的项只会把每台 mac 拖成 incomplete。
+  if (timerKind === "systemd") {
+    const ailyPath = ailyDaemonUnitPath(home);
+    const foreign = foreignAilyDaemonUnits({ home });
+    const foreignText = foreign.length > 0
+      ? "；已有不是本桥写的 aily daemon 单元：" + foreign.map((f) => f.path).join("、") + "（本桥不接管，也不覆盖）"
+      : "";
+    if (fs.existsSync(ailyPath)) {
+      const enabled = systemctlFn(["is-enabled", "feishu-bridge-aily.service"]);
+      const active = systemctlFn(["is-active", "feishu-bridge-aily.service"]);
+      const enabledText = String(enabled.ok ? enabled.out : enabled.err ?? enabled.out ?? "").trim();
+      const activeText = String(active.ok ? active.out : active.err ?? active.out ?? "").trim();
+      const absent = systemdUnitAbsent(enabledText + activeText);
+      // 与⑥同一口径：「本来就没有」→ 不算故障；「查不清」（连不上 manager）→ unknown，不当 ready。
+      const ok = absent ? true : enabledText.startsWith("enabled") && activeText === "active" ? true
+        : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
+        ok === true ? "已启用且在跑（" + ailyPath + "）" + foreignText
+          : absent ? "单元在本机 manager 里查不到（本来就未加载）" + foreignText
+            : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
+              + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
+              : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
+        ok === false ? PREVIEW.installOutbound : null);
+    } else {
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", true,
+        "没有本桥写的单元 —— 入站运输靠 aily-cli 自己起的 daemon（本桥不接管）" + foreignText, null);
+    }
+  }
 
   // ⑧′ 机器人发送凭据的密钥在哪（PK3-L1，仅在 linux 上核）：
   // aily（provision）把每个 agent 的密钥写在 <configDir>/data/lark-cli/；linux 上 lark-cli 不用钥匙串、
@@ -1496,6 +1543,22 @@ export function runDoctor({
       (MODE_TEXT[authority.mode] ?? String(authority.mode)) + "；依据：" + authority.why + where + view, null);
   }
 
+  // ── 未安装态（PK3-U1）：**"装好的运行时对不对"这类项不适用**，不是故障。
+  //   runtime 与 ⑦（默认处理器在不在 runtime/current 之下）问的都是这件事，而一台没装本桥的机器上
+  //   runtime/current 本来就不在 —— 报 ✗ 会把"没装"说成"坏了"。卸后验证（uninstall --apply 之后跑
+  //   doctor）要的正是"零 ✗"，所以在这一处统一降级成 unknown。
+  //   **只降这两项**：保留的数据本身自不自洽（① 路由有没有状态入口、③ 话题登记指向的路由在不在）
+  //   与装不装无关，卸了也照样该报 —— 那是数据的问题，不是"没装"。
+  if (foot.clean) {
+    const INSTALL_DEPENDENT = new Set(["runtime", "default_route_handler"]);
+    for (const c of checks) {
+      if (!INSTALL_DEPENDENT.has(c.id) || c.ok === null || c.ok === true) continue;
+      c.ok = null;
+      c.detail = "未安装 —— 不适用（" + c.detail + "）";
+      c.next = null;
+    }
+  }
+
   // ── 汇总：三态唯一判据（`summarizeDoctorChecks`；非布尔 ok 一律视为 unknown，不得当 ready）
   const summary = summarizeDoctorChecks(checks);
   return { overall: summary.overall, checks, next: summary.next };
@@ -1508,9 +1571,16 @@ export function renderDoctor(report) {
     lines.push(mark + c.name + "：" + c.detail);
   }
   lines.push("");
-  lines.push(report.overall === "ready" ? "结论：ready —— 没有发现跨项目说不通的地方。"
-    : report.overall === "blocked" ? "结论：blocked —— 上面标 ✗ 的是真故障，需要人处理。"
-    : "结论：incomplete —— 没有发现故障，但标 ? 的本地查不出来。");
+  // PK3-U1：未安装态有它自己的结论句 —— 一台没装本桥的机器上，"incomplete" 会把读的人带向"查不清"，
+  // 而真实情况是"没装"。卸后验证要的正是这句话。
+  // 只在**没有 ✗** 时用它：机器没装归没装，保留的数据真有问题（① ③ ④ ⑤ 那些）还是要报 blocked。
+  const uninstalled = report.overall !== "blocked"
+    && report.checks.some((c) => c.id === "install_state" && c.detail.startsWith("未安装"));
+  lines.push(uninstalled
+    ? "结论：未安装 —— 本机没装本桥（三处 hooks / 技能 / 定时器 / runtime 都不在）。这不是故障；装上就是 `node scripts/install-outbound.mjs --apply`（再跟一次 install-inbound.mjs --apply）。"
+    : report.overall === "ready" ? "结论：ready —— 没有发现跨项目说不通的地方。"
+      : report.overall === "blocked" ? "结论：blocked —— 上面标 ✗ 的是真故障，需要人处理。"
+        : "结论：incomplete —— 没有发现故障，但标 ? 的本地查不出来。");
   if (report.next.length > 0) {
     lines.push("", "下一步（都是预览形式，改动要你自己确认）：");
     report.next.forEach((n, i) => lines.push((i + 1) + ". " + n));

@@ -290,6 +290,20 @@ node scripts/codex/install.mjs --uninstall --apply
 **单元文件已经丢了但 systemd 里还记着**的情况（孤儿 timer）也会被收掉，不需要手工 `systemctl --user disable`。
 卸载不会删除 `~/.codex/feishu-bridge/` 中的 registry、话题映射和历史回执，便于审计或恢复。
 
+**整机卸载走一键入口**（2026-09-18 起，PK3-U1）—— 它按固定顺序把三条链一起收口，
+顺序错了会留下半截状态（详见 SETUP.md「五点五、卸载」）：
+
+```bash
+node scripts/uninstall.mjs                                     # 预览：将停 / 将删 / 将保留
+node scripts/uninstall.mjs --apply                             # 按序卸（含 Codex 链与其兜底排空服务）
+node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数据一起删（要两个参数）
+```
+
+卸载**默认不删数据**：`~/.codex/feishu-bridge/` 里的 registry、话题映射和历史回执都留着，
+便于审计或恢复；`--purge --yes-delete-data` 才会删掉。卸完用
+`npm run doctor:codex`（Codex 侧）与 `node scripts/doctor.mjs`（机器级，Claude 侧）各看一遍 ——
+后者的「装机状态」应报「未安装」且没有 ✗。
+
 ## 已知边界
 
 - 正在运行的 Desktop turn 不从另一个 CLI 进程强行 steer；命中活跃 lease 时会 fail-closed 为 busy；

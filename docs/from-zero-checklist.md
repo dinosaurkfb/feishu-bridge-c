@@ -425,19 +425,23 @@ npm run doctor:codex
 
 ## 8. 卸载、卸后验证与重装
 
-### 8.1 卸载执行顺序
-执行卸载时同样遵循顺序原则（注：统一一键卸载脚本正由 issue #234 推进落地）：
+### 8.1 卸载执行顺序（一键入口，PK3-U1 起）
 
 ```bash
-# 1. 卸载入站技能
-node scripts/install-inbound.mjs --uninstall --apply
+node scripts/uninstall.mjs                     # 预览：将停 / 将删 / 将保留（默认不动任何东西）
+node scripts/uninstall.mjs --apply             # 按固定顺序卸三条链
+node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数据一起删（要两个参数）
 
-# 2. 卸载出站 hooks、技能、并注销 systemd 用户定时器
-node scripts/install-outbound.mjs --uninstall --apply
-
-# 3. 卸载 Codex 侧 hooks、技能及 systemd 单元（若安装或启用过）
-node scripts/codex/install.mjs --uninstall --apply
+# 只想单独卸某一条链时，仍可分别跑（顺序同理）：
+#   node scripts/install-inbound.mjs  --uninstall --apply
+#   node scripts/install-outbound.mjs --uninstall --apply
+#   node scripts/codex/install.mjs    --uninstall --apply
 ```
+
+顺序写死在 `scripts/uninstall.mjs` 里（**别自己改成别的顺序**）：入站技能（止血）→ 出站 hooks/技能/
+兜底定时器/（linux）aily daemon 服务 → Codex 链 → `runtime/current` → `--purge` 才动 `versions/` 与数据。
+底层仍然是三个安装器各自的 `--uninstall`，一键入口只是把它们按序串起来并逐个核退出码
+（失败即停、报在第几步）。想单独卸某一条链，仍可直接跑那条链的 `--uninstall --apply`。
 
 ### 8.2 卸载保留项（设计约束）
 卸载命令严格只移除非侵入性 hooks、技能目录与定时器，**绝不清理以下权威配置**：
@@ -448,14 +452,19 @@ node scripts/codex/install.mjs --uninstall --apply
 
 ### 8.3 卸后验证
 ```bash
-# 1. 确认 systemd 定时器已停止并注销
-systemctl --user is-active feishu-bridge-cc-drain.timer     # 应显示 inactive 或 not-found
-systemctl --user is-active feishu-bridge-codex-drain.timer  # 应显示 inactive 或 not-found
-systemctl --user list-unit-files | grep feishu-bridge       # 应输出为空
+# 1. 确认三份 systemd --user 单元都已停止并注销
+#    （Claude 兜底定时器 / Codex 兜底定时器 / aily daemon 服务）
+systemctl --user is-active feishu-bridge-cc-drain.timer      # 应显示 inactive 或 not-found
+systemctl --user is-active feishu-bridge-codex-drain.timer   # 应显示 inactive 或 not-found
+systemctl --user is-active feishu-bridge-aily.service        # 同上
+systemctl --user list-unit-files | grep feishu-bridge        # 应输出为空
 
-# 2. 运行 doctor，应提示 hooks/技能未安装
+# 2. 运行 doctor：应报「装机状态：未安装」且**一条 ✗ 都没有**
 node scripts/doctor.mjs
 ```
+
+doctor 的判据（`install_state`）与卸载入口**共用一份**（`install-projection.installFootprint`），
+所以"卸干净了"与"doctor 说还有残留"不会互相矛盾；若还有残留，doctor 会把在的项逐条列出来。
 
 ### 8.4 再次安装验证
 在未删除保留配置的前提下，只需原样重新执行 **第 3 节 安装** 的三条 `--apply` 命令，整条链路即可无缝恢复全功能工作。
@@ -468,8 +477,13 @@ node scripts/doctor.mjs
 
 1. **外部处理器话题不自动回复**：
    通过 `routes.json` 路由转交给外部系统（如 `cc2cd`）的话题，其后续回复完全由外部处理程序接管；本桥分发器不会越权向该话题回发卡片。
-2. **aily daemon 服务化需配置**：
-   仓库不负责将 `aily-cli daemon` 包装为系统级驻留服务，Linux 上须通过前置步骤 0 配置 `systemd --user` 并开启 linger 保证后台常驻。
+2. **aily daemon 服务化（PK3-U1 起由安装器接管）**：
+   `node scripts/install-outbound.mjs --apply` 在 Linux 上会写
+   `~/.config/systemd/user/feishu-bridge-aily.service`（绝对路径 ExecStart、`Restart=on-failure`、
+   HOME/PATH 最小补齐，代理等其余环境从 `environment.d` 继承）并 `enable --now`；卸载反向。
+   机器上已有 `aily-cli` 自己生成的单元（`aily-cli-daemon-*.service`）时**不覆盖**，会报出来让人定夺。
+   非登录常驻仍需 `loginctl enable-linger <用户>`（要 sudo，安装器只提示）。前置步骤 0 的手工做法
+   仍然有效（想自己管的时候用）。
 3. **单授权人类边界**：
    当前架构授权单一 `frank_sender_id`，非授权用户的 @mention 会被拒绝，暂不适用于开放式多租户团队协作。
 

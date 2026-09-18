@@ -13,6 +13,10 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+// PK3-T3：套件级安装面卫兵 —— 启动时快照真实权威文件哈希
+import { installSurfaceGuard } from "./test-support/install-surface-guard.mjs";
+installSurfaceGuard();
+
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, resolveTimerPlatform, timerKindFor, timerPlatform, TIMER_PLATFORM_ENV } from "./drain-schedule.mjs";
 import { claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan } from "./install-projection.mjs";
 import { runDoctor } from "./doctor.mjs";

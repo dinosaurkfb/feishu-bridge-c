@@ -291,8 +291,9 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
  * 不能由「首建」命令暗中完成。有默认 → `default_route_exists`（指路 --restore-default）；
  * 有路由但没默认 → `routes_without_default`（#222 描述的坑本身，交人核对 + Frank，本命令不修）。
  *
- * `dryRun: true`：**同一份判据、同一把锁**走完校验，不写盘，把"会不会写 / 为什么拒"交回调用方。
- * 预览必须与 --apply 同源 —— 否则会出现"预览说没事、apply 说不行"（只有停用路由的表就是这样）。
+ * 预览走 previewInitDefault（只读：不 mkdir、不取锁、不写），apply 在锁内重读后用同一份 judgeInitDefault
+ * 裁决，路由表写入在锁内判定通过后进行 —— 预览与 --apply 同源，否则会出现"预览说没事、apply 说不行"
+ * （只有停用路由的表就是这样）。
  */
 /** PK3-R222-fix2：--init-default 的**纯判定**（不碰文件系统）：doc 可为 null（表不存在 = 可首建）。
  *  预览（previewInitDefault）与 apply（initDefaultRoute）都调它 —— 预览结论与 apply 结论同源。
@@ -343,8 +344,8 @@ export function initDefaultRoute({ file = routesPath(), id, handler, note = null
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "routes_busy" };
   try {
-    // 取锁**之后**重读、纯判定 —— mkdir 推迟到判定通过、真要写之前（PK3-R222-fix2：预览不建目录，
-    //   apply 也不在判定前就动文件系统）。
+    // 取锁**之后**重读、纯判定 —— 路由表写入在锁内判定通过后进行（取锁原语本身会确保父目录存在）（PK3-R222-fix2：预览不建目录，
+    //   apply 只在锁内判定通过后才写表）。
     const read = readRoutesDoc(file);
     if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
     const judged = judgeInitDefault({ doc: read.doc, id });

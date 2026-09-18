@@ -7399,11 +7399,15 @@ test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
   // 但 launchctl bootout/bootstrap 操作的是**真实用户的 launchd 域**，与 HOME 无关。
   // 我为了测 shell 安全写的几条 --apply 回归就是这么把线上 30 分钟兜底任务
   // 切到临时目录的 —— 临时目录一清，定时器就指向不存在的文件。
-  const src = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  // 判据住在 timer-exec.mjs（PK3-L6-fix2 抽出的叶子模块）：安装器只 import 它，自己不另写一份。
+  const src = fs.readFileSync(path.resolve("scripts", "timer-exec.mjs"), "utf-8");
   assert.match(src, /os\.userInfo\(\)\.homedir/u,
     "判据要用密码库里的 home，它不受 HOME 环境变量影响");
   assert.match(src, /if \(SANDBOXED\) return \{ ok: false, skipped: true \};/u,
     "launchctl 必须在沙箱安装时直接短路");
+  // 包装只有一份：安装器自己不许再执行控制面命令（两份会各自漂移）。
+  const installerSrc = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
+  assert.doesNotMatch(installerSrc, /execFileSync/u, "安装器只能走 timer-exec，不再自己执行控制面命令");
 
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "launchd-guard-"));
   const home = path.join(base, "我的 家");
@@ -8812,7 +8816,7 @@ test("状态入口登记命令：默认预览，受控写入", () => {
   assert.equal(fs.readFileSync(file, "utf-8"), "{ 坏掉的 json");
 });
 
-test("PK3-L6 register-status-provider --user 授权闸门：-- 之后的参数不得越过授权闸门", () => {
+test("登记命令：-- 之后的参数不得越过授权闸门；含 --apply 时预览里点明「仍是 dry-run」", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bypass-"));
   const file = path.join(dir, "providers.json");
   const script = path.resolve("scripts", "group-binding-status.mjs");
@@ -8820,32 +8824,32 @@ test("PK3-L6 register-status-provider --user 授权闸门：-- 之后的参数�
     path.resolve("scripts", "register-status-provider.mjs"), ...args,
   ], { encoding: "utf-8", env: { ...process.env, HOME: dir, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
 
-  // 行为用例 1：... --apply -- --apply 退出码 1、stderr 含 own_flag_after_separator、登记表未写
-  const applyCase = cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--apply"]);
-  assert.equal(applyCase.status, 1, "透传段出现 --apply 退出码必须是 1");
-  assert.match(applyCase.stderr, /own_flag_after_separator/u);
-  assert.match(applyCase.stderr, /本命令的参数放在 -- 之前/u);
-  assert.equal(fs.existsSync(file), false, "透传段出现 --apply 不得落盘");
-
-  // 行为用例 2：... -- --replace 退出码 1、stderr 含 own_flag_after_separator、登记表未写
-  const replaceCase = cli(["--id", "cc2cd", "--script", script, "--", "--replace"]);
-  assert.equal(replaceCase.status, 1, "透传段出现 --replace 退出码必须是 1");
-  assert.match(replaceCase.stderr, /own_flag_after_separator/u);
-  assert.match(replaceCase.stderr, /本命令的参数放在 -- 之前/u);
-  assert.equal(fs.existsSync(file), false, "透传段出现 --replace 不得落盘");
-
-  // 行为用例 3：--id 等自家配置参数也不得放在 -- 之后
-  const idCase = cli(["--script", script, "--apply", "--", "--id", "sneaky"]);
-  assert.equal(idCase.status, 1, "--id 放在 -- 之后必须报错");
-  assert.match(idCase.stderr, /own_flag_after_separator/u);
-  assert.match(idCase.stderr, /本命令的参数放在 -- 之前/u);
+  // 控制面和数据面混在同一个 argv 里，"整个数组里搜 --apply"就会把
+  // 一个透传给 provider 的参数当成授权。
+  const run = cli(["--id", "cc2cd", "--script", script, "--", "--apply"]);
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, /dry-run/u);
+  // PK3-L6-fix2：**不拦**（`--` 之后按约定就是 provider 的原样参数，splitArgv 已保证它越不过
+  // 授权闸门），只在预览里加一行不改行为的提示 —— 人容易把 `-- --apply` 当成"已落盘"。
+  assert.match(run.stdout,
+    /提示：-- 之后的 --apply 是传给 provider 的参数；本命令仍是 dry-run，要落盘把 --apply 放在 -- 之前/u);
   assert.equal(fs.existsSync(file), false, "透传参数不得触发落盘");
 
-  // 对照：合法透传参数 --provider-id 正常放行并成功落盘
-  const okRun = cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--provider-id", "x"]);
-  assert.equal(okRun.status, 0, okRun.stderr);
-  assert.equal(fs.existsSync(file), true, "合法透传参数正常落盘");
+  // 对照：`--` 之后没有 --apply 时这行提示不出现（它不是常驻声明）
+  const noHint = cli(["--id", "cc2cd", "--script", script, "--", "--provider-id", "x"]);
+  assert.equal(noHint.status, 0, noHint.stderr);
+  assert.equal(/提示：-- 之后的 --apply/u.test(noHint.stdout), false, noHint.stdout);
+  assert.equal(fs.existsSync(file), false, "对照用例同样不许落盘");
+
+  // 对照：真的把 --apply 放在 `--` 之前才是落盘（授权闸门只看 control 段）
+  const applied = cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--provider-id", "x"]);
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(fs.existsSync(file), true, "--apply 在 -- 之前才落盘");
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].args, ["--provider-id", "x"]);
+
+  // --id 之类也一样：控制参数只从 -- 前半段读。
+  const spoof = cli(["--script", script, "--apply", "--", "--id", "sneaky"]);
+  assert.equal(spoof.status, 2, "缺 --id 就该报用法，而不是从透传段捡一个");
 });
 
 test("登记命令：任一字段不同都不许报「无变化」", () => {

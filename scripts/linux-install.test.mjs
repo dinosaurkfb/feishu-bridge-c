@@ -20,7 +20,7 @@ import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
 import { bootoutTimer, bootstrapTimer, timerPhase } from "./maintenance/timers.mjs";
 import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
-import { systemctl, timerCmd } from "./install-outbound.mjs";
+import { systemctl, timerCmd } from "./timer-exec.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER = path.join(REPO, "scripts", "install-outbound.mjs");
@@ -934,7 +934,7 @@ test("PK3-L6 doctor(linux)：每一次调用 systemctl 的 argv[0] 恒为 --user
   }
 });
 
-test("PK3-L6 install-outbound systemctl 包装断言：不带 --user 抛，带 --user 正常执行", () => {
+test("PK3-L6 timer-exec systemctl 包装断言：不带 --user 抛，带 --user 正常执行", () => {
   // ① 不带 --user：systemctl 包装与 timerCmd 均抛
   assert.throws(
     () => systemctl(["daemon-reload"]),

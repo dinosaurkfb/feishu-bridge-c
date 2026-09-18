@@ -49,7 +49,6 @@ const REASON_TEXT = {
   providers_busy: "登记表正被别的进程写，稍后重试",
   script_missing: "provider 脚本不存在",
   script_not_a_file: "--script 不是普通文件",
-  own_flag_after_separator: "本命令的参数放在 -- 之前",
 };
 
 /**
@@ -78,23 +77,6 @@ const FLAGS = new Set(["apply", "replace", "unregister"]);
 const OPTIONS = new Set([
   "id", "script", "executable", "kinds", "relations", "display-name", "project-root",
 ]);
-
-export const OWN_FLAGS = new Set([
-  ...[...FLAGS, ...OPTIONS].map((name) => "--" + name),
-  "--routes",
-]);
-
-/**
- * 校验 -- 之后的透传参数中不得包含本命令自己的 flag。
- * 防止把本命令的参数（如 --apply / --replace）错放在 -- 之后而被 provider 吞掉或持久化。
- */
-export function validatePassthrough(tokens) {
-  const bad = tokens.find((t) => OWN_FLAGS.has(t));
-  if (bad) {
-    return { ok: false, reason: "own_flag_after_separator", flag: bad };
-  }
-  return { ok: true };
-}
 
 export function parseControl(tokens) {
   const seen = new Map();
@@ -232,12 +214,6 @@ function main() {
   // 没护住解析：任何 import 这个模块的程序都会被**调用方自己的**命令行参数搞崩，
   // 而现成的"被 import 时不得有 stderr"那条守卫抓不到 —— 它 import 时 argv 是干净的。
   const { control, passthrough } = splitArgv(process.argv);
-  const passCheck = validatePassthrough(passthrough);
-  if (!passCheck.ok) {
-    console.error("失败（" + passCheck.reason + "）：" +
-      REASON_TEXT[passCheck.reason] + "（发现 " + passCheck.flag + "）");
-    process.exit(1);
-  }
   const parsed = parseControl(control);
   if (!parsed.ok) {
     console.error("失败（" + parsed.reason + "）：" +
@@ -324,6 +300,12 @@ function main() {
   }
 
   if (!apply) {
+    // PK3-L6-fix2：`-- --apply` 按约定就是传给 provider 的参数 —— splitArgv 已经保证它只进
+    // `entry.args`、越不过授权闸门（闸门只看 control 段），所以这里**不拦它**。
+    // 但人容易把它当成"已落盘"，所以在预览里把那件事说清楚（不改行为、不加退出口）。
+    if (passthrough.includes("--apply")) {
+      console.log("\n提示：-- 之后的 --apply 是传给 provider 的参数；本命令仍是 dry-run，要落盘把 --apply 放在 -- 之前。");
+    }
     console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
     process.exit(PLAN_FAILS.has(plan.action) ? 1 : 0);
   }

@@ -48190,6 +48190,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   // ── R66 返修一 P2：真入口行为钉（aily-inbound 全流程，替换源码字符串断言）──
 
   test("R66 返修一 P2 真入口（T7-T11）：收据四态 × 账本模式 × 项目根等式——拒收/legacy 行为从入口跑出来", () => {
+  const r66Now = fixtureNow(); assertFreshFixtureClock(r66Now, { label: "r66Now" });   // PK3-T4 二轮 P2：R66 注入钟也过不变量
     const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66entry-")));
     const root = path.join(local, "project"); const bin = path.join(local, "bin");
     fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin, { recursive: true });
@@ -48212,7 +48213,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
     process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
-    const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => fixtureNow() });
+    const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => r66Now });
     if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
     assert.ok(b1.ok, "B1 夹具：" + JSON.stringify(b1));
     // PK2-I2-fix1 P1-1：cutover 之后 expiry.json 必须在场、且覆盖每条 live B —— 这份夹具少了它，
@@ -55279,6 +55280,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   });
 
   test("PK2-W2-fix2 P1-1②：1.1-transition 账本上 void(expired) 的**双键 CAS** —— 传错任一键拒、正确双键通过（零写 / 真作废）", () => {
+  const r66Now = fixtureNow(); assertFreshFixtureClock(r66Now, { label: "r66Now" });   // PK3-T4 二轮 P2：R66 注入钟也过不变量
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "w2f2-")));
     const ledgerRoot = path.join(base, "ledger");
     const EP = "endpoint_" + "5".repeat(24);
@@ -55295,7 +55297,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
         }, records: {} };
       fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc0, null, 2) + "\n", { mode: 0o600 });
       const b1 = TAL.createB1({ endpointId: EP, requestKey: "f2_b1", chatId: TPL.chat_id, rootOm: "om_f2", lineageId: "lin_f2",
-        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => fixtureNow() });
+        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => r66Now });
       assert.equal(b1.ok, true, "1.1-transition 下 create_b1（签 handle）：" + JSON.stringify(b1).slice(0, 240));
       const id = b1.result.created_id;
       const handle = b1.result.selection_handle;

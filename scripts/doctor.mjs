@@ -97,8 +97,9 @@ const PREVIEW = {
   bindProject: "node scripts/bind-project.mjs（预览；确认后自行加 --apply）",
   // 这条命令控制权威路由：路径一律 shellQuote，不靠"本机路径恰好没空格"。命令与说明之间留一个空格，整段可复制、也可切出命令。
   restoreDefaultRoute: (routesFile, handler, id) => "node scripts/register-route.mjs --restore-default --routes " + shellQuote(routesFile) + " --handler " + shellQuote(handler) + " --id " + shellQuote(id) + " （预览；切权威路由，Frank 授权后自行加 --apply）",
-  // 不是必败命令的替代品：本项的 ✗ 态正是"表里已经有路由"（--init-default 会拒），所以这条只讲顺序与找谁。
-  initDefaultRoute: (handler) => "node scripts/register-route.mjs --init-default --id self --handler " + shellQuote(handler) + " （新机器按「装机 → --init-default 首建本链默认路由 → 登记外部处理器」；本机表里已经有路由，该命令会拒 —— 改默认路由的去向要人工核对 + Frank）",
+  // 不给命令：本项的 ✗ 态就是"表里已经有路由"，而首建（--init-default）只对没有表的机器成立 ——
+  // 一条必败的命令看起来能跑，比不给更糟（返修 P2-2）。这里只留该表路径与找谁。
+  routesWithoutDefault: (routesFile) => "表 " + shellQuote(routesFile) + " 里已经有路由，别再跑首建（它只对还没有表的机器成立，会被拒）；人工核对未登记话题该投给谁，再由 Frank 定夺（改默认路由是切权威路由）",
   rotate: "/feishu-rotate（在对应项目的会话里）",
   drainCodex: "node scripts/codex/drain-service.mjs --enable（预览；确认后自行加 --apply）",
   feishuOutbox: "$feishu-outbox（Codex 侧只读积压视图）/ node scripts/drain-outbox.mjs --dry-run",
@@ -365,7 +366,7 @@ export function runDoctor({
           + "本链自己也就接不到待绑定认领；" + Object.keys(routes.sessions).length + " 条话题登记"
         : routes.routes.length + " 条启用路由，" + Object.keys(routes.sessions).length + " 条话题登记")
       : "读不出来（" + (routes.reason ?? "说不清") + (routes.problem ? "：" + routes.problem : "") + "）",
-    routesNoDefault ? PREVIEW.initDefaultRoute(expectedHandler) : null);
+    routesNoDefault ? PREVIEW.routesWithoutDefault(routesFile) : null);
   const providers = loadStatusProviders(providersFile);
   add("providers", "状态入口表", providers.ok,
     providers.ok ? (providers.providers ?? []).length + " 个状态入口" : "读不出来（" + (providers.reason ?? "说不清") + (providers.problem ? "：" + providers.problem : "") + "）",

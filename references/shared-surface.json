@@ -341,6 +341,7 @@
       "registerRouteBinding",
       "registerSession",
       "restoreDefaultRoute",
+      "routeRejectText",
       "routesPath",
       "selectRoute",
       "validateRoutesDoc"

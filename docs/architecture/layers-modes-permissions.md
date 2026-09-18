@@ -94,9 +94,10 @@
 | 普通文本 | ordinary | R1 / R2 按模式 | 是 | — | 按交叉表 | Mapping：跑 run；Dialogue：对话回合；无绑定：今天拒（提议 chat） |
 | `register-sender.mjs`、`--apply` 类安装、`register-route --restore-default` / `--init-default` | —（终端脚本） | — | 否 | 是 | owner 逐次授权 | 不经路由器 |
 
-路由表**首次落盘**的顺序（issue #222）：**装机 → `register-route --init-default --id <self|codex> --handler <runtime/current/scripts/inbound.mjs> --apply`（首建本链默认路由）→ 登记外部处理器**。
-表不存在、或表里没有默认路由时，新写入路由一律被 `no_default_route_yet` 拒（只往已有路由登记话题不受影响），`doctor` 的「路由表」项也会报 ✗；兜底只认显式 `default: true`（单条非默认不算默认，未登记话题一律拒收）。
+路由表**首次落盘**的顺序（issue #222）：**装机 → `register-route --init-default --routes <该链的 routes.json 绝对路径> --id <self|codex> --handler <runtime/current/scripts/inbound.mjs> [--apply]`（首建本链默认路由）→ 登记外部处理器**。`--routes` 必填（Claude 链 `~/.claude/feishu-bridge/routes.json`、Codex 链 `~/.codex/feishu-bridge/routes.json`），不给就 exit 2 —— 靠环境变量兜底会把 codex 的默认写进 Claude 那张表。
+表不存在、或表里没有默认路由时，新写入路由一律被 `no_default_route_yet` 拒（只往已有路由登记话题不受影响）；兜底只认显式 `default: true`（单条非默认不算默认）。这种表读侧给 `no_default_route`（「路由表里有 N 条启用路由但没有默认路由，未登记话题一律拒收」），与「一条启用路由都没有」的 `no_route_handler` 分开报；`doctor` 的「路由表」项对此判 ✗（**没有路由表仍判 ✓** —— 分发器用运行时自带的默认处理器，那时是正常状态）。
 表里已经有路由时 `--init-default` 会拒（有默认 → `default_route_exists`，指向 `--restore-default`；有路由无默认 → `routes_without_default`）：给它们补默认等于改变未登记话题的去向，那是切权威路由，要人工核对 + Frank。
+**升级说明（issue #222 返修）**：删掉「单条即兜底」后，旧机器上「只有一条路由且没标 default」的表会让未登记话题从「投给那一条」变成一律拒收（doctor ✗）；已知 Mac 与 omm 都有显式默认，升级本身不需要动作，真遇到就人工核对后由 Frank 定夺 —— 不是跑 `--init-default`（它只对还没有表的机器成立）。
 
 ## 6. 未决事项（要 Frank 定）
 

@@ -131,6 +131,9 @@ function readRoutesDoc(file) {
 
 export const ROUTE_REJECT = {
   NO_HANDLER: "no_route_handler",
+  // "本机没有配置任何入站处理者" 在"有路由但一条都没标 default"时是假话（issue #222 返修 P2-3）：
+  // 两种态分开 —— 零启用路由是 NO_HANDLER，有路由但无默认是下面这条。
+  NO_DEFAULT_ROUTE: "no_default_route",
   UNKNOWN_ROUTE: "session_maps_to_unknown_route",
   HANDLER_MISSING: "route_handler_missing",
   TABLE_UNREADABLE: "routes_table_unreadable",
@@ -138,12 +141,24 @@ export const ROUTE_REJECT = {
 };
 
 export const ROUTE_REJECT_TEXT = {
-  [ROUTE_REJECT.NO_HANDLER]: "本机没有配置任何入站处理者",
+  [ROUTE_REJECT.NO_HANDLER]: "本机没有配置任何可用的入站处理者（没有路由，或路由全被停用）",
+  [ROUTE_REJECT.NO_DEFAULT_ROUTE]: "路由表里有路由但没有一条标 default，未登记话题一律拒收",
   [ROUTE_REJECT.UNKNOWN_ROUTE]: "这个话题登记的路由在路由表里不存在",
   [ROUTE_REJECT.HANDLER_MISSING]: "路由指向的脚本不在",
   [ROUTE_REJECT.TABLE_UNREADABLE]: "本机路由表读不出来，已停止投递",
   [ROUTE_REJECT.TABLE_SHAPE]: "本机路由表结构异常，已停止投递",
 };
+
+/**
+ * 回执 / 日志用的拒收文案。**数得清候选时把条数带上** —— 「路由表里有 3 条启用路由但没有默认路由」
+ * 比「没有配置任何入站处理者」有用得多（后者在有路由时是假话）。
+ */
+export function routeRejectText(reason, { candidates } = {}) {
+  if (reason === ROUTE_REJECT.NO_DEFAULT_ROUTE && Number.isInteger(candidates) && candidates > 0) {
+    return "路由表里有 " + candidates + " 条启用路由但没有默认路由，未登记话题一律拒收";
+  }
+  return ROUTE_REJECT_TEXT[reason] ?? reason;
+}
 
 /**
  * 选路由。纯函数，不碰文件系统 —— handler 存不存在由调用方另判，
@@ -154,7 +169,8 @@ export const ROUTE_REJECT_TEXT = {
  *   2. 没登记 → **标了 default 的那条**（通常是本仓库，它自己会处理待绑定认领）
  *
  * 没有默认路由就拒收 —— **包括表里只有一条非默认路由的时候**（issue #222：以前"单条即兜底"，
- * 于是先登记外部处理器的机器上所有未登记话题都投给它，而且不报错。
+ * 于是先登记外部处理器的机器上所有未登记话题都投给它，而且不报错）。那条路给的是
+ * `NO_DEFAULT_ROUTE`（有路由、没默认）。“一条路由都没有”才是 `NO_HANDLER` —— 两种态回执不同。
  *
  * 刻意**不做**「问每个 handler 这是不是你的」：那要为每条路由起一个进程，
  * 在秒级回执的预算里放不下，而且「谁先回答谁赢」会让结果依赖进程调度。
@@ -178,7 +194,8 @@ export function selectRoute({ sessionId, routes, sessions }) {
   // 把"只有一条路由"变成了"那一条就是全机兜底"，与写入口的守卫互相矛盾：一边拒绝新增路由，
   // 一边又在读侧把唯一那条当默认。取消它后，判据只有一条：标了 default 才算默认。
   const fallback = list.find((r) => r.isDefault) ?? null;
-  if (!fallback) return { ok: false, reason: ROUTE_REJECT.NO_HANDLER, candidates: list.length };
+  // 有路由、但一条都没标 default —— 与"一条路由都没有"是两种态，回执上要能分开。
+  if (!fallback) return { ok: false, reason: ROUTE_REJECT.NO_DEFAULT_ROUTE, candidates: list.length };
   return { ok: true, route: fallback, matchedBy: "default" };
 }
 
@@ -273,8 +290,11 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
  * 给**已经有路由**的表补默认是另一件事：那会改变未登记话题的去向，等于切权威路由，
  * 不能由「首建」命令暗中完成。有默认 → `default_route_exists`（指路 --restore-default）；
  * 有路由但没默认 → `routes_without_default`（#222 描述的坑本身，交人核对 + Frank，本命令不修）。
+ *
+ * `dryRun: true`：**同一份判据、同一把锁**走完校验，不写盘，把"会不会写 / 为什么拒"交回调用方。
+ * 预览必须与 --apply 同源 —— 否则会出现"预览说没事、apply 说不行"（只有停用路由的表就是这样）。
  */
-export function initDefaultRoute({ file = routesPath(), id, handler, note = null } = {}) {
+export function initDefaultRoute({ file = routesPath(), id, handler, note = null, dryRun = false } = {}) {
   if (typeof id !== "string" || !id) return { ok: false, reason: "no_route_id" };
   if (typeof handler !== "string" || !path.isAbsolute(handler)) {
     return { ok: false, reason: "handler_not_absolute" };
@@ -302,6 +322,7 @@ export function initDefaultRoute({ file = routesPath(), id, handler, note = null
       const hasDefault = doc.routes.some((r) => isPlainObject(r) && r.default === true && r.enabled !== false);
       return { ok: false, reason: hasDefault ? "default_route_exists" : "routes_without_default", routes: doc.routes.length };
     }
+    if (dryRun) return { ok: true, dryRun: true, id, handler, routes: 0 };
     doc.routes.push(note ? { id, handler, default: true, note } : { id, handler, default: true });
     const wrote = writeRoutesDoc(doc, file);
     if (!wrote.ok) return wrote;

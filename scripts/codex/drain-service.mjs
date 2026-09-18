@@ -24,12 +24,11 @@
  *   node scripts/codex/drain-service.mjs --disable --apply
  */
 
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
-import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
+import { acquireInstallSurfaceLockOrRefuse } from "../install-surface-lock.mjs";
 import {
   LAUNCHCTL_ENV, PHASE_TEXT, absentJob, loadedPhase as loadedPhaseOf, parseLaunchctlList, spawnLaunchctl,
 } from "../launchd-job.mjs";
@@ -632,6 +631,259 @@ export function enableBlockers(state) {
   return blockers;
 }
 
+// ── systemd --user 现场与清理（PK3-L7-fix6：从 codex/install.mjs 搬到这里）────────────────────────
+//
+// 为什么搬家：install.mjs 是**顶层线性脚本**（import 即执行安装），在那里导不出可被用例 import 的函数；
+// 而这段现场（盘上两份 unit + manager 三态）与"收掉定时器"本来就归 drain-service 管（单元名、路径、
+// 投影都在本模块）。install.mjs 现在只调 `uninstallDrainUnitsInLock`，预览仍用 `linuxDrainScene` /
+// `codexDrainRemovalPlan` —— 定义只有一份，两侧不会漂。
+
+/**
+ * manager（systemd --user）里那个 timer 的**三态**：present / absent / unverifiable（PK3-L7-fix4 P2-1）。
+ * 旧版只给 true/false，于是「查不了」被折成「不在 manager」—— dry-run 预览「未启用」而 apply 可能去停
+ * 一个孤儿 timer（预览与执行不一致）。三态里：`absent` 要三个探针都说“不在”（fail-closed），
+ * 说不清的归 `unverifiable`。`skipped`（沙箱 HOME 且没注入）单独一态：那是「没问」，不是「问了说没有」。
+ */
+export function systemdTimerLookup({ systemctlFn = systemctl } = {}) {
+  const timerUnit = CODEX_DRAIN_SYSTEMD_UNIT + ".timer";
+  const first = (r) => String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+  const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
+  const enabled = systemctlFn(["--user", "is-enabled", timerUnit], { tolerate: true });
+  const active = systemctlFn(["--user", "is-active", timerUnit], { tolerate: true });
+  const show = systemctlFn(["--user", "show", timerUnit, "-p", "LoadState", "--value"], { tolerate: true });
+  if (enabled?.skipped || active?.skipped || show?.skipped) return { state: "skipped", why: "沙箱 HOME，没问真实 systemd --user" };
+  if (first(enabled) === "enabled" || first(active) === "active" || String(show?.out ?? "").trim() === "loaded") return { state: "present" };
+  // 「没有它」要说准：每个探针要么 ok、要么是协议认的 not-found 说法、要么是最常见的 disabled/inactive 词
+  const absentish = (r) => r?.ok === true || systemdUnitAbsent(say(r)) || ["disabled", "inactive", "unknown", "not-found"].includes(first(r));
+  if (absentish(enabled) && absentish(active) && absentish(show)) return { state: "absent" };
+  return { state: "unverifiable", why: say(!absentish(enabled) ? enabled : !absentish(active) ? active : show).slice(0, 120) };
+}
+
+/**
+ * 卸载要不要动、以及预览要说哪句话 —— **dry-run 与 apply 共用这一份判断**（fix4 P2-1）。
+ * action：none（本来就没启用）/ files（盘上有文件）/ orphan（只有 manager 里那个）/ refuse（查不清）。
+ */
+export function codexDrainRemovalPlan({ hasFiles, look }) {
+  if (look.state === "unverifiable") {
+    return { action: "refuse", text: "兜底排空    **manager 查不清**（" + look.why + "）—— --apply 会在这一步拒绝（不静默跳过，也不当成「未启用」）" };
+  }
+  if (look.state === "present" && !hasFiles) {
+    return { action: "orphan", text: "兜底排空    将停用 manager 中的**孤儿 timer**（盘上没有单元文件，systemd --user 里还在），并 daemon-reload" };
+  }
+  if (hasFiles) return { action: "files", text: "兜底排空    待停用并删除 systemd 单元" };
+  if (look.state === "skipped") return { action: "none", text: "兜底排空    未启用（默认；manager 没问 —— 沙箱 HOME）" };
+  return { action: "none", text: "兜底排空    未启用（默认）" };
+}
+
+/** linux 卸载要看的现场（盘上两份 unit + manager 三态 + 计划）：预览与执行都从这里取，不各算一遍。 */
+export function linuxDrainScene({ home = os.homedir(), systemctlFn = systemctl } = {}) {
+  const spaths = codexDrainSystemdPaths(home);
+  const hasFiles = fs.existsSync(spaths.service) || fs.existsSync(spaths.timer);
+  return { spaths, hasFiles, look: systemdTimerLookup({ systemctlFn }) };
+}
+
+/**
+ * 卸载时收掉 linux 上的兜底定时器（**PK3-L7-fix6：可导入单出口**）。
+ *
+ * 契约：**调用方已经持着安装面锁**（codex/install.mjs 的 `--apply` 段在它之前取的锁）—— 所以这里只做
+ * 「锁内重读现场 → disable --now → 删两份 unit → daemon-reload」，不再自己取锁（同进程再取一次必 busy）。
+ * 现场在**函数内重读**（fix5 P1-3）：模块顶部那份预览快照只给人看，不能拿来执行。
+ *
+ * `hooks` 只给用例（**CLI 不可触达**）：`hooks.beforeScene()` 在「重读现场之前」跑，用来确定性地复现
+ * 「预览快照之后、真正动手之前有人放下 unit」的交错。旧版这个注入点是一个环境变量指向任意 `.mjs`
+ * （生产可达：设上它就能在锁外跑任意代码），已删除。
+ *
+ * 不调 `process.exit`：打印走 `log` / `error`，退出码由调用方按 `{ ok, code }` 映射。
+ */
+export function uninstallDrainUnitsInLock({
+  home = os.homedir(), platform = timerPlatform({ home }),
+  systemctlFn = systemctl, log = console.log, error = console.error, hooks = {},
+} = {}) {
+  // 非 linux 什么都不做（darwin 真机上一次 systemctl 都不许调 —— fix5 P1-1）。
+  if (platform !== "linux") return { ok: true, code: 0, action: "none", removed: false };
+  if (typeof hooks.beforeScene === "function") hooks.beforeScene();
+  const scene = linuxDrainScene({ home, systemctlFn });
+  const plan = codexDrainRemovalPlan(scene);
+  if (plan.action === "refuse") {
+    error(plan.text + "\n什么都没动（先查清 systemd --user 能不能用、里面到底有没有同名 timer，再卸载）。");
+    return { ok: false, code: 1, action: "refuse", removed: false };
+  }
+  if (plan.action === "none") return { ok: true, code: 0, action: "none", removed: false };
+
+  const { spaths, hasFiles } = scene;
+  const disabled = systemctlFn(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
+  if (!disabled.ok && !disabled.skipped && !disabled.absent) {
+    error("兜底定时器停用失败：" + (disabled.text ?? "说不清") + "，单元文件未删。");
+    return { ok: false, code: 1, action: plan.action, removed: false };
+  }
+  fs.rmSync(spaths.service, { force: true });
+  fs.rmSync(spaths.timer, { force: true });
+  const reloaded = systemctlFn(["--user", "daemon-reload"], { tolerate: true });
+  if (!reloaded.ok && !reloaded.skipped) {
+    error("已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text ?? "说不清"));
+    return { ok: false, code: 1, action: plan.action, removed: true };
+  }
+  const skipped = disabled.skipped;
+  log("兜底排空    " + (skipped
+    ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）"
+    : plan.action === "orphan" || !hasFiles
+      ? "收了一个孤儿 timer（单元文件早已不在，systemd --user 里还在），已停用并 daemon-reload"
+      : "已停用并删除 systemd 单元"));
+  return { ok: true, code: 0, action: plan.action, removed: true };
+}
+
+/**
+ * 持锁段的外壳（PK3-L7-fix6）：**取锁 → 跑 body → finally 释放并把释放状态折叠成退出码**。
+ * body 返回 0 / 非 0；释放不干净一律 3（"释放失败不许报成功"）。`beforeLock` 只在**取锁之前**跑。
+ */
+function runUnderInstallSurfaceLock({ home, env, error, exit, beforeLock, body }) {
+  if (typeof beforeLock === "function") beforeLock();
+  const refused = acquireInstallSurfaceLockOrRefuse({ home, env, err: error });
+  if (!refused.ok) return exit(refused.code);
+  let code = 0;
+  try { code = body(); }
+  catch (err) {
+    error("写段抛异常（" + String(err?.code ?? err?.message ?? err) + "）：停在这里，锁按下一条结论交还。");
+    code = 1;
+  } finally {
+    const rel = refused.lock.release();
+    if (!rel.ok) { error("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）。"); code = 3; }
+  }
+  return exit(code);
+}
+
+/**
+ * `--enable --apply` 的**持锁段**（**PK3-L7-fix6：可导入单出口**，CLI 只传生产实现）。
+ *
+ * `hooks.beforeLock()` 在「取锁之前」跑 —— 交错注入**只能从函数参数来**（CLI 不传、也不读任何
+ * "只给测试"的环境变量）。整段：取锁 → 锁内重查维护门 → 锁内重读 node 与单元现状 → 写两份 unit →
+ * daemon-reload → enable --now → 用现成判据复核 manager 实态；释放走 finally（失败折叠成 3）。
+ * 返回 `exit(code)`（退出码由注入的 exit 决定，与 runDrainService 的既有契约一致）。
+ */
+export function enableDrainInLock({
+  home = os.homedir(), codexHome = codexHomeOf(home), bridge = codexBridgeOf({ codexHome }),
+  paths = codexDrainSystemdPaths(home), systemctlFn = systemctl, serviceStateFn = serviceState,
+  log = console.log, error = console.error, exit = process.exit, env = process.env, hooks = {},
+} = {}) {
+  return runUnderInstallSurfaceLock({ home, env, error, exit, beforeLock: hooks.beforeLock, body: () => {
+    // **锁内重查维护门**（fix5 P1-3）：门是"窗口内不许写安装面"的裁决，取锁前的检查只是礼貌。
+    const gateNow = gateBlocks();
+    if (gateNow.blocked) {
+      error("维护门开着（" + String(gateNow.text ?? "") + "）—— 锁内复核发现的，什么都没写。");
+      return 2;
+    }
+    // **锁内重读现场**（fix5 P1-3）：node 与单元现状都以此刻为准（上面那份是给预览/拒绝用的）。
+    let node = null;
+    {
+      let why = null;
+      try { node = pickNode("linux", home); } catch (err) { why = String(err?.message ?? err); }
+      if (why !== null) {
+        error("\n锁内重读发现 node 又解不出来了：" + why + "\n什么都没写。");
+        return 1;
+      }
+    }
+
+    const units = codexDrainSystemdUnits({ home, codexHome, bridge, node });
+    fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(paths.service, units.service, { mode: 0o644 });
+    fs.writeFileSync(paths.timer, units.timer, { mode: 0o644 });
+
+    const reload = systemctlFn(["--user", "daemon-reload"]);
+    if (reload.skipped) {
+      log("\n单元已写入，但跳过真实 systemd --user（HOME 被重定向到 " + home + "）。");
+      return 0;
+    }
+    if (!reload.ok) {
+      error("\n单元已写入，但 systemctl --user daemon-reload 失败：" + (reload.text || reload.err || ""));
+      error("**定时器现在不会跑。**修好后重跑本命令。");
+      return 1;
+    }
+
+    const start = systemctlFn(["--user", "enable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"]);
+    if (start.skipped) {
+      log("\n单元已写入，但跳过真实 systemd --user（HOME 被重定向到 " + home + "）。");
+      return 0;
+    }
+    if (!start.ok) {
+      error("\n单元已写入，但 systemctl --user enable --now 失败：" + (start.text || start.err || ""));
+      error("**定时器现在不会跑。**修好后重跑本命令。");
+      return 1;
+    }
+
+    // PK3-L7-fix3 P1-3：**enable --now 返回 0 不等于实态对。**systemd 可以返回成功但定时器
+    //   仍是 inactive（masked / 依赖没起来 / 别的地方改了同名单元），或者 manager 里还是**旧定义**。
+    //   复核用现成的那三道（is-enabled / is-active / show ExecStart）+ fix4 补的 LoadState / Environment
+    //   —— 就是 serviceState 的 linux 分支，不另写一份。复核不过就说清是哪一道不过，**不打印「已加载」**。
+    const after = serviceStateFn({ home, codexHome, bridge, platform: "linux", systemctlFn });
+    if (after.phase !== "loaded") {
+      error("\nenable --now 返回成功，但复核 systemd manager 实态不过：" +
+        (SYSTEMD_PHASE_TEXT[after.phase] ?? after.phase));
+      if (after.why) error("  判据：" + after.why);
+      error("**不当作已启用** —— 返回 0 不代表它真的在按这份配置跑。");
+      error("  修好后：先 --disable --apply，再 --enable --apply。");
+      return 1;
+    }
+
+    log("\n已启用，定时器已加载（manager 实态已复核：enabled + active + ExecStart 与投影一致）。");
+    log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
+    return 0;
+  } });
+}
+
+/**
+ * `--disable --apply` 的**持锁段**（**PK3-L7-fix6：可导入单出口**）。
+ *
+ * 与 enable 同一条纪律：取锁 → 锁内重查门 → 单元文件读不出来就一个字节不动 → disable --now →
+ * 删两份 unit → daemon-reload；停不下来不删（删了会把还在跑的定时器显示成"未启用"）。
+ * `hooks.beforeLock()` 同样只在函数参数里，CLI 不可触达。
+ */
+export function disableDrainInLock({
+  home = os.homedir(), paths = codexDrainSystemdPaths(home), systemctlFn = systemctl,
+  log = console.log, error = console.error, exit = process.exit, env = process.env, hooks = {},
+} = {}) {
+  return runUnderInstallSurfaceLock({ home, env, error, exit, beforeLock: hooks.beforeLock, body: () => {
+    const gateNow = gateBlocks();
+    if (gateNow.blocked) {
+      error("维护门开着（" + String(gateNow.text ?? "") + "）—— 锁内复核发现的，什么都没写。");
+      return 2;
+    }
+
+    let plistUnreadable = null;
+    for (const p of [paths.service, paths.timer]) {
+      try { fs.readFileSync(p, "utf-8"); }
+      catch (err) {
+        if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable";
+      }
+    }
+    if (plistUnreadable !== null) {
+      error("\n单元文件读不出来（" + plistUnreadable + "），**不知道它是什么状态**。");
+      error("什么都没动 —— 先把那个文件处理掉再来。");
+      return 1;
+    }
+
+    const out = systemctlFn(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
+    if (!out.ok && !out.skipped && !out.absent) {
+      error("\n卸载失败：" + (out.text || out.err || "退出码非零"));
+      error("**单元文件没有删。**删了的话，下次查状态会把一个可能还在跑的");
+      error("定时器报成「未启用」—— 先把它停掉再来。");
+      return 1;
+    }
+    fs.rmSync(paths.service, { force: true });
+    fs.rmSync(paths.timer, { force: true });
+    const reloaded = systemctlFn(["--user", "daemon-reload"], { tolerate: true });
+    if (!reloaded.ok && !reloaded.skipped) {
+      error("\n已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text || reloaded.err || "说不清") + "；请手工执行 systemctl --user daemon-reload");
+      return 1;
+    }
+    if (out.skipped) {
+      log("\n单元文件已删，但真实 systemd --user 未动（HOME 被重定向到 " + home + "）。");
+    } else {
+      log("\n已停用。systemd --user 里确认没有它了，单元文件也已删除。");
+    }
+    return 0;
+  } });
+}
+
 export function runDrainService(argv = process.argv.slice(2), {
   home = os.homedir(),
   codexHome = codexHomeOf(home),
@@ -723,9 +975,9 @@ export function runDrainService(argv = process.argv.slice(2), {
       });
       // PK3-L7-fix3 P1-1：node 解析**先于任何动作**求值 —— 解不出来就拒绝，
       //   绝不退回 process.execPath（退回会把当前进程那个带版本号的 node 写进长期单元）。
-      let node = null;
       let nodeProblem = null;
-      try { node = pickNode("linux", home); }
+      // 这里只问"能不能解出来"（不能就拒绝）；**真正的值在锁内重读**（enableDrainInLock）。
+      try { pickNode("linux", home); }
       catch (err) { nodeProblem = String(err?.message ?? err); }
       if (nodeProblem !== null) blockers.push({ code: "node_unresolvable", detail: nodeProblem });
 
@@ -765,79 +1017,12 @@ export function runDrainService(argv = process.argv.slice(2), {
         return exit(0);
       }
 
-      // 接下来才真的动东西（**写路径**）：先进安装面锁，再查门、重读现场。
-      // 取锁只自己直接跑 CLI 时做（被 uninstall.mjs 编排时走 HELD 继承）；被当库调（用例）时不代替调用方持锁。
-      {
-        const hook = process.env.FEISHU_BRIDGE_DRAIN_BEFORE_LOCK;
-        if (typeof hook === "string" && hook.length > 0) {
-          try { spawnSync(process.execPath, [hook], { encoding: "utf-8", env: process.env, timeout: 60_000 }); }
-          catch (err) { error("（取锁前的注入脚本跑不动：" + String(err?.message ?? err) + "）"); }
-        }
-      }
-      const surface = isDirectRun(import.meta.url) ? holdInstallSurfaceLockOrExit({ home, err: error }) : null;
-      const gateNow = gateBlocks();
-      if (gateNow.blocked) {
-        // 锁由 holdInstallSurfaceLockOrExit 挂的 exit 钩子交还（**不要**在这里手动 release：会释放两遍，
-        // 第二遍 lock_lost 反而把"零写拒绝"变成"锁丢了"）。
-        error("维护门开着（" + String(gateNow.text ?? "") + "）—— 锁内复核发现的，什么都没写。");
-        return exit(2);
-      }
-      // **锁内重读现场**（fix5 P1-3）：node 与单元现状都以此刻为准（上面那份是给预览/拒绝用的）。
-      {
-        let node2 = null;
-        let why = null;
-        try { node2 = pickNode("linux", home); } catch (err) { why = String(err?.message ?? err); }
-        if (why !== null) {
-          error("\n锁内重读发现 node 又解不出来了：" + why + "\n什么都没写。");
-          return exit(1);   // 锁由 exit 钩子交还
-        }
-        node = node2;
-      }
-
-      const units = codexDrainSystemdUnits({ home, codexHome, bridge, node });
-      fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(paths.service, units.service, { mode: 0o644 });
-      fs.writeFileSync(paths.timer, units.timer, { mode: 0o644 });
-
-      const reload = spawnSystemctlFn(["--user", "daemon-reload"]);
-      if (reload.skipped) {
-        log("\n单元已写入，但跳过真实 systemd --user（HOME 被重定向到 " + home + "）。");
-        return exit(0);
-      }
-      if (!reload.ok) {
-        error("\n单元已写入，但 systemctl --user daemon-reload 失败：" + (reload.text || reload.err || ""));
-        error("**定时器现在不会跑。**修好后重跑本命令。");
-        return exit(1);
-      }
-
-      const start = spawnSystemctlFn(["--user", "enable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"]);
-      if (start.skipped) {
-        log("\n单元已写入，但跳过真实 systemd --user（HOME 被重定向到 " + home + "）。");
-        return exit(0);
-      }
-      if (!start.ok) {
-        error("\n单元已写入，但 systemctl --user enable --now 失败：" + (start.text || start.err || ""));
-        error("**定时器现在不会跑。**修好后重跑本命令。");
-        return exit(1);
-      }
-
-      // PK3-L7-fix3 P1-3：**enable --now 返回 0 不等于实态对。**systemd 可以返回成功但定时器
-      //   仍是 inactive（masked / 依赖没起来 / 别的地方改了同名单元），或者 manager 里还是**旧定义**。
-      //   复核用现成的那三道（is-enabled / is-active / show ExecStart）—— 就是 serviceState 的 linux 分支，
-      //   不另写一份。复核不过就说清是哪一道不过，**不打印「已加载」**。
-      const after = serviceStateFn({ home, codexHome, bridge, platform: "linux", systemctlFn: spawnSystemctlFn });
-      if (after.phase !== "loaded") {
-        error("\nenable --now 返回成功，但复核 systemd manager 实态不过：" +
-          (SYSTEMD_PHASE_TEXT[after.phase] ?? after.phase));
-        if (after.why) error("  判据：" + after.why);
-        error("**不当作已启用** —— 返回 0 不代表它真的在按这份配置跑。");
-        error("  修好后：先 --disable --apply，再 --enable --apply。");
-        return exit(1);
-      }
-
-      log("\n已启用，定时器已加载（manager 实态已复核：enabled + active + ExecStart 与投影一致）。");
-      log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
-      return exit(0);
+      // 写路径：**持锁段抽成可导入的单出口函数**（PK3-L7-fix6）。CLI 不传 hooks、也不读任何
+      // "只给测试"的环境变量 —— 交错注入只能经函数参数（用例直接 import 那个函数并传 hooks）。
+      return enableDrainInLock({
+        home, codexHome, bridge, paths, systemctlFn: spawnSystemctlFn, serviceStateFn,
+        log, error, exit, env: process.env,
+      });
     }
 
     if (disable) {
@@ -846,47 +1031,8 @@ export function runDrainService(argv = process.argv.slice(2), {
         return exit(0);
       }
 
-      // PK3-L7-fix5 P1-3：停用也是写路径（停服务 + 删单元）—— 同一条纪律：锁 → 锁内查门 → 现场 → 写。
-      const surface = isDirectRun(import.meta.url) ? holdInstallSurfaceLockOrExit({ home, err: error }) : null;
-      const gateNow = gateBlocks();
-      if (gateNow.blocked) {
-        error("维护门开着（" + String(gateNow.text ?? "") + "）—— 锁内复核发现的，什么都没写。");
-        return exit(2);   // 锁由 exit 钩子交还（手动 release 会释放两遍 → lock_lost）
-      }
-
-      let plistUnreadable = null;
-      for (const p of [paths.service, paths.timer]) {
-        try { fs.readFileSync(p, "utf-8"); }
-        catch (err) {
-          if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable";
-        }
-      }
-      if (plistUnreadable !== null) {
-        error("\n单元文件读不出来（" + plistUnreadable + "），**不知道它是什么状态**。");
-        error("什么都没动 —— 先把那个文件处理掉再来。");
-        return exit(1);
-      }
-
-      const out = spawnSystemctlFn(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
-      if (!out.ok && !out.skipped && !out.absent) {
-        error("\n卸载失败：" + (out.text || out.err || "退出码非零"));
-        error("**单元文件没有删。**删了的话，下次查状态会把一个可能还在跑的");
-        error("定时器报成「未启用」—— 先把它停掉再来。");
-        return exit(1);
-      }
-      fs.rmSync(paths.service, { force: true });
-      fs.rmSync(paths.timer, { force: true });
-      const reloaded = spawnSystemctlFn(["--user", "daemon-reload"], { tolerate: true });
-      if (!reloaded.ok && !reloaded.skipped) {
-        error("\n已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text || reloaded.err || "说不清") + "；请手工执行 systemctl --user daemon-reload");
-        return exit(1);
-      }
-      if (out.skipped) {
-        log("\n单元文件已删，但真实 systemd --user 未动（HOME 被重定向到 " + home + "）。");
-      } else {
-        log("\n已停用。systemd --user 里确认没有它了，单元文件也已删除。");
-      }
-      return exit(0);
+      // 停用同样是写路径（停服务 + 删单元）：**持锁段抽成可导入的单出口函数**（PK3-L7-fix6）。
+      return disableDrainInLock({ home, paths, systemctlFn: spawnSystemctlFn, log, error, exit, env: process.env });
     }
   }
 

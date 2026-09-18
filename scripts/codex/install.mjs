@@ -7,7 +7,6 @@
  * migrate-auto-publish.mjs，这里只报数。
  */
 
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { chatReplyPathStatus } from "../chat-reply.mjs";
 import os from "node:os";
@@ -16,12 +15,11 @@ import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
-import { referencedRuntimeScripts, timerPlatform, systemdUnitAbsent } from "../install-projection.mjs";
-import { systemctl } from "../timer-exec.mjs";
+import { referencedRuntimeScripts, timerPlatform } from "../install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
-import { CODEX_DRAIN_SYSTEMD_UNIT, codexDrainSystemdPaths } from "./drain-service.mjs";
+import { codexDrainRemovalPlan, linuxDrainScene, uninstallDrainUnitsInLock } from "./drain-service.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -37,54 +35,11 @@ const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
-/**
- * manager（systemd --user）里那个 timer 的**三态**：present / absent / unverifiable（PK3-L7-fix4 P2-1）。
- * 旧版只给 true/false，于是「查不了」被折成「不在 manager」—— dry-run 预览「未启用」而 apply 可能去停
- * 一个孤儿 timer（预览与执行不一致）。三态里：`absent` 要三个探针都说“不在”（fail-closed），
- * 说不清的归 `unverifiable`。`skipped`（沙箱 HOME 且没注入）单独一态：那是「没问」，不是「问了说没有」。
- */
-const systemdTimerLookup = () => {
-  const timerUnit = CODEX_DRAIN_SYSTEMD_UNIT + ".timer";
-  const first = (r) => String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
-  const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
-  const enabled = systemctl(["--user", "is-enabled", timerUnit], { tolerate: true });
-  const active = systemctl(["--user", "is-active", timerUnit], { tolerate: true });
-  const show = systemctl(["--user", "show", timerUnit, "-p", "LoadState", "--value"], { tolerate: true });
-  if (enabled?.skipped || active?.skipped || show?.skipped) return { state: "skipped", why: "沙箱 HOME，没问真实 systemd --user" };
-  if (first(enabled) === "enabled" || first(active) === "active" || String(show?.out ?? "").trim() === "loaded") return { state: "present" };
-  // 「没有它」要说准：每个探针要么 ok、要么是协议认的 not-found 说法、要么是最常见的 disabled/inactive 词
-  const absentish = (r) => r?.ok === true || systemdUnitAbsent(say(r)) || ["disabled", "inactive", "unknown", "not-found"].includes(first(r));
-  if (absentish(enabled) && absentish(active) && absentish(show)) return { state: "absent" };
-  return { state: "unverifiable", why: say(!absentish(enabled) ? enabled : !absentish(active) ? active : show).slice(0, 120) };
-};
-
-/**
- * 卸载要不要动、以及预览要说哪句话 —— **dry-run 与 apply 共用这一份判断**（fix4 P2-1）。
- * action：none（本来就没启用）/ files（盘上有文件）/ orphan（只有 manager 里那个）/ refuse（查不清）。
- */
-const codexDrainRemovalPlan = ({ hasFiles, look }) => {
-  if (look.state === "unverifiable") {
-    return { action: "refuse", text: "兜底排空    **manager 查不清**（" + look.why + "）—— --apply 会在这一步拒绝（不静默跳过，也不当成「未启用」）" };
-  }
-  if (look.state === "present" && !hasFiles) {
-    return { action: "orphan", text: "兜底排空    将停用 manager 中的**孤儿 timer**（盘上没有单元文件，systemd --user 里还在），并 daemon-reload" };
-  }
-  if (hasFiles) return { action: "files", text: "兜底排空    待停用并删除 systemd 单元" };
-  if (look.state === "skipped") return { action: "none", text: "兜底排空    未启用（默认；manager 没问 —— 沙箱 HOME）" };
-  return { action: "none", text: "兜底排空    未启用（默认）" };
-};
-
-/** linux 卸载要看的现场（盘上两份 unit + manager 三态 + 计划）：预览与 apply 都从这里取，不各算一遍。 */
-const linuxDrainScene = () => {
-  const spaths = codexDrainSystemdPaths(os.homedir());
-  const hasFiles = fs.existsSync(spaths.service) || fs.existsSync(spaths.timer);
-  return { spaths, hasFiles, look: systemdTimerLookup() };
-};
 // **只在 linux 构造现场**（PK3-L7-fix5 P1-1）：darwin 真机上根本没有 systemd，这里连一次 systemctl
 // 都不该调 —— 旧版 `uninstall ? linuxDrainScene() : null` 会在 Mac 上把探询打成"查不清"，
 // 于是 --uninstall --apply 在任何卸载动作之前就 exit 1（真回归，隔离探针已复现）。
 const PFORM = timerPlatform({ home: os.homedir() });
-/** 预览用（锁外只读、算一份给人看）；apply 会在**锁内重算**（fix5 P1-3）。 */
+/** 预览用（锁外只读、算一份给人看）；apply 会在**锁内重读现场**（fix5 P1-3，由 uninstallDrainUnitsInLock 做）。 */
 const PREVIEW_DRAIN = uninstall && PFORM === "linux" ? linuxDrainScene() : null;
 const PREVIEW_DRAIN_PLAN = PREVIEW_DRAIN === null ? null : codexDrainRemovalPlan(PREVIEW_DRAIN);
 
@@ -181,15 +136,6 @@ if (!apply) {
 
 // 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
 // 门检是瞬时的，锁才是原子准入（评审探针：过检后门才建立，安装器照写不误）。
-// 测试注入点（**只给用例用**，生产不设就是空转）：取锁前跑一次外部脚本（.mjs 绝对路径），
-// 用来确定性地复现"预览快照之后、锁内重读之前"的交错 —— 不靠 sleep 竞速。只在 linux 卸载这条写路径上跑。
-if (uninstall && PFORM === "linux") {
-  const hook = process.env.FEISHU_BRIDGE_CODEX_INSTALL_BEFORE_LOCK;
-  if (typeof hook === "string" && hook.length > 0) {
-    try { spawnSync(process.execPath, [hook], { encoding: "utf-8", env: process.env, timeout: 60_000 }); }
-    catch (err) { console.error("（取锁前的注入脚本跑不动：" + String(err?.message ?? err) + "）"); }
-  }
-}
 holdInstallSurfaceLockOrExit();
 {
   const g = gateBlocks();
@@ -301,38 +247,13 @@ if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
 }
 if (uninstall) {
-  // PK3-L7：若 linux 上单元存在（或 manager 里还有），按同纪律停并删
-  // PK3-L7-fix3 P2：**不拿「盘上有文件」当前提** —— manager 里还有、盘上文件已丢的 orphan
-  //   正是最容易被漏掉的一种（卸载会说「本来就没启用」，而那个 timer 可能还在跑）。
-  // PK3-L7-fix5 P1-3：**锁内重读现场**（旧版在模块顶部冻结，锁后不重读 → stale plan），
-  //   并且"查不清就拒绝"也挪到这里 —— 此时已持锁、还没写过任何东西。
-  const LINUX_DRAIN = PFORM === "linux" ? linuxDrainScene() : null;
-  const LINUX_DRAIN_PLAN = LINUX_DRAIN === null ? null : codexDrainRemovalPlan(LINUX_DRAIN);
-  if (LINUX_DRAIN_PLAN !== null && LINUX_DRAIN_PLAN.action === "refuse") {
-    console.error(LINUX_DRAIN_PLAN.text + "\n什么都没动（先查清 systemd --user 能不能用、里面到底有没有同名 timer，再卸载）。");
-    process.exit(1);
-  }
-  if (LINUX_DRAIN !== null && LINUX_DRAIN_PLAN.action !== "none") {
-    const { spaths, hasFiles, plan } = { spaths: LINUX_DRAIN.spaths, hasFiles: LINUX_DRAIN.hasFiles, plan: LINUX_DRAIN_PLAN };
-    const disabled = systemctl(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
-    if (!disabled.ok && !disabled.skipped && !disabled.absent) {
-      console.error("兜底定时器停用失败：" + (disabled.text ?? "说不清") + "，单元文件未删。");
-      process.exit(1);
-    }
-    fs.rmSync(spaths.service, { force: true });
-    fs.rmSync(spaths.timer, { force: true });
-    const reloaded = systemctl(["--user", "daemon-reload"], { tolerate: true });
-    if (!reloaded.ok && !reloaded.skipped) {
-      console.error("已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text ?? "说不清"));
-      process.exit(1);
-    }
-    const skipped = disabled.skipped;
-    console.log("兜底排空    " + (skipped
-      ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）"
-      : plan.action === "orphan" || !hasFiles
-      ? "收了一个孤儿 timer（单元文件早已不在，systemd --user 里还在），已停用并 daemon-reload"
-      : "已停用并删除 systemd 单元"));
-  }
+  // linux 上收掉兜底定时器（单元已丢、manager 里还在的孤儿也要收）。
+  // **PK3-L7-fix6**：这段是**持锁段**（锁在上面就取了，覆盖到这里），抽成 drain-service 的可导入函数
+  //   `uninstallDrainUnitsInLock` —— 交错注入只能从函数参数来；旧版那个"设了环境变量就在**锁外**跑任意
+  //   .mjs"的注入点已删除（生产可达，与 U1 四轮 P1-1 同类）。现场在函数里**重读**（fix5 P1-3），
+  //   不拿模块顶部那份预览快照；非 linux 一次 systemctl 都不调（fix5 P1-1）。
+  const drain = uninstallDrainUnitsInLock({ home: os.homedir(), platform: PFORM });
+  if (!drain.ok) process.exit(drain.code);
 }
 
 if (!uninstall) {

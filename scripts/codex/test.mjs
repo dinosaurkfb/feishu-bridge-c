@@ -25,6 +25,8 @@ import {
   pickNode as pickDrainNode, expectedJob, shellQuoteItems, systemdEnvValue,
 } from "./drain-service.mjs";
 import { drainTimerCheck, drainTimerText, runDrainService } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台 / PK3-L2-fix3：模块函数入参测入口
+// PK3-L7-fix6：持锁段抽成可导入单出口 —— 交错的确定性注入走**函数参数**（不再是环境变量）
+import { disableDrainInLock, enableDrainInLock, uninstallDrainUnitsInLock } from "./drain-service.mjs";
 import {
   classifyOutboxRecord, codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
@@ -11824,28 +11826,45 @@ test("PK3-L7-fix5 P1-2：Environment 按 systemd shell_maybe_quote 的真实形�
   }
 });
 
-// 拿掉哪行会红：删掉 drain-service 里那次 `holdInstallSurfaceLockOrExit`（回到 fix4 的“只查门不取锁”），
-//   ① 会红在「exit 2 零写」（它会写完单元再出口 0）；② 会红在 exit 2/busy（它根本不会去拿锁）。
-test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门 + 锁内重读现场）", () => {
-  const writeHook = (p, lines) => { fs.writeFileSync(p, lines.join("\n") + "\n"); return p; };
+// 拿掉哪行会红（四条都**实测**过，各自红在点名的那条断言上）：
+//   · `acquireInstallSurfaceLockOrRefuse` 那次取锁 → ② 红在 `bRun.status`（期望 2、实得 0）；
+//   · 锁内那次维护门复核 → ① 红在 `aRun.code`（期望 2、实得 0 —— 它会写完单元再出口 0）；
+//   · finally 里的 `refused.lock.release()` → ① 红在「锁要交还（不许留 stale lock）」；
+//   · 把现场计算挪到 hooks.beforeScene 之前（拿旧快照执行）→ ③ 红在「动作要报准」（实得 action:"none"）。
+// **PK3-L7-fix6**：交错注入改走**函数参数**（`hooks.beforeLock` / `hooks.beforeScene`）—— 旧版那两个
+//   "设了环境变量就在锁外跑任意 .mjs"的注入点已删除（生产可达，与 U1 四轮 P1-1 同类）。
+test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门 + 锁内重读现场，函数参数注入）", () => {
   const drain = (fx, extra) => spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
     { encoding: "utf-8", env: { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome,
       FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...extra } });
   const drainLockPath = (fx) => path.join(fx.home, ".claude", "feishu-bridge", "install-surface.lock");
+  /** 进程内跑持锁段的公共出口：日志合并成一份、退出码记下来（exit 注入，与套件里其它入口同一约定）。 */
+  const inProcess = (fn, args, env) => {
+    const saved = new Map();
+    for (const [k, v] of Object.entries(env)) { saved.set(k, process.env[k]); process.env[k] = v; }
+    let out = "";
+    let code = null;
+    let ret = null;
+    try {
+      ret = fn({ ...args, log: (m) => { out += m + "\n"; }, error: (m) => { out += m + "\n"; }, exit: (c) => { code = c; } });
+    } finally {
+      for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+    return { out, code, ret };
+  };
 
-  // ① 取锁前建维护门 → exit 2、零写、锁已交还
+  // ① 「查门之后、取锁之前，维护流程建门」→ 锁内复核必须拦住（exit 2、零写、锁已交还）
   const a = linuxDrainFixture();
   const gateFile = path.join(a.base, "maint.gate");
-  const hookGate = writeHook(path.join(a.base, "hook-gate.mjs"), [
-    "import { createGate } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "maintenance-gate-core.mjs")).href) + ";",
-    "createGate({ file: " + JSON.stringify(gateFile) + ", reason: \"交错反例：取锁前建门\" });",
-  ]);
-  const aRun = drain(a, { FEISHU_BRIDGE_SYSTEMCTL: a.fakeBin, FEISHU_BRIDGE_DRAIN_BEFORE_LOCK: hookGate,
-    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile });
-  assert.equal(aRun.status, 2, aRun.stdout + aRun.stderr);
-  assert.match(aRun.stderr, /维护门/u, aRun.stderr);
-  assert.equal(fs.existsSync(codexDrainSystemdPaths(a.home).service), false, "① 拒了就零写：" + aRun.stdout);
+  const aRun = inProcess(enableDrainInLock, {
+    home: a.home, codexHome: a.codexHome, bridge: a.bridge, paths: codexDrainSystemdPaths(a.home),
+    hooks: { beforeLock: () => { createGate({ file: gateFile, reason: "交错反例：取锁前建门" }); } },
+  }, { FEISHU_BRIDGE_SYSTEMCTL: a.fakeBin, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile });
+  assert.equal(aRun.code, 2, aRun.out);
+  assert.match(aRun.out, /维护门/u, aRun.out);
+  assert.match(aRun.out, /锁内复核/u, "要说明是锁内复核发现的：" + aRun.out);
+  assert.equal(fs.existsSync(codexDrainSystemdPaths(a.home).service), false, "① 拒了就零写：" + aRun.out);
   assert.equal(lockPresent(drainLockPath(a)), false, "① 锁要交还（不许留 stale lock）");
 
   // ② 锁被别人持有 → surface_install_busy exit 2 零写（enable 与 install --uninstall 两条写路径都受管）
@@ -11867,25 +11886,26 @@ test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门
     fs.rmSync(drainLockPath(b), { force: true });
   }
 
-  // ③ 锁内重读现场：注入钩子在取锁前把两份 unit 放上去 → apply 必须看见并收掉（旧版拿预览快照会跳过）
+  // ③ 重读现场：hook 在「读现场之前」把两份 unit 放上去 → 必须看见并收掉。
+  //    这里把假 manager 设成"三探针都说不在"——**重读前**的现场是 action:"none"（什么都不做），
+  //    重读后的现场才有文件可收。拿旧快照执行的实现会在这一条上红（它会直接返回 none）。
   const d = linuxDrainFixture();
   const dPaths = codexDrainSystemdPaths(d.home);
   fs.rmSync(dPaths.dir, { recursive: true, force: true });
-  const hookUnits = writeHook(path.join(d.base, "hook-units.mjs"), [
-    "import fs from \"node:fs\"; import path from \"node:path\";",
-    "fs.mkdirSync(" + JSON.stringify(dPaths.dir) + ", { recursive: true });",
-    "fs.writeFileSync(" + JSON.stringify(dPaths.service) + ", \"service\\n\");",
-    "fs.writeFileSync(" + JSON.stringify(dPaths.timer) + ", \"timer\\n\");",
-  ]);
-  const dRun = spawnSync(process.execPath,
-    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
-    { encoding: "utf-8", env: { ...process.env, HOME: d.home, CODEX_HOME: d.codexHome,
-      FEISHU_CODEX_BRIDGE_HOME: d.bridge, FEISHU_BRIDGE_SYSTEMCTL: d.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
-      FEISHU_BRIDGE_CODEX_INSTALL_BEFORE_LOCK: hookUnits } });
-  assert.equal(dRun.status, 0, dRun.stdout + dRun.stderr);
-  assert.equal(fs.existsSync(dPaths.service), false, "③ 锁内重读必须看见锁前放上去的 unit：" + dRun.stdout);
+  const dRun = inProcess(uninstallDrainUnitsInLock, {
+    home: d.home, platform: "linux",
+    hooks: { beforeScene: () => {
+      fs.mkdirSync(dPaths.dir, { recursive: true });
+      fs.writeFileSync(dPaths.service, "service\n");
+      fs.writeFileSync(dPaths.timer, "timer\n");
+    } },
+  }, { FEISHU_BRIDGE_SYSTEMCTL: d.fakeBin, SYSTEMCTL_MOCK_IS_ENABLED: "disabled",
+    SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "not-found" });
+  assert.equal(dRun.ret?.ok, true, "③ 收成功要如实返回（这个函数不调 exit：退出码由调用方按 {ok,code} 映射）：" + JSON.stringify(dRun.ret) + dRun.out);
+  assert.equal(dRun.ret?.action, "files", "③ 动作要报准（盘上有文件）：" + JSON.stringify(dRun.ret));
+  assert.equal(fs.existsSync(dPaths.service), false, "③ 重读前放上去的 unit 必须被收掉：" + dRun.out);
   assert.equal(fs.existsSync(dPaths.timer), false, "③ 同上（timer）");
-  assert.match(dRun.stdout, /已停用并删除 systemd 单元/u, dRun.stdout);
+  assert.match(dRun.out, /已停用并删除 systemd 单元/u, dRun.out);
 
   // 对照：正常路径（不注入）→ 0
   const e = linuxDrainFixture();
@@ -11893,6 +11913,65 @@ test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门
   assert.equal(eRun.status, 0, eRun.stdout + eRun.stderr);
   assert.match(eRun.stdout, /已启用，定时器已加载/u, eRun.stdout);
   assert.equal(lockPresent(drainLockPath(e)), false, "对照：正常收尾也要交还锁");
+});
+
+// 拿掉哪行会红（两条都**实测**过）：把 CLI 改回读环境变量注入点 —— 变量名**字面量**写出来 →
+//   结构断言红（点名 scripts/codex/drain-service.mjs）；变量名在源码里**拼出来**躲过结构扫描 →
+//   行为断言红（「drain 的旧环境变量是死字母：它指向的脚本一个字都不许跑」，探针脚本真的被执行了）。
+test("PK3-L7-fix6：两个测试注入点只剩函数参数 —— 旧环境变量是死字母（CLI 设了也不跑）", () => {
+  // 名字拼出来：否则本文件自己会被下面的结构扫描扫到。
+  const VAR_DRAIN = "FEISHU_BRIDGE_DRAIN_" + "BEFORE_LOCK";
+  const VAR_INSTALL = "FEISHU_BRIDGE_CODEX_INSTALL_" + "BEFORE_LOCK";
+
+  // ① 结构：scripts/**（除测试）里 grep 不到 BEFORE_LOCK —— 注入面不许以任何形式回潮。
+  const hits = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { walk(full); continue; }
+      if (!e.name.endsWith(".mjs")) continue;
+      if (/^test.*\.mjs$/u.test(e.name) || /\.test\.mjs$/u.test(e.name)) continue;   // 测试自己会提到它
+      if (fs.readFileSync(full, "utf-8").includes("BEFORE_LOCK")) hits.push(path.relative(ROOT, full));
+    }
+  };
+  walk(path.join(ROOT, "scripts"));
+  assert.deepEqual(hits, [], "卸载 / 启停的测试注入点不许回到环境变量上：" + JSON.stringify(hits));
+
+  // ② 行为：设了它 → 什么也不跑（标记文件不出现），退出码与不设时一致。
+  const fx = linuxDrainFixture();
+  const marker = path.join(fx.base, "before-lock-ran.marker");
+  const hookFile = path.join(fx.base, "before-lock-hook.mjs");
+  fs.writeFileSync(hookFile, "import fs from \"node:fs\";\nfs.writeFileSync(" + JSON.stringify(marker) + ", \"ran\");\n");
+  const baseEnv = { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" };
+  const runCli = (script, extra) => spawnSync(process.execPath, [path.join(ROOT, "scripts", script), "--enable", "--apply"],
+    { encoding: "utf-8", env: { ...baseEnv, ...extra } });
+
+  const withDrain = runCli(path.join("codex", "drain-service.mjs"), { [VAR_DRAIN]: hookFile });
+  assert.equal(fs.existsSync(marker), false, "drain 的旧环境变量是死字母：它指向的脚本一个字都不许跑");
+  const withoutDrain = runCli(path.join("codex", "drain-service.mjs"), {});
+  assert.equal(withDrain.status, withoutDrain.status, "设与不设退出码要一致：" + withDrain.stdout + withDrain.stderr);
+  assert.equal(withDrain.status, 0, withDrain.stdout + withDrain.stderr);
+  assert.match(withDrain.stdout, /已启用，定时器已加载/u, withDrain.stdout);
+  assert.equal(fs.existsSync(marker), false, "跑了 enable 之后标记文件依然不许出现");
+
+  // install --uninstall 那条写路径同理
+  const fx2 = linuxDrainFixture();
+  const paths2 = codexDrainSystemdPaths(fx2.home);
+  fs.mkdirSync(paths2.dir, { recursive: true });
+  fs.writeFileSync(paths2.service, "service\n");
+  fs.writeFileSync(paths2.timer, "timer\n");
+  const marker2 = path.join(fx2.base, "install-before-lock-ran.marker");
+  const hookFile2 = path.join(fx2.base, "install-before-lock-hook.mjs");
+  fs.writeFileSync(hookFile2, "import fs from \"node:fs\";\nfs.writeFileSync(" + JSON.stringify(marker2) + ", \"ran\");\n");
+  const uninstallCli = (extra) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
+    { encoding: "utf-8", env: { ...baseEnv, HOME: fx2.home, CODEX_HOME: fx2.codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: fx2.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx2.fakeBin, ...extra } });
+  const withInstall = uninstallCli({ [VAR_INSTALL]: hookFile2 });
+  assert.equal(withInstall.status, 0, withInstall.stdout + withInstall.stderr);
+  assert.equal(fs.existsSync(marker2), false, "install 的旧环境变量是死字母");
+  assert.equal(fs.existsSync(paths2.service), false, "卸载照常收掉单元：" + withInstall.stdout);
 });
 
 test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {

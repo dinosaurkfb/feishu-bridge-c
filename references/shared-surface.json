@@ -389,6 +389,7 @@
       "INSTALL_SURFACE_LOCK_ENV",
       "INSTALL_SURFACE_LOCK_STALE_MS",
       "acquireInstallSurfaceLock",
+      "acquireInstallSurfaceLockOrRefuse",
       "holdInstallSurfaceLockOrExit",
       "inspectInstallSurfaceLock",
       "installSurfaceLockPath"

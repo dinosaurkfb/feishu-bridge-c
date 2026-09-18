@@ -18477,7 +18477,10 @@ test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允�
     'const home = process.env.HOME; const file = m.plistPath(home); fs.mkdirSync(path.dirname(file), { recursive: true });' +
     'fs.writeFileSync(file, m.plistBody({ home })); process.stdout.write(JSON.stringify({ expect: m.expectedJob({ home }), label: m.LAUNCH_LABEL }));',
     pathToFileURL(path.resolve("scripts", "codex", "drain-service.mjs")).href],
-    { encoding: "utf-8", env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex") } });
+    // PK3-L7-fix4 P1-1：显式桥根现在是权威来源，写 plist 的这一侧必须与 doctor 那一侧**同一个桥根**
+    //   （fixture 的 doctor run env 里就是这个值）—— 否则 plist 与投影对不上，会被判 stale。
+    { encoding: "utf-8", env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
+      FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") } });
   assert.equal(gen.status, 0, gen.stderr);
   const { expect, label } = JSON.parse(gen.stdout);
   const claudeJob = claudeDrainExpectedJob({ home: m.home });

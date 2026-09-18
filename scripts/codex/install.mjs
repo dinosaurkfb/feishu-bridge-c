@@ -15,7 +15,7 @@ import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
-import { referencedRuntimeScripts, timerPlatform } from "../install-projection.mjs";
+import { referencedRuntimeScripts, timerPlatform, systemdUnitAbsent } from "../install-projection.mjs";
 import { systemctl } from "../timer-exec.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
@@ -37,21 +37,55 @@ const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
 /**
- * manager（systemd --user）里还有同名 timer 吗 —— **跟盘上有没有文件是两回事**（PK3-L7-fix3 P2）。
- * 三道判据与 doctor 那份同一套：is-enabled / is-active / show -p LoadState。
- * 沙箱（HOME 被重定向且未注入 FEISHU_BRIDGE_SYSTEMCTL）得到 skipped → 一律 false：
- * 那种情况下我们**没问过** manager，不能把“问不到”当成“里面没有”（后续删文件那条路仍走盘上判断）。
+ * manager（systemd --user）里那个 timer 的**三态**：present / absent / unverifiable（PK3-L7-fix4 P2-1）。
+ * 旧版只给 true/false，于是「查不了」被折成「不在 manager」—— dry-run 预览「未启用」而 apply 可能去停
+ * 一个孤儿 timer（预览与执行不一致）。三态里：`absent` 要三个探针都说“不在”（fail-closed），
+ * 说不清的归 `unverifiable`。`skipped`（沙箱 HOME 且没注入）单独一态：那是「没问」，不是「问了说没有」。
  */
-const systemdTimerInManager = () => {
+const systemdTimerLookup = () => {
   const timerUnit = CODEX_DRAIN_SYSTEMD_UNIT + ".timer";
   const first = (r) => String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+  const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
   const enabled = systemctl(["--user", "is-enabled", timerUnit], { tolerate: true });
   const active = systemctl(["--user", "is-active", timerUnit], { tolerate: true });
   const show = systemctl(["--user", "show", timerUnit, "-p", "LoadState", "--value"], { tolerate: true });
-  if (enabled?.skipped || active?.skipped || show?.skipped) return false;
-  // LoadState=loaded 盖住“enabled 但当前 inactive、文件又已经不在”的那种（manager 还记着它）。
-  return first(enabled) === "enabled" || first(active) === "active" || String(show?.out ?? "").trim() === "loaded";
+  if (enabled?.skipped || active?.skipped || show?.skipped) return { state: "skipped", why: "沙箱 HOME，没问真实 systemd --user" };
+  if (first(enabled) === "enabled" || first(active) === "active" || String(show?.out ?? "").trim() === "loaded") return { state: "present" };
+  // 「没有它」要说准：每个探针要么 ok、要么是协议认的 not-found 说法、要么是最常见的 disabled/inactive 词
+  const absentish = (r) => r?.ok === true || systemdUnitAbsent(say(r)) || ["disabled", "inactive", "unknown", "not-found"].includes(first(r));
+  if (absentish(enabled) && absentish(active) && absentish(show)) return { state: "absent" };
+  return { state: "unverifiable", why: say(!absentish(enabled) ? enabled : !absentish(active) ? active : show).slice(0, 120) };
 };
+
+/**
+ * 卸载要不要动、以及预览要说哪句话 —— **dry-run 与 apply 共用这一份判断**（fix4 P2-1）。
+ * action：none（本来就没启用）/ files（盘上有文件）/ orphan（只有 manager 里那个）/ refuse（查不清）。
+ */
+const codexDrainRemovalPlan = ({ hasFiles, look }) => {
+  if (look.state === "unverifiable") {
+    return { action: "refuse", text: "兜底排空    **manager 查不清**（" + look.why + "）—— --apply 会在这一步拒绝（不静默跳过，也不当成「未启用」）" };
+  }
+  if (look.state === "present" && !hasFiles) {
+    return { action: "orphan", text: "兜底排空    将停用 manager 中的**孤儿 timer**（盘上没有单元文件，systemd --user 里还在），并 daemon-reload" };
+  }
+  if (hasFiles) return { action: "files", text: "兜底排空    待停用并删除 systemd 单元" };
+  if (look.state === "skipped") return { action: "none", text: "兜底排空    未启用（默认；manager 没问 —— 沙箱 HOME）" };
+  return { action: "none", text: "兜底排空    未启用（默认）" };
+};
+
+/** linux 卸载要看的现场（盘上两份 unit + manager 三态 + 计划）：预览与 apply 都从这里取，不各算一遍。 */
+const linuxDrainScene = () => {
+  const spaths = codexDrainSystemdPaths(os.homedir());
+  const hasFiles = fs.existsSync(spaths.service) || fs.existsSync(spaths.timer);
+  return { spaths, hasFiles, look: systemdTimerLookup() };
+};
+const LINUX_DRAIN = uninstall ? linuxDrainScene() : null;
+const LINUX_DRAIN_PLAN = LINUX_DRAIN === null ? null : codexDrainRemovalPlan(LINUX_DRAIN);
+// 查不清就不动：**在动任何东西之前**拒绝（写在这是为了不让“钩子/技能已经删了、到定时器这步才拒”）。
+if (uninstall && apply && LINUX_DRAIN_PLAN.action === "refuse") {
+  console.error(LINUX_DRAIN_PLAN.text + "\n什么都没动（先查清 systemd --user 能不能用、里面到底有没有同名 timer，再卸载）。");
+  process.exit(1);
+}
 
 
 // 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
@@ -134,12 +168,10 @@ if (!uninstall) {
 // 评审的裁决：启用要是一条独立命令，否则仍可能误组合。
 if (uninstall) {
   const pform = timerPlatform({ home: os.homedir() });
-  const spaths = codexDrainSystemdPaths(os.homedir());
-  if (pform === "linux" && (fs.existsSync(spaths.service) || fs.existsSync(spaths.timer))) {
-    console.log("兜底排空    待停用并删除 systemd 单元");
-  } else {
-    console.log("兜底排空    未启用（默认）");
-  }
+  // fix4 P2-1：预览也查 manager（与 apply 同一份计划、同一句话），不再只看盘上文件。
+  console.log(LINUX_DRAIN_PLAN !== null && pform === "linux"
+    ? LINUX_DRAIN_PLAN.text
+    : "兜底排空    未启用（默认）");
 } else {
   console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
 }
@@ -265,31 +297,27 @@ if (uninstall) {
   // PK3-L7：若 linux 上单元存在（或 manager 里还有），按同纪律停并删
   // PK3-L7-fix3 P2：**不拿「盘上有文件」当前提** —— manager 里还有、盘上文件已丢的 orphan
   //   正是最容易被漏掉的一种（卸载会说「本来就没启用」，而那个 timer 可能还在跑）。
-  const pform = timerPlatform({ home: os.homedir() });
-  if (pform === "linux") {
-    const spaths = codexDrainSystemdPaths(os.homedir());
-    const hasFiles = fs.existsSync(spaths.service) || fs.existsSync(spaths.timer);
-    const inManager = systemdTimerInManager();
-    if (hasFiles || inManager) {
-      const disabled = systemctl(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
-      if (!disabled.ok && !disabled.skipped && !disabled.absent) {
-        console.error("兜底定时器停用失败：" + (disabled.text ?? "说不清") + "，单元文件未删。");
-        process.exit(1);
-      }
-      fs.rmSync(spaths.service, { force: true });
-      fs.rmSync(spaths.timer, { force: true });
-      const reloaded = systemctl(["--user", "daemon-reload"], { tolerate: true });
-      if (!reloaded.ok && !reloaded.skipped) {
-        console.error("已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text ?? "说不清"));
-        process.exit(1);
-      }
-      const skipped = disabled.skipped;
-      console.log("兜底排空    " + (skipped
-        ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）"
-        : !hasFiles
-        ? "收了一个孤儿 timer（单元文件早已不在，systemd --user 里还在），已停用并 daemon-reload"
-        : "已停用并删除 systemd 单元"));
+  // PK3-L7-fix4 P2-1：用模块顶部算好的同一份现场与计划（预览/apply 不可能不一致）。
+  if (LINUX_DRAIN !== null && LINUX_DRAIN_PLAN.action !== "none") {
+    const { spaths, hasFiles, plan } = { spaths: LINUX_DRAIN.spaths, hasFiles: LINUX_DRAIN.hasFiles, plan: LINUX_DRAIN_PLAN };
+    const disabled = systemctl(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
+    if (!disabled.ok && !disabled.skipped && !disabled.absent) {
+      console.error("兜底定时器停用失败：" + (disabled.text ?? "说不清") + "，单元文件未删。");
+      process.exit(1);
     }
+    fs.rmSync(spaths.service, { force: true });
+    fs.rmSync(spaths.timer, { force: true });
+    const reloaded = systemctl(["--user", "daemon-reload"], { tolerate: true });
+    if (!reloaded.ok && !reloaded.skipped) {
+      console.error("已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text ?? "说不清"));
+      process.exit(1);
+    }
+    const skipped = disabled.skipped;
+    console.log("兜底排空    " + (skipped
+      ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）"
+      : plan.action === "orphan" || !hasFiles
+      ? "收了一个孤儿 timer（单元文件早已不在，systemd --user 里还在），已停用并 daemon-reload"
+      : "已停用并删除 systemd 单元"));
   }
 }
 

@@ -94,11 +94,46 @@ const isExecutable = (p) => {
 };
 
 /**
+ * `systemctl show -p Environment --value` 里某个变量的值（null = 没有这个变量）—— fix4 P1-2。
+ * manager 打的是 `VAR=value` 一列；值里有空格 / 特殊字符时 systemd 会加引号或按 C 风格转义（`\x20`），
+ * 两种都要还原 —— 否则含空格的桥根（比如 `…/My Codex Home/feishu-bridge`）会被误判成漂移。
+ */
+export const systemdEnvValue = (text, name) => {
+  const m = new RegExp("(?:^|\\s)" + name + "=(\"[^\"]*\"|\\S*)", "u").exec(String(text ?? ""));
+  if (m === null) return null;
+  const raw = m[1];
+  const body = raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"") ? raw.slice(1, -1) : raw;
+  return body.replace(/\\x([0-9a-fA-F]{2})/gu, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/\\(.)/gu, "$1");
+};
+
+/**
  * 桥的状态根（`FEISHU_CODEX_BRIDGE_HOME`）—— **darwin plist 与 linux 单元用的是同一个值、同一来源**（PK3-L7-fix3 P1-2）。
  * 两处各算一遍就会漂：自定义 CODEX_HOME 时 plist 指向自定义桥根、而 systemd 那一份没有这个变量，
  * drain 跑起来会按默认 `~/.codex/feishu-bridge` 找状态 —— 运行时代码与状态目录分叉。
  */
-const codexBridgeHomeOf = (codexHome = codexHomeOf()) => path.join(codexHome, "feishu-bridge");
+/**
+ * 桥的状态根（`FEISHU_CODEX_BRIDGE_HOME`）：**显式值优先，否则 codexHome/feishu-bridge**。
+ *
+ * 规则只有一份（codex/state.mjs 的 `bridgeHome`，不在这里另推导）—— 这里只是把 codexHome 也做成显式入参，
+ * 否则沙箱 home 会被 os.homedir() 绕过去。
+ *
+ * **为什么不能从 codexHome 重新推导（PK3-L7-fix4 P1-1）**：显式 `FEISHU_CODEX_BRIDGE_HOME` 指到别处时，
+ * 两种投影（systemd unit 的 `Environment=` / darwin plist 的 `EnvironmentVariables`）必须写**那个值** ——
+ * 否则 drain 跑起来按默认桥根找状态，与安装时投影出来的东西分叉（运行时代码与状态目录各一套）。
+ *
+ * `codexHome` 是**必填**（PK3-L7-fix4 P2-2）：旧版把它写成自调用的默认参数 `codexBridgeHomeOf(codexHome = codexBridgeHomeOf())`，
+ * 谁不传参就 RangeError（爆栈）—— 那种默认值不如没有。
+ */
+export function codexBridgeOf({ codexHome, env = process.env } = {}) {
+  if (typeof codexHome !== "string" || codexHome.length === 0) {
+    throw new Error("codexBridgeOf 需要显式的 codexHome（旧版有个会自调用爆栈的默认值，已去掉）");
+  }
+  const explicit = env?.FEISHU_CODEX_BRIDGE_HOME;
+  return bridgeHome(typeof explicit === "string" && explicit.length > 0
+    ? { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: explicit }
+    : { CODEX_HOME: codexHome });
+}
 
 /**
  * 调度器要跑的脚本。**只能是 runtime/current 下那一份。**
@@ -132,12 +167,12 @@ export function expectedJob({ home = os.homedir(), codexHome = codexHomeOf(home)
 }
 
 export function plistBody({ home = os.homedir(), node = pickNode(),
-  codexHome = codexHomeOf(home) } = {}) {
+  codexHome = codexHomeOf(home), bridge = codexBridgeOf({ codexHome }) } = {}) {
   const script = drainScriptPath(home, codexHome);
   const workdir = path.join(codexRuntimeRoot(codexHome), "current");
   const log = path.join(codexHome, "feishu-bridge", "drain.log");
   const [xNode, xScript, xWork, xLog, xHome, xBridge] =
-    [node, script, workdir, log, home, codexBridgeHomeOf(codexHome)].map(xml);
+    [node, script, workdir, log, home, bridge].map(xml);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -167,6 +202,7 @@ export function plistBody({ home = os.homedir(), node = pickNode(),
 export function codexDrainSystemdUnits({
   home = os.homedir(),
   codexHome = codexHomeOf(home),
+  bridge = codexBridgeOf({ codexHome }),
   node = pickNode("linux", home),
 } = {}) {
   const script = drainScriptPath(home, codexHome);
@@ -176,7 +212,7 @@ export function codexDrainSystemdUnits({
   // PK3-L7-fix3 P1-2：与 darwin plist 的 EnvironmentVariables 那一条**同值同源**。
   // systemd 的引用规则对 Environment 值与 ExecStart 参数是同一条（systemd.syntax 的 quoted words），
   // 所以直接复用同一个引用函数 —— 各写一份引号规则就会漂（含空格/引号的路径会静默变成错的）。
-  const envBridge = systemdExecStartValue([codexBridgeHomeOf(codexHome)]);
+  const envBridge = systemdExecStartValue([bridge]);
   const service = `[Unit]
 Description=feishu-bridge 兜底发布（Codex 链，drain-all）
 After=default.target
@@ -245,8 +281,8 @@ export function classifyBacklog({ home = bridgeHome() } = {}) {
  * 现在处于哪个状态。**"未启用"是安装后的正常态，不是故障。**
  * 把它报成故障，人就会去"修"一件本来就该这样的事。
  */
-export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
-  codexHome = codexHomeOf(home), platform = timerPlatform({ home }), systemctlFn = systemctl } = {}) {
+export function serviceState({ home = os.homedir(), codexHome = codexHomeOf(home),
+  bridge = codexBridgeOf({ codexHome }), platform = timerPlatform({ home }), systemctlFn = systemctl } = {}) {
   if (platform === "linux") {
     const runtime = verifyRuntime({ root: codexRuntimeRoot(codexHome) });
     const paths = codexDrainSystemdPaths(home);
@@ -256,7 +292,8 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
     let nodeProblem = null;
     try { node = pickNode("linux", home); }
     catch (err) { nodeProblem = String(err?.message ?? err); }
-    const units = node === null ? null : codexDrainSystemdUnits({ home, codexHome, node });
+    // 投影用**同一个 bridge**（fix4 P1-1）：显式桥根优先，否则 codexHome/feishu-bridge。
+    const units = node === null ? null : codexDrainSystemdUnits({ home, codexHome, bridge, node });
     const backlog = classifyBacklog({ home: bridge });
     const scan = scanRunnable({ home: bridge });
 
@@ -334,16 +371,31 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
             phaseWhy = "单元文件与当前运行时对不上（要重装）";
           } else if (isEnabled && isActive) {
             const show = systemctlFn(["--user", "show", serviceUnit, "-p", "ExecStart", "--value"], { tolerate: true });
+            // fix4 P1-2：+ 两道 —— manager 实际加载的 **LoadState**（error/bad-setting 也“在跑”？不）
+            // 与 **Environment**（旧桥根 = 状态目录分叉）。两者与 ExecStart 同一份判据、同一处报。
+            const loadProbe = systemctlFn(["--user", "show", serviceUnit, "-p", "LoadState", "--value"], { tolerate: true });
+            const envProbe = systemctlFn(["--user", "show", serviceUnit, "-p", "Environment", "--value"], { tolerate: true });
             const expectedArgs = expectedJob({ home, codexHome, platform: "linux", node }).args;
             const loadedArgv = systemdShowExecArgv(String(show?.out ?? ""));
             const sameExec = show?.ok === true && loadedArgv !== null &&
               (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
-            if (show?.ok !== true) {
+            const loadWord = String(loadProbe?.out ?? "").trim();
+            const loadedBridge = systemdEnvValue(String(envProbe?.out ?? ""), "FEISHU_CODEX_BRIDGE_HOME");
+            if (show?.ok !== true || loadProbe?.ok !== true || envProbe?.ok !== true) {
               phase = "unverifiable";
-              phaseWhy = "systemctl --user show 查不了（" + say(show).slice(0, 120) + "）—— 已加载的定义核不了，查不清";
+              phaseWhy = "systemctl --user show 查不了（" + say([show, loadProbe, envProbe].find((r) => r?.ok !== true)).slice(0, 120) + "）—— 已加载的定义核不了，查不清";
+            } else if (loadWord !== "loaded") {
+              // 单元起不来（语法错 / 依赖缺）—— enabled + active 也可能落到这里（timer 看似在跑，其实是旧实例）
+              phase = "installed_not_loaded";
+              phaseWhy = "systemd manager 里这个单元的 LoadState=" + (loadWord || "?") + "（不是 loaded）—— 它起不来";
             } else if (!sameExec) {
               phase = "loaded_other";
               phaseWhy = "systemd manager 里已加载的 ExecStart 与当前配置不一致";
+            } else if (loadedBridge !== bridge) {
+              phase = "loaded_other";
+              phaseWhy = loadedBridge === null
+                ? "manager 里加载的 Environment 没有 FEISHU_CODEX_BRIDGE_HOME（旧定义）—— 跑起来会按默认桥根找状态，与投影的 " + bridge + " 不一致"
+                : "manager 里加载的 FEISHU_CODEX_BRIDGE_HOME=" + loadedBridge + " 与投影的 " + bridge + " 不一致（旧定义）";
             } else {
               phase = "loaded";
             }
@@ -384,7 +436,7 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
   let plistUnreadable = null;
   try { installed = fs.readFileSync(file, "utf-8"); }
   catch (err) { if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable"; }
-  const wanted = plistBody({ home, codexHome });
+  const wanted = plistBody({ home, codexHome, bridge });
   const backlog = classifyBacklog({ home: bridge });
   const scan = scanRunnable({ home: bridge });
   return {
@@ -539,7 +591,7 @@ export function enableBlockers(state) {
 export function runDrainService(argv = process.argv.slice(2), {
   home = os.homedir(),
   codexHome = codexHomeOf(home),
-  bridge = path.join(codexHome, "feishu-bridge"),
+  bridge = codexBridgeOf({ codexHome }),
   platform = timerPlatform({ home }),
   serviceStateFn = serviceState,
   spawnLaunchctlFn = spawnLaunchctl,
@@ -669,7 +721,7 @@ export function runDrainService(argv = process.argv.slice(2), {
         return exit(0);
       }
 
-      const units = codexDrainSystemdUnits({ home, codexHome, node });
+      const units = codexDrainSystemdUnits({ home, codexHome, bridge, node });
       fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(paths.service, units.service, { mode: 0o644 });
       fs.writeFileSync(paths.timer, units.timer, { mode: 0o644 });
@@ -757,7 +809,7 @@ export function runDrainService(argv = process.argv.slice(2), {
     }
   }
 
-  const st = serviceStateFn({ home });
+  const st = serviceStateFn({ home, codexHome, bridge });
 
   log("调度器    " + st.plist);
   log("状态      " + (PHASE_TEXT[st.phase] ?? st.phase));
@@ -883,7 +935,7 @@ export function runDrainService(argv = process.argv.slice(2), {
     error("**没有动 plist。**旧 job 可能还在按旧配置跑，先处理它再来。");
     return exit(1);
   }
-  fs.writeFileSync(st.plist, plistBody({ home }), { mode: 0o644 });
+  fs.writeFileSync(st.plist, plistBody({ home, codexHome, bridge }), { mode: 0o644 });
   const loaded = spawnLaunchctlFn(["bootstrap", "gui/" + process.getuid(), st.plist]);
   if (!loaded.ok) {
     // **加载失败必须非零退出。**报成功而定时器没在跑，就是"界面说正常、实际不工作"——

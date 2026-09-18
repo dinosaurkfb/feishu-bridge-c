@@ -2,6 +2,8 @@
 
 从零把这座桥接到一个新项目 / 新机器上。
 
+> 💡 **Linux 新宿主机端到端安装指引**：若在全新 Linux 机器（如 omm）上通过非交互 SSH 从零部署、验收与卸载，请参考按严格执行顺序编写的 [从零到全功能验收清单（docs/from-zero-checklist.md）](docs/from-zero-checklist.md)。
+
 **读之前先知道两件事：**
 
 1. **有些步骤代码替代不了。**飞书侧那个智能体、群，得人工建；机器级模板得人工填。
@@ -216,8 +218,8 @@ tail ~/.claude/feishu-bridge/stop-hook.log         # 出站钩子每次干了什
 
   然后 `systemctl --user daemon-reload` + `systemctl --user enable --now feishu-bridge-cc-drain.timer`。
   语义与 macOS 的 plist 一致：跑 `drain-outbox.mjs --all`，`OnUnitActiveSec=30min`。
-- **不常驻登录时**还要 `loginctl enable-linger <你的用户>`（要 sudo）—— 安装器只**打印**这条提示，
-  不执行（sudo 的动作交给你）。
+- **不常驻登录时**还要 `loginctl enable-linger <你的用户>`（先不带 sudo 试，被拒再 sudo）—— 安装器只**打印**这条提示，
+  不执行（交给你决定）。
 - **凭据位置（只在 Linux）**：lark-cli 在 Linux 上不用系统钥匙串，改用文件加密库，默认根
   `~/.local/share/lark-cli/`；而 aily 给每个 agent 写的密钥在 `<agent 凭据目录>/data/lark-cli/`。
   桥会给每个 lark-cli 调用补上 `LARKSUITE_CLI_DATA_DIR=<agent 凭据目录>/data`，让两边对上。
@@ -283,7 +285,7 @@ WantedBy=default.target
 systemctl --user daemon-reload
 systemctl --user enable --now aily-daemon.service
 ```
-若需要非登录常驻，配合前文提到的 `sudo loginctl enable-linger <你的用户>` 即可。
+若需要非登录常驻，配合前文提到的 `loginctl enable-linger <你的用户>`（被拒再 sudo）即可。
 
 > **同一家族的教训**：“我的终端里能跑 ≠ 任何上下文都能跑”。本桥安装器的 node 路径解析（优先寻找 mise shim，见 PK3-L1 / PR #212）、doctor 的 systemctl 检查恒带 `--user` 避免误判为系统级单元（见 issue #225 / PR #227），以及此处的非交互 ssh 代理与环境变量隔离，本质均属同一家族问题——切勿将交互式终端中的 rc 隐式环境视为通用假设。
 

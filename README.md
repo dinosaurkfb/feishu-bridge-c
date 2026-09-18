@@ -121,7 +121,7 @@ Claude/Codex 长期任务，不会另开一个缺少上下文的临时聊天。
 上传到飞书，但你从飞书或本机运行时提交的文本指令、受理状态和最终答复会经过飞书/Aily 链路。
 本地输入同步的是 hooks 收到的文本，不会复制附件文件本体。
 
-> **Linux / 远程非交互 SSH 注意事项**：在 Linux 宿主机（如通过 `ssh host 'cmd'`）部署时，shell 环境不读取 `~/.bashrc`，代理、node 绝对路径以及 `aily daemon` 的 systemd 服务化配置请务必参考 [SETUP.md: 非交互 ssh 没有代理、也没有 PATH 之外的任何 shell 环境](SETUP.md#非交互-ssh-没有代理也没有-path-之外的任何-shell-环境)。
+> **Linux / 远程非交互 SSH 注意事项**：在 Linux 宿主机（如通过 `ssh host 'cmd'`）部署时，shell 环境不读取 `~/.bashrc`，代理、node 绝对路径以及 `aily daemon` 的 systemd 服务化配置请务必参考 [SETUP.md: 非交互 ssh 没有代理、也没有 PATH 之外的任何 shell 环境](SETUP.md#非交互-ssh-没有代理也没有-path-之外的任何-shell-环境)。Linux 全新机器从零装到全功能的逐步核对执行清单请参见 [从零到全功能验收清单（docs/from-zero-checklist.md）](docs/from-zero-checklist.md)。
 
 ### 哪些需要人工准备，哪些由工具完成
 

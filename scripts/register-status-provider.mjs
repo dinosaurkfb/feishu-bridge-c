@@ -300,6 +300,12 @@ function main() {
   }
 
   if (!apply) {
+    // PK3-L6-fix2：`-- --apply` 按约定就是传给 provider 的参数 —— splitArgv 已经保证它只进
+    // `entry.args`、越不过授权闸门（闸门只看 control 段），所以这里**不拦它**。
+    // 但人容易把它当成"已落盘"，所以在预览里把那件事说清楚（不改行为、不加退出口）。
+    if (passthrough.includes("--apply")) {
+      console.log("\n提示：-- 之后的 --apply 是传给 provider 的参数；本命令仍是 dry-run，要落盘把 --apply 放在 -- 之前。");
+    }
     console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
     process.exit(PLAN_FAILS.has(plan.action) ? 1 : 0);
   }

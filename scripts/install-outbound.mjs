@@ -19,8 +19,6 @@
  */
 
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerPlatform } from "./drain-schedule.mjs";
-import { absentJob } from "./launchd-job.mjs";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,10 +27,13 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill, systemdUnitAbsent } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, readInstalledSurface, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
+// launchctl / systemctl 包装（PK3-L6-fix2 抽出的叶子模块）：带上"沙箱 HOME 不碰真实控制面"
+// 与 systemctl 首项必须 --user 两条纪律，以及计划里那条给人看的命令行的执行方式。
+import { timerCmd } from "./timer-exec.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -348,75 +349,6 @@ for (const sk of skillPlan) {
 
 // launchd：先 bootout 再 bootstrap。改了 plist 不重新加载的话，跑的还是旧的那份，
 // 而且看不出来 —— 文件是新的，行为是旧的，是最难查的那种不一致。
-/**
- * **HOME 被覆盖时一律不碰 launchctl。**
- *
- * plist 文件路径跟着 `os.homedir()` 走，所以指定 HOME 就能把安装引到别处 —— 看起来像
- * 一个安全的沙箱安装。但 `launchctl bootout/bootstrap` 操作的是**真实用户的 launchd 域**，
- * 跟 HOME 一点关系都没有。于是一次"沙箱"安装会把线上那个兜底定时器卸掉，
- * 再把一个临时目录里的 plist 装进真实域 —— 临时目录一清，定时器就指向不存在的文件。
- *
- * 这不是假设：我为了测试 shell 安全性写了几条跑 `--apply` 的回归，用的正是临时 HOME，
- * 结果把线上 30 分钟兜底任务切到了临时目录。Codex 只读复核时发现的。
- *
- * `os.userInfo().homedir` 读的是密码库，不受 HOME 环境变量影响，所以能可靠区分
- * "真实安装"和"被重定向的安装"。
- */
-const REAL_HOME = os.userInfo().homedir;
-const SANDBOXED = os.homedir() !== REAL_HOME;
-
-const launchctl = (args, { tolerate = false } = {}) => {
-  const injected = process.env.FEISHU_BRIDGE_LAUNCHCTL;
-  if (!injected) {
-    if (SANDBOXED) return { ok: false, skipped: true };
-  }
-  const bin = injected || "/bin/launchctl";
-  try {
-    execFileSync(bin, args, { stdio: "pipe", timeout: 15_000 });
-    return { ok: true };
-  } catch (err) {
-    // 失败要把**它说的话**带回来：卸载那一步要区分「本来就没有这个 job」与「真失败」。
-    const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
-    if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + text);
-    return { ok: false, text, absent: absentJob(text) };
-  }
-};
-
-// systemd 那一侧同一条纪律（PK3-L1）：沙箱 HOME 不碰**真实** systemd --user 实例 —— 理由与 launchctl 处
-// 逐字相同：systemctl --user 操作的是当前登录用户的实例，跟 HOME 一点关系都没有。
-// FEISHU_BRIDGE_SYSTEMCTL 是测试隔离点（与 FEISHU_BRIDGE_LAUNCHCTL 同一口径）。
-const systemctl = (args, { tolerate = false } = {}) => {
-  // 沙箱 HOME 默认不碰真实 systemd --user；**显式注入 FEISHU_BRIDGE_SYSTEMCTL 时例外** ——
-  // 与 doctor 的 `sandboxed && !injected` 同一口径：注入点本来就是"换掉二进制"，
-  // 而 linux 分支的卸载顺序只能在注入下做产品级验证（本机是 macOS）。
-  const injected = process.env.FEISHU_BRIDGE_SYSTEMCTL;
-  if (SANDBOXED && !injected) return { ok: false, skipped: true };
-  const bin = injected || "systemctl";
-  try {
-    execFileSync(bin, args, { stdio: "pipe", timeout: 15_000 });
-    return { ok: true };
-  } catch (err) {
-    const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
-    if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + text);
-    // `absent`："本来就没有这个单元" —— 干净卸载的常见形态，不箿成失败（判据与 doctor 共用一份）。
-    return { ok: false, text, absent: systemdUnitAbsent(text) };
-  }
-};
-
-/**
- * 跑计划里的一条命令。计划里的 `commands` 是**给人看的命令行**（首项是程序名，launchd 那条还带 `<uid>`
- * 占位符），直接拿去 execFileSync 会变成 `systemctl systemctl --user disable --now …` /
- * `launchctl launchctl bootout gui/<uid>/…` —— 两件都是静默失败（fix1 的卸载就是这么写的，所以那句
- * "已卸载"从来没真卸过）。执行只能走这里：去掉程序名、对每个参数做子串替换补齐真实 uid，
- * 二进制用本脚本自己的（可以被 FEISHU_BRIDGE_LAUNCHCTL / FEISHU_BRIDGE_SYSTEMCTL 注入替换）。
- */
-const timerCmd = (argv) => {
-  const [program, ...rest] = argv;
-  if (program !== "launchctl" && program !== "systemctl") throw new Error("兜底定时器计划里不认识的程序：" + program);
-  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "";
-  const args = rest.map((a) => a.replaceAll("<uid>", uid));
-  return program === "launchctl" ? launchctl(args, { tolerate: true }) : systemctl(args, { tolerate: true });
-};
 let launchNote;
 if (uninstall) {
   // PK3-L1-fix1 P1-2：卸载**也按平台计划**。旧版无条件调 launchctl、只删 plist ——

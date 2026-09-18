@@ -20,6 +20,7 @@ import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
 import { bootoutTimer, bootstrapTimer, timerPhase } from "./maintenance/timers.mjs";
 import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
+import { systemctl, timerCmd } from "./timer-exec.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER = path.join(REPO, "scripts", "install-outbound.mjs");
@@ -387,12 +388,13 @@ function fakeSystemctl({ enabled = "enabled", active = "active", show = null, ac
   const calls = [];
   const fn = (args) => {
     calls.push(args);
-    if (args[0] === "is-enabled") return { ok: true, out: enabled + "\n" };
-    if (args[0] === "is-active") {
+    const sub = args[0] === "--user" ? args[1] : args[0];
+    if (sub === "is-enabled") return { ok: true, out: enabled + "\n" };
+    if (sub === "is-active") {
       const out = activeOut ?? active;
       return out === "inactive" ? { ok: false, out: "inactive\n", err: "" } : { ok: true, out: out + "\n" };
     }
-    if (args[0] === "show") return { ok: true, out: String(show) };
+    if (sub === "show") return { ok: true, out: String(show) };
     return { ok: false, out: "", err: "不认识的调用：" + args.join(" ") };
   };
   return { fn, calls };
@@ -407,8 +409,8 @@ test("fix2/P1-3 doctor ⑥ 还要核 manager 里**已加载**的 ExecStart：磁
   const green = sixOf(fx, good.fn);
   assert.equal(green.ok, true, green.detail);
   assert.match(green.detail, /已加载，正在按计划跑/u);
-  assert.deepEqual(good.calls.find((a) => a[0] === "show"),
-    ["show", "feishu-bridge-cc-drain.service", "-p", "ExecStart", "--value"], "问的就是 service 的 ExecStart");
+  assert.deepEqual(good.calls.find((a) => a.includes("show")),
+    ["--user", "show", "feishu-bridge-cc-drain.service", "-p", "ExecStart", "--value"], "问的就是 service 的 ExecStart");
 
   // 磁盘 unit 与投影逐字相同，但 manager 里加载的是旧定义 → 不许报"已加载"。
   const stale = fakeSystemctl({ show: fx.oldShow });
@@ -423,7 +425,7 @@ test("fix2/P1-3 doctor ⑥ 还要核 manager 里**已加载**的 ExecStart：磁
   const notInstalled = sixOf(fx, none.fn);
   assert.equal(notInstalled.ok, false, notInstalled.detail);
   assert.match(notInstalled.detail, /未启用|没被 systemd --user 加载/u);
-  assert.equal(none.calls.some((a) => a[0] === "show"), false, "没装就别问 show：" + JSON.stringify(none.calls));
+  assert.equal(none.calls.some((a) => a.includes("show")), false, "没装就别问 show：" + JSON.stringify(none.calls));
 });
 
 test("fix2/P2 is-active 的 inactive 是**读到了状态**（installed_not_loaded），不是「查不清」；连不上 manager 才是查不清", () => {
@@ -437,7 +439,7 @@ test("fix2/P2 is-active 的 inactive 是**读到了状态**（installed_not_load
 
   // ② 连不上 manager（命令在、实例不在）→ 查不清（ok:null），既不说"没装"也不说"在跑"。
   const broken = fakeSystemctl({ active: "Failed to connect to bus: No such file or directory" });
-  const brokenFn = (args) => (args[0] === "is-active" ? { ok: false, out: "", err: "Failed to connect to bus: No such file or directory" } : broken.fn(args));
+  const brokenFn = (args) => (args.includes("is-active") ? { ok: false, out: "", err: "Failed to connect to bus: No such file or directory" } : broken.fn(args));
   const unverifiable = sixOf(fx, brokenFn);
   assert.equal(unverifiable.ok, null, unverifiable.detail);
   assert.match(unverifiable.detail, /查不清/u);
@@ -881,4 +883,97 @@ test("fix1/P1-1 四个调用点传的是**当下 home**：沙箱 home 下 env �
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
   assert.equal(realHome, os.userInfo().homedir, "没动真家目录");
+});
+
+test("PK3-L6 doctor(linux)：每一次调用 systemctl 的 argv[0] 恒为 --user（注入函数与 FEISHU_BRIDGE_SYSTEMCTL 假二进制全覆盖）", () => {
+  const fx = linuxDoctorFixture();
+
+  // 1. 注入函数路径：逐一断言每次调用 argv[0] === "--user"（is-enabled / is-active / show 三处逐一）
+  const recordedCalls = [];
+  const recordingSystemctl = (args) => {
+    recordedCalls.push(args);
+    if (args.includes("is-enabled")) return { ok: true, out: "enabled\n" };
+    if (args.includes("is-active")) return { ok: true, out: "active\n" };
+    if (args.includes("show")) return { ok: true, out: fx.projectedShow };
+    return { ok: false, out: "", err: "unknown" };
+  };
+
+  const doc = runDoctor({ home: fx.home, platform: "linux", systemctl: recordingSystemctl, registryFile: fx.registryFile });
+  const check = doc.checks.find((c) => c.id === "backlog_vs_publisher");
+  assert.equal(check.ok, true, check.detail);
+  assert.equal(recordedCalls.length, 3, "is-enabled / is-active / show 必须各调用一次");
+  assert.deepEqual(recordedCalls[0].slice(0, 2), ["--user", "is-enabled"]);
+  assert.deepEqual(recordedCalls[1].slice(0, 2), ["--user", "is-active"]);
+  assert.deepEqual(recordedCalls[2].slice(0, 2), ["--user", "show"]);
+  for (const call of recordedCalls) {
+    assert.equal(call[0], "--user", "注入函数路径每次调用 argv[0] 必须是 --user: " + JSON.stringify(call));
+  }
+
+  // 2. FEISHU_BRIDGE_SYSTEMCTL 假二进制路径：写入 log 文件，每行首项是 --user
+  const base = tmpBase("pk3-l6-doctor-bin-");
+  const bin = path.join(base, "fake-systemctl.sh");
+  const log = path.join(base, "calls.log");
+  fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nif [ "$2" = "is-enabled" ]; then echo "enabled"; exit 0; fi\nif [ "$2" = "is-active" ]; then echo "active"; exit 0; fi\nif [ "$2" = "show" ]; then echo "${fx.projectedShow}"; exit 0; fi\nexit 0\n`, { mode: 0o755 });
+
+  const prevEnv = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = bin;
+  try {
+    const docBin = runDoctor({ home: fx.home, platform: "linux", registryFile: fx.registryFile });
+    const checkBin = docBin.checks.find((c) => c.id === "backlog_vs_publisher");
+    assert.equal(checkBin.ok, true, checkBin.detail);
+    assert.ok(fs.existsSync(log), "假二进制必须产生调用日志");
+    const lines = fs.readFileSync(log, "utf-8").trim().split("\n").filter(Boolean);
+    assert.equal(lines.length, 3, "假二进制必须记录 3 次调用：" + JSON.stringify(lines));
+    for (const line of lines) {
+      assert.match(line, /^--user(\s|$)/, "文件里每行首项必须是 --user：" + line);
+    }
+  } finally {
+    if (prevEnv === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = prevEnv;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("PK3-L6 timer-exec systemctl 包装断言：不带 --user 抛，带 --user 正常执行", () => {
+  // ① 不带 --user：systemctl 包装与 timerCmd 均抛
+  assert.throws(
+    () => systemctl(["daemon-reload"]),
+    /systemctl 包装收到的 args 首项必须是 "--user"/,
+    "直接调用 systemctl 不带 --user 必须抛",
+  );
+  assert.throws(
+    () => systemctl(["enable", "--now", "foo.timer"]),
+    /systemctl 包装收到的 args 首项必须是 "--user"/,
+    "直接调用 systemctl enable 不带 --user 必须抛",
+  );
+  assert.throws(
+    () => timerCmd(["systemctl", "daemon-reload"]),
+    /systemctl 包装收到的 args 首项必须是 "--user"/,
+    "timerCmd 计划命令不带 --user 必须抛",
+  );
+
+  // ② 带 --user：注入假二进制后正常执行
+  const base = tmpBase("pk3-l6-outbound-sys-");
+  const bin = path.join(base, "fake-systemctl.sh");
+  const log = path.join(base, "calls.log");
+  fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nexit 0\n`, { mode: 0o755 });
+
+  const prevEnv = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = bin;
+  try {
+    const res1 = systemctl(["--user", "daemon-reload"]);
+    assert.equal(res1.ok, true);
+
+    const res2 = timerCmd(["systemctl", "--user", "enable", "--now", "foo.timer"]);
+    assert.equal(res2.ok, true);
+
+    const lines = fs.readFileSync(log, "utf-8").trim().split("\n").filter(Boolean);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0], "--user daemon-reload");
+    assert.equal(lines[1], "--user enable --now foo.timer");
+  } finally {
+    if (prevEnv === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = prevEnv;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

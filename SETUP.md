@@ -226,6 +226,67 @@ tail ~/.claude/feishu-bridge/stop-hook.log         # 出站钩子每次干了什
 - **node 从哪来**：hooks 与单元里的 node 是**解析**出来的（`FEISHU_BRIDGE_NODE` → PATH → 常见安装位置），
   不写死 macOS 的 `/opt/homebrew/bin/node`；版本管理器（mise/nvm）下拿到的是 shim，切版本也不会失效。
 
+### 非交互 ssh 没有代理、也没有 PATH 之外的任何 shell 环境
+
+在 Linux 远端宿主机（如 omm）通过 `ssh host 'cmd'` 执行安装命令或自动化脚本时，shell 处于非登录、非交互模式，**压根不会读取 `~/.bashrc`**（不仅是被常规 `.bashrc` 顶部的 `[[ $- != *i* ]] && return` 交互守卫阻断，非登录非交互 bash 默认根本不尝试 source 该文件）。
+
+实测极易在同一问题上连续三次踩坑：
+1. `git clone` 拿不到代理，直接报错 `Failed to connect to github.com:443`；
+2. `aily-cli daemon` 随手在非交互终端启动，因缺代理无法与平台建连；
+3. 命令中加 `source ~/.bashrc` 撞上早退判断，环境变量依然没有导入。
+
+#### 1. 代理配置：单次显式前置或写入 environment.d（根治）
+- **单次命令**：需要网络的步骤显式 export 或在命令前置代理变量：
+  ```bash
+  https_proxy=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 git clone ...
+  ```
+- **机器级持久根治**：配置 `~/.config/environment.d/10-proxy.conf`（systemd 用户实例拉起的进程会统一继承该配置）：
+  ```ini
+  HTTP_PROXY=http://127.0.0.1:7890
+  HTTPS_PROXY=http://127.0.0.1:7890
+  http_proxy=http://127.0.0.1:7890
+  https_proxy=http://127.0.0.1:7890
+  ALL_PROXY=socks5://127.0.0.1:7890
+  all_proxy=socks5://127.0.0.1:7890
+  NO_PROXY=localhost,127.0.0.1
+  no_proxy=localhost,127.0.0.1
+  ```
+  通过 shell rc 文件修代理在非交互上下文下怎么改都是补丁，写入 `environment.d` 并配合 systemd 托管服务是彻底解法。
+
+#### 2. Node.js 路径：给出绝对路径
+非交互 ssh 的 `PATH` 仅包含系统基础目录，不包含交互 shell 加载的用户级目录。需要 node 的步骤请直接给绝对路径。
+本桥安装器在生成 hooks 与 systemd 单元时，已严格按 PK3-L1 顺序解析 node 路径：
+- **Linux**：显式 `env.FEISHU_BRIDGE_NODE` → 原单元/服务已装路径（installed）→ mise shim（`~/.local/share/mise/shims/node`）→ 当前 `PATH` → `/usr/local/bin/node` → `~/.local/bin/node`；
+- **Darwin**：显式 `env.FEISHU_BRIDGE_NODE` → 已装路径 → `/opt/homebrew/bin/node` → `/usr/local/bin/node` → 当前 `PATH` → `~/.local/bin/node`。
+若以上均未找到则直接报错退出，坚决不回退版本升级易失效的 `process.execPath`。
+
+#### 3. aily daemon 建议托管为 systemd --user 服务
+切勿在非交互 ssh 下随手执行 `nohup aily-cli daemon &`，不仅脱机后上下文脆弱，也无法稳定继承代理。推荐将其配置为 `systemd --user` 服务（拉起时自动继承 `environment.d` 中的代理环境变量）：
+
+新建单元文件 `~/.config/systemd/user/aily-daemon.service`（最小 unit 示例，不含敏感凭据）：
+```ini
+[Unit]
+Description=Aily CLI Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env aily-cli daemon
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+```
+生效并启动：
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now aily-daemon.service
+```
+若需要非登录常驻，配合前文提到的 `sudo loginctl enable-linger <你的用户>` 即可。
+
+> **同一家族的教训**：“我的终端里能跑 ≠ 任何上下文都能跑”。本桥安装器的 node 路径解析（优先寻找 mise shim，见 PK3-L1 / PR #212）、doctor 的 systemctl 检查恒带 `--user` 避免误判为系统级单元（见 issue #225 / PR #227），以及此处的非交互 ssh 代理与环境变量隔离，本质均属同一家族问题——切勿将交互式终端中的 rc 隐式环境视为通用假设。
+
 ## 四、接一个新项目（两下）
 
 机器装好之后，**接入不需要建话题、不需要写配置**。

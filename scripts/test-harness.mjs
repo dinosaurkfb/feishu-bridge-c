@@ -32,6 +32,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { currentSuiteTempRoot, formatSuiteTempReport } from "./test-support/suite-temp-root.mjs";
+import { currentSurfaceGuard } from "./test-support/install-surface-guard.mjs";
 
 const isThenable = (v) => v !== null && (typeof v === "object" || typeof v === "function") && typeof v.then === "function";
 
@@ -430,10 +431,15 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
       // PK3-T1：本用例在临时根里新造的东西，用例结束当场收回（套件退出还有一道兜底）。
       // 用例之间不许靠临时目录传递状态：真有那种依赖，会在下一条用例里当场红（响亮，不静默）。
       if (tempRoot !== null) tempRoot.reclaimSince(tempBefore);
+      // PK3-T3：安装面卫兵 —— 逐用例边界核验，变了就点名肇事用例
+      const surfaceGuard = currentSurfaceGuard();
+      const surfaceHit = surfaceGuard && typeof surfaceGuard.checkBoundary === "function"
+        ? surfaceGuard.checkBoundary(name)
+        : null;
       // R60 返修二 P1-2a：核验、恢复、cleanTree 覆盖成功与抛错两路，放进 finally
       const drift = suiteInvariants && typeof suiteInvariants.envDrift === "function" ? suiteInvariants.envDrift() : null;
       const treeHit = suiteInvariants && typeof suiteInvariants.treeProblem === "function" ? suiteInvariants.treeProblem() : null;
-      const invariantProblem = drift ?? treeHit;
+      const invariantProblem = drift ?? treeHit ?? surfaceHit;
       if (invariantProblem) {
         failedEnvDrift.push(name);
         if (suiteInvariants && typeof suiteInvariants.restore === "function") suiteInvariants.restore();
@@ -488,6 +494,15 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
       console.error("\n✗ " + treeProblem + " —— 有测试往绊线里写了东西（R60 泄漏源），点名不了具体用例就整批停在这里");
       process.exitCode = 1;
     }
+    // PK3-T3：汇总前核安装面未被破坏
+    const surfaceGuard = currentSurfaceGuard();
+    const surfaceCheck = surfaceGuard && typeof surfaceGuard.check === "function"
+      ? surfaceGuard.check()
+      : null;
+    if (surfaceCheck && surfaceCheck.changed) {
+      console.error("\n" + surfaceGuard.formatErrorReport(surfaceCheck));
+      process.exitCode = process.exitCode || 1;
+    }
     // 合同：退出码权威，汇总行是它的投影，两者不许矛盾。打印前先形成唯一最终判决。
     const exitNow = process.exitCode ?? 0;
     const verdictFailed = failed > 0 || exitNow !== 0;
@@ -501,6 +516,13 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
     if (tempRootNow !== null) {
       const swept = tempRootNow.sweep();
       console.log(formatSuiteTempReport(swept) + "（根 " + swept.root + "）");
+    }
+    // PK3-T3：安装面卫兵通过报告
+    if (surfaceGuard !== null && surfaceCheck !== null) {
+      if (!surfaceCheck.changed) {
+        console.log(surfaceGuard.formatPassReport(surfaceCheck));
+      }
+      surfaceGuard.markReported();
     }
     if (TEST_FILTER.length > 0) {
       console.log("TEST_FILTER 命中 " + executed + " / 总 " + registered

@@ -5,6 +5,7 @@
  * 这里要钉的都是「换到另一台机器上不会静默装错」——错法都很安静：写一个永远不生效的 plist、
  * 把一个不存在的 node 写进 hooks、或者让 lark-cli 去找一个没有密钥的目录。
  */
+import "./test-support/install-surface-boot.mjs";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";

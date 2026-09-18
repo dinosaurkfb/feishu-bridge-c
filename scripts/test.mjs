@@ -8812,34 +8812,37 @@ test("状态入口登记命令：默认预览，受控写入", () => {
   assert.equal(fs.readFileSync(file, "utf-8"), "{ 坏掉的 json");
 });
 
-test("登记命令：-- 之后的参数不得越过授权闸门", () => {
+test("PK3-L6 register-status-provider --user 授权闸门：-- 之后的参数不得越过授权闸门", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-bypass-"));
   const file = path.join(dir, "providers.json");
   const script = path.resolve("scripts", "group-binding-status.mjs");
-  // 控制面和数据面混在同一个 argv 里，"整个数组里搜 --apply"就会把
-  // 一个透传给 provider 的参数当成授权。
-  // PK3-L6：-- 之后的 token 若等于本命令自己的 flag（如 --apply / --id），直接报错退出非 0 并拦截落盘
-  const run = spawnSync(process.execPath, [
-    path.resolve("scripts", "register-status-provider.mjs"),
-    "--id", "cc2cd", "--script", script, "--", "--apply",
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
-  assert.notEqual(run.status, 0, "透传段出现 --apply 必须报错退出");
-  assert.match(run.stderr, /本命令的参数放在 -- 之前/u);
+  const cli = (args) => spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"), ...args,
+  ], { encoding: "utf-8", env: { ...process.env, HOME: dir, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+
+  // 行为用例 1：... --apply -- --apply 退出码 1、stderr 含 own_flag_after_separator、登记表未写
+  const applyCase = cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--apply"]);
+  assert.equal(applyCase.status, 1, "透传段出现 --apply 退出码必须是 1");
+  assert.match(applyCase.stderr, /own_flag_after_separator/u);
+  assert.match(applyCase.stderr, /本命令的参数放在 -- 之前/u);
+  assert.equal(fs.existsSync(file), false, "透传段出现 --apply 不得落盘");
+
+  // 行为用例 2：... -- --replace 退出码 1、stderr 含 own_flag_after_separator、登记表未写
+  const replaceCase = cli(["--id", "cc2cd", "--script", script, "--", "--replace"]);
+  assert.equal(replaceCase.status, 1, "透传段出现 --replace 退出码必须是 1");
+  assert.match(replaceCase.stderr, /own_flag_after_separator/u);
+  assert.match(replaceCase.stderr, /本命令的参数放在 -- 之前/u);
+  assert.equal(fs.existsSync(file), false, "透传段出现 --replace 不得落盘");
+
+  // 行为用例 3：--id 等自家配置参数也不得放在 -- 之后
+  const idCase = cli(["--script", script, "--apply", "--", "--id", "sneaky"]);
+  assert.equal(idCase.status, 1, "--id 放在 -- 之后必须报错");
+  assert.match(idCase.stderr, /own_flag_after_separator/u);
+  assert.match(idCase.stderr, /本命令的参数放在 -- 之前/u);
   assert.equal(fs.existsSync(file), false, "透传参数不得触发落盘");
 
-  // --id 之类也一样：控制参数不得放在 -- 之后
-  const spoof = spawnSync(process.execPath, [
-    path.resolve("scripts", "register-status-provider.mjs"),
-    "--script", script, "--apply", "--", "--id", "sneaky",
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
-  assert.notEqual(spoof.status, 0, "--id 放在 -- 之后必须报错");
-  assert.match(spoof.stderr, /本命令的参数放在 -- 之前/u);
-
-  // 正向：合法透传参数 --provider-id 正常放行并成功落盘
-  const okRun = spawnSync(process.execPath, [
-    path.resolve("scripts", "register-status-provider.mjs"),
-    "--id", "cc2cd", "--script", script, "--apply", "--", "--provider-id", "x",
-  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  // 对照：合法透传参数 --provider-id 正常放行并成功落盘
+  const okRun = cli(["--id", "cc2cd", "--script", script, "--apply", "--", "--provider-id", "x"]);
   assert.equal(okRun.status, 0, okRun.stderr);
   assert.equal(fs.existsSync(file), true, "合法透传参数正常落盘");
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].args, ["--provider-id", "x"]);

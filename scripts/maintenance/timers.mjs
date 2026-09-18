@@ -47,8 +47,20 @@ const readableSystemctl = (r) => r?.ok === true || stateWord(r) !== null || syst
 export function systemctlRunner(custom) {
   if (typeof custom === "function") {
     return (args) => {
-      const fullArgs = args[0] === "--user" ? args : ["--user", ...args];
-      return custom(fullArgs);
+      const res = custom(args);
+      if (res && (res.ok || stateWord(res) !== null || systemdUnitAbsent(say(res)))) return res;
+      if (args[0] === "--user") {
+        const fallback = custom(args.slice(1));
+        if (fallback && (fallback.ok || stateWord(fallback) !== null || systemdUnitAbsent(say(fallback)))) {
+          return fallback;
+        }
+      } else {
+        const fallback = custom(["--user", ...args]);
+        if (fallback && (fallback.ok || stateWord(fallback) !== null || systemdUnitAbsent(say(fallback)))) {
+          return fallback;
+        }
+      }
+      return res;
     };
   }
   return spawnSystemctl;

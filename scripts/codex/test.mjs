@@ -11671,6 +11671,10 @@ test("PK3-L7-fix4 P1-2：enable 复核补 LoadState 与 Environment 两道（doc
   assert.equal(systemdEnvValue('PATH=/usr/bin FEISHU_CODEX_BRIDGE_HOME="/a b/c"', "FEISHU_CODEX_BRIDGE_HOME"), "/a b/c");
   assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a\\x20b/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a b/c");
   assert.equal(systemdEnvValue("PATH=/usr/bin", "FEISHU_CODEX_BRIDGE_HOME"), null, "没有这个变量 → null（不是空串）");
+  // PK3-L7-fix7（Codex 四轮 P2）：字面反斜杠只解码一次 —— 拿掉"先拆 = 再各解码一次"改回整项先解码，下面两条会得到 /ab/c
+  assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a\\\\b/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a\\b/c", "systemd 把字面反斜杠写成 \\\\，解一次得 /a\\b/c");
+  assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a\\x5cb/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a\\b/c", "\\x5c 形式也只解一次");
+  assert.equal(systemdEnvValue('"FEISHU_CODEX_BRIDGE_HOME=/a\\\\b c"', "FEISHU_CODEX_BRIDGE_HOME"), "/a\\b c", "整条加引号 + 反斜杠 + 空格");
 });
 
 // 拿掉哪行会红：把 systemdTimerLookup 换回 fix3 的 true/false（unverifiable 折成 false）→ 第二半红

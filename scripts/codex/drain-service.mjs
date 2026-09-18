@@ -98,9 +98,9 @@ const isExecutable = (p) => {
  * 把一个 shell 引号项里的转义还原（systemd 的 `shell_maybe_quote` 用的是 C 风格转义：`\xHH`，
  * 以及 `\"` / `\\` 这种反斜杠单字符形式）。
  */
+// PK3-L7-fix7（Codex 四轮 P2）：**一趟**解码 —— 先 \xHH 再 \. 两趟会把 \x5c 解出来的反斜杠再吃掉一个字符（/a\x5cb/c → /ab/c）。
 const unescapeSystemdWord = (s) => String(s ?? "")
-  .replace(/\\x([0-9a-fA-F]{2})/gu, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
-  .replace(/\\(.)/gu, "$1");
+  .replace(/\\x([0-9a-fA-F]{2})|\\(.)/gu, (_, hex, ch) => (hex !== undefined ? String.fromCharCode(Number.parseInt(hex, 16)) : ch));
 
 /** 去掉恰好包住整个字符串的一对双引号（`"a b"` → `a b`；`a"b` 不动）。 */
 const stripOuterQuotes = (s) => (s.length >= 2 && s.startsWith("\"") && s.endsWith("\"") ? s.slice(1, -1) : s);
@@ -141,10 +141,12 @@ export const shellQuoteItems = (text) => {
  */
 export const systemdEnvValue = (text, name) => {
   for (const rawItem of shellQuoteItems(text)) {
-    const item = unescapeSystemdWord(stripOuterQuotes(rawItem));
+    // PK3-L7-fix7（Codex 四轮 P2）：**先按首个 = 拆键值、再各解码一次** —— 先整项解码再对值解码会把
+    // 合法路径里的字面反斜杠解两遍（`/a\\b/c` → `/ab/c`），含反斜杠的桥根复核就会误报 loaded_other。
+    const item = stripOuterQuotes(rawItem);
     const eq = item.indexOf("=");
     if (eq <= 0) continue;
-    if (item.slice(0, eq) !== name) continue;
+    if (unescapeSystemdWord(item.slice(0, eq)) !== name) continue;
     return unescapeSystemdWord(stripOuterQuotes(item.slice(eq + 1)));
   }
   return null;

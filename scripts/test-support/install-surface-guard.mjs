@@ -45,10 +45,6 @@ export function resolveAuthoritativePaths({ home = null, files = null } = {}) {
   if (Array.isArray(files)) {
     return files.map((f) => path.resolve(f));
   }
-  const envFiles = process.env.FEISHU_BRIDGE_SURFACE_GUARD_FILES;
-  if (envFiles) {
-    return envFiles.split(path.delimiter).filter(Boolean).map((f) => path.resolve(f));
-  }
   const realHome = home ?? (process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME || os.userInfo().homedir);
   return DEFAULT_AUTHORITATIVE_FILES.map((rel) => path.join(realHome, rel));
 }
@@ -56,7 +52,7 @@ export function resolveAuthoritativePaths({ home = null, files = null } = {}) {
 export function snapshotFile(filepath) {
   const p = path.resolve(filepath);
   try {
-    const st = fs.lstatSync(p);
+    const st = fs.lstatSync(p, { bigint: true });
     if (st.isSymbolicLink()) {
       let target;
       try {
@@ -72,6 +68,7 @@ export function snapshotFile(filepath) {
         symlinkTarget: target,
         sha,
         mtime: st.mtime.toISOString(),
+        mtimeNs: st.mtimeNs,
       };
     }
     if (st.isDirectory()) {
@@ -82,6 +79,7 @@ export function snapshotFile(filepath) {
         symlinkTarget: null,
         sha: null,
         mtime: st.mtime.toISOString(),
+        mtimeNs: st.mtimeNs,
       };
     }
     const buf = fs.readFileSync(p);
@@ -93,6 +91,7 @@ export function snapshotFile(filepath) {
       symlinkTarget: null,
       sha,
       mtime: st.mtime.toISOString(),
+      mtimeNs: st.mtimeNs,
     };
   } catch (err) {
     if (err?.code === "ENOENT") {
@@ -103,6 +102,7 @@ export function snapshotFile(filepath) {
         symlinkTarget: null,
         sha: null,
         mtime: null,
+        mtimeNs: null,
       };
     }
     return {
@@ -113,6 +113,7 @@ export function snapshotFile(filepath) {
       symlinkTarget: null,
       sha: null,
       mtime: null,
+      mtimeNs: null,
     };
   }
 }
@@ -139,6 +140,8 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
         afterSha: after?.sha ?? null,
         beforeMtime: before?.mtime ?? null,
         mtime: after?.mtime ?? null,
+        beforeMtimeNs: before?.mtimeNs ?? null,
+        mtimeNs: after?.mtimeNs ?? null,
         culprit,
       });
     } else if (before.state === "absent" && after.state === "present") {
@@ -148,6 +151,7 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
         beforeSha: null,
         afterSha: after.sha,
         mtime: after.mtime,
+        mtimeNs: after.mtimeNs,
         culprit,
       });
     } else if (before.state === "present" && after.state === "absent") {
@@ -157,6 +161,7 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
         beforeSha: before.sha,
         afterSha: null,
         mtime: null,
+        mtimeNs: null,
         culprit,
       });
     } else if (before.state === "present" && after.state === "present") {
@@ -170,6 +175,7 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
             beforeSha: before.sha,
             afterSha: after.sha,
             mtime: after.mtime,
+            mtimeNs: after.mtimeNs,
             culprit,
           });
         }
@@ -182,6 +188,7 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
           beforeSha: before.sha,
           afterSha: after.sha,
           mtime: after.mtime,
+          mtimeNs: after.mtimeNs,
           culprit,
         });
       } else if (before.type === "file" && after.type === "file") {
@@ -193,9 +200,15 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
             afterSha: after.sha,
             beforeMtime: before.mtime,
             mtime: after.mtime,
+            beforeMtimeNs: before.mtimeNs,
+            mtimeNs: after.mtimeNs,
             culprit,
           });
-        } else if (before.mtime !== after.mtime) {
+        } else if (
+          (before.mtimeNs !== undefined && after.mtimeNs !== undefined && before.mtimeNs !== null && after.mtimeNs !== null)
+            ? before.mtimeNs !== after.mtimeNs
+            : before.mtime !== after.mtime
+        ) {
           diffs.push({
             path: p,
             kind: "touched",
@@ -204,6 +217,8 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
             afterSha: after.sha,
             beforeMtime: before.mtime,
             mtime: after.mtime,
+            beforeMtimeNs: before.mtimeNs,
+            mtimeNs: after.mtimeNs,
             culprit,
           });
         }
@@ -222,6 +237,8 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
           afterSha: null,
           beforeMtime: null,
           mtime: null,
+          beforeMtimeNs: null,
+          mtimeNs: null,
           culprit,
         });
       } else if (after.state === "present") {
@@ -231,6 +248,7 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
           beforeSha: null,
           afterSha: after.sha,
           mtime: after.mtime,
+          mtimeNs: after.mtimeNs,
           culprit,
         });
       }
@@ -254,7 +272,10 @@ export function formatErrorReport({ diffs = [] } = {}) {
       lines.push("  - " + d.path + "（sha: " + bSha + " → " + aSha + "，mtime: " + (d.mtime ?? "n/a") + culpritPart + "）");
     } else if (d.kind === "touched") {
       const sha = d.afterSha ? d.afterSha.slice(0, 12) : (d.beforeSha ? d.beforeSha.slice(0, 12) : "n/a");
-      lines.push("  - " + d.path + "（sha 未变（" + sha + "）但 mtime 被改动: " + (d.beforeMtime ?? "n/a") + " → " + (d.mtime ?? "n/a") + culpritPart + "）");
+      const nsPart = d.beforeMtimeNs !== undefined && d.mtimeNs !== undefined && d.beforeMtimeNs !== d.mtimeNs
+        ? "，mtimeNs: " + d.beforeMtimeNs + " → " + d.mtimeNs
+        : "";
+      lines.push("  - " + d.path + "（sha 未变（" + sha + "）但 mtime 被改动: " + (d.beforeMtime ?? "n/a") + " → " + (d.mtime ?? "n/a") + nsPart + culpritPart + "）");
     } else if (d.kind === "unverifiable") {
       lines.push("  - " + d.path + "（读取出错无法验证: " + (d.error ?? "unknown") + culpritPart + "）");
     } else if (d.kind === "symlink_modified") {
@@ -305,8 +326,7 @@ export function installSurfaceGuard({
   if (activeSurfaceGuard && files === null && home === null && registerExitHook) {
     return activeSurfaceGuard;
   }
-  const realHome = home ?? os.userInfo().homedir;
-  const targetPaths = resolveAuthoritativePaths({ home: realHome, files });
+  const targetPaths = resolveAuthoritativePaths({ home, files });
   const baseline = takeSurfaceSnapshot(targetPaths);
   let lastSnapshot = baseline;
   const culprits = new Map();

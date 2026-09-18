@@ -58534,7 +58534,9 @@ test("PK3-T3-fix2 单元（注入 files）：同字节重写/utimes 改动 mtime
 test("PK3-T3-fix2 集成（子进程 + import 阶段副作用反例）：假产品模块在 import 阶段写权威文件 → 卫兵先于 import 启动故捕获并退出非 0", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-import-pollution-"));
   try {
-    const mockAuthFile = path.join(tmp, "mock-chain-config.json");
+    const tmpHome = path.join(tmp, "home");
+    const mockAuthFile = path.join(tmpHome, ".claude", "feishu-bridge", "chain-config.json");
+    fs.mkdirSync(path.dirname(mockAuthFile), { recursive: true });
     fs.writeFileSync(mockAuthFile, '{"chain":"original"}');
 
     const fakeProductModule = path.join(tmp, "fake-product-module.mjs");
@@ -58556,13 +58558,13 @@ process.exit(0);
 `);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
-      env: { ...process.env, HOME: tmp, FEISHU_BRIDGE_SURFACE_GUARD_FILES: mockAuthFile },
+      env: { ...process.env, HOME: tmpHome, FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome },
       encoding: "utf-8",
     });
 
     assert.notEqual(sp.status, 0, "import 阶段被污染必须导致非 0 退出（证明快照在 import 之前）（实际：" + sp.status + "）");
     assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
-    assert.match(sp.stderr, /mock-chain-config\.json/);
+    assert.match(sp.stderr, /chain-config\.json/);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -58571,7 +58573,9 @@ process.exit(0);
 test("PK3-T3-fix2 集成（子进程 + EACCES 反例）：权威文件被 chmod 000 → exit 钩子非 0 退出并打印 unverifiable", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-eacces-"));
   try {
-    const mockAuthFile = path.join(tmp, "mock-routes.json");
+    const tmpHome = path.join(tmp, "home");
+    const mockAuthFile = path.join(tmpHome, ".claude", "feishu-bridge", "routes.json");
+    fs.mkdirSync(path.dirname(mockAuthFile), { recursive: true });
     fs.writeFileSync(mockAuthFile, '{"routes":[]}');
 
     const runnerScript = path.join(tmp, "eacces-runner.mjs");
@@ -58588,7 +58592,7 @@ process.exit(0);
     fs.writeFileSync(runnerScript, scriptSrc);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
-      env: { ...process.env, HOME: tmp, FEISHU_BRIDGE_SURFACE_GUARD_FILES: mockAuthFile },
+      env: { ...process.env, HOME: tmpHome, FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome },
       encoding: "utf-8",
     });
 
@@ -58604,7 +58608,9 @@ process.exit(0);
 test("PK3-T3-fix2 集成（子进程 + touched 反例）：同字节重写/utimes 改动权威文件 mtime → exit 钩子非 0 退出并打印 touched 报告", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-touched-"));
   try {
-    const mockAuthFile = path.join(tmp, "mock-subscriptions.json");
+    const tmpHome = path.join(tmp, "home");
+    const mockAuthFile = path.join(tmpHome, ".claude", "feishu-bridge", "subscriptions.json");
+    fs.mkdirSync(path.dirname(mockAuthFile), { recursive: true });
     fs.writeFileSync(mockAuthFile, '{"subscriptions":[]}');
 
     const runnerScript = path.join(tmp, "touched-runner.mjs");
@@ -58622,13 +58628,104 @@ process.exit(0);
     fs.writeFileSync(runnerScript, scriptSrc);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
-      env: { ...process.env, HOME: tmp, FEISHU_BRIDGE_SURFACE_GUARD_FILES: mockAuthFile },
+      env: { ...process.env, HOME: tmpHome, FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome },
       encoding: "utf-8",
     });
 
     assert.notEqual(sp.status, 0, "mtime 变动必须导致非 0 退出（实际：" + sp.status + "）");
     assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
     assert.match(sp.stderr, /sha 未变.*但 mtime 被改动/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix3 集成（子进程 + P1 变量旁路反例）：设置 FEISHU_BRIDGE_SURFACE_GUARD_FILES 指向别处，boot 仍守真实清单", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-bypass-"));
+  try {
+    const tmpHome = path.join(tmp, "home");
+    const mockAuthFile = path.join(tmpHome, ".claude", "feishu-bridge", "chain-config.json");
+    fs.mkdirSync(path.dirname(mockAuthFile), { recursive: true });
+    fs.writeFileSync(mockAuthFile, '{"chain":"original"}');
+
+    // 企图通过 FEISHU_BRIDGE_SURFACE_GUARD_FILES 旁路真实清单、指向一个不会被改动的替罪羊文件
+    const decoyFile = path.join(tmp, "decoy-never-modified.json");
+    fs.writeFileSync(decoyFile, '{"decoy":true}');
+
+    const runnerScript = path.join(tmp, "bypass-runner.mjs");
+    const scriptSrc = `
+import fs from "node:fs";
+import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+
+const mockFile = ${JSON.stringify(mockAuthFile)};
+// 测试中篡改了真实清单中的权威文件
+fs.writeFileSync(mockFile, '{"chain":"tampered-auth-file"}');
+
+process.exit(0);
+`;
+    fs.writeFileSync(runnerScript, scriptSrc);
+
+    const sp = spawnSync(process.execPath, [runnerScript], {
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome,
+        FEISHU_BRIDGE_SURFACE_GUARD_FILES: decoyFile, // 企图旁路
+      },
+      encoding: "utf-8",
+    });
+
+    assert.notEqual(sp.status, 0, "即使设了 FEISHU_BRIDGE_SURFACE_GUARD_FILES，卫兵仍必须监控真实清单并拦截改动（实际：" + sp.status + "）");
+    assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
+    assert.match(sp.stderr, /chain-config\.json/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix3 单元（注入 files）：同毫秒不同纳秒重写 → bigint mtimeNs 抓出 touched 且 changed: true", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-ns-"));
+  try {
+    const f1 = path.join(tmp, "same-ms.json");
+    fs.writeFileSync(f1, "identical-bytes");
+
+    // 设定初始时间戳（例如 1700000000 秒 + 1ms + 100ns）
+    const sec = 1700000000;
+    fs.utimesSync(f1, sec + 0.0010001, sec + 0.0010001);
+
+    // 探测当前底层文件系统是否支持亚毫秒/纳秒时间戳精度
+    const check1 = fs.lstatSync(f1, { bigint: true });
+    fs.utimesSync(f1, sec + 0.0010005, sec + 0.0010005);
+    const check2 = fs.lstatSync(f1, { bigint: true });
+
+    if (check1.mtimeNs === check2.mtimeNs) {
+      // 底层文件系统（例如 FAT32 / HFS+ 等）不支持纳秒精度：显式说明并跳过，不假绿
+      console.log("  ℹ [跳过] 底层文件系统不支持纳秒级时间戳精度（mtimeNs 未变），跳过同毫秒微秒差反例");
+      return;
+    }
+
+    // 重置回到 t1 并建立卫兵快照
+    fs.utimesSync(f1, sec + 0.0010001, sec + 0.0010001);
+    const guard = installSurfaceGuard({ files: [f1], registerExitHook: false });
+    try {
+      // 变动到同毫秒内的 t2
+      fs.utimesSync(f1, sec + 0.0010005, sec + 0.0010005);
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "同毫秒不同纳秒变动必须判 changed: true（mtimeNs 必须识别）");
+      assert.equal(res.diffs.length, 1);
+      const d = res.diffs[0];
+      assert.equal(d.kind, "touched");
+      assert.equal(d.beforeSha, d.afterSha, "sha 必须相同");
+      assert.equal(d.beforeMtime, d.mtime, "ISO 毫秒字符串必须相同（证明落在同一毫秒）");
+      assert.notEqual(d.beforeMtimeNs, d.mtimeNs, "mtimeNs 必须不同");
+
+      const errReport = guard.formatErrorReport(res);
+      assert.match(errReport, /安装面硬门：套件改动了本机安装面/);
+      assert.match(errReport, /sha 未变.*但 mtime 被改动/);
+    } finally {
+      guard.uninstall();
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

@@ -17,7 +17,23 @@ import {
 } from "../handoff.mjs";
 import { REJECT, normalizeBody } from "../selector.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS, OFF_TEMPLATE_HINT, isPrivateChatTurn } from "../inbound-route.mjs";
+import { loadRoutes } from "../inbound-routes.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText, chatReplyPathStatus } from "../chat-reply.mjs";
+
+function externalProcessorForSession(sessionId, routesFile) {
+  if (typeof sessionId !== "string" || !sessionId.trim()) return null;
+  try {
+    const table = loadRoutes(routesFile || undefined);
+    if (!table || !table.ok) return null;
+    const targetRouteId = table.sessions?.[sessionId];
+    if (typeof targetRouteId !== "string" || !targetRouteId.trim()) return null;
+    const defaultRoute = (table.routes ?? []).find((r) => r.isDefault);
+    if (defaultRoute && targetRouteId === defaultRoute.id) return null;
+    return targetRouteId;
+  } catch {
+    return null;
+  }
+}
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "../chat-ledger.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -98,6 +114,37 @@ export function selectLegacyUpdate(u, { task, home = bridgeHome(), now = Date.no
   }
   const generationId = u.action === "activate" ? u.lineageId : pending.channel_generation_id;
   return promoteTask({ logicalTaskKey: targetTask.logical_task_key, sessionId: u.eventSessionId, generationId, operationId: loaded.state.rotation?.operation_id ?? null, home, now });
+}
+
+export function ackText(kind, detail, { transportAgentName } = {}) {
+  const agent = transportAgentName
+    ?? (loadCodexTemplate().ok ? (loadCodexTemplate().template.transport_agent_name || "运输 agent") : "运输 agent");
+  if (kind === "accepted") return [
+    "已受理 · " + detail.taskName,
+    "已投递到绑定的 Codex task。严格确认完成后会自动回复到本话题；失败会发送风险回执。",
+    "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
+  ].join("\n");
+  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
+  if (kind === "bound") {
+    const ext = detail?.externalProcessor ?? externalProcessorForSession(detail?.sessionId, detail?.routesFile);
+    if (ext) {
+      return [
+        "绑定完成 · " + detail.taskName,
+        "此话题由外部处理器 " + ext + " 接管：回复方式由该处理器决定。",
+      ].join("\n");
+    }
+    return [
+      "绑定完成 · " + detail.taskName,
+      "这个话题现在精确通向一个 Codex task。之后在这里 @ " + agent + " 即可续接。",
+    ].join("\n");
+  }
+  if (kind === "control") return detail.text;
+  if (kind === "rejected") return [
+    "已拒绝 · " + detail.reasonText,
+    detail.taskName ? "本话题通向：" + detail.taskName + "。" : null,
+    "本条指令没有被投递给任何任务。",
+  ].filter(Boolean).join("\n");
+  return "系统错误 · " + detail.detail + "\n本条指令没有被投递，请勿视为已受理。";
 }
 
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {
@@ -254,26 +301,6 @@ function chatTurn({ chain, template, event, dryRun, ledgerDir }) {
   finish("chat", { text: displaySafe(reply.text), ledgerNote: (recorded.ok ? "" : "（账本没记下这次回答：" + recorded.reason + "；同一条消息的重放不会再答）") + admitNote || null }, { mode: CHAT_POLICY_ID, kind: "reply", elapsed_ms: reply.elapsedMs, role: gates.role, risk_class: risk.riskClass, ledger: recorded.ok ? "recorded" : recorded.reason, lock_uncleared: admitted.lockUncleared ?? null });
 }
 
-function ackText(kind, detail) {
-  if (kind === "accepted") return [
-    "已受理 · " + detail.taskName,
-    "已投递到绑定的 Codex task。严格确认完成后会自动回复到本话题；失败会发送风险回执。",
-    "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
-  ].join("\n");
-  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
-  if (kind === "bound") return [
-    "绑定完成 · " + detail.taskName,
-    "这个话题现在精确通向一个 Codex task。之后在这里 @ " + transportAgentName + " 即可续接。",
-  ].join("\n");
-  if (kind === "control") return detail.text;
-  if (kind === "rejected") return [
-    "已拒绝 · " + detail.reasonText,
-    detail.taskName ? "本话题通向：" + detail.taskName + "。" : null,
-    "本条指令没有被投递给任何任务。",
-  ].filter(Boolean).join("\n");
-  return "系统错误 · " + detail.detail + "\n本条指令没有被投递，请勿视为已受理。";
-}
-
 // ---------- 频道定位采样旁路（不承重）----------
 // 取到事件之前 sampleCtx 为 null：那几条是系统错误 / 模板不可用 / 信封失败，不是入站消息，不入样本。
 let sampleCtx = null; // { event, canonical, template, chain }
@@ -295,7 +322,7 @@ function recordChannelSample(kind, reason) {
 
 function finish(kind, detail, _result) {
   recordChannelSample(kind, _result?.reason);
-  process.stdout.write(ackText(kind, detail) + "\n");
+  process.stdout.write(ackText(kind, detail, { transportAgentName }) + "\n");
   // Aily 的 exec_command 会把 stdout 与 stderr 合并进模型可见输出。结构化诊断若写到
   // stderr，就会被 M5Codex 原样带回飞书并泄露 task locator。机器证据已写入 Git 外
   // receipt/claim/run 文件；进程通道只保留面向用户的 stdout 与退出码。
@@ -548,7 +575,7 @@ if (justBound && verdict.decision === "reject" && verdict.reason === REJECT.EMPT
     claim_acquired: false, handed_off: false,
     subscription_claim_shadow: subscriptionClaimShadow,
   });
-  finish("bound", { taskName: task.task_display_name }, { bound: true, logical_task_key: task.logical_task_key });
+  finish("bound", { taskName: task.task_display_name, sessionId: event.session_id }, { bound: true, logical_task_key: task.logical_task_key });
 }
 
 if (dryRun) {

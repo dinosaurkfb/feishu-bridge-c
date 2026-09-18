@@ -161,6 +161,8 @@ import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
+import { ackText as inboundAckText } from "./inbound.mjs";
+import { ackText as codexInboundAckText } from "./codex/inbound.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
@@ -59149,6 +59151,140 @@ test("PK3-T3-fix3 单元（注入 files）：同毫秒不同纳秒重写 → big
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("PK3-W232：临时 routes 文件登记外部路由 → 绑定完成文案含「外部处理器」且不含「每轮回答会合成卡片」；未登记 → 原文案一字不差", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-w232-routes-"));
+  try {
+    const routesFile = path.join(tmp, "routes.json");
+    const routesDoc = {
+      routes: [
+        { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
+        { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" },
+      ],
+      sessions: {
+        "session_external_123": "c2c-inbound",
+      },
+    };
+    fs.writeFileSync(routesFile, JSON.stringify(routesDoc, null, 2) + "\n");
+
+    // ① Claude 链绑定完成（inbound.mjs ackText bound）：
+    // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」
+    const extAck = inboundAckText("bound", {
+      taskName: "demo-task",
+      root: "/opt/demo-project",
+      sessionId: "session_external_123",
+      routesFile,
+    });
+    assert.match(extAck, /外部处理器 c2c-inbound 接管/u);
+    assert.doesNotMatch(extAck, /每轮回答会合成卡片/u);
+    assert.doesNotMatch(extAck, /以卡片发回/u);
+    assert.equal(
+      extAck,
+      [
+        "绑定完成 · demo-task",
+        "这个话题现在通向 /opt/demo-project。",
+        "此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。",
+      ].join("\n")
+    );
+
+    // 未登记（走默认路由）→ 原文案一字不差
+    const unregAck = inboundAckText("bound", {
+      taskName: "demo-task",
+      root: "/opt/demo-project",
+      sessionId: "session_unregistered_456",
+      routesFile,
+    });
+    assert.equal(
+      unregAck,
+      [
+        "绑定完成 · demo-task",
+        "这个话题现在通向 /opt/demo-project。",
+        "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
+      ].join("\n"),
+      "未登记外部路由时，绑定完成文案必须一字不差"
+    );
+
+    // ② Codex 链绑定完成（codex/inbound.mjs ackText bound）：
+    // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」
+    const codexExtAck = codexInboundAckText("bound", {
+      taskName: "codex-task",
+      sessionId: "session_external_123",
+      routesFile,
+    });
+    assert.match(codexExtAck, /外部处理器 c2c-inbound 接管/u);
+    assert.doesNotMatch(codexExtAck, /每轮回答会合成卡片/u);
+    assert.equal(
+      codexExtAck,
+      [
+        "绑定完成 · codex-task",
+        "此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。",
+      ].join("\n")
+    );
+
+    // 未登记 → 原文案一字不差
+    const codexUnregAck = codexInboundAckText("bound", {
+      taskName: "codex-task",
+      sessionId: "session_unregistered_456",
+      routesFile,
+    });
+    assert.match(codexUnregAck, /这个话题现在精确通向一个 Codex task/u);
+    assert.doesNotMatch(codexUnregAck, /外部处理器/u);
+
+    // ③ 根消息生成（composeRootMessage）：
+    // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」
+    const extRootMsg = composeRootMessage({
+      name: "demo",
+      root: "/opt/demo-project",
+      token: "tok123",
+      sessionId: "session_external_123",
+      routesFile,
+    });
+    assert.match(extRootMsg, /此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。/u);
+    assert.doesNotMatch(extRootMsg, /每轮回答会合成卡片/u);
+
+    // 未登记 → 原文案一字不差
+    const unregRootMsg = composeRootMessage({
+      name: "demo",
+      root: "/opt/demo-project",
+      token: "tok123",
+      sessionId: "session_unregistered_456",
+      routesFile,
+    });
+    assert.match(unregRootMsg, /本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。/u);
+    assert.doesNotMatch(unregRootMsg, /外部处理器/u);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-W232：doctor ⑯ 入站转发结果文案包含「只统计本链 live_session」", () => {
+  // 空转状态（scanned === 0）
+  const mEmpty = doctorMachine();
+  const rootEmpty = mEmpty.project("fwdnone", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  mEmpty.writeTables({ projects: [{ id: "fwdnone", root: rootEmpty, root_message_id: "om_root_fwdnone", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const cEmpty = checkOf(doctorReport(mEmpty.run()), "inbound_forward_result");
+  assert.equal(cEmpty.ok, true);
+  assert.match(cEmpty.detail, /只统计本链 live_session/u);
+  assert.match(cEmpty.detail, /外部处理器（routes\.json 非默认路由）的转发结果不在此项/u);
+
+  // 有转发记录状态（scanned > 0）
+  const mHasRuns = doctorMachine();
+  const rootHasRuns = mHasRuns.project("fwdhas", { expiresAt: "2099-01-01T00:00:00.000Z" });
+  mHasRuns.writeTables({ projects: [{ id: "fwdhas", root: rootHasRuns, root_message_id: "om_root_fwdhas", status: "active", expires_at: "2099-01-01T00:00:00.000Z" }] });
+  const runsDir = path.join(rootHasRuns, ".runtime-data", "inbound", "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const now = Date.now();
+  const k1 = "12".repeat(32);
+  fs.writeFileSync(
+    path.join(runsDir, k1 + ".forward.result.json"),
+    JSON.stringify(r54FullResult(k1, { finished_at: new Date(now - 60e3).toISOString() })) + "\n",
+    { mode: 0o600 }
+  );
+  const cHasRuns = checkOf(doctorReport(mHasRuns.run()), "inbound_forward_result");
+  assert.equal(cHasRuns.ok, true);
+  assert.match(cHasRuns.detail, /只统计本链 live_session/u);
+  assert.match(cHasRuns.detail, /外部处理器（routes\.json 非默认路由）的转发结果不在此项/u);
 });
 
 sealSummary();

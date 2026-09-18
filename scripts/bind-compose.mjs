@@ -14,9 +14,25 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { loadRoutes } from "./inbound-routes.mjs";
 import {
   materializeLegacyTopicFields, topicGenerationStateForLegacy
 } from "./topic-generation.mjs";
+
+function externalProcessorForSession(sessionId, routesFile) {
+  if (typeof sessionId !== "string" || !sessionId.trim()) return null;
+  try {
+    const table = loadRoutes(routesFile || undefined);
+    if (!table || !table.ok) return null;
+    const targetRouteId = table.sessions?.[sessionId];
+    if (typeof targetRouteId !== "string" || !targetRouteId.trim()) return null;
+    const defaultRoute = (table.routes ?? []).find((r) => r.isDefault);
+    if (defaultRoute && targetRouteId === defaultRoute.id) return null;
+    return targetRouteId;
+  } catch {
+    return null;
+  }
+}
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -139,15 +155,22 @@ export function readProjectIdentity({ root, files = IDENTITY_FILES }) {
  * Aily 自动附带的根消息引用中读取这行短码，在同时存在多个 pending task 时确定性选中目标；
  * 绑定完成后仍回到 sessionID 路由。Claude 根消息也保留同一信号，不影响其既有行为。
  */
-export function composeRootMessage({ name, heading = name, purpose, root, token }) {
+export function composeRootMessage({
+  name, heading = name, purpose, root, token,
+  sessionId = null, routesFile = undefined, externalProcessor = null,
+}) {
   const lines = ["🌉 " + heading];
   if (purpose) lines.push("", purpose);
+  const ext = externalProcessor ?? externalProcessorForSession(sessionId, routesFile);
+  const replyLine = ext
+    ? "此话题由外部处理器 " + ext + " 接管：回复方式由该处理器决定。"
+    : "本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。";
   lines.push(
     "",
     "本机项目  " + root,
     "绑定码    " + token,
     "",
-    "本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。",
+    replyLine,
   );
   return lines.join("\n");
 }

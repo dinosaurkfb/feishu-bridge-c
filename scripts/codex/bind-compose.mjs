@@ -60,7 +60,7 @@ function readDefaultTransportAgentName() {
 
 export function composeCodexBinding({
   root, threadId, nameOverride, threadDescriptions, globalStateFile, idempotencyScope,
-  transportAgentName, template,
+  transportAgentName, template, sessionId, routesFile, externalProcessor,
 }) {
   const identity = readProjectIdentity({ root });
   const bindingIdentity = root + "\n" + threadId;
@@ -96,7 +96,10 @@ export function composeCodexBinding({
     idempotencyKey: idempotencyKeyFor(
       idempotencyScope ? bindingIdentity + "\n" + idempotencyScope : bindingIdentity,
     ),
-    rootText: composeRootMessage({ name, heading, purpose: identity.purpose, root, token }),
+    rootText: composeRootMessage({
+      name, heading, purpose: identity.purpose, root, token,
+      sessionId, routesFile, externalProcessor,
+    }),
     statusText: composeStatusMessage({ name })
       .replace("在这条消息下面 @ 一下运输 agent", "在这条消息下面真实 @" + agentName)
       .replace(

@@ -162,7 +162,6 @@ import {
 } from "./canonical-event.mjs";
 import { runInboundDispatcher } from "./inbound-dispatcher.mjs";
 import { ackText as inboundAckText } from "./inbound.mjs";
-import { ackText as codexInboundAckText } from "./codex/inbound.mjs";
 import { bindingToConnections } from "./group-binding-status.mjs";
 import {
   SYNC_ACTION, SYNC_REJECT, authorizationCovers, planSubscriptionSync, renderSyncPlan,
@@ -59205,31 +59204,7 @@ test("PK3-W232：临时 routes 文件登记外部路由 → 绑定完成文案�
       "未登记外部路由时，绑定完成文案必须一字不差"
     );
 
-    // ② Codex 链绑定完成（codex/inbound.mjs ackText bound）：
-    // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」
-    const codexExtAck = codexInboundAckText("bound", {
-      taskName: "codex-task",
-      sessionId: "session_external_123",
-      routesFile,
-    });
-    assert.match(codexExtAck, /外部处理器 c2c-inbound 接管/u);
-    assert.doesNotMatch(codexExtAck, /每轮回答会合成卡片/u);
-    assert.equal(
-      codexExtAck,
-      [
-        "绑定完成 · codex-task",
-        "此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。",
-      ].join("\n")
-    );
-
-    // 未登记 → 原文案一字不差
-    const codexUnregAck = codexInboundAckText("bound", {
-      taskName: "codex-task",
-      sessionId: "session_unregistered_456",
-      routesFile,
-    });
-    assert.match(codexUnregAck, /这个话题现在精确通向一个 Codex task/u);
-    assert.doesNotMatch(codexUnregAck, /外部处理器/u);
+    // ②（Codex 链 ackText 的同形断言在 scripts/codex/test.mjs —— Claude 套件不 import codex/）
 
     // ③ 根消息生成（composeRootMessage）：
     // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」

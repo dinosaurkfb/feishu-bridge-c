@@ -10927,5 +10927,35 @@ test("PK3-L2-fix2 P2-3：darwin absent 且有积压时保留「还有 N 条历�
   assert.doesNotMatch(withoutBacklog.detail, /历史积压未分类/u, "无积压时不带后缀：" + withoutBacklog.detail);
 });
 
+test("PK3-W232（Codex 链）：临时 routes 登记外部路由 → 绑定完成文案含「外部处理器」且不含「每轮回答会合成卡片」；未登记 → 原文案", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-w232-codex-routes-"));
+  try {
+    const routesFile = path.join(tmp, "routes.json");
+    fs.writeFileSync(routesFile, JSON.stringify({
+      routes: [
+        { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
+        { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" },
+      ],
+      sessions: { "session_external_123": "c2c-inbound" },
+    }, null, 2) + "\n");
+
+    // 已登记外部处理器 → 中性说明，不承诺合成卡片
+    const codexExtAck = CODEX.ackText("bound", { taskName: "codex-task", sessionId: "session_external_123", routesFile });
+    assert.match(codexExtAck, /外部处理器 c2c-inbound 接管/u);
+    assert.doesNotMatch(codexExtAck, /每轮回答会合成卡片/u);
+    assert.equal(codexExtAck, [
+      "绑定完成 · codex-task",
+      "此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。",
+    ].join("\n"));
+
+    // 未登记（走默认路由）→ 原文案
+    const codexUnregAck = CODEX.ackText("bound", { taskName: "codex-task", sessionId: "session_unregistered_456", routesFile });
+    assert.match(codexUnregAck, /这个话题现在精确通向一个 Codex task/u);
+    assert.doesNotMatch(codexUnregAck, /外部处理器/u);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 sealSummary();
 printSummary({ suiteLabel: "Codex adapter" });

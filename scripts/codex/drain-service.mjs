@@ -47,7 +47,7 @@ import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
-import { systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent, timerPlatform, resolveNodeForHooks } from "../install-projection.mjs";
+import { systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent, timerPlatform, resolveNodeForHooks, unitFirstArg } from "../install-projection.mjs";
 import { systemctl } from "../timer-exec.mjs";
 import { SYSTEMCTL_STATE_WORDS } from "../maintenance/timers.mjs";
 
@@ -72,17 +72,33 @@ export const codexDrainSystemdPaths = (home = os.homedir()) => {
 
 export const pickNode = (platform = process.platform, home = os.homedir()) => {
   if (platform === "linux") {
-    try {
-      return resolveNodeForHooks({ homedir: home, platform: "linux" });
-    } catch {
-      return process.execPath;
-    }
+    // PK3-L7-fix3 P1-1：**解析失败就是失败，不回退 process.execPath。**
+    //
+    // 回退的后果不是“降级”，是把当前进程那个 node 写进**长期**单元：钩子/定时器是被 systemd 起的，
+    // 而 process.execPath 常常是 mise 的 `installs/<版本>/bin/node` 真身 —— 升级清掉那个目录之后，
+    // ExecStart 指向不存在的路径，定时器**静默失效**（没有任何一处会报）。那正是 omm 上已经发生过的
+    // 故障形状，也是这条兜底本身要防的东西。所以这里把 resolveNodeForHooks 的错**原话**带出去，
+    // 由调用方拒绝启用（含「显式 FEISHU_BRIDGE_NODE 不可用」那一种 —— 它本来是个配置错误，
+    // 静默换成别的二进制会把它掩盖掉）。
+    return resolveNodeForHooks({ homedir: home, platform: "linux" });
   }
   for (const file of ["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath]) {
     try { fs.accessSync(file, fs.constants.X_OK); return file; } catch { /* next */ }
   }
   return process.execPath;
 };
+
+/** 这个路径现在是不是一个可执行的程序（判单元里那个 node 还在不在用）。 */
+const isExecutable = (p) => {
+  try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; }
+};
+
+/**
+ * 桥的状态根（`FEISHU_CODEX_BRIDGE_HOME`）—— **darwin plist 与 linux 单元用的是同一个值、同一来源**（PK3-L7-fix3 P1-2）。
+ * 两处各算一遍就会漂：自定义 CODEX_HOME 时 plist 指向自定义桥根、而 systemd 那一份没有这个变量，
+ * drain 跑起来会按默认 `~/.codex/feishu-bridge` 找状态 —— 运行时代码与状态目录分叉。
+ */
+const codexBridgeHomeOf = (codexHome = codexHomeOf()) => path.join(codexHome, "feishu-bridge");
 
 /**
  * 调度器要跑的脚本。**只能是 runtime/current 下那一份。**
@@ -121,7 +137,7 @@ export function plistBody({ home = os.homedir(), node = pickNode(),
   const workdir = path.join(codexRuntimeRoot(codexHome), "current");
   const log = path.join(codexHome, "feishu-bridge", "drain.log");
   const [xNode, xScript, xWork, xLog, xHome, xBridge] =
-    [node, script, workdir, log, home, path.join(codexHome, "feishu-bridge")].map(xml);
+    [node, script, workdir, log, home, codexBridgeHomeOf(codexHome)].map(xml);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -157,12 +173,17 @@ export function codexDrainSystemdUnits({
   const workdir = path.join(codexRuntimeRoot(codexHome), "current");
   const log = path.join(codexHome, "feishu-bridge", "drain.log");
   const exec = systemdExecStartValue([node, script]);
+  // PK3-L7-fix3 P1-2：与 darwin plist 的 EnvironmentVariables 那一条**同值同源**。
+  // systemd 的引用规则对 Environment 值与 ExecStart 参数是同一条（systemd.syntax 的 quoted words），
+  // 所以直接复用同一个引用函数 —— 各写一份引号规则就会漂（含空格/引号的路径会静默变成错的）。
+  const envBridge = systemdExecStartValue([codexBridgeHomeOf(codexHome)]);
   const service = `[Unit]
 Description=feishu-bridge 兜底发布（Codex 链，drain-all）
 After=default.target
 
 [Service]
 Type=oneshot
+Environment=FEISHU_CODEX_BRIDGE_HOME=${envBridge}
 WorkingDirectory=${workdir}
 ExecStart=${exec}
 StandardOutput=append:${log}
@@ -229,7 +250,13 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
   if (platform === "linux") {
     const runtime = verifyRuntime({ root: codexRuntimeRoot(codexHome) });
     const paths = codexDrainSystemdPaths(home);
-    const units = codexDrainSystemdUnits({ home, codexHome });
+    // PK3-L7-fix3 P1-1：node 解析失败**不再回退 process.execPath**，所以这里主动接住它 ——
+    //   它不是「查不出来」，是一个明确的、可修的问题（说的就是该用哪个 node）。
+    let node = null;
+    let nodeProblem = null;
+    try { node = pickNode("linux", home); }
+    catch (err) { nodeProblem = String(err?.message ?? err); }
+    const units = node === null ? null : codexDrainSystemdUnits({ home, codexHome, node });
     const backlog = classifyBacklog({ home: bridge });
     const scan = scanRunnable({ home: bridge });
 
@@ -276,7 +303,12 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
           phaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).slice(0, 120) + "）—— 查不清，不等于没在跑";
         } else {
           const hasFiles = serviceContent !== null || timerContent !== null;
-          const projected = serviceContent === units.service && timerContent === units.timer;
+          const projected = units !== null && serviceContent === units.service && timerContent === units.timer;
+          // 单元里那个 node 还在不在（PK3-L7-fix3 P1-1 的另一半）：升级把版本真身清掉后，
+          //   manager 那边一切正常、ExecStart 却指向不存在的路径 —— 那是**静默失效**，
+          //   必须报 stale 并把那个路径点出来（否则人只会看到「已加载、正在按计划跑」）。
+          const diskNode = serviceContent === null ? null : unitFirstArg(serviceContent);
+          const diskNodeMissing = diskNode !== null && !isExecutable(diskNode);
           const isEnabled = String(enabled?.out ?? "").trim() === "enabled";
           const isActive = String(active?.out ?? "").trim() === "active";
 
@@ -290,12 +322,19 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
           } else if (serviceContent === null || timerContent === null) {
             phase = "installed_not_loaded";
             phaseWhy = "systemd 单元文件不完整";
+          } else if (diskNodeMissing) {
+            phase = "stale";
+            phaseWhy = "单元里的 node 不存在了：" + diskNode +
+              "（升级把版本真身清掉？装回 mise shim 或设 FEISHU_BRIDGE_NODE 后重跑 --enable --apply）";
+          } else if (nodeProblem !== null) {
+            phase = "stale";
+            phaseWhy = "现在解析不出可用的 node：" + nodeProblem;
           } else if (!projected) {
             phase = "stale";
             phaseWhy = "单元文件与当前运行时对不上（要重装）";
           } else if (isEnabled && isActive) {
             const show = systemctlFn(["--user", "show", serviceUnit, "-p", "ExecStart", "--value"], { tolerate: true });
-            const expectedArgs = expectedJob({ home, codexHome, platform: "linux" }).args;
+            const expectedArgs = expectedJob({ home, codexHome, platform: "linux", node }).args;
             const loadedArgv = systemdShowExecArgv(String(show?.out ?? ""));
             const sameExec = show?.ok === true && loadedArgv !== null &&
               (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
@@ -453,7 +492,10 @@ export function drainTimerCheck({ platform = timerPlatform({ home: os.homedir() 
     ? "；还有 " + svc.backlog.total + " 条历史积压未分类"
     : "";
   const phaseTexts = platform === "linux" ? SYSTEMD_PHASE_TEXT : PHASE_TEXT;
-  return { name: "兜底排空", ok, phase: svc.phase, detail: (phaseTexts[svc.phase] ?? svc.phase) + backlogSuffix, next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
+  // 相位词后面带上为什么：linux 的 stale 会点名**那个不存在的 node 路径**（PK3-L7-fix3 P1-1），
+  //   只说「对不上（要重装）」的话，doctor 里看不出是路径死了还是配置变了。
+  const detail = (phaseTexts[svc.phase] ?? svc.phase) + (svc.why ? "（" + svc.why + "）" : "") + backlogSuffix;
+  return { name: "兜底排空", ok, phase: svc.phase, detail, next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
 }
 
 export function drainTimerText({ platform = timerPlatform({ home: os.homedir() }) } = {}) {
@@ -541,6 +583,9 @@ export function runDrainService(argv = process.argv.slice(2), {
 
       log("调度器    " + paths.timer);
       log("状态      " + (SYSTEMD_PHASE_TEXT[st.phase] ?? st.phase));
+      // 状态行的 why 要说出来：stale 时它点的是**哪个路径/哪一道判据**（fix3 P1-1），
+      // 只说「对不上」人会不知道该看哪里。
+      if (st.why) log("原因      " + st.why);
       log("运行时    " + (st.runtimeOk
         ? "校验通过" : "**校验不过**（" + st.runtimeReason + "）"));
       log("排空脚本  " + drainScriptPath(home, codexHome));
@@ -580,6 +625,13 @@ export function runDrainService(argv = process.argv.slice(2), {
         runtimeReason: runtime.ok ? null : (runtime.reason ?? "drift"),
         backlog,
       });
+      // PK3-L7-fix3 P1-1：node 解析**先于任何动作**求值 —— 解不出来就拒绝，
+      //   绝不退回 process.execPath（退回会把当前进程那个带版本号的 node 写进长期单元）。
+      let node = null;
+      let nodeProblem = null;
+      try { node = pickNode("linux", home); }
+      catch (err) { nodeProblem = String(err?.message ?? err); }
+      if (nodeProblem !== null) blockers.push({ code: "node_unresolvable", detail: nodeProblem });
 
       if (blockers.length > 0) {
         error("\n不能启用，什么都没写：");
@@ -599,6 +651,12 @@ export function runDrainService(argv = process.argv.slice(2), {
             error("    定时器要跑的就是它，跑不通就不能装。");
           } else if (b.code === "runtime_unverified") {
             error("  · 运行时校验不过（" + b.detail + "）—— 先跑 scripts/codex/install.mjs --apply。");
+          } else if (b.code === "node_unresolvable") {
+            error("  · 找不到可用的 node：" + b.detail);
+            error("    **不会退回当前进程的 node** —— 那个路径常带版本号（mise 的 installs/<版本>/bin/node），");
+            error("    升级清掉之后单元里的 ExecStart 就指向不存在的东西，定时器静默失效。");
+            error("    指路：装一个 mise shim（~/.local/share/mise/shims/node）或设 FEISHU_BRIDGE_NODE");
+            error("    指向一个**不带版本号**的绝对路径，然后重跑本命令。");
           } else {
             error("  · " + b.code + "（" + b.detail + "）");
           }
@@ -611,7 +669,7 @@ export function runDrainService(argv = process.argv.slice(2), {
         return exit(0);
       }
 
-      const units = codexDrainSystemdUnits({ home, codexHome });
+      const units = codexDrainSystemdUnits({ home, codexHome, node });
       fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(paths.service, units.service, { mode: 0o644 });
       fs.writeFileSync(paths.timer, units.timer, { mode: 0o644 });
@@ -638,7 +696,21 @@ export function runDrainService(argv = process.argv.slice(2), {
         return exit(1);
       }
 
-      log("\n已启用，定时器已加载。");
+      // PK3-L7-fix3 P1-3：**enable --now 返回 0 不等于实态对。**systemd 可以返回成功但定时器
+      //   仍是 inactive（masked / 依赖没起来 / 别的地方改了同名单元），或者 manager 里还是**旧定义**。
+      //   复核用现成的那三道（is-enabled / is-active / show ExecStart）—— 就是 serviceState 的 linux 分支，
+      //   不另写一份。复核不过就说清是哪一道不过，**不打印「已加载」**。
+      const after = serviceStateFn({ home, codexHome, bridge, platform: "linux", systemctlFn: spawnSystemctlFn });
+      if (after.phase !== "loaded") {
+        error("\nenable --now 返回成功，但复核 systemd manager 实态不过：" +
+          (SYSTEMD_PHASE_TEXT[after.phase] ?? after.phase));
+        if (after.why) error("  判据：" + after.why);
+        error("**不当作已启用** —— 返回 0 不代表它真的在按这份配置跑。");
+        error("  修好后：先 --disable --apply，再 --enable --apply。");
+        return exit(1);
+      }
+
+      log("\n已启用，定时器已加载（manager 实态已复核：enabled + active + ExecStart 与投影一致）。");
       log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
       return exit(0);
     }

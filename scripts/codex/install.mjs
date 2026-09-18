@@ -36,6 +36,23 @@ const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
+/**
+ * manager（systemd --user）里还有同名 timer 吗 —— **跟盘上有没有文件是两回事**（PK3-L7-fix3 P2）。
+ * 三道判据与 doctor 那份同一套：is-enabled / is-active / show -p LoadState。
+ * 沙箱（HOME 被重定向且未注入 FEISHU_BRIDGE_SYSTEMCTL）得到 skipped → 一律 false：
+ * 那种情况下我们**没问过** manager，不能把“问不到”当成“里面没有”（后续删文件那条路仍走盘上判断）。
+ */
+const systemdTimerInManager = () => {
+  const timerUnit = CODEX_DRAIN_SYSTEMD_UNIT + ".timer";
+  const first = (r) => String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+  const enabled = systemctl(["--user", "is-enabled", timerUnit], { tolerate: true });
+  const active = systemctl(["--user", "is-active", timerUnit], { tolerate: true });
+  const show = systemctl(["--user", "show", timerUnit, "-p", "LoadState", "--value"], { tolerate: true });
+  if (enabled?.skipped || active?.skipped || show?.skipped) return false;
+  // LoadState=loaded 盖住“enabled 但当前 inactive、文件又已经不在”的那种（manager 还记着它）。
+  return first(enabled) === "enabled" || first(active) === "active" || String(show?.out ?? "").trim() === "loaded";
+};
+
 
 // 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
 // 这个仓库今天已经为这类重复付过一次代价（时间格式在两处各写一份，边界收紧了一处、
@@ -245,11 +262,15 @@ if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
 }
 if (uninstall) {
-  // PK3-L7：若 linux 上 unit 存在，按同纪律停并删（装机不自动启用，卸载要能收干净）
+  // PK3-L7：若 linux 上单元存在（或 manager 里还有），按同纪律停并删
+  // PK3-L7-fix3 P2：**不拿「盘上有文件」当前提** —— manager 里还有、盘上文件已丢的 orphan
+  //   正是最容易被漏掉的一种（卸载会说「本来就没启用」，而那个 timer 可能还在跑）。
   const pform = timerPlatform({ home: os.homedir() });
   if (pform === "linux") {
     const spaths = codexDrainSystemdPaths(os.homedir());
-    if (fs.existsSync(spaths.service) || fs.existsSync(spaths.timer)) {
+    const hasFiles = fs.existsSync(spaths.service) || fs.existsSync(spaths.timer);
+    const inManager = systemdTimerInManager();
+    if (hasFiles || inManager) {
       const disabled = systemctl(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
       if (!disabled.ok && !disabled.skipped && !disabled.absent) {
         console.error("兜底定时器停用失败：" + (disabled.text ?? "说不清") + "，单元文件未删。");
@@ -263,7 +284,11 @@ if (uninstall) {
         process.exit(1);
       }
       const skipped = disabled.skipped;
-      console.log("兜底排空    " + (skipped ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）" : "已停用并删除 systemd 单元"));
+      console.log("兜底排空    " + (skipped
+        ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）"
+        : !hasFiles
+        ? "收了一个孤儿 timer（单元文件早已不在，systemd --user 里还在），已停用并 daemon-reload"
+        : "已停用并删除 systemd 单元"));
     }
   }
 }

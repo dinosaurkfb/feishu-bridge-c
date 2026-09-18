@@ -410,7 +410,7 @@ npm run doctor:codex
 
 ### 7.2 Linux 环境下的已知 `?` 项说明
 - **`⑧′ 机器人发送凭据（lark-cli 密钥）`**：在 Linux 上必须为 **`✓`**。如果为 `✗`，说明 aily 未生成密钥或 `LARKSUITE_CLI_DATA_DIR` 配置缺失。
-- **`⑥ 积压有人发（Codex 侧）`**：新装后默认显示为 **`?`**（「未启用（安装后的默认态，不是故障）」）。Codex 链兜底定时器在 Linux 上基于 `systemd --user` 实现，属于可选启用项；安装后默认未启用，日常由 task 正常触发发布。若需启用 30 分钟兜底排空，执行 `node scripts/codex/drain-service.mjs --enable --apply`，启用后该项将变为 **`✓`**；停用执行 `node scripts/codex/drain-service.mjs --disable --apply`。
+- **`⑥ 积压有人发（Codex 侧）`**：新装后默认显示为 **`?`**（「未启用（安装后的默认态，不是故障）」）。Codex 链兜底定时器在 Linux 上基于 `systemd --user` 实现，属于可选启用项；安装后默认未启用，日常由 task 正常触发发布。若需启用 30 分钟兜底排空，执行 `node scripts/codex/drain-service.mjs --enable --apply`（**要求能解析到一个不带版本号的 node**：mise shim 或 `FEISHU_BRIDGE_NODE`；解不出来会拒绝启用，不会退回当前进程的 node），启用后该项将变为 **`✓`**；停用执行 `node scripts/codex/drain-service.mjs --disable --apply`。单元里的 node 后来被清掉时，这一项会报 stale 并点出那个路径。
 - **`hook 信任（Codex 侧）`**：显示为 **`?`**。Codex 的 hook 安全确认需人工在交互界面核准，命令行无法代劳。
 
 除上述已知 `?` 外，其余项在正式投入使用前均应为 `✓`。

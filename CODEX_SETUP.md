@@ -271,6 +271,13 @@ node scripts/codex/drain-service.mjs --disable --apply
 ```
 
 > **说明**：启用前会自动执行门槛检查（运行时完整性、链路预检、历史积压是否已分类等）。若 outbox 存在未分类的历史待发内容，必须先通过 `scripts/codex/suppress-outbox.mjs` 确认是发还是停，再行启用。
+>
+> **Linux 前置：一个不带版本号的 node。**系统定时器（systemd / launchd）不继承交互 shell 的 PATH，
+> 所以单元里的 `ExecStart` 写的是 node 的**绝对路径**。Linux 上必须能解析到「不带版本号」的那个：
+> mise shim（`~/.local/share/mise/shims/node`）优先，其次 `PATH` / `/usr/local/bin` / `~/.local/bin`，
+> 也可以用 `FEISHU_BRIDGE_NODE` 显式指定。**解不出来就拒绝启用**（不会退回当前进程的 node ——
+> 那通常是 `installs/<版本>/bin/node`，升级清掉之后定时器会静默失效）。
+> 同一个判据也在状态里：若单元里的 node 已经不存在，`drain-service.mjs` 与 `doctor:codex` 会把它报为 stale 并点出那个路径。
 
 卸载 hooks、技能及定时器单元：
 
@@ -279,7 +286,9 @@ node scripts/codex/install.mjs --uninstall
 node scripts/codex/install.mjs --uninstall --apply
 ```
 
-若在 Linux 上启用了 systemd 定时器，`install.mjs --uninstall --apply` 会按纪律先停用再删除单元文件并 reload。卸载不会删除 `~/.codex/feishu-bridge/` 中的 registry、话题映射和历史回执，便于审计或恢复。
+若在 Linux 上启用了 systemd 定时器，`install.mjs --uninstall --apply` 会按纪律先停用再删除单元文件并 reload。
+**单元文件已经丢了但 systemd 里还记着**的情况（孤儿 timer）也会被收掉，不需要手工 `systemctl --user disable`。
+卸载不会删除 `~/.codex/feishu-bridge/` 中的 registry、话题映射和历史回执，便于审计或恢复。
 
 ## 已知边界
 

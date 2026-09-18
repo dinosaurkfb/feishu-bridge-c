@@ -382,7 +382,8 @@
       "systemdShowExecArgv",
       "systemdUnitAbsent",
       "timerKindFor",
-      "timerPlatform"
+      "timerPlatform",
+      "unitFirstArg"
     ],
     "install-surface-lock.mjs": [
       "INSTALL_SURFACE_LOCK_ENV",

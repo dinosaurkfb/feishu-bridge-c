@@ -151,8 +151,9 @@ function main() {
   });
   if (r.status === "dry_run") {
     const text = composeDigest(r.selected, { taskName: task.task_display_name });
+    const agentName = resolved.template.transport_agent_name || "运输 agent";
     console.log("task   " + task.task_display_name + "  " + task.logical_task_key);
-    console.log("身份   " + resolved.template.transport_agent_name + "（单 M5Codex）");
+    console.log("身份   " + agentName + "（单 " + agentName + "）");
     console.log("待发布 " + r.count + " 条（" + r.batches.length + " 张卡）\n\n---\n" + text + "\n---");
     // **打印完整可执行命令**：含脚本路径与 selector，过 shellQuote。
     // 提示指向的操作做不到它说的事 —— 这个坑踩过不止一次，所以整条给全。

@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   bindingToken, composeRootMessage, composeStatusMessage, idempotencyKeyFor, readProjectIdentity,
 } from "../bind-compose.mjs";
-import { findActiveThreadsForRoot, logicalTaskKeyFor } from "./state.mjs";
+import { findActiveThreadsForRoot, loadCodexTemplate, logicalTaskKeyFor } from "./state.mjs";
 import { readCodexThreadTitle } from "./thread-title.mjs";
 
 export function validThreadId(value) {
@@ -49,8 +49,18 @@ export function resolveThreadId({ explicit, root }) {
   return { ok: true, threadId: active[0].thread_id, source: "current-hook-lease" };
 }
 
+function readDefaultTransportAgentName() {
+  try {
+    const loaded = loadCodexTemplate();
+    return loaded?.ok ? (loaded.template?.transport_agent_name ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function composeCodexBinding({
   root, threadId, nameOverride, threadDescriptions, globalStateFile, idempotencyScope,
+  transportAgentName, template,
 }) {
   const identity = readProjectIdentity({ root });
   const bindingIdentity = root + "\n" + threadId;
@@ -67,6 +77,9 @@ export function composeCodexBinding({
   // 短码必须在首行可见：即使 Desktop 标题拿不到，同仓库的两个 task 也不会再长得一样。
   const heading = !nameOverride && !taskTitle ? name : name + " · " + token;
   const logicalTaskKey = logicalTaskKeyFor(root, threadId);
+  const agentName = (typeof transportAgentName === "string" && transportAgentName.trim())
+    ? transportAgentName.trim()
+    : (template?.transport_agent_name?.trim() || readDefaultTransportAgentName() || "运输 agent");
   return {
     root,
     threadId,
@@ -85,10 +98,10 @@ export function composeCodexBinding({
     ),
     rootText: composeRootMessage({ name, heading, purpose: identity.purpose, root, token }),
     statusText: composeStatusMessage({ name })
-      .replace("在这条消息下面 @ 一下运输 agent", "在这条消息下面真实 @M5Codex")
+      .replace("在这条消息下面 @ 一下运输 agent", "在这条消息下面真实 @" + agentName)
       .replace(
         "绑完之后，在这个话题里说话就是给 " + name + " 下指令。",
-        "绑完之后，在这个话题里真实 @M5Codex，mention 后的正文就是给 " + name +
+        "绑完之后，在这个话题里真实 @" + agentName + "，mention 后的正文就是给 " + name +
           " 的指令，不需要额外关键字。",
       ),
   };

@@ -57,7 +57,7 @@ const mask = (value) => {
 console.log("模板      " + templateFile());
 console.log("运行时    codex");
 console.log("唯一身份  " + transportName);
-console.log("入站关键字  无（真实 @M5Codex 后的正文直接作为指令）");
+console.log("入站关键字  无（真实 @" + transportName + " 后的正文直接作为指令）");
 for (const field of ["agent_uid", "transport_app_id", "transport_open_id", "frank_sender_id", "chat_id"]) {
   console.log("  " + (template[field] ? "✓ " + field + " = " + mask(template[field]) : "✗ " + field + " 缺"));
 }

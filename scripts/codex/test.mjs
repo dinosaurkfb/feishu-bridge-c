@@ -3054,14 +3054,28 @@ test("安装器预览的待迁移数必须等于实际会改的数", () => {
 test("绑定预览为同一 thread 生成稳定逻辑键与平台幂等键", () => {
   const dir = temp();
   fs.writeFileSync(path.join(dir, "README.md"), "# Demo\n\n一个演示项目。\n");
-  const a = composeCodexBinding({ root: dir, threadId: THREAD_A });
-  const b = composeCodexBinding({ root: dir, threadId: THREAD_A });
+  const a = composeCodexBinding({ root: dir, threadId: THREAD_A, template: TEMPLATE });
+  const b = composeCodexBinding({ root: dir, threadId: THREAD_A, template: TEMPLATE });
   assert.equal(a.logicalTaskKey, b.logicalTaskKey);
   assert.equal(a.idempotencyKey, b.idempotencyKey);
   assert.equal(a.rootText.includes(THREAD_A), false, "根消息不暴露 Codex locator");
   assert.equal(a.statusText.includes("真实 @M5Codex"), true);
   assert.equal(a.statusText.includes("不需要额外关键字"), true);
   assert.equal(a.statusText.includes("运输 agent"), false);
+
+  // PK3-A2: 无模板/缺 transport_agent_name 时退回中性词「运输 agent」，不退回 M5Codex
+  const fallback = composeCodexBinding({ root: dir, threadId: THREAD_A });
+  assert.equal(fallback.statusText.includes("真实 @运输 agent"), true);
+  assert.equal(fallback.statusText.includes("M5Codex"), false);
+
+  // PK3-A2: omm 模板 transport_agent_name=mmcdx 时生成 @mmcdx，不含 M5Codex
+  const mmcdx = composeCodexBinding({
+    root: dir,
+    threadId: THREAD_A,
+    template: { ...TEMPLATE, transport_agent_name: "mmcdx", outbound_agent_name: "mmcdx" },
+  });
+  assert.equal(mmcdx.statusText.includes("真实 @mmcdx"), true);
+  assert.equal(mmcdx.statusText.includes("M5Codex"), false);
 });
 
 test("绑定目标默认沿用机器群，显式跨群时要求 chat-id 并隔离平台幂等域", () => {
@@ -9538,6 +9552,76 @@ test("Codex 真入口：off-template mismatch + 无 @ → 拒绝回执带诊断 
   const noChannel = run({});
   assert.match(noChannel.stdout, /没有真实 @ M5Codex/u, noChannel.stdout);
   assert.doesNotMatch(noChannel.stdout, /诊断：/u, "env 缺失连 hint 都不加：" + noChannel.stdout);
+});
+
+test("PK3-A2: inbound 拒因文案在 transport_agent_name=mmcdx 模板下包含 @mmcdx 且不含 M5Codex", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(root); fs.mkdirSync(bin);
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "abc123" });
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const mmcdxTemplate = {
+    ...TEMPLATE,
+    transport_agent_name: "mmcdx",
+    outbound_agent_name: "mmcdx",
+  };
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(mmcdxTemplate));
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node", "process.stdout.write(process.env.FAKE_AILY_ENVELOPE);"].join("\n") + "\n", { mode: 0o700 });
+  const envelope = JSON.stringify({ envelopes: [{ type: "message.create", payload: JSON.stringify({ message: {
+    id: "msg_mmcdx_1", sessionID: "aily_unbound_p2p", role: "user", createdBy: mmcdxTemplate.frank_sender_id,
+    createdAtMs: Date.now(), content: "能收到吗（没有 @）",
+  } }) }] });
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs")], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
+      AILY_CLI_CALLER_AGENT_UID: mmcdxTemplate.agent_uid, AILY_CLI_SESSION_ID: "aily_unbound_p2p", AILY_CLI_RUN_ID: "run_mmcdx", FAKE_AILY_ENVELOPE: envelope },
+  });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /没有真实 @ mmcdx/u, "拒因应使用 mmcdx：" + r.stdout);
+  assert.equal(r.stdout.includes("M5Codex"), false, "拒因不许出现硬编码 M5Codex：" + r.stdout);
+});
+
+test("PK3-A2: bind-preview 在 transport_agent_name=mmcdx 模板下包含 @mmcdx 且不含 M5Codex；Mac 模板输出 @M5Codex", () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, "README.md"), "# Demo\n\n一个演示项目。\n");
+  const mmcdxTemplate = {
+    ...TEMPLATE,
+    transport_agent_name: "mmcdx",
+    outbound_agent_name: "mmcdx",
+  };
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(mmcdxTemplate));
+  const r = spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "bind-preview.mjs"),
+    "--project", root,
+    "--thread-id", THREAD_A,
+  ], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
+  });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /入站关键字\s+无（只需真实 @mmcdx）/u, "CLI 提示应使用 mmcdx：" + r.stdout);
+  assert.match(r.stdout, /在这条消息下面真实 @mmcdx/u, "状态卡片应使用 mmcdx：" + r.stdout);
+  assert.match(r.stdout, /在这个话题里真实 @mmcdx/u, "状态卡片应使用 mmcdx：" + r.stdout);
+  assert.equal(r.stdout.includes("M5Codex"), false, "mmcdx 模板输出不许出现硬编码 M5Codex：" + r.stdout);
+
+  // Mac 模板（TEMPLATE，transport_agent_name=M5Codex）输出不变
+  const homeMac = temp();
+  fs.writeFileSync(path.join(homeMac, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const rMac = spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "bind-preview.mjs"),
+    "--project", root,
+    "--thread-id", THREAD_A,
+  ], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: homeMac },
+  });
+  assert.equal(rMac.status, 0, rMac.stdout + rMac.stderr);
+  assert.match(rMac.stdout, /入站关键字\s+无（只需真实 @M5Codex）/u, "Mac 模板应使用 M5Codex：" + rMac.stdout);
+  assert.match(rMac.stdout, /在这条消息下面真实 @M5Codex/u, "Mac 模板状态卡片应使用 M5Codex：" + rMac.stdout);
+  assert.equal(rMac.stdout.includes("运输 agent"), false, "Mac 模板不许出现未解析回退词：" + rMac.stdout);
 });
 
 // ─── 第 3 层：飞书正文里的 $feishu-mode 由入站路由器当场执行 ───────────────────────

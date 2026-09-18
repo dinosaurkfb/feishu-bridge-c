@@ -110,6 +110,8 @@ const HOME = bridgeHome();
 let receiptDir = path.join(HOME, "receipts");
 // 采样旁路文件：机器级 codex inbound 目录（跟随 FEISHU_CODEX_BRIDGE_HOME）。
 const CHANNEL_SAMPLES_FILE = path.join(HOME, "inbound", "channel-samples.jsonl");
+const template = loadCodexTemplate();
+const transportAgentName = template.ok ? (template.template.transport_agent_name || "运输 agent") : "运输 agent";
 
 function writeReceipt(name, payload) {
   try {
@@ -141,7 +143,7 @@ const REASON_TEXT = {
   duplicate_pending_binding_token: "多个待绑定 Codex task 使用同一绑定码，无法确定目标",
   pending_binding_expired: "等待绑定已过期，需要重新执行接入",
   sender_not_frank: "发送者不是授权用户",
-  transport_not_mentioned: "没有真实 @ M5Codex",
+  transport_not_mentioned: "没有真实 @ " + transportAgentName,
   stale_message: "消息超出时效窗口",
   malformed_event: "消息信封字段不完整",
 };
@@ -261,7 +263,7 @@ function ackText(kind, detail) {
   if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
   if (kind === "bound") return [
     "绑定完成 · " + detail.taskName,
-    "这个话题现在精确通向一个 Codex task。之后在这里 @ M5Codex 即可续接。",
+    "这个话题现在精确通向一个 Codex task。之后在这里 @ " + transportAgentName + " 即可续接。",
   ].join("\n");
   if (kind === "control") return detail.text;
   if (kind === "rejected") return [
@@ -301,7 +303,6 @@ function finish(kind, detail, _result) {
 }
 
 const dryRun = process.argv.includes("--dry-run");
-const template = loadCodexTemplate();
 if (!template.ok) {
   writeReceipt("template-" + Date.now(), { status: "error", reason: template.reason });
   finish("error", { detail: "Codex 单智能体链路模板不可用（" + template.reason + "）" },
@@ -314,7 +315,7 @@ if (callerAgent !== template.template.agent_uid) {
   writeReceipt("wrong-agent-" + Date.now(), {
     status: "rejected", reason: "caller_agent_mismatch", claim_acquired: false, handed_off: false,
   });
-  finish("rejected", { reasonText: "调用方不是本链路配置的 M5Codex", taskName: null },
+  finish("rejected", { reasonText: "调用方不是本链路配置的 " + transportAgentName, taskName: null },
     { reason: "caller_agent_mismatch" });
 }
 

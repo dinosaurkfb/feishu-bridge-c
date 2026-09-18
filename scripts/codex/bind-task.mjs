@@ -45,12 +45,15 @@ const intent = requireIntent({
     name: arg("name") ?? null }),
   home: bridgeHome() });
 if (!intent.ok) die(intent.text);
+const tpl = loadCodexTemplate();
+const transportAgentName = tpl.ok ? (tpl.template?.transport_agent_name || "运输 agent") : "运输 agent";
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
 if (existing.ok) {
   if ((existing.task.status ?? "active") === "active") {
     const awaitingFirstMention = existing.task.inbound_state === "pending" && !existing.task.session_id;
     const d = composeCodexBinding({
       root: existing.task.root, threadId: thread.threadId, nameOverride: arg("name"),
+      template: tpl.ok ? tpl.template : undefined,
     });
     if (awaitingFirstMention && !apply) {
       console.log("这个 Codex task 已建好原话题，但首次 mention 的握手窗口需要刷新。");
@@ -61,7 +64,7 @@ if (existing.ok) {
       const refreshed = refreshPendingTaskBinding({ threadId: thread.threadId });
       if (!refreshed.ok) die("刷新首次绑定窗口失败：" + refreshed.reason +
         (refreshed.error ? "（" + refreshed.error + "）" : ""));
-      console.log("已复用原话题并刷新首次绑定窗口；请在该话题真实 @ M5Codex 完成绑定。");
+      console.log("已复用原话题并刷新首次绑定窗口；请在该话题真实 @ " + transportAgentName + " 完成绑定。");
     }
     if (existing.task.task_display_name === d.name) {
       if (!awaitingFirstMention) {
@@ -77,7 +80,6 @@ if (existing.ok) {
       console.log("[dry-run] 没有编辑飞书消息，也没有修改登记表。加 --apply 才执行。");
       process.exit(0);
     }
-    const tpl = loadCodexTemplate();
     if (!tpl.ok) die("Codex 单智能体模板不可用（" + tpl.reason + "）");
     const identity = resolveLarkIdentity(tpl.template);
     try {
@@ -92,7 +94,7 @@ if (existing.ok) {
     } catch (err) {
       if (awaitingFirstMention) {
         console.error("首次绑定窗口已刷新，但旧话题标题无法同步：" + err.message);
-        console.error("这不影响在原话题完成首次 @M5Codex 握手。");
+        console.error("这不影响在原话题完成首次 @" + transportAgentName + " 握手。");
         process.exit(0);
       }
       die("旧话题改名失败，登记表没有修改：" + err.message);
@@ -136,7 +138,6 @@ if (existing.ok) {
   console.log("已恢复当前 Codex task 的飞书接入，继续使用原话题。");
   process.exit(0);
 }
-const tpl = loadCodexTemplate();
 if (!tpl.ok) die("Codex 单智能体模板不可用（" + tpl.reason + "）");
 const target = resolveBindingTarget({
   template: tpl.template,
@@ -149,6 +150,7 @@ const d = composeCodexBinding({
   threadId: thread.threadId,
   nameOverride: arg("name"),
   idempotencyScope: target.overridden ? target.chatId : undefined,
+  template: tpl.template,
 });
 
 console.log("任务      " + d.name + "  " + d.logicalTaskKey);
@@ -217,4 +219,4 @@ if (!lr.ok) {
 // #R37 P1-4：legacy 已提交但 shadow 镜像不干净 → 持久机器回执（不谎报 clean）。
 const bindUnclean = uncleanWired(wired);
 if (!bindUnclean.clean) emitUncleanReceipt("cli_bind_task", wired, { receiptDir: path.join(bridgeHome(), "receipts") });
-console.log("已接入并发布状态回复。去新话题真实 @ M5Codex 一下完成绑定；后续不需要关键字前缀。");
+console.log("已接入并发布状态回复。去新话题真实 @ " + transportAgentName + " 一下完成绑定；后续不需要关键字前缀。");

@@ -38,13 +38,19 @@ if (!tpl.ok) {
   console.error("Codex 单智能体模板不可用（" + tpl.reason + "）：" + tpl.file);
   process.exit(1);
 }
-const d = composeCodexBinding({ root, threadId: thread.threadId, nameOverride: arg("name") });
+const transportAgentName = tpl.template.transport_agent_name || "运输 agent";
+const d = composeCodexBinding({
+  root,
+  threadId: thread.threadId,
+  nameOverride: arg("name"),
+  template: tpl.template,
+});
 console.log("任务      " + d.name + "  " + d.logicalTaskKey);
 console.log("项目      " + root);
 console.log("Codex     " + displayThread(thread.threadId) + "（来源 " + thread.source + "）");
 console.log("群        " + tpl.template.chat_name);
 console.log("唯一身份  " + tpl.template.transport_agent_name);
-console.log("入站关键字  无（只需真实 @M5Codex）");
+console.log("入站关键字  无（只需真实 @" + transportAgentName + "）");
 console.log("\n--- 根消息（长期稳定）---\n" + d.rootText);
 console.log("\n--- 底下第一条 ---\n" + d.statusText);
 console.log("\n这条命令没有写文件、没有联网、没有发送。运行 bind-task.mjs --apply 可执行绑定。");

@@ -58336,6 +58336,18 @@ test("PK3-T3 单元：逐用例边界 checkBoundary 核验并在命中时记录�
   }
 });
 
+// PK3-T3-fix4：子进程集成用例不再靠 FEISHU_BRIDGE_SURFACE_GUARD_HOME 改根（boot 已不读任何环境变量）；
+// 改为生成一个显式注入 home 的引导垫片，作为子进程入口的第一条 import——验证的仍是「第一条 import 先于一切
+// 副作用模块建立基线」这条 ESM 顺序性质。
+function writeSurfaceBootShim(dir, home) {
+  const shim = path.join(dir, "surface-boot-shim.mjs");
+  fs.writeFileSync(shim, `
+import { installSurfaceGuard } from ${JSON.stringify(path.resolve("scripts/test-support/install-surface-guard.mjs"))};
+export const bootGuard = installSurfaceGuard({ home: ${JSON.stringify(home)} });
+`);
+  return shim;
+}
+
 test("PK3-T3 集成（子进程 + 注册器）：用例写注入的权威文件 → 套件非 0 退出并点名肇事用例", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-harness-"));
   try {
@@ -58547,9 +58559,10 @@ fs.writeFileSync(${JSON.stringify(mockAuthFile)}, '{"chain":"polluted-at-import-
 `);
 
     const runnerScript = path.join(tmp, "test-runner.mjs");
+    const bootShim = writeSurfaceBootShim(tmp, tmpHome);
     fs.writeFileSync(runnerScript, `
-// 第一项 import 必须是 install-surface-boot.mjs
-import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+// 第一项 import 必须是引导垫片（显式注入 home 的卫兵，等价于正式入口的 install-surface-boot.mjs）
+import ${JSON.stringify(bootShim)};
 // 后续 import 是具有写盘副作用的产品模块
 import ${JSON.stringify(fakeProductModule)};
 
@@ -58558,7 +58571,7 @@ process.exit(0);
 `);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
-      env: { ...process.env, HOME: tmpHome, FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome },
+      env: { ...process.env, HOME: tmpHome },
       encoding: "utf-8",
     });
 
@@ -58579,9 +58592,10 @@ test("PK3-T3-fix2 集成（子进程 + EACCES 反例）：权威文件被 chmod 
     fs.writeFileSync(mockAuthFile, '{"routes":[]}');
 
     const runnerScript = path.join(tmp, "eacces-runner.mjs");
+    const bootShim = writeSurfaceBootShim(tmp, tmpHome);
     const scriptSrc = `
 import fs from "node:fs";
-import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+import ${JSON.stringify(bootShim)};
 
 const mockFile = ${JSON.stringify(mockAuthFile)};
 // 模拟测试过程中文件权限变为不可读
@@ -58592,7 +58606,7 @@ process.exit(0);
     fs.writeFileSync(runnerScript, scriptSrc);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
-      env: { ...process.env, HOME: tmpHome, FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome },
+      env: { ...process.env, HOME: tmpHome },
       encoding: "utf-8",
     });
 
@@ -58614,9 +58628,10 @@ test("PK3-T3-fix2 集成（子进程 + touched 反例）：同字节重写/utime
     fs.writeFileSync(mockAuthFile, '{"subscriptions":[]}');
 
     const runnerScript = path.join(tmp, "touched-runner.mjs");
+    const bootShim = writeSurfaceBootShim(tmp, tmpHome);
     const scriptSrc = `
 import fs from "node:fs";
-import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+import ${JSON.stringify(bootShim)};
 
 const mockFile = ${JSON.stringify(mockAuthFile)};
 // 同字节重写，仅更新 mtime
@@ -58628,7 +58643,7 @@ process.exit(0);
     fs.writeFileSync(runnerScript, scriptSrc);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
-      env: { ...process.env, HOME: tmpHome, FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome },
+      env: { ...process.env, HOME: tmpHome },
       encoding: "utf-8",
     });
 
@@ -58640,44 +58655,115 @@ process.exit(0);
   }
 });
 
-test("PK3-T3-fix3 集成（子进程 + P1 变量旁路反例）：设置 FEISHU_BRIDGE_SURFACE_GUARD_FILES 指向别处，boot 仍守真实清单", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-bypass-"));
+test("PK3-T3-fix4 单元：resolveAuthoritativePaths 默认只认 os.userInfo().homedir，FEISHU_BRIDGE_SURFACE_GUARD_HOME / _FILES 环境变量一律无效", () => {
+  const saved = {
+    home: process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME,
+    files: process.env.FEISHU_BRIDGE_SURFACE_GUARD_FILES,
+  };
+  const decoyHome = path.join(os.tmpdir(), "pk3-t3-fix4-decoy-home-" + process.pid);
+  try {
+    process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME = decoyHome;
+    process.env.FEISHU_BRIDGE_SURFACE_GUARD_FILES = path.join(decoyHome, "decoy.json");
+    const resolved = resolveAuthoritativePaths();
+    const realHome = os.userInfo().homedir;
+    assert.equal(resolved.length, DEFAULT_AUTHORITATIVE_FILES.length);
+    for (const p of resolved) {
+      assert.ok(p.startsWith(realHome + path.sep), "默认根必须是 os.userInfo().homedir：" + p);
+      assert.ok(!p.startsWith(decoyHome), "环境变量不得改根：" + p);
+    }
+    assert.ok(!resolved.some((p) => p.endsWith("decoy.json")), "环境变量不得改清单");
+  } finally {
+    if (saved.home === undefined) delete process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME; else process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME = saved.home;
+    if (saved.files === undefined) delete process.env.FEISHU_BRIDGE_SURFACE_GUARD_FILES; else process.env.FEISHU_BRIDGE_SURFACE_GUARD_FILES = saved.files;
+  }
+});
+
+test("PK3-T3-fix4 集成（子进程 + 真实 boot + 残留变量反例）：设了 _HOME/_FILES 指向临时目录，boot 仍守真实家目录（只读快照，不写真实安装面）", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-envroot-"));
   try {
     const tmpHome = path.join(tmp, "home");
-    const mockAuthFile = path.join(tmpHome, ".claude", "feishu-bridge", "chain-config.json");
-    fs.mkdirSync(path.dirname(mockAuthFile), { recursive: true });
-    fs.writeFileSync(mockAuthFile, '{"chain":"original"}');
+    const decoyAuthFile = path.join(tmpHome, ".claude", "feishu-bridge", "chain-config.json");
+    fs.mkdirSync(path.dirname(decoyAuthFile), { recursive: true });
+    fs.writeFileSync(decoyAuthFile, '{"chain":"decoy-original"}');
+    const decoyListFile = path.join(tmp, "decoy-list.json");
+    fs.writeFileSync(decoyListFile, '{"decoy":true}');
 
-    // 企图通过 FEISHU_BRIDGE_SURFACE_GUARD_FILES 旁路真实清单、指向一个不会被改动的替罪羊文件
-    const decoyFile = path.join(tmp, "decoy-never-modified.json");
-    fs.writeFileSync(decoyFile, '{"decoy":true}');
-
-    const runnerScript = path.join(tmp, "bypass-runner.mjs");
-    const scriptSrc = `
+    const runnerScript = path.join(tmp, "envroot-runner.mjs");
+    fs.writeFileSync(runnerScript, `
 import fs from "node:fs";
-import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
-
-const mockFile = ${JSON.stringify(mockAuthFile)};
-// 测试中篡改了真实清单中的权威文件
-fs.writeFileSync(mockFile, '{"chain":"tampered-auth-file"}');
-
-process.exit(0);
-`;
-    fs.writeFileSync(runnerScript, scriptSrc);
+import { bootGuard } from ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+// 子进程只改临时目录里的替身文件；真实安装面只读快照、绝不写
+fs.writeFileSync(${JSON.stringify(decoyAuthFile)}, '{"chain":"decoy-tampered"}');
+process.stdout.write("TARGETS " + JSON.stringify(bootGuard.targetPaths) + "\\n");
+`);
 
     const sp = spawnSync(process.execPath, [runnerScript], {
       env: {
         ...process.env,
         HOME: tmpHome,
-        FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome,
-        FEISHU_BRIDGE_SURFACE_GUARD_FILES: decoyFile, // 企图旁路
+        FEISHU_BRIDGE_SURFACE_GUARD_HOME: tmpHome, // 残留变量：企图把卫兵指向临时目录
+        FEISHU_BRIDGE_SURFACE_GUARD_FILES: decoyListFile, // 残留变量：企图换清单
       },
       encoding: "utf-8",
     });
 
-    assert.notEqual(sp.status, 0, "即使设了 FEISHU_BRIDGE_SURFACE_GUARD_FILES，卫兵仍必须监控真实清单并拦截改动（实际：" + sp.status + "）");
-    assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
-    assert.match(sp.stderr, /chain-config\.json/);
+    const m = /^TARGETS (.*)$/m.exec(sp.stdout);
+    assert.ok(m, "子进程必须打印卫兵目标清单（stdout：" + sp.stdout + " stderr：" + sp.stderr + "）");
+    const targets = JSON.parse(m[1]);
+    const realHome = os.userInfo().homedir;
+    assert.equal(targets.length, DEFAULT_AUTHORITATIVE_FILES.length);
+    for (const p of targets) {
+      assert.ok(p.startsWith(realHome + path.sep), "boot 的监控根必须是真实家目录：" + p);
+      assert.ok(!p.startsWith(tmp), "残留变量不得把卫兵指向临时目录：" + p);
+    }
+    // 替身文件被改了，但它不在真实清单里 → 卫兵不该报硬门；真实安装面未动 → 退出 0 且打通过行
+    assert.equal(sp.status, 0, "真实安装面未动，退出码必须为 0（stderr：" + sp.stderr + "）");
+    assert.doesNotMatch(sp.stderr, /安装面硬门/);
+    assert.match(sp.stdout, /安装面卫兵 : 7 个权威文件与启动时一致/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix4 结构：三个正式套件入口的第一条 import 都是 install-surface-boot.mjs", () => {
+  const entries = ["scripts/test.mjs", "scripts/codex/test.mjs", "scripts/linux-install.test.mjs"];
+  for (const entry of entries) {
+    const src = fs.readFileSync(path.resolve(entry), "utf-8");
+    const firstImport = src.split("\n").find((line) => /^\s*import\b/.test(line));
+    assert.ok(firstImport, entry + " 必须有 import");
+    assert.match(firstImport, /install-surface-boot\.mjs["']/, entry + " 的第一条 import 必须是安装面卫兵引导模块，实际：" + firstImport);
+  }
+});
+
+test("PK3-T3-fix4 单元（注入 files）：符号链接同目标重建（unlink + symlink 同一目标）→ 判 touched 且 changed: true", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-symlink-rebuild-"));
+  try {
+    const target = path.join(tmp, "versions", "abc");
+    fs.mkdirSync(target, { recursive: true });
+    const link = path.join(tmp, "current");
+    fs.symlinkSync(target, link);
+    // 把链接本身的时间戳拨到过去，重建后的新链接必然拿到"现在"
+    const past = 1700000000;
+    fs.lutimesSync(link, past, past);
+
+    const guard = installSurfaceGuard({ files: [link], registerExitHook: false });
+    try {
+      assert.equal(guard.check().changed, false, "未动之前必须 changed: false");
+      fs.unlinkSync(link);
+      fs.symlinkSync(target, link);
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "同目标重建必须判 changed: true（目标没变不能假绿）");
+      assert.equal(res.diffs.length, 1);
+      const d = res.diffs[0];
+      assert.equal(d.kind, "touched");
+      assert.equal(d.symlinkTarget, target);
+      assert.equal(d.beforeSha, d.afterSha, "目标未变 → sha 相同");
+      assert.notEqual(d.beforeMtimeNs, d.mtimeNs, "mtimeNs 必须不同");
+      assert.match(guard.formatErrorReport(res), /sha 未变.*但 mtime 被改动/);
+    } finally {
+      guard.uninstall();
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

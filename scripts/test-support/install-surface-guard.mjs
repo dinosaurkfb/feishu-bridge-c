@@ -18,6 +18,9 @@
  *   回复触发账本更新，导致无辜用例被误报拦截）。安装面卫兵只守护**装机才写**
  *   的静态权威配置与钩子；活账本的自洽性由 doctor 的账本自洽项管。
  *
+ * 监控根只认 os.userInfo().homedir（PK3-T3-fix4：不读任何环境变量，残留变量不能改根；
+ * 测试要换根只能显式传 home / files）。符号链接除目标外也比 lstat mtimeNs：同目标重建算 touched。
+ *
  * 逐用例边界核验：在 harness reclaimSince 旁比对，命中时记录肇事用例名；
  * 汇总 / 退出兜底：重算比对，变了就打「安装面硬门：套件改动了本机安装面」并置退出码非 0。
  * 只报不改、不恢复。
@@ -45,7 +48,9 @@ export function resolveAuthoritativePaths({ home = null, files = null } = {}) {
   if (Array.isArray(files)) {
     return files.map((f) => path.resolve(f));
   }
-  const realHome = home ?? (process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME || os.userInfo().homedir);
+  // PK3-T3-fix4：默认 boot 只认 os.userInfo().homedir，不读任何环境变量——残留变量不得把三个正式入口的
+  // 卫兵指向别处；测试要换根只能显式传 home / files（Codex 三轮 P1）。
+  const realHome = home ?? os.userInfo().homedir;
   return DEFAULT_AUTHORITATIVE_FILES.map((rel) => path.join(realHome, rel));
 }
 
@@ -175,6 +180,26 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
             beforeSha: before.sha,
             afterSha: after.sha,
             mtime: after.mtime,
+            mtimeNs: after.mtimeNs,
+            culprit,
+          });
+        } else if (
+          // PK3-T3-fix4：同目标重建（unlink + symlink 到同一目标）与普通文件同字节重写同口径——
+          // 链接本身的 lstat mtimeNs 变了就算 touched，不因目标未变而假绿（Codex 三轮 P2）。
+          (before.mtimeNs !== undefined && after.mtimeNs !== undefined && before.mtimeNs !== null && after.mtimeNs !== null)
+            ? before.mtimeNs !== after.mtimeNs
+            : before.mtime !== after.mtime
+        ) {
+          diffs.push({
+            path: p,
+            kind: "touched",
+            symlinkTarget: after.symlinkTarget,
+            sha: after.sha,
+            beforeSha: before.sha,
+            afterSha: after.sha,
+            beforeMtime: before.mtime,
+            mtime: after.mtime,
+            beforeMtimeNs: before.mtimeNs,
             mtimeNs: after.mtimeNs,
             culprit,
           });

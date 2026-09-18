@@ -7,6 +7,7 @@
  * v2：标识符全部换到 Aily 命名空间（见 selector.mjs 顶部说明）。
  */
 
+import "./test-support/install-surface-boot.mjs";
 import { CONTROL_MODES, controlAckText, controlIntentProblem, parseControlCommand, readConsumedRecord, RESUMABLE_CONTROL_STATES, resumeControlClaim, inspectControlClaim, runControlTransaction, listControlSidecars, withControlLock, consumedResidue, CONTROL_LOCK_RE, classifyControlLockEntry, inspectControlLockArtifact, normalizeControlText, CONTROL_MODE_WORDS, controlFailedRecordProblem, consumedRecordProblem, readControlCommittedUncleanRecord, controlCommittedUncleanRecordProblem } from "./control-command.mjs";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -418,8 +419,6 @@ if (!registryRoot.ok) {
     " 在 HOME 里 —— 测试登记表必须落在 HOME 之外。");
   process.exit(2);
 }
-// PK3-T3：套件级安装面卫兵 —— 启动时快照真实权威文件哈希，必须在 installTestHomeIsolation 之前
-installSurfaceGuard();
 // PK3-T1：过了上面那道门（拒绝路径不许先造目录）之后、**任何 mkdtemp 之前**，建本轮私有临时根并接管 TMPDIR：
 // 之后所有 os.tmpdir() 派生的东西（含下面的登记表目录、SUITE_HOME、各夹具）都落在这棵树里，
 // 用例结束回收、套件退出整棵清掉。写盘失败也在这里接上翻译（ENOSPC / UNKNOWN → TMPDIR 与剩余空间）。
@@ -58446,6 +58445,190 @@ process.exit(0);
 
     assert.equal(sp.status, 0, "未改动时退出码必须为 0（实际：" + sp.status + "）");
     assert.match(sp.stdout, /安装面卫兵 : 1 个权威文件与启动时一致/, "stdout 必须打印卫兵通过行");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix2 单元（注入 files）：文件 present 变为读取出错（chmod 000 模拟 EACCES）→ 判 unverifiable 且 changed: true", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-unverifiable-"));
+  try {
+    const f1 = path.join(tmp, "auth-file.json");
+    fs.writeFileSync(f1, "valid-content");
+    const guard = installSurfaceGuard({ files: [f1], registerExitHook: false });
+    try {
+      fs.chmodSync(f1, 0o000);
+      const res = guard.check();
+      assert.equal(res.changed, true, "读取出错必须判 changed: true（硬门失败，不能 fail-open）");
+      assert.equal(res.diffs.length, 1);
+      const d = res.diffs[0];
+      assert.equal(d.path, path.resolve(f1));
+      assert.equal(d.kind, "unverifiable");
+      assert.match(d.error, /EACCES/i);
+
+      const errReport = guard.formatErrorReport(res);
+      assert.match(errReport, /安装面硬门：套件改动了本机安装面/);
+      assert.match(errReport, /读取出错无法验证/);
+    } finally {
+      fs.chmodSync(f1, 0o644);
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix2 单元（注入 files）：启动时基线读不出（chmod 000）→ 判 unverifiable 且 changed: true（无法证明，不能绿）", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-baseline-error-"));
+  try {
+    const f1 = path.join(tmp, "unreadable-baseline.json");
+    fs.writeFileSync(f1, "baseline-content");
+    fs.chmodSync(f1, 0o000);
+    const guard = installSurfaceGuard({ files: [f1], registerExitHook: false });
+    try {
+      const res = guard.check();
+      assert.equal(res.changed, true, "基线读不出时必须判 changed: true（无法证明不能绿）");
+      assert.equal(res.diffs.length, 1);
+      assert.equal(res.diffs[0].kind, "unverifiable");
+      assert.match(guard.formatErrorReport(res), /读取出错无法验证/);
+    } finally {
+      fs.chmodSync(f1, 0o644);
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix2 单元（注入 files）：同字节重写/utimes 改动 mtime → 判 touched 且 changed: true", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-touched-"));
+  try {
+    const f1 = path.join(tmp, "auth-file.json");
+    fs.writeFileSync(f1, "same-exact-bytes");
+    const guard = installSurfaceGuard({ files: [f1], registerExitHook: false });
+    try {
+      // 模拟只改 mtime（内容未变，同字节重写或污染后还原）
+      const newTime = new Date(Date.now() + 10000);
+      fs.utimesSync(f1, newTime, newTime);
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "mtime 被改动时 changed 必须为 true（不能 fail-open）");
+      assert.equal(res.diffs.length, 1);
+      const d = res.diffs[0];
+      assert.equal(d.path, path.resolve(f1));
+      assert.equal(d.kind, "touched");
+      assert.equal(d.beforeSha, d.afterSha, "sha 必须相同");
+      assert.notEqual(d.beforeMtime, d.mtime, "mtime 必须不同");
+
+      const errReport = guard.formatErrorReport(res);
+      assert.match(errReport, /安装面硬门：套件改动了本机安装面/);
+      assert.match(errReport, /sha 未变.*但 mtime 被改动/);
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix2 集成（子进程 + import 阶段副作用反例）：假产品模块在 import 阶段写权威文件 → 卫兵先于 import 启动故捕获并退出非 0", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-import-pollution-"));
+  try {
+    const mockAuthFile = path.join(tmp, "mock-chain-config.json");
+    fs.writeFileSync(mockAuthFile, '{"chain":"original"}');
+
+    const fakeProductModule = path.join(tmp, "fake-product-module.mjs");
+    fs.writeFileSync(fakeProductModule, `
+import fs from "node:fs";
+// 假产品模块在 import 顶层求值阶段产生写盘副作用
+fs.writeFileSync(${JSON.stringify(mockAuthFile)}, '{"chain":"polluted-at-import-time"}');
+`);
+
+    const runnerScript = path.join(tmp, "test-runner.mjs");
+    fs.writeFileSync(runnerScript, `
+// 第一项 import 必须是 install-surface-boot.mjs
+import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+// 后续 import 是具有写盘副作用的产品模块
+import ${JSON.stringify(fakeProductModule)};
+
+// 测试正常结束
+process.exit(0);
+`);
+
+    const sp = spawnSync(process.execPath, [runnerScript], {
+      env: { ...process.env, HOME: tmp, FEISHU_BRIDGE_SURFACE_GUARD_FILES: mockAuthFile },
+      encoding: "utf-8",
+    });
+
+    assert.notEqual(sp.status, 0, "import 阶段被污染必须导致非 0 退出（证明快照在 import 之前）（实际：" + sp.status + "）");
+    assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
+    assert.match(sp.stderr, /mock-chain-config\.json/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix2 集成（子进程 + EACCES 反例）：权威文件被 chmod 000 → exit 钩子非 0 退出并打印 unverifiable", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-eacces-"));
+  try {
+    const mockAuthFile = path.join(tmp, "mock-routes.json");
+    fs.writeFileSync(mockAuthFile, '{"routes":[]}');
+
+    const runnerScript = path.join(tmp, "eacces-runner.mjs");
+    const scriptSrc = `
+import fs from "node:fs";
+import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+
+const mockFile = ${JSON.stringify(mockAuthFile)};
+// 模拟测试过程中文件权限变为不可读
+fs.chmodSync(mockFile, 0o000);
+
+process.exit(0);
+`;
+    fs.writeFileSync(runnerScript, scriptSrc);
+
+    const sp = spawnSync(process.execPath, [runnerScript], {
+      env: { ...process.env, HOME: tmp, FEISHU_BRIDGE_SURFACE_GUARD_FILES: mockAuthFile },
+      encoding: "utf-8",
+    });
+
+    fs.chmodSync(mockAuthFile, 0o644);
+    assert.notEqual(sp.status, 0, "不可读文件必须导致非 0 退出（实际：" + sp.status + "）");
+    assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
+    assert.match(sp.stderr, /读取出错无法验证/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-T3-fix2 集成（子进程 + touched 反例）：同字节重写/utimes 改动权威文件 mtime → exit 钩子非 0 退出并打印 touched 报告", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-integ-touched-"));
+  try {
+    const mockAuthFile = path.join(tmp, "mock-subscriptions.json");
+    fs.writeFileSync(mockAuthFile, '{"subscriptions":[]}');
+
+    const runnerScript = path.join(tmp, "touched-runner.mjs");
+    const scriptSrc = `
+import fs from "node:fs";
+import ${JSON.stringify(path.resolve("scripts/test-support/install-surface-boot.mjs"))};
+
+const mockFile = ${JSON.stringify(mockAuthFile)};
+// 同字节重写，仅更新 mtime
+const newTime = new Date(Date.now() + 15000);
+fs.utimesSync(mockFile, newTime, newTime);
+
+process.exit(0);
+`;
+    fs.writeFileSync(runnerScript, scriptSrc);
+
+    const sp = spawnSync(process.execPath, [runnerScript], {
+      env: { ...process.env, HOME: tmp, FEISHU_BRIDGE_SURFACE_GUARD_FILES: mockAuthFile },
+      encoding: "utf-8",
+    });
+
+    assert.notEqual(sp.status, 0, "mtime 变动必须导致非 0 退出（实际：" + sp.status + "）");
+    assert.match(sp.stderr, /安装面硬门：套件改动了本机安装面/);
+    assert.match(sp.stderr, /sha 未变.*但 mtime 被改动/);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

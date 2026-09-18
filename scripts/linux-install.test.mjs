@@ -5,6 +5,7 @@
  * 这里要钉的都是「换到另一台机器上不会静默装错」——错法都很安静：写一个永远不生效的 plist、
  * 把一个不存在的 node 写进 hooks、或者让 lark-cli 去找一个没有密钥的目录。
  */
+import "./test-support/install-surface-boot.mjs";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -12,10 +13,6 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-
-// PK3-T3：套件级安装面卫兵 —— 启动时快照真实权威文件哈希
-import { installSurfaceGuard } from "./test-support/install-surface-guard.mjs";
-installSurfaceGuard();
 
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, resolveTimerPlatform, timerKindFor, timerPlatform, TIMER_PLATFORM_ENV } from "./drain-schedule.mjs";
 import { claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan } from "./install-projection.mjs";

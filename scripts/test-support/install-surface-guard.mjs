@@ -2,15 +2,21 @@
  * PK3-T3：套件级安装面卫兵（issue #233）。
  *
  * 启动时（installTestHomeIsolation 之前，用 os.userInfo().homedir 而非 HOME 取真实家目录）
- * 快照真实 ~/.claude/feishu-bridge 权威文件与 settings / Codex 模板的 sha256：
+ * 快照真实 ~/.claude/feishu-bridge 权威文件与 settings / Codex 模板的 sha256 与 mtime（共 7 个文件）：
  *   1. ~/.claude/feishu-bridge/chain-config.json
- *   2. ~/.claude/feishu-bridge/registry.json
- *   3. ~/.claude/feishu-bridge/routes.json
- *   4. ~/.claude/feishu-bridge/status-providers.json
- *   5. ~/.claude/feishu-bridge/subscriptions.json
- *   6. ~/.claude/feishu-bridge/runtime/current（符号链接目标）
- *   7. ~/.claude/settings.json
- *   8. ~/.codex/feishu-bridge/chain-config.json
+ *   2. ~/.claude/feishu-bridge/routes.json
+ *   3. ~/.claude/feishu-bridge/status-providers.json
+ *   4. ~/.claude/feishu-bridge/subscriptions.json
+ *   5. ~/.claude/feishu-bridge/runtime/current（符号链接目标）
+ *   6. ~/.claude/settings.json
+ *   7. ~/.codex/feishu-bridge/chain-config.json
+ *
+ * 为什么不包含 registry.json（7 个而非 8 个）：
+ *   registry.json 是活账本（出站发布器 / stop hook 每发一条消息就改写 message_count 与
+ *   最后发布时间）。开发机跑测试套件的同时，线上桥服务也在并发运行；若把活账本纳入安装面
+ *   快照，线上桥正常处理消息时的账本写入就会被误判为测试用例"写穿安装面"（曾发生过线上
+ *   回复触发账本更新，导致无辜用例被误报拦截）。安装面卫兵只守护**装机才写**
+ *   的静态权威配置与钩子；活账本的自洽性由 doctor 的账本自洽项管。
  *
  * 逐用例边界核验：在 harness reclaimSince 旁比对，命中时记录肇事用例名；
  * 汇总 / 退出兜底：重算比对，变了就打「安装面硬门：套件改动了本机安装面」并置退出码非 0。
@@ -35,11 +41,16 @@ export const DEFAULT_AUTHORITATIVE_FILES = Object.freeze([
   path.join(".codex", "feishu-bridge", "chain-config.json"),
 ]);
 
-export function resolveAuthoritativePaths({ home = os.userInfo().homedir, files = null } = {}) {
+export function resolveAuthoritativePaths({ home = null, files = null } = {}) {
   if (Array.isArray(files)) {
     return files.map((f) => path.resolve(f));
   }
-  return DEFAULT_AUTHORITATIVE_FILES.map((rel) => path.join(home, rel));
+  const envFiles = process.env.FEISHU_BRIDGE_SURFACE_GUARD_FILES;
+  if (envFiles) {
+    return envFiles.split(path.delimiter).filter(Boolean).map((f) => path.resolve(f));
+  }
+  const realHome = home ?? (process.env.FEISHU_BRIDGE_SURFACE_GUARD_HOME || os.userInfo().homedir);
+  return DEFAULT_AUTHORITATIVE_FILES.map((rel) => path.join(realHome, rel));
 }
 
 export function snapshotFile(filepath) {
@@ -119,7 +130,18 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
   for (const [p, before] of baseline.entries()) {
     const after = current.get(p) ?? snapshotFile(p);
     const culprit = culprits.get(p) ?? null;
-    if (before.state === "absent" && after.state === "present") {
+    if (before.state === "error" || after.state === "error") {
+      diffs.push({
+        path: p,
+        kind: "unverifiable",
+        error: after.error || before.error || "unreadable",
+        beforeSha: before?.sha ?? null,
+        afterSha: after?.sha ?? null,
+        beforeMtime: before?.mtime ?? null,
+        mtime: after?.mtime ?? null,
+        culprit,
+      });
+    } else if (before.state === "absent" && after.state === "present") {
       diffs.push({
         path: p,
         kind: "added",
@@ -169,6 +191,18 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
             kind: "modified",
             beforeSha: before.sha,
             afterSha: after.sha,
+            beforeMtime: before.mtime,
+            mtime: after.mtime,
+            culprit,
+          });
+        } else if (before.mtime !== after.mtime) {
+          diffs.push({
+            path: p,
+            kind: "touched",
+            sha: after.sha,
+            beforeSha: before.sha,
+            afterSha: after.sha,
+            beforeMtime: before.mtime,
             mtime: after.mtime,
             culprit,
           });
@@ -177,15 +211,29 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
     }
   }
   for (const [p, after] of current.entries()) {
-    if (!baseline.has(p) && after.state === "present") {
-      diffs.push({
-        path: p,
-        kind: "added",
-        beforeSha: null,
-        afterSha: after.sha,
-        mtime: after.mtime,
-        culprit: culprits.get(p) ?? null,
-      });
+    if (!baseline.has(p)) {
+      const culprit = culprits.get(p) ?? null;
+      if (after.state === "error") {
+        diffs.push({
+          path: p,
+          kind: "unverifiable",
+          error: after.error || "unreadable",
+          beforeSha: null,
+          afterSha: null,
+          beforeMtime: null,
+          mtime: null,
+          culprit,
+        });
+      } else if (after.state === "present") {
+        diffs.push({
+          path: p,
+          kind: "added",
+          beforeSha: null,
+          afterSha: after.sha,
+          mtime: after.mtime,
+          culprit,
+        });
+      }
     }
   }
   return {
@@ -204,6 +252,11 @@ export function formatErrorReport({ diffs = [] } = {}) {
       const bSha = d.beforeSha ? d.beforeSha.slice(0, 12) : "n/a";
       const aSha = d.afterSha ? d.afterSha.slice(0, 12) : "n/a";
       lines.push("  - " + d.path + "（sha: " + bSha + " → " + aSha + "，mtime: " + (d.mtime ?? "n/a") + culpritPart + "）");
+    } else if (d.kind === "touched") {
+      const sha = d.afterSha ? d.afterSha.slice(0, 12) : (d.beforeSha ? d.beforeSha.slice(0, 12) : "n/a");
+      lines.push("  - " + d.path + "（sha 未变（" + sha + "）但 mtime 被改动: " + (d.beforeMtime ?? "n/a") + " → " + (d.mtime ?? "n/a") + culpritPart + "）");
+    } else if (d.kind === "unverifiable") {
+      lines.push("  - " + d.path + "（读取出错无法验证: " + (d.error ?? "unknown") + culpritPart + "）");
     } else if (d.kind === "symlink_modified") {
       const bSha = d.beforeSha ? d.beforeSha.slice(0, 12) : "n/a";
       const aSha = d.afterSha ? d.afterSha.slice(0, 12) : "n/a";
@@ -248,6 +301,10 @@ export function installSurfaceGuard({
   outErr = (s) => process.stderr.write(s),
   registerExitHook = true,
 } = {}) {
+  // PK3-T3-fix2：若已安装默认卫兵且未传入自定义 files/home，复用已有单例避免重复快照与 exit 钩子
+  if (activeSurfaceGuard && files === null && home === null && registerExitHook) {
+    return activeSurfaceGuard;
+  }
   const realHome = home ?? os.userInfo().homedir;
   const targetPaths = resolveAuthoritativePaths({ home: realHome, files });
   const baseline = takeSurfaceSnapshot(targetPaths);

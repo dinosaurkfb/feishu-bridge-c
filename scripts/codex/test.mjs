@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import "../test-support/install-surface-boot.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -11,8 +12,6 @@ import { moduleRoot } from "../direct-run.mjs";
 // 两套件共用一份注册器（R59）：async 用例拒绝、汇总/退出码一致都在那里
 import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsolation } from "../test-harness.mjs";
 // PK3-T1：本轮临时目录根 + 写盘失败翻译 —— 从 test-support/ 取（不动共用面 test-harness.mjs 的导出）
-// PK3-T3：套件级安装面卫兵
-import { installSurfaceGuard } from "../test-support/install-surface-guard.mjs";
 import { installSuiteTempRoot } from "../test-support/suite-temp-root.mjs";
 import { installWriteDiagnosis } from "../test-support/write-diagnosis.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
@@ -135,9 +134,6 @@ import {
 } from "../dialogue-shadow-readiness.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
-
-// PK3-T3：套件级安装面卫兵 —— 启动时快照真实权威文件哈希，必须在 installTestHomeIsolation 之前
-installSurfaceGuard();
 
 // PK3-T1：**在任何 mkdtemp 之前**建本轮私有临时根并接管 TMPDIR —— 下面那个假 launchctl 目录、
 // 每条用例的夹具、SUITE_HOME 全部落进这棵树；用例结束回收、套件退出整棵清掉。

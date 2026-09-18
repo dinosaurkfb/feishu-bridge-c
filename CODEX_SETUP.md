@@ -96,6 +96,8 @@ node scripts/codex/init-chain-template.mjs \
 模板保存在 `~/.codex/feishu-bridge/chain-config.json`。它包含本机身份与路由信息，不得提交。
 仓库绝对路径也会写入模板；移动仓库后必须重新生成模板并重装 hooks/skills。
 
+> ⚠️ **装机顺序与 bridge_root 维护**：必须**先写模板（第 2 步 init-chain-template），再跑安装器（第 3 步 install.mjs）**。`bridge_root` 由安装器装机时改写为 `runtime/current` 隔离运行时，**不要手工指定 `--bridge-root`**，初始化脚本会明确拒绝该参数。
+
 ## 3. 安装 Codex hooks 和技能
 
 仍然先预览，再安装：

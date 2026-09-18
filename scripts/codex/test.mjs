@@ -5271,6 +5271,142 @@ test("安装器要把模板的 bridge_root 更新到 runtime/current", () => {
   assert.equal(afterCheck.ok, true, "装完必须一致：" + afterCheck.detail);
 });
 
+test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root）退出 2，不写模板", () => {
+  // 卫兵：用例开始时记录真实 ~/.claude/... 与 ~/.codex/... 模板 sha256，结束时断言绝未被修改
+  const realClaudeTpl = path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "chain-config.json");
+  const realClaudeShaBefore = fs.existsSync(realClaudeTpl)
+    ? createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex")
+    : null;
+  const realCodexTpl = path.join(os.userInfo().homedir, ".codex", "feishu-bridge", "chain-config.json");
+  const realCodexShaBefore = fs.existsSync(realCodexTpl)
+    ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
+    : null;
+
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const bridgeHomeDir = path.join(dir, "bridge-home");
+  const tplFile = path.join(bridgeHomeDir, "chain-config.json");
+  const initArgs = [
+    "--agent-uid", "agent_codex_test",
+    "--transport-agent-name", "M5Codex",
+    "--transport-app-id", "cli_test",
+    "--transport-open-id", "ou_test",
+    "--frank-sender-id", "1234567890",
+    "--chat-id", "oc_test123",
+    "--chat-name", "测试群",
+    "--lark-cli-bin", "/bin/lark-cli",
+  ];
+  const env = isolatedEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
+
+  try {
+    // ① --bridge-root x --apply → 退出 2、stderr 含「bridge_root 由安装器维护」、模板未生成
+    const rBridge = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--bridge-root" && arr[k - 1] !== "--bridge-root") /* fix2：去掉同名 flag 再测 */, "--bridge-root", "/custom/path", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rBridge.status, 2, "带 --bridge-root 退出 2：" + rBridge.stdout + rBridge.stderr);
+    assert.match(rBridge.stderr, /不认识的参数：--bridge-root/u);
+    assert.match(rBridge.stderr, /bridge_root 由安装器维护：Codex 链装机时改写为 runtime\/current，Claude 链仅作标志；先写模板再跑安装器/u);
+    assert.ok(!fs.existsSync(tplFile), "模板文件不得生成");
+
+    // ② 既有模板未变：若模板已存在，带 --bridge-root 退出 2 且文件内容一字未动
+    fs.mkdirSync(bridgeHomeDir, { recursive: true });
+    const originalContent = JSON.stringify({ sentinel: "c220-codex-untouched" });
+    fs.writeFileSync(tplFile, originalContent);
+    const rBridgeExisting = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--bridge-root" && arr[k - 1] !== "--bridge-root") /* fix2：去掉同名 flag 再测 */, "--bridge-root", "/custom/path", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rBridgeExisting.status, 2, "已有模板时带 --bridge-root 退出 2：" + rBridgeExisting.stdout + rBridgeExisting.stderr);
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), originalContent, "既有模板内容不得改变");
+    fs.rmSync(tplFile);
+
+    // ③ 未知 flag → 退出 2，且不含 bridge_root 专有提示
+    const rUnknown = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--unknown-arg" && arr[k - 1] !== "--unknown-arg") /* fix2：该 flag 已在 initArgs 里，去掉再测缺值 */, "--unknown-arg", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rUnknown.status, 2, "带未知 flag 退出 2：" + rUnknown.stdout + rUnknown.stderr);
+    assert.match(rUnknown.stderr, /不认识的参数：--unknown-arg/u);
+    assert.doesNotMatch(rUnknown.stderr, /bridge_root 由安装器维护/u);
+    assert.ok(!fs.existsSync(tplFile), "模板文件不得生成");
+
+    // ④ 正常参数 --apply → 退出 0、模板成功生成且 bridge_root 指向 ROOT
+    const rNormal = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--apply" && arr[k - 1] !== "--apply") /* fix2：去掉同名 flag 再测 */, "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rNormal.status, 0, "合法参数成功退出 0：" + rNormal.stdout + rNormal.stderr);
+    assert.ok(fs.existsSync(tplFile), "合法参数模板成功生成");
+    const parsed = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+    assert.equal(parsed.agent_uid, "agent_codex_test");
+    assert.equal(parsed.bridge_root, ROOT);
+    // PK3-C220-fix1 ⑤：`--k=v` 等号形式真正生效（旧 arg() 接受却忽略，仍写 M5Codex）
+    const rEq = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--transport-agent-name" && arr[k - 1] !== "--transport-agent-name") /* PK3-C220-fix2：等号形式单独给，避免与分离形式重复 */, "--transport-agent-name=mmcdx", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rEq.status, 0, "等号形式退出 0：" + rEq.stdout + rEq.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(tplFile, "utf-8")).transport_agent_name, "mmcdx",
+      "--k=v 写入 v（不是默认 M5Codex）");
+    // ⑥ 取值 flag 的下一项是 --apply → 缺值，exit 2、零写
+    const beforeMissing = fs.readFileSync(tplFile, "utf-8");
+    const rMissing = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--lark-cli-profile" && arr[k - 1] !== "--lark-cli-profile") /* fix2：该 flag 已在 initArgs 里，去掉再测缺值 */, "--lark-cli-profile", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rMissing.status, 2, "取值 flag 缺值退出 2：" + rMissing.stdout + rMissing.stderr);
+    assert.match(rMissing.stderr, /--lark-cli-profile 缺值/u, rMissing.stderr);
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeMissing, "缺值拒绝零写入");
+    // ⑦ 取值 flag 在末尾（无下一项）→ 缺值，exit 2
+    const rTail = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--chat-name" && arr[k - 1] !== "--chat-name") /* fix2：去掉同名 flag 再测 */, "--chat-name"],
+      { encoding: "utf-8", env });
+    assert.equal(rTail.status, 2, "末尾缺值退出 2：" + rTail.stdout + rTail.stderr);
+    assert.match(rTail.stderr, /--chat-name 缺值/u, rTail.stderr);
+  } finally {
+    const realClaudeShaAfter = fs.existsSync(realClaudeTpl)
+      ? createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex")
+      : null;
+    assert.equal(realClaudeShaAfter, realClaudeShaBefore, "真实 ~/.claude/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+    const realCodexShaAfter = fs.existsSync(realCodexTpl)
+      ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
+      : null;
+    assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 ~/.codex/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+  }
+});
+
+test("PK3-C220-fix2: codex init 空值与重复 flag → 退出 2、零写（可选字段空串、分离/等号混用重复、--apply --apply）", () => {
+  const realCodexTpl = path.join(os.userInfo().homedir, ".codex", "feishu-bridge", "chain-config.json");
+  const realCodexShaBefore = fs.existsSync(realCodexTpl)
+    ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex") : null;
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const bridgeHomeDir = path.join(dir, "bridge-home");
+  const tplFile = path.join(bridgeHomeDir, "chain-config.json");
+  const initArgs = [
+    "--agent-uid", "agent_codex_test", "--transport-agent-name", "M5Codex", "--transport-app-id", "cli_test",
+    "--transport-open-id", "ou_test", "--frank-sender-id", "1234567890", "--chat-id", "oc_test123", "--chat-name", "测试群", "--lark-cli-bin", "/bin/lark-cli",
+  ];
+  const env = isolatedEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
+  const run = (extra) => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, ...extra], { encoding: "utf-8", env });
+  try {
+    const rEmpty = run(["--lark-cli-config-base", "", "--apply"]);
+    assert.equal(rEmpty.status, 2, "空串应退出 2：" + rEmpty.stdout + rEmpty.stderr);
+    assert.match(rEmpty.stderr, /--lark-cli-config-base 缺值/u);
+    assert.ok(!fs.existsSync(tplFile), "空串不得写模板");
+    const rDup = run(["--frank-sender-id=222", "--apply"]);
+    assert.equal(rDup.status, 2, "重复 flag 应退出 2：" + rDup.stdout + rDup.stderr);
+    assert.match(rDup.stderr, /--frank-sender-id 重复出现/u);
+    assert.ok(!fs.existsSync(tplFile), "重复 flag 不得写模板");
+    const rApply2 = run(["--apply", "--apply"]);
+    assert.equal(rApply2.status, 2, "--apply --apply 应退出 2：" + rApply2.stdout + rApply2.stderr);
+    assert.match(rApply2.stderr, /--apply 重复出现/u);
+    assert.ok(!fs.existsSync(tplFile));
+    const rOk = run(["--apply"]);
+    assert.equal(rOk.status, 0, "合法参数应退出 0：" + rOk.stdout + rOk.stderr);
+    assert.ok(fs.existsSync(tplFile), "合法参数应写模板");
+  } finally {
+    const realCodexShaAfter = fs.existsSync(realCodexTpl)
+      ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex") : null;
+    assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 Codex 模板不得被触碰");
+  }
+});
+
 test("doctor 的 bridge_root 判据不许写成「永远通过」", () => {
   // **判据本身也要被验。**上一版加完之后我做变异，把它改成恒 true —— 全绿。
   // 那说明那条判据当时一条守卫都没有：加了个看起来对的东西，坏了也没人知道。

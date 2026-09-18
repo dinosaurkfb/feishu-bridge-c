@@ -32,24 +32,47 @@ import {
 
 /** 模板认识的全部字段。**派生、命令行覆盖、预览必须用同一个集合**，否则只会改一半。 */
 const TEMPLATE_FIELDS = [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS];
+const CLI_ALLOWED_FIELDS = TEMPLATE_FIELDS.filter((f) => f !== "bridge_root");
 import { moduleRoot } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
+import { parseArgvOptions } from "./argv-options.mjs"; // PK3-C220-fix1：一次解析 argv
 
 const ROOT = moduleRoot(import.meta.url, "..");
-
-const arg = (n) => {
-  const i = process.argv.indexOf("--" + n);
-  return i >= 0 ? process.argv[i + 1] : undefined;
-};
-const apply = process.argv.includes("--apply");
-if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 
 /** 字段名 → 命令行开关名。用短横线是为了敲起来顺手，映射只此一处。 */
 const flagOf = (field) => field.replace(/_/g, "-");
 
+const USAGE = "用法：\n" +
+  "  node scripts/init-chain-template.mjs \\\n" +
+  "    --agent-uid agent_xxx --transport-app-id cli_xxx --transport-open-id ou_xxx \\\n" +
+  "    --frank-sender-id 762... --chat-id oc_xxx --chat-name \"群名\" [--apply]\n\n" +
+  "  node scripts/init-chain-template.mjs --from /path/to/old-project --chat-id oc_xxx [--apply]";
+
+const KNOWN_BOOLEAN_FLAGS = new Set(["--apply"]);
+const KNOWN_VALUE_FLAGS = new Set([
+  "--from",
+  ...CLI_ALLOWED_FIELDS.map((f) => "--" + flagOf(f)),
+]);
+
+// PK3-C220-fix1：argv 一次解析成 options map（等号形式、缺值校验）—— 旧 arg() 只认分离形式：
+// `--k=v` 被白名单接受却被忽略（写默认值）、`--profile --apply` 会把 "--apply" 当值写进去。
+const parsed = parseArgvOptions(process.argv.slice(2),
+  { booleanFlags: KNOWN_BOOLEAN_FLAGS, valueFlags: KNOWN_VALUE_FLAGS });
+if (!parsed.ok) {
+  console.error(parsed.message);
+  if (parsed.kind === "unknown" && parsed.flag === "--bridge-root") {
+    console.error("bridge_root 由安装器维护：Codex 链装机时改写为 runtime/current，Claude 链仅作标志；先写模板再跑安装器");
+  }
+  console.error("\n" + USAGE);
+  process.exit(2);
+}
+const opt = (n) => parsed.options[n];
+const apply = opt("apply") === true;
+if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
+
 // ---------- 1. 先从项目派生（如果指定了） ----------
 
-const from = arg("from");
+const from = opt("from");
 const derived = {};
 const sources = {};
 
@@ -78,7 +101,8 @@ const tpl = { schema_version: "1.0", ...derived };
 // 往 OPTIONAL_CHAIN_FIELDS 里加了字段（如 aily_cli_bin），写入器却接不了，
 // 于是「模板支持这个字段」这句话只在读的那一侧成立。
 for (const f of TEMPLATE_FIELDS) {
-  const v = arg(flagOf(f));
+  if (f === "bridge_root") continue;
+  const v = opt(flagOf(f));
   if (v === undefined) continue;
   // 数字字段要转，否则形状校验会把 "900000" 判成配错（那正是它该做的）。
   tpl[f] = f.endsWith("_ms") ? Number(v) : v;

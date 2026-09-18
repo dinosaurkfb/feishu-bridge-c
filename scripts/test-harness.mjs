@@ -31,6 +31,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { currentSuiteTempRoot, formatSuiteTempReport } from "./test-support/suite-temp-root.mjs";
+
 const isThenable = (v) => v !== null && (typeof v === "object" || typeof v === "function") && typeof v.then === "function";
 
 const isAsyncFunction = (fn) =>
@@ -410,6 +412,9 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
     // 没命中的**不调用 fn()**：被跳过的测试不许留下副作用（夹具会往真 tmp 写东西）。
     if (TEST_FILTER.length > 0 && !TEST_FILTER.some((needle) => name.includes(needle))) return;
     executed += 1;
+    // PK3-T1：记下这条用例开始前临时根里有哪些顶层条目 —— 结束时把**新造的**收回去（用例自己收尾）。
+    const tempRoot = currentSuiteTempRoot();
+    const tempBefore = tempRoot === null ? null : tempRoot.snapshot();
     // R60：tripwire 守卫要点名泄漏源 —— 记录当前正在跑的用例名（finally 清掉，异步逃逸的不背）。
     activeTestName = name;
     let r;
@@ -422,6 +427,9 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
       testErr = err;
     } finally {
       activeTestName = null;
+      // PK3-T1：本用例在临时根里新造的东西，用例结束当场收回（套件退出还有一道兜底）。
+      // 用例之间不许靠临时目录传递状态：真有那种依赖，会在下一条用例里当场红（响亮，不静默）。
+      if (tempRoot !== null) tempRoot.reclaimSince(tempBefore);
       // R60 返修二 P1-2a：核验、恢复、cleanTree 覆盖成功与抛错两路，放进 finally
       const drift = suiteInvariants && typeof suiteInvariants.envDrift === "function" ? suiteInvariants.envDrift() : null;
       const treeHit = suiteInvariants && typeof suiteInvariants.treeProblem === "function" ? suiteInvariants.treeProblem() : null;
@@ -488,6 +496,12 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
       : String(failed);
     console.log((suiteLabel === "" ? "\n" : suiteLabel + " ") +
       "通过 " + passed + " / 失败 " + failedLine + (suiteLabel === "" ? "\n" : ""));
+    // PK3-T1：本轮临时目录的清理报告（清完这棵树，仍留下的按名列出）。
+    const tempRootNow = currentSuiteTempRoot();
+    if (tempRootNow !== null) {
+      const swept = tempRootNow.sweep();
+      console.log(formatSuiteTempReport(swept) + "（根 " + swept.root + "）");
+    }
     if (TEST_FILTER.length > 0) {
       console.log("TEST_FILTER 命中 " + executed + " / 总 " + registered
         + "（子串：" + TEST_FILTER.join(" | ") + "）—— 这不是全量，不许当全量绿");

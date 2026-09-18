@@ -61,6 +61,9 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
+// PK3-T1：本轮临时目录根 + 写盘失败翻译（都在 test-support/ 下：不动共用面 test-harness.mjs 的导出）
+import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
+import { freeBytesOf, installWriteDiagnosis, writeFailureMessage } from "./test-support/write-diagnosis.mjs";
 import { resumeHint, describeStatus as describeStatusCtl } from "./feishu-control.mjs"; // PK2-W3-fix8：恢复提示一处分流
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
 import { resolveDeliveryTargetFromLedger, decideInboundDeliveryTarget, appendShadowDivergenceNote, classifyLedgerAuthority } from "./m1a/delivery-target.mjs"; // R66：入站投递目标解析/判源/决策
@@ -408,7 +411,12 @@ if (!registryRoot.ok) {
     " 在 HOME 里 —— 测试登记表必须落在 HOME 之外。");
   process.exit(2);
 }
-const registryDir = fs.mkdtempSync(path.join(registryRoot.root, "bridge-test-registry-"));
+// PK3-T1：过了上面那道门（拒绝路径不许先造目录）之后、**任何 mkdtemp 之前**，建本轮私有临时根并接管 TMPDIR：
+// 之后所有 os.tmpdir() 派生的东西（含下面的登记表目录、SUITE_HOME、各夹具）都落在这棵树里，
+// 用例结束回收、套件退出整棵清掉。写盘失败也在这里接上翻译（ENOSPC / UNKNOWN → TMPDIR 与剩余空间）。
+const SUITE_TMP = installSuiteTempRoot();
+installWriteDiagnosis();
+const registryDir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-test-registry-"));
 // mkdtemp 保证新建且 0700；这里把这个前提断言出来，而不是默认它成立。
 if (fs.readdirSync(registryDir).length !== 0) {
   console.error("拒绝运行：新建的临时登记表目录不是空的 —— " + registryDir);
@@ -7956,6 +7964,63 @@ test("R60 返修二 P1-2b：HOME 纳入每测不变量——用例改 HOME 不�
   assert.equal(seen[0][0], "改HOME不恢复用例");
   assert.match(String(seen[0][1]), /HOME/u, "why 点名 HOME 漂移：" + seen[0][1]);
   assert.equal(process.env.HOME, savedHome, "套件当前 HOME 已恢复");
+});
+
+// ── PK3-T1：临时目录残留与写盘失败翻译 ────────────────────────────────────────────────────
+// 背景（omm 实测）：夹具到处 mkdtemp(os.tmpdir())，一轮全量在 3.9G tmpfs 上留 ~426MB / 1142 个目录；
+// 两天几轮撑到 80%，而盘满之后 writeFileSync 抛的是 `UNKNOWN: unknown error` —— 看不出是盘满。
+
+test("PK3-T1：夹具新建的临时目录落进**本轮私有临时根**，不散到宿主 TMPDIR", () => {
+  assert.equal(process.env.TMPDIR, SUITE_TMP.root, "TMPDIR 必须指向本轮根");
+  assert.match(path.basename(SUITE_TMP.root), /^feishu-suite-run-\d+-/u, "根名带本轮标记（pid）");
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), "t1-locate-probe-"));
+  assert.ok(probe.startsWith(SUITE_TMP.root + path.sep),
+    "临时目录要落进本轮根（否则退出时清不到）：" + probe + " vs " + SUITE_TMP.root);
+});
+
+const T1_RECLAIM_PROBE = path.join(os.tmpdir(), "t1-reclaim-pin");
+test("PK3-T1 前一条：用例自己造的临时目录（这条写下来，下一条断言已被收回）", () => {
+  fs.rmSync(T1_RECLAIM_PROBE, { recursive: true, force: true });
+  fs.mkdirSync(path.join(T1_RECLAIM_PROBE, "inner"), { recursive: true });
+  fs.writeFileSync(path.join(T1_RECLAIM_PROBE, "inner", "x.json"), "{}");
+  assert.ok(fs.existsSync(T1_RECLAIM_PROBE), "夹具先造出来");
+});
+
+test("PK3-T1 后一条：上一条用例造的临时目录**已被逐用例回收**（用例之间不许靠临时目录传状态）", () => {
+  // 这条依赖"上一条"先跑（注册器顺序执行）。真有人依赖跨用例的临时目录，就会在这里当场红 —— 响亮。
+  assert.equal(fs.existsSync(T1_RECLAIM_PROBE), false, "上一条用例的临时目录该被收回了：" + T1_RECLAIM_PROBE);
+  assert.ok(fs.existsSync(SUITE_TMP.root), "本轮根本身还在（只在套件退出时清）");
+});
+
+test("PK3-T1：写盘失败翻译 —— ENOSPC/低余量 UNKNOWN 带 TMPDIR 与剩余空间；别的错误原样抛", () => {
+  const here = os.tmpdir();
+  assert.equal(freeBytesOf(here) !== null, true, "statfs 读得到剩余空间");
+  const enospc = Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+  const msg = writeFailureMessage(enospc, { target: "/x/y.json", dir: here });
+  assert.match(msg, /像是盘满/u, msg);
+  assert.ok(msg.includes("TMPDIR=" + here), "要点名 TMPDIR：" + msg);
+  assert.match(msg, /剩余 /u, "要带剩余空间：" + msg);
+  // UNKNOWN 只在余量确实低时才敢说"像是盘满"；余量正常时只贴数字，不猜结论。
+  const unknown = Object.assign(new Error("UNKNOWN: unknown error, write"), { code: "UNKNOWN" });
+  assert.match(writeFailureMessage(unknown, { dir: here, free: 1024 }), /像是盘满/u);
+  assert.doesNotMatch(writeFailureMessage(unknown, { dir: here, free: 4 * 1024 * 1024 * 1024 }), /像是盘满/u);
+  // 认不出来的错误 → null（调用方原样抛，不许改标签）
+  assert.equal(writeFailureMessage(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }), { dir: here }), null);
+  // 包装确实装在本进程的 fs 上：非盘满错误原样穿出（不带翻译标记）
+  let denied = null;
+  try { fs.writeFileSync("/t1-no-such-dir/y", "z"); } catch (err) { denied = err; }
+  assert.ok(denied !== null && denied.writeDiagnosis !== true, "非盘满错误不许被改标签：" + String(denied?.message));
+  // 真 ENOSPC：/dev/full 只在 Linux 有（omm 就是在那上面红的）；macOS 跳过并说明。
+  if (fs.existsSync("/dev/full")) {
+    let err = null;
+    try { fs.writeFileSync("/dev/full", "x"); } catch (e) { err = e; }
+    assert.ok(err !== null, "写 /dev/full 必须失败");
+    assert.equal(err.code, "ENOSPC", "原 code 必须保留：" + String(err.message));
+    assert.ok(err.writeDiagnosis === true, "真 ENOSPC 要经过翻译：" + String(err.message));
+    assert.match(String(err.message), /TMPDIR=.*剩余 /u, String(err.message));
+  } else {
+    console.log("  跳过：本平台没有 /dev/full（真 ENOSPC 只能在 Linux 上验）");
+  }
 });
 
 test("R60 返修二 P1-2c：createTestHarness 支持显式 filter: [] 关闭过滤，保证内层用例不被外部 TEST_FILTER 误过滤", () => {

@@ -18,6 +18,7 @@ import {
 import { REJECT, normalizeBody } from "../selector.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS, OFF_TEMPLATE_HINT, isPrivateChatTurn } from "../inbound-route.mjs";
 import { topicHandlerKind, topicHandlerText } from "../inbound-routes.mjs";
+import { fileURLToPath } from "node:url";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText, chatReplyPathStatus } from "../chat-reply.mjs";
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "../chat-ledger.mjs";
 import {
@@ -113,7 +114,11 @@ export function ackText(kind, detail, { transportAgentName } = {}) {
   if (kind === "bound") {
     // PK3-W232-fix2 P1-1：三态判定只有一份（inbound-routes.topicHandlerKind）。能走到这里说明本链自己接管；
     // external 防御性、**unavailable 不落旧承诺**（说清判不了，去 doctor）。
-    const handler = detail?.topicHandler ?? topicHandlerKind({ sessionId: detail?.sessionId, routesFile: detail?.routesFile });
+    // fix3：带上本链默认路由（id codex，与 codex/aily-inbound 给 dispatcher 的同形），表空时判 local。
+    const handler = detail?.topicHandler ?? topicHandlerKind({
+      sessionId: detail?.sessionId, routesFile: detail?.routesFile,
+      defaultRoute: { id: "codex", handler: fileURLToPath(import.meta.url) },
+    });
     const tail = topicHandlerText(handler)
       ?? "这个话题现在精确通向一个 Codex task。之后在这里 @ " + agent + " 即可续接。";
     return [

@@ -156,7 +156,7 @@ import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
-import { ROUTE_REJECT, ROUTE_REJECT_TEXT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, topicHandlerKind, topicHandlerText, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute, judgeInitDefault, previewInitDefault, routeRejectText } from "./inbound-routes.mjs";
+import { ROUTE_REJECT, ROUTE_REJECT_TEXT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, topicHandlerKind, topicHandlerText, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute, judgeInitDefault, previewInitDefault, routeRejectText, effectiveRoutes } from "./inbound-routes.mjs";
 import { composeSessionRootMessage } from "./bind-session.mjs";
 import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
@@ -59210,8 +59210,15 @@ test("PK3-W232-fix2 P1-1：三态判定严格复用选路 —— 停用/不存�
     assert.match(text, /doctor/u, label + "：要指路 doctor：" + text);
     // 回执层面同一条口径（真实 bound 回执走的就是它）
     const ack = inboundAckText("bound", { taskName: "t", root: "/p", sessionId, routesFile: f });
-    assert.doesNotMatch(ack, /每轮回答会合成卡片|以卡片发回|外部处理器 \S+ 接管/u, label + "：ack 不许落旧承诺：" + ack);
-    assert.match(ack, /判不了/u, label + "：" + ack);
+    if (label.startsWith("一条启用路由都没有")) {
+      // PK3-W232-fix3 P1-1：空表对本链回执**不是**判不了 —— inbound.mjs 带着本链默认路由（与 dispatcher 同一份
+      // fallback），空表时 dispatcher 会分发给 self，回执就该按本链承诺写；纯判定（无默认路由）仍是 unavailable（上面已断言）。
+      assert.doesNotMatch(ack, /外部处理器 \S+ 接管|判不了/u, label + "：空表对本链就是 local：" + ack);
+      assert.match(ack, /以卡片发回/u, label + "：" + ack);
+    } else {
+      assert.doesNotMatch(ack, /每轮回答会合成卡片|以卡片发回|外部处理器 \S+ 接管/u, label + "：ack 不许落旧承诺：" + ack);
+      assert.match(ack, /判不了/u, label + "：" + ack);
+    }
   }
 
   // 对照一：登记给**启用的**非默认 route → external（带 id）
@@ -59373,6 +59380,78 @@ test("PK3-W232-fix2 P2-1：三态判定只剩一份实现（三处复制收成�
   // 两个调用点都改调它（两链各自的 bound 回执）
   for (const rel of ["scripts/inbound.mjs", "scripts/codex/inbound.mjs"]) {
     assert.match(fs.readFileSync(path.resolve(rel), "utf-8"), /topicHandlerKind\(/u, rel + " 要改调共享判定");
+  }
+});
+
+test("PK3-W232-fix3 P1-1：无路由表 / 空表时三态判定与 dispatcher 同一份 fallback —— 有本链默认路由就是 local，不是 unavailable", () => {
+  // 拿掉哪行会红：把 topicHandlerKind 里的 effectiveRoutes({ routes, defaultRoute }) 换回 table.routes，
+  //   本用例会红在 kind（期望 local、实得 unavailable/no_route_handler）；把 dispatcher 里的 effectiveRoutes 换回
+  //   内联 fallback，会红在"fallback 投影只此一份"的结构断言上。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w232-fallback-"));
+  try {
+    const self = { id: "self", handler: "/opt/fake/inbound.mjs" };
+    // ① 新装机：routes.json 根本不存在（还没 --init-default）
+    const missing = path.join(dir, "routes.json");
+    const a = topicHandlerKind({ sessionId: "s-new", routesFile: missing, defaultRoute: self });
+    assert.equal(a.kind, "local", JSON.stringify(a));
+    assert.equal(a.routeId, "self");
+    // ② 表在但一条路由都没有
+    const empty = path.join(dir, "empty.json");
+    fs.writeFileSync(empty, JSON.stringify({ schema_version: "1.0", routes: [], sessions: {} }, null, 2) + "\n");
+    const b = topicHandlerKind({ sessionId: "s-new", routesFile: empty, defaultRoute: self });
+    assert.equal(b.kind, "local", JSON.stringify(b));
+    // ③ 没有本链默认路由可退 → 才是 unavailable（与 dispatcher 拒收同因）
+    const c = topicHandlerKind({ sessionId: "s-new", routesFile: empty });
+    assert.equal(c.kind, "unavailable", JSON.stringify(c));
+    assert.equal(c.reason, "no_route_handler");
+    // ④ 表里有路由时 fallback 不介入（与 dispatcher 一致：只在空表时退）
+    const withExt = path.join(dir, "ext.json");
+    fs.writeFileSync(withExt, JSON.stringify({ schema_version: "1.0",
+      routes: [{ id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" }], sessions: { "s-ext": "c2c-inbound" } }, null, 2) + "\n");
+    const d = topicHandlerKind({ sessionId: "s-ext", routesFile: withExt, defaultRoute: self });
+    assert.equal(d.kind, "external", JSON.stringify(d));
+    assert.equal(d.routeId, "c2c-inbound");
+    // ⑤ fallback 投影只此一份：dispatcher 调 effectiveRoutes，源码里不再有内联 fallback
+    const dispatcherSrc = fs.readFileSync(path.resolve("scripts", "inbound-dispatcher.mjs"), "utf-8");
+    assert.match(dispatcherSrc, /effectiveRoutes\(\{ routes: table\.routes, defaultRoute \}\)/u, "dispatcher 必须用共享的 effectiveRoutes");
+    assert.doesNotMatch(dispatcherSrc, /isDefault: true \}\]/u, "dispatcher 不许再有内联的 fallback 投影");
+    assert.deepEqual(effectiveRoutes({ routes: [], defaultRoute: self }), [{ id: "self", handler: "/opt/fake/inbound.mjs", isDefault: true }]);
+    assert.deepEqual(effectiveRoutes({ routes: [], defaultRoute: null }), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("PK3-W232-fix3 P1-2：register-route --session 登记到默认路由 → 提示「仍由本链处理」，不得称外部接管", () => {
+  // 拿掉哪行会红：register-route.mjs 的提示不按 topicHandlerKind 三态分支、退回只看 sessionChanged，
+  //   本用例会红在"不含外部处理器 self 决定"与"含仍由本链处理"两处。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w232-register-default-"));
+  try {
+    const home = path.join(dir, "home");
+    fs.mkdirSync(path.join(home, ".claude", "feishu-bridge"), { recursive: true });
+    const selfHandler = path.join(dir, "inbound.mjs");
+    fs.writeFileSync(selfHandler, "// 本链入站夹具\n");
+    const routesFile = path.join(home, ".claude", "feishu-bridge", "routes.json");
+    fs.writeFileSync(routesFile, JSON.stringify({
+      schema_version: "1.0",
+      routes: [{ id: "self", handler: selfHandler, default: true }],
+      sessions: {},
+    }, null, 2) + "\n");
+    const bin = path.join(dir, "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    const counter = path.join(dir, "lark-calls.txt");
+    fs.writeFileSync(path.join(bin, "lark-cli"), "#!/bin/sh\necho x >> " + JSON.stringify(counter) + "\nexit 0\n", { mode: 0o755 });
+    const r = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"),
+      "--id", "self", "--handler", selfHandler, "--session", "s-local", "--routes", routesFile, "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: home, PATH: bin + path.delimiter + process.env.PATH } });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stdout, /外部处理器 self 决定/u, r.stdout);
+    assert.doesNotMatch(r.stdout, /本链不再回复/u, r.stdout);
+    assert.match(r.stdout, /仍由本链处理/u, r.stdout);
+    assert.equal(fs.existsSync(counter), false, "登记命令不许写飞书：" + r.stdout);
+    assert.equal(loadRoutes(routesFile).sessions["s-local"], "self");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

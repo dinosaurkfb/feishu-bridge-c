@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { topicHandlerKind, topicHandlerText } from "./inbound-routes.mjs";
+import { fileURLToPath } from "node:url";
 import { EXPIRY_SOURCE, normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
@@ -136,7 +137,11 @@ export function ackText(kind, detail) {
     // PK3-W232-fix2 P1-1：三态判定只有一份（inbound-routes.topicHandlerKind，内部复用 loadRoutes + selectRoute）。
     // 能走到这里说明本链自己接管（已登记外部 route 时 dispatcher 根本不进本链），所以 local 就承诺本链；
     // external 是防御性的；**unavailable 不许落回旧承诺** —— 说清判不了，让人去 doctor。
-    const handler = detail?.topicHandler ?? topicHandlerKind({ sessionId: detail?.sessionId, routesFile: detail?.routesFile });
+    // fix3：带上本链默认路由 —— 与 aily-inbound 给 dispatcher 的那份同形（id self），表空时判 local 而不是 unavailable。
+    const handler = detail?.topicHandler ?? topicHandlerKind({
+      sessionId: detail?.sessionId, routesFile: detail?.routesFile,
+      defaultRoute: { id: "self", handler: fileURLToPath(import.meta.url) },
+    });
     const instructionLine = topicHandlerText(handler)
       ?? "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。";
     const lines = [

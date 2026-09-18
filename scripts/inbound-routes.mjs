@@ -214,12 +214,25 @@ export function selectRoute({ sessionId, routes, sessions }) {
  * 建话题那一刻平台侧会话还不存在，sessionId 拿不到 —— 那种场景**不要**用它去猜未来选路：
  * 根消息用中性措辞（那里根本不承诺回复方式）。
  */
-export function topicHandlerKind({ sessionId = null, routesFile = undefined } = {}) {
+/**
+ * dispatcher 真正拿去选路的路由集合（PK3-W232-fix3 P1-1）：**表里一条路由都没有时，退到本链的默认路由**。
+ * 这是"新装机还没 --init-default"的常见正常态 —— inbound-dispatcher 一直这么做；三态判定必须用**同一份**
+ * 投影，否则会对着一台正常分发给 self 的机器说"路由表判不了"。只此一份，dispatcher 与 topicHandlerKind 都调它。
+ */
+export function effectiveRoutes({ routes = [], defaultRoute = null } = {}) {
+  const fallback = defaultRoute && typeof defaultRoute.id === "string" && typeof defaultRoute.handler === "string"
+    ? [{ id: defaultRoute.id, handler: defaultRoute.handler, isDefault: true }]
+    : [];
+  return Array.isArray(routes) && routes.length > 0 ? routes : fallback;
+}
+
+export function topicHandlerKind({ sessionId = null, routesFile = undefined, defaultRoute = null } = {}) {
   let table = null;
   try { table = loadRoutes(routesFile || undefined); }
   catch (err) { return { kind: "unavailable", routeId: null, reason: ROUTE_REJECT.TABLE_UNREADABLE, detail: String(err?.message ?? err) }; }
   if (!table || table.ok !== true) return { kind: "unavailable", routeId: null, reason: table?.reason ?? ROUTE_REJECT.TABLE_UNREADABLE };
-  const sel = selectRoute({ sessionId, routes: table.routes, sessions: table.sessions });
+  // PK3-W232-fix3 P1-1：与 dispatcher 同一份 fallback 投影（表空 → 本链默认路由），不然新装机会假报 unavailable。
+  const sel = selectRoute({ sessionId, routes: effectiveRoutes({ routes: table.routes, defaultRoute }), sessions: table.sessions });
   if (!sel.ok) return { kind: "unavailable", routeId: null, reason: sel.reason, declared: sel.declared ?? null };
   return sel.route.isDefault === true
     ? { kind: "local", routeId: sel.route.id, reason: null, matchedBy: sel.matchedBy }
@@ -229,6 +242,7 @@ export function topicHandlerKind({ sessionId = null, routesFile = undefined } = 
 /** 三态给**人**看的一句话（两链回执共用一条口径）。 */
 export function topicHandlerText(handler) {
   if (handler.kind === "external") return "此话题由外部处理器 " + handler.routeId + " 接管：回复方式由该处理器决定。";
+  if (handler.kind === "local") return null;   // local：由调用方按本链的承诺写（两链承诺不同）
   if (handler.kind === "unavailable") {
     return "这个话题的路由表判不了（" + (ROUTE_REJECT_TEXT[handler.reason] ?? handler.reason) + "）：" +
       "回复方式暂无法判断，先在终端跑 node scripts/doctor.mjs 看清楚。";

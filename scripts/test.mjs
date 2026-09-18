@@ -7643,7 +7643,7 @@ test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
   const src = fs.readFileSync(path.resolve("scripts", "timer-exec.mjs"), "utf-8");
   assert.match(src, /os\.userInfo\(\)\.homedir/u,
     "判据要用密码库里的 home，它不受 HOME 环境变量影响");
-  assert.match(src, /if \(SANDBOXED\) return \{ ok: false, skipped: true \};/u,
+  assert.match(src, /if \(isSandboxed\(\)\) return \{ ok: false, skipped: true \};/u,
     "launchctl 必须在沙箱安装时直接短路");
   // 包装只有一份：安装器自己不许再执行控制面命令（两份会各自漂移）。
   const installerSrc = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");

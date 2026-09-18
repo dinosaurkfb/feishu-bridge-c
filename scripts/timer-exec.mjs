@@ -30,12 +30,15 @@ import { systemdUnitAbsent } from "./install-projection.mjs";
  * "真实安装"和"被重定向的安装"。
  */
 const REAL_HOME = os.userInfo().homedir;
-const SANDBOXED = os.homedir() !== REAL_HOME;
+// PK3-L7-fix1：**调用时**求值，不在 import 时定死——套件的 HOME 隔离（installTestHomeIsolation）发生在
+// 所有 ESM import 之后；import 时按真实 HOME 算出"非沙箱"会让「沙箱不碰真实 systemd」在套件里失效、
+// 而外层 HOME=mktemp 起跑时又成立，用例随环境漂移。
+const isSandboxed = () => os.homedir() !== REAL_HOME;
 
 export const launchctl = (args, { tolerate = false } = {}) => {
   const injected = process.env.FEISHU_BRIDGE_LAUNCHCTL;
   if (!injected) {
-    if (SANDBOXED) return { ok: false, skipped: true };
+    if (isSandboxed()) return { ok: false, skipped: true };
   }
   const bin = injected || "/bin/launchctl";
   try {
@@ -62,7 +65,7 @@ export const systemctl = (args, { tolerate = false } = {}) => {
   // 与 doctor 的 `sandboxed && !injected` 同一口径：注入点本来就是"换掉二进制"，
   // 而 linux 分支的卸载顺序只能在注入下做产品级验证（本机是 macOS）。
   const injected = process.env.FEISHU_BRIDGE_SYSTEMCTL;
-  if (SANDBOXED && !injected) return { ok: false, skipped: true };
+  if (isSandboxed() && !injected) return { ok: false, skipped: true };
   const bin = injected || "systemctl";
   try {
     const res = execFileSync(bin, args, { stdio: "pipe", timeout: 15_000, encoding: "utf-8" });

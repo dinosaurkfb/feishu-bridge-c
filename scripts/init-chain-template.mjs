@@ -35,6 +35,7 @@ const TEMPLATE_FIELDS = [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS];
 const CLI_ALLOWED_FIELDS = TEMPLATE_FIELDS.filter((f) => f !== "bridge_root");
 import { moduleRoot } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
+import { parseArgvOptions } from "./argv-options.mjs"; // PK3-C220-fix1：一次解析 argv
 
 const ROOT = moduleRoot(import.meta.url, "..");
 
@@ -53,45 +54,25 @@ const KNOWN_VALUE_FLAGS = new Set([
   ...CLI_ALLOWED_FIELDS.map((f) => "--" + flagOf(f)),
 ]);
 
-for (let i = 2; i < process.argv.length; i += 1) {
-  const a = process.argv[i];
-  if (!a.startsWith("--")) {
-    console.error("不认识的参数：" + a + "\n\n" + USAGE);
-    process.exit(2);
-  }
-  const eq = a.indexOf("=");
-  const flag = eq >= 0 ? a.slice(0, eq) : a;
-  if (KNOWN_BOOLEAN_FLAGS.has(flag)) {
-    if (eq >= 0) {
-      console.error("参数不接受赋值：" + a + "\n\n" + USAGE);
-      process.exit(2);
-    }
-    continue;
-  }
-  if (KNOWN_VALUE_FLAGS.has(flag)) {
-    if (eq < 0) {
-      i += 1;
-    }
-    continue;
-  }
-  console.error("不认识的参数：" + flag);
-  if (flag === "--bridge-root") {
+// PK3-C220-fix1：argv 一次解析成 options map（等号形式、缺值校验）—— 旧 arg() 只认分离形式：
+// `--k=v` 被白名单接受却被忽略（写默认值）、`--profile --apply` 会把 "--apply" 当值写进去。
+const parsed = parseArgvOptions(process.argv.slice(2),
+  { booleanFlags: KNOWN_BOOLEAN_FLAGS, valueFlags: KNOWN_VALUE_FLAGS });
+if (!parsed.ok) {
+  console.error(parsed.message);
+  if (parsed.kind === "unknown" && parsed.flag === "--bridge-root") {
     console.error("bridge_root 由安装器维护：Codex 链装机时改写为 runtime/current，Claude 链仅作标志；先写模板再跑安装器");
   }
   console.error("\n" + USAGE);
   process.exit(2);
 }
-
-const arg = (n) => {
-  const i = process.argv.indexOf("--" + n);
-  return i >= 0 ? process.argv[i + 1] : undefined;
-};
-const apply = process.argv.includes("--apply");
+const opt = (n) => parsed.options[n];
+const apply = opt("apply") === true;
 if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
 
 // ---------- 1. 先从项目派生（如果指定了） ----------
 
-const from = arg("from");
+const from = opt("from");
 const derived = {};
 const sources = {};
 
@@ -121,7 +102,7 @@ const tpl = { schema_version: "1.0", ...derived };
 // 于是「模板支持这个字段」这句话只在读的那一侧成立。
 for (const f of TEMPLATE_FIELDS) {
   if (f === "bridge_root") continue;
-  const v = arg(flagOf(f));
+  const v = opt(flagOf(f));
   if (v === undefined) continue;
   // 数字字段要转，否则形状校验会把 "900000" 判成配错（那正是它该做的）。
   tpl[f] = f.endsWith("_ms") ? Number(v) : v;

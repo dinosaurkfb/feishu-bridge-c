@@ -58068,6 +58068,33 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     const parsed = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
     assert.equal(parsed.agent_uid, "agent_x");
     assert.equal(parsed.bridge_root, path.resolve("."));
+    // PK3-C220-fix1 ⑤：`--k=v` 等号形式**真正生效**（旧 arg() 只认分离形式，等号被接受却忽略）
+    const rEq = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--default-freshness-ms=123", "--apply"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rEq.status, 0, "等号形式退出 0：" + rEq.stdout + rEq.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(tplFile, "utf-8")).default_freshness_ms, 123,
+      "--k=v 写入 v（不是默认 900000）");
+    // ⑥ 取值 flag 的下一项是 --apply → 缺值，exit 2、零写
+    const beforeMissing = fs.readFileSync(tplFile, "utf-8");
+    const rMissing = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--lark-cli-profile", "--apply"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rMissing.status, 2, "取值 flag 缺值退出 2：" + rMissing.stdout + rMissing.stderr);
+    assert.match(rMissing.stderr, /--lark-cli-profile 缺值/u, rMissing.stderr);
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeMissing, "缺值拒绝零写入");
+    // ⑦ 取值 flag 在末尾（无下一项）→ 缺值，exit 2
+    const rTail = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--lark-cli-profile"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rTail.status, 2, "末尾缺值退出 2：" + rTail.stdout + rTail.stderr);
+    assert.match(rTail.stderr, /--lark-cli-profile 缺值/u, rTail.stderr);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     const realClaudeShaAfter = fs.existsSync(realClaudeTpl)

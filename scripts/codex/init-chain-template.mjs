@@ -2,6 +2,7 @@
 /** 生成 ~/.codex/feishu-bridge/chain-config.json；单 M5Codex 身份是强约束。 */
 
 import fs from "node:fs";
+import { parseArgvOptions } from "../argv-options.mjs"; // PK3-C220-fix1：一次解析 argv
 import os from "node:os";
 import path from "node:path";
 
@@ -39,46 +40,25 @@ const KNOWN_VALUE_FLAGS = new Set([
   "--agent-uid",
 ]);
 
-for (let i = 2; i < process.argv.length; i += 1) {
-  const a = process.argv[i];
-  if (!a.startsWith("--")) {
-    console.error("不认识的参数：" + a + "\n\n" + USAGE);
-    process.exit(2);
-  }
-  const eq = a.indexOf("=");
-  const flag = eq >= 0 ? a.slice(0, eq) : a;
-  if (KNOWN_BOOLEAN_FLAGS.has(flag)) {
-    if (eq >= 0) {
-      console.error("参数不接受赋值：" + a + "\n\n" + USAGE);
-      process.exit(2);
-    }
-    continue;
-  }
-  if (KNOWN_VALUE_FLAGS.has(flag)) {
-    if (eq < 0) {
-      i += 1;
-    }
-    continue;
-  }
-  console.error("不认识的参数：" + flag);
-  if (flag === "--bridge-root") {
+// PK3-C220-fix1：argv 一次解析成 options map（等号形式、缺值校验）—— 与 Claude 链同形状。
+const parsed = parseArgvOptions(process.argv.slice(2),
+  { booleanFlags: KNOWN_BOOLEAN_FLAGS, valueFlags: KNOWN_VALUE_FLAGS });
+if (!parsed.ok) {
+  console.error(parsed.message);
+  if (parsed.kind === "unknown" && parsed.flag === "--bridge-root") {
     console.error("bridge_root 由安装器维护：Codex 链装机时改写为 runtime/current，Claude 链仅作标志；先写模板再跑安装器");
   }
   console.error("\n" + USAGE);
   process.exit(2);
 }
-
-const arg = (name) => {
-  const at = process.argv.indexOf("--" + name);
-  return at >= 0 ? process.argv[at + 1] : undefined;
-};
-const apply = process.argv.includes("--apply");
+const opt = (n) => parsed.options[n];
+const apply = opt("apply") === true;
 if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
-const transportName = arg("transport-agent-name") ?? "M5Codex";
-const transportApp = arg("transport-app-id");
-const transportOpen = arg("transport-open-id");
+const transportName = opt("transport-agent-name") ?? "M5Codex";
+const transportApp = opt("transport-app-id");
+const transportOpen = opt("transport-open-id");
 
-let larkBin = arg("lark-cli-bin");
+let larkBin = opt("lark-cli-bin");
 if (!larkBin) {
   larkBin = ["/opt/homebrew/bin/lark-cli", "/usr/local/bin/lark-cli"].find((p) => fs.existsSync(p));
 }
@@ -92,16 +72,16 @@ const template = {
   outbound_agent_name: transportName,
   outbound_app_id: transportApp,
   outbound_open_id: transportOpen,
-  lark_cli_profile: arg("lark-cli-profile") ?? "platform-bot",
+  lark_cli_profile: opt("lark-cli-profile") ?? "platform-bot",
   lark_cli_bin: larkBin,
-  lark_cli_home: arg("lark-cli-home") ?? path.join(os.homedir(), ".lark-cli"),
-  lark_cli_config_base: arg("lark-cli-config-base") ?? DEFAULT_CONFIG_BASE,
-  frank_sender_id: arg("frank-sender-id"),
-  chat_name: arg("chat-name"),
-  chat_id: arg("chat-id"),
-  default_freshness_ms: Number(arg("default-freshness-ms") ?? 15 * 60 * 1000),
+  lark_cli_home: opt("lark-cli-home") ?? path.join(os.homedir(), ".lark-cli"),
+  lark_cli_config_base: opt("lark-cli-config-base") ?? DEFAULT_CONFIG_BASE,
+  frank_sender_id: opt("frank-sender-id"),
+  chat_name: opt("chat-name"),
+  chat_id: opt("chat-id"),
+  default_freshness_ms: Number(opt("default-freshness-ms") ?? 15 * 60 * 1000),
   inbound_prefix: null,
-  agent_uid: arg("agent-uid"),
+  agent_uid: opt("agent-uid"),
   bridge_root: ROOT,
 };
 const common = validateChainTemplate(template);

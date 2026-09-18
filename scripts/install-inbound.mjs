@@ -34,7 +34,7 @@ import { referencedRuntimeScripts, renderClaudeSkill } from "./install-projectio
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
-import { moduleRoot } from "./direct-run.mjs";
+import { isDirectRun, moduleRoot } from "./direct-run.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 /**
@@ -61,6 +61,69 @@ const expectedContent = (f) =>
 const SKILL_NAME = "m5claude-inbound-router";
 const SRC = path.join(ROOT, "skills", SKILL_NAME);
 const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".claude", "skills");
+
+/**
+ * 探测本身失败的原因（PK3-I241）：**不许**把"命令跑不起来"说成"daemon 没跑"。
+ * 输入是 execFile 抛出来的异常，输出一句人话 —— 三类各自点名：找不到命令 / 非零退出 / 超时。
+ */
+export function probeFailureReason(err) {
+  if (err?.code === "ENOENT") {
+    return "找不到 aily-cli（ENOENT）—— 非交互 ssh 下 PATH 里常常没有它（mise shims 不在 PATH）";
+  }
+  if (err?.code === "ETIMEDOUT" || err?.signal === "SIGTERM") return "探测超时（30 秒）";
+  if (typeof err?.status === "number") {
+    const tail = String(err.stderr ?? "").trim().split("\n").filter(Boolean).slice(-1)[0] ?? "";
+    return "退出码 " + err.status + (tail ? "：" + tail.slice(0, 160) : "");
+  }
+  return String(err?.code ?? err?.message ?? err);
+}
+
+/**
+ * **装完自检的最后两项**（PK3-I241：可导入、单出口）。
+ *
+ * 为什么要有它：旧版把 `aily-cli skill scan-local` 的任何异常都折成「查不了（aily-cli 没跑起来）」——
+ * 2026-09-18 在 omm 上经**非交互 ssh** 装机时 PATH 里没有 mise shims、`aily-cli` 直接 ENOENT，
+ * 于是那句话把「探测命令不可用」说成了「daemon 没跑」；同一时刻 daemon 其实是 active 的、桥 doctor 密钥 ✓。
+ * **两件事各有各的判据，不能互相代言：**
+ *
+ *   · daemon 在不在跑：看 `~/.aily-cli/sockets/aily-cli.sock` 在不在（**不经 exec**、不依赖 PATH）；
+ *   · 技能有没有被发现：跑 `scan-local`，分**三态** —— 报到了 / 报不到（已知如此）/ **查不了**
+ *     （探测本身失败，原因原话带出来；这一态**不许**断言 daemon 的状态）。
+ *
+ * `execFile` 是**函数参数**（用例注入用）：CLI 调它不传，生产恒 `execFileSync` —— 不读任何
+ * "只给测试"的环境变量（Codex 对 U1/L7 都判过：那种钩子生产可达）。
+ * @returns {{ socket: string, daemonRunning: boolean, scan: { state: "reported"|"not_reported"|"unavailable", why: string|null } }}
+ */
+export function inboundPostInstallProbe({ home = os.homedir(), execFile = execFileSync, log = console.log, skillName = SKILL_NAME } = {}) {
+  const socket = path.join(home, ".aily-cli", "sockets", "aily-cli.sock");
+  const daemonRunning = fs.existsSync(socket);
+  log("  · aily daemon 是否在跑：" + (daemonRunning
+    ? "在跑（socket 在：" + socket + "）"
+    : "未运行（socket 不在：" + socket + "）——启动：aily-cli daemon start"));
+
+  let scan;
+  try {
+    const out = execFile("aily-cli", ["skill", "scan-local", "--json"],
+      { encoding: "utf-8", timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+    scan = { state: String(out).includes(skillName) ? "reported" : "not_reported", why: null };
+  } catch (err) {
+    scan = { state: "unavailable", why: probeFailureReason(err) };
+  }
+  /**
+   * 最后这一项是**验不了的那一项**，必须如实说。
+   * scan-local 报不到本技能是已知的（它扫宿主 agent 目录），所以它报不到
+   * 既不能证明装坏了，也不能证明装好了 —— 唯一的验证是真的从飞书发一条指令。
+   */
+  log("  · aily 是否已发现本技能：" + (
+    scan.state === "reported" ? "scan-local 报到了"
+      : scan.state === "not_reported" ? "scan-local 报不到（已知如此 —— 它扫的是宿主 agent 目录，不扫这里）"
+        : "查不了：" + scan.why + "（**这是探测本身的问题，不是 daemon 的状态** —— daemon 看上面那一行）"));
+  return { socket, daemonRunning, scan };
+}
+
+if (!isDirectRun(import.meta.url)) {
+  // 被 import 时只提供上面那个纯函数（+ 原因映射），不跑安装、不碰任何文件。
+} else {
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -239,22 +302,9 @@ for (const f of files) {
 }
 console.log("  ✓ 目标是真实目录（不是软链）");
 
-/**
- * 最后这一项是**验不了的那一项**，必须如实说。
- * scan-local 报不到本技能是已知的（它扫宿主 agent 目录），所以它报不到
- * 既不能证明装坏了，也不能证明装好了 —— 唯一的验证是真的从飞书发一条指令。
- */
-let scanned = null;
-try {
-  const out = execFileSync("aily-cli", ["skill", "scan-local", "--json"],
-    { encoding: "utf-8", timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
-  scanned = out.includes(SKILL_NAME);
-} catch {
-  scanned = null;
-}
-console.log("  · aily 是否已发现本技能：" +
-  (scanned === true ? "scan-local 报到了"
-    : scanned === false ? "scan-local 报不到（已知如此 —— 它扫的是宿主 agent 目录，不扫这里）"
-      : "查不了（aily-cli 没跑起来）"));
+// 最后两项**各有各的判据**（PK3-I241）：daemon 在不在跑看 socket（不经 exec），
+// 「是否已发现本技能」三态分开 —— 探测本身失败只说自己失败，不代言 daemon 的状态。
+inboundPostInstallProbe({ home: os.homedir() });
 
 console.log("\n**装好 ≠ 能用。**唯一的验证是从飞书发一条指令（@ 运输智能体），看回执。");
+}

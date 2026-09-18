@@ -22,6 +22,12 @@ import { bootoutTimer, bootstrapTimer, timerPhase } from "./maintenance/timers.m
 import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
 import { systemctl, timerCmd } from "./timer-exec.mjs";
+import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
+
+// PK3-T2-fix1：这个入口也是测试，也要有本轮私有临时根 —— **在任何 mkdtemp 之前**装，
+// 装上之后越出私有根的 mkdtemp 当场 throw（硬门在退出时把 violations 汇总成非 0）。
+// 以前它直接往宿主 TMPDIR 造 pk3* 目录（实测一次全量在宿主 tmp 顶层新增 21 条）。
+installSuiteTempRoot();
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER = path.join(REPO, "scripts", "install-outbound.mjs");

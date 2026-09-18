@@ -431,6 +431,9 @@ export function createTestHarness({ onFail = () => {}, filter = null } = {}) {
       // PK3-T1：本用例在临时根里新造的东西，用例结束当场收回（套件退出还有一道兜底）。
       // 用例之间不许靠临时目录传递状态：真有那种依赖，会在下一条用例里当场红（响亮，不静默）。
       if (tempRoot !== null) tempRoot.reclaimSince(tempBefore);
+      // PK3-T2-fix2：逐用例边界把 mkdtemp 包装补回来（有别的用例把它换回原函数的话，
+      // 后面的用例就不再依赖“谁先跑”）——发现了就记一条 violation，退出硬门会把它报出来。
+      if (tempRoot !== null && typeof tempRoot.ensure === "function") { try { tempRoot.ensure(); } catch { /* 下面照旧 */ } }
       // PK3-T3：安装面卫兵 —— 逐用例边界核验，变了就点名肇事用例
       const surfaceGuard = currentSurfaceGuard();
       const surfaceHit = surfaceGuard && typeof surfaceGuard.checkBoundary === "function"

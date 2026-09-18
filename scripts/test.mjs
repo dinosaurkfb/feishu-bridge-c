@@ -62,13 +62,14 @@ import {
 import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
-// PK3-T3：套件级安装面卫兵
+// PK3-T1：本轮临时目录根 + 写盘失败翻译（都在 test-support/ 下：不动共用面 test-harness.mjs 的导出）
+import { installSuiteTempRoot, insideRoot, installMkdtempGuard, MKDTEMP_SENTINEL } from "./test-support/suite-temp-root.mjs";
+// PK3-T3：套件级安装面卫兵（启动快照 + 逐用例边界比对）
 import {
   installSurfaceGuard, resolveAuthoritativePaths, snapshotFile,
   takeSurfaceSnapshot, diffSurfaceSnapshots, formatErrorReport, formatPassReport,
   currentSurfaceGuard, DEFAULT_AUTHORITATIVE_FILES,
 } from "./test-support/install-surface-guard.mjs";
-import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
 // PK3-T4：夹具基准钟（相对当前时间）+「别把写死日期当 now」的守卫判据
 import { fixtureNow, isoAt, assertFreshFixtureClock, FIXTURE_CLOCK_MAX_SKEW_MS } from "./test-support/fixture-clock.mjs";
 import { freeBytesOf, installWriteDiagnosis, writeFailureMessage } from "./test-support/write-diagnosis.mjs";
@@ -8251,6 +8252,339 @@ test("PK3-T4 守卫（运行时不变量）：夹具基准钟必须就在当下�
   assert.throws(() => assertFreshFixtureClock(literal, { now: literal - FIXTURE_CLOCK_MAX_SKEW_MS - 1 }), /时钟炸弹/u);
   // ④ 不是时间 → 红且说明
   assert.throws(() => assertFreshFixtureClock("not-a-date", { label: "T0" }), /T0 不是时间/u);
+});
+
+// ── PK3-T2-fix1：本进程经 fs.mkdtemp* 越出私有根的硬门（issue #223）──────────────────────
+// 第一版是"跑完扫宿主 TMPDIR 顶层、找本轮新增的 mkdtemp 目录"——Codex 一轮判定它**归因不了**：
+// 宿主 tmp 是共享命名空间，并行会话 / 旧分支 / 别的测试入口造的目录都会被算到本套件头上
+// （验收时 22 条命中就是反例），退出枚举后被并发删掉的目标还会 stat 失败而被计成命中；
+// 2.19M 条 readdir withFileTypes 的内存也远不止当初估的 17MB。
+// 改成**进程内归因**：包装 fs.mkdtemp*，前缀落在私有根之外就当场 throw + 记 violation，
+// 退出时只核「私有根已删 + violations 为空」。谁造的、就谁红。
+
+test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 三路都不通）", () => {
+  // 用**自己的**根与 violations 列表装一份包装（不污染本轮真套件的 violations），finally 还原。
+  const fakeRootBase = fs.mkdtempSync(path.join(os.tmpdir(), "t2-guard-"));
+  const fakeRoot = fs.realpathSync(fakeRootBase);
+  const violations = [];
+  const hostTmp = SUITE_TMP.hostTmp;
+  // 前缀带本轮唯一标记：**断言不依赖宿主 tmp 的历史残留**（别人跑过一遍留下的同名目录
+  // 会让"没造出目录"这条假红 —— fix2 验收就是这么红的）。
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  const escape = path.join(hostTmp, "t2-escape-" + uniq + "-");
+  const guard = installMkdtempGuard({ root: fakeRoot, violations });
+  const noLeftover = (stem) => fs.readdirSync(hostTmp).filter((n) => n.startsWith(stem));
+  try {
+    // ① sync：前缀指向宿主 tmp → 抛，消息里带上前缀、解析后的目标、私有根、调用处
+    let err = null;
+    assert.throws(() => fs.mkdtempSync(escape), (e) => {
+      err = e; return /临时目录硬门/u.test(e.message);
+    });
+    assert.match(err.message, new RegExp("t2-escape-" + uniq, "u"), err.message);
+    assert.equal(err.message.includes(fakeRoot), true, "消息里要有本轮私有根：" + err.message);
+    assert.match(err.message, /调用处：.*test\.mjs/u, "消息里要指得出调用处：" + err.message);
+    assert.deepEqual(noLeftover("t2-escape-" + uniq), [], "越界那次不许真的造出目录（硬门是拦住，不是事后记账）");
+    assert.equal(violations.length, 1, "越界要记一条 violation 给退出汇总");
+    // 记的是**可能生成的名字**（prefix + 哨兵后缀）—— 判据与消息都以它为准（PK3-T2-fix4）
+    assert.deepEqual([violations[0].prefix, violations[0].target, violations[0].root], [escape, escape + MKDTEMP_SENTINEL, fakeRoot]);
+    // ② callback / promises 两路同样**当场**抛（不是把失败塞进 callback / rejected promise）
+    assert.throws(() => fs.mkdtemp(path.join(hostTmp, "t2-escape-cb-" + uniq + "-"), () => {}), /临时目录硬门/u);
+    assert.throws(() => fs.promises.mkdtemp(path.join(hostTmp, "t2-escape-pr-" + uniq + "-")), /临时目录硬门/u);
+    assert.equal(violations.length, 3, "三路各记一条：" + JSON.stringify(violations.map((v) => v.prefix)));
+    assert.deepEqual([...noLeftover("t2-escape-cb-" + uniq), ...noLeftover("t2-escape-pr-" + uniq)], []);
+    // ③ 私有根之内照常透传（含夹具最常用的 os.tmpdir() 写法）
+    const inside = fs.mkdtempSync(path.join(fakeRoot, "t2-inside-"));
+    assert.ok(inside.startsWith(fakeRoot + path.sep), inside);
+    // ④ 边界：判的是**可能生成的那个名字**（prefix + 6 位后缀），不是 prefix 本身（PK3-T2-fix4）
+    assert.equal(insideRoot(fakeRoot, fakeRoot), false, "mkdtempSync(根) 造的是根的**兄弟**（根 + 6 位后缀），不在根内");
+    assert.equal(insideRoot(fakeRoot + path.sep, fakeRoot), true, "根 + 分隔符 → 造在根内");
+    assert.equal(insideRoot(fakeRoot + "-x", fakeRoot), false, "root-x 不是 root 之内");
+    assert.equal(insideRoot(path.join(fakeRoot, "a", "b"), fakeRoot), true);
+    assert.equal(insideRoot(path.dirname(fakeRoot), fakeRoot), false);
+    // ⑤ PK3-T2-fix3：符号链接按 realpath 算 —— 根内指到根外不算之内；指回根内仍算之内
+    const outLink = path.join(fakeRoot, "jump");
+    const inLink = path.join(fakeRoot, "inlink");
+    fs.symlinkSync(hostTmp, outLink, "dir");
+    fs.symlinkSync(fakeRoot, inLink, "dir");
+    assert.equal(insideRoot(path.join(outLink, "x-"), fakeRoot), false, "根内 symlink 指到根外 → 不是之内");
+    assert.equal(insideRoot(path.join(outLink, "notyet", "x-"), fakeRoot), false, "深层还没建也一样");
+    assert.equal(insideRoot(path.join(inLink, "x-"), fakeRoot), true, "根内 symlink 指回根内 → 仍是之内");
+    assert.equal(violations.length, 3, "透传与边界判定不该新增 violation");
+  } finally {
+    guard.restore();
+  }
+});
+
+test("PK3-T2-fix4：判据按「可能生成的名字」——四类边界（三路覆盖）", () => {
+  // Codex 三轮实测：mkdtemp 造的是 prefix + 6 位随机后缀，判 prefix 本身两头都错：
+  //   · `mkdtempSync(<根>)` 生成的是根的**兄弟**（根外）却被放行 —— 绕过硬门还留宿主 tmp 残骸；
+  //   · prefix 最后一段本身是 symlink 时（`mkdtempSync(<根>/jump)`）实际造的是 `<根>/jumpXXXXXX`
+  //     （根内的新目录，不穿过那个链接）却被误拒。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-fix4-"));
+  const fakeRoot = fs.realpathSync(base);
+  const hostTmp = SUITE_TMP.hostTmp;
+  const violations = [];
+  // 装包装**之前**的原函数：正控需要一个“真 Node 生成的名字”，而装之后在假根之外造东西会被硬门拦（那正是被测的行为）
+  const rawMkdtempSync = fs.mkdtempSync;
+  const guard = installMkdtempGuard({ root: fakeRoot, violations });
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  const leftover = (stem) => fs.readdirSync(hostTmp).filter((n) => n.startsWith(stem));
+  try {
+    // ① mkdtempSync(根) 必须拒，且根的**兄弟**零创建（三路都覆盖）
+    //    断言按**前后目录集合比较** —— Node 生成的是 `basename(根) + 6 位 [A-Za-z0-9]`，
+    //    找字面 "XXXXXX" 永远找不到（Codex 四轮 P2：旧断言因此是空转的）。匹配器另配正控。
+    const siblingDir = path.dirname(fakeRoot);
+    const sibSig = (base) => (n) => n.startsWith(base) && /^[A-Za-z0-9]{6}$/u.test(n.slice(base.length));
+    const sibOfRoot = sibSig(path.basename(fakeRoot));
+    // 正控：用装包装前的原函数真造一个“根的兄弟”（就是这条断言要抓的那个形状），断言匹配器认得出它，
+    // 随后再清掉 —— 否则下面那条 [] 是空的（空转的断言改坏了也照样绿）。
+    const fakeSibling = rawMkdtempSync(path.join(siblingDir, path.basename(fakeRoot)));
+    assert.deepEqual(fs.readdirSync(siblingDir).filter(sibOfRoot), [path.basename(fakeSibling)],
+      "正控：匹配器必须认得 Node 生成的 basename(根) + 六位后缀");
+    fs.rmSync(fakeSibling, { recursive: true, force: true });
+    assert.deepEqual(fs.readdirSync(siblingDir).filter(sibOfRoot), [], "正控清掉之后根没有兄弟");
+    const beforeSiblings = new Set(fs.readdirSync(siblingDir));
+    assert.throws(() => fs.mkdtempSync(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "sync：mkdtempSync(根) 要拒");
+    assert.throws(() => fs.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot)), () => {}), /临时目录硬门/u, "callback：同样拒");
+    assert.throws(() => fs.promises.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "promises：同样拒");
+    const addedSiblings = fs.readdirSync(siblingDir).filter((n) => !beforeSiblings.has(n));
+    assert.deepEqual(addedSiblings, [], "被拒时父目录里不许有任何新增条目：" + JSON.stringify(addedSiblings));
+    assert.deepEqual(addedSiblings.filter(sibOfRoot), [], "尤其不许有 basename(根) + 六位 的兄弟");
+    // ② 根 + 分隔符 → 允许，且真的建在根内
+    const ok = fs.mkdtempSync(fakeRoot + path.sep);
+    assert.equal(path.dirname(ok), fakeRoot, "建在根内：" + ok);
+    assert.match(path.basename(ok), /^[A-Za-z0-9]{6}$/u, "前缀到分隔符为止时，生成名就是 6 位随机位：" + path.basename(ok));
+
+    // ③ 根内祖先 symlink 指向根外 → 仍拒；而 prefix 末段本身是 symlink（造根内新目录）→ 允许
+    const outLink = path.join(fakeRoot, "jump");
+    fs.symlinkSync(hostTmp, outLink, "dir");
+    assert.throws(() => fs.mkdtempSync(path.join(outLink, "t2-fix4-leak-" + uniq + "-")), /临时目录硬门/u, "穿过指向根外的链接 → 拒");
+    assert.deepEqual(leftover("t2-fix4-leak-" + uniq), [], "拒的时候根外零创建");
+    const besideLink = fs.mkdtempSync(outLink);   // 造的是 <根>/jumpXXXXXX，不穿过链接
+    assert.equal(path.dirname(besideLink), fakeRoot, "末段是 symlink 时造的是根内的新目录：" + besideLink);
+
+    // ④ 父目录还不存在：最近存在祖先的拼接判定仍要对（根内允许、根外拒）
+    //    「允许」≠「能建」：父目录缺席时 mkdtemp 自己报 ENOENT —— 那不是硬门的事（硬门只为"会不会落到根外"负责）
+    assert.equal(insideRoot(path.join(fakeRoot, "notyet", "x-"), fakeRoot), true, "根内、父目录还没建 → 判据允许");
+    let noParent = null;
+    assert.throws(() => fs.mkdtempSync(path.join(fakeRoot, "notyet", "x-" + uniq + "-")), (e) => { noParent = e; return true; });
+    assert.equal(noParent.code, "ENOENT", "允许之后是 mkdtemp 自己的 ENOENT，不是硬门：" + noParent.message);
+    assert.equal(/临时目录硬门/u.test(noParent.message), false, "别把 ENOENT 说成越界");
+    fs.mkdirSync(path.join(fakeRoot, "notyet"), { recursive: true });
+    const deepIn = fs.mkdtempSync(path.join(fakeRoot, "notyet", "x-" + uniq + "-"));
+    assert.equal(deepIn.startsWith(fakeRoot + path.sep), true, "父目录建好之后当然能建在根内：" + deepIn);
+    fs.rmSync(path.join(fakeRoot, "notyet"), { recursive: true, force: true });
+    assert.throws(() => fs.mkdtempSync(path.join(hostTmp, "t2-fix4-out-" + uniq + "-")), /临时目录硬门/u, "根外（父目录在）→ 拒");
+    assert.throws(() => fs.mkdtempSync(path.join(hostTmp, "t2-fix4-none-", "deep-" + uniq + "-")), /临时目录硬门/u, "根外且父目录不存在 → 也拒");
+    assert.deepEqual([...leftover("t2-fix4-out-" + uniq), ...leftover("t2-fix4-none-")], [], "根外零创建");
+
+    // 判据本身（纯函数）逐条钉：这四条是这次返修的全部内容
+    assert.deepEqual([
+      insideRoot(fakeRoot, fakeRoot),                        // ① 根的兄弟 → 不在内
+      insideRoot(fakeRoot + path.sep, fakeRoot),             // ② 根内 → 在内
+      insideRoot(path.join(outLink, "x-"), fakeRoot),        // ③ 穿过根外链接 → 不在内
+      insideRoot(outLink, fakeRoot),                         // ③b 末段是链接本身 → 在内
+      insideRoot(path.join(fakeRoot, "notyet", "x-"), fakeRoot),  // ④ 根内、父目录不存在 → 在内
+    ], [false, true, false, true, true], "四条边界：" + JSON.stringify(violations.map((v) => v.target)));
+  } finally {
+    guard.restore();
+  }
+});
+
+test("PK3-T2-fix5：固定哨兵路径已存在且是 symlink → 仍按“这次会造出的名字”判（三路 + 真假两头都钉）", () => {
+  // Codex 四轮 P1：判据会 realpath 那个**固定**哨兵叶子（prefix + "XXXXXX"）。那只是个占位名 ——
+  // Node 最终用的随机名必定还不存在，所以盘上有没有同名链接跟这次创建落到哪里**无关**：
+  // 跟着它走就会两头都错。根外前缀 escape- 上建 escape-XXXXXX -> 根内 的时候，
+  // 旧判据说“在根内”放行，而真实 mkdtempSync(escape-) 在**根外**建出 escape-<6 位>。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-fix5-"));
+  const fakeRoot = fs.realpathSync(fs.mkdtempSync(path.join(base, "root-")));
+  const siblingDir = path.dirname(fakeRoot);                    // = base：根外
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  const escape = path.join(siblingDir, "escape-" + uniq + "-");
+  fs.symlinkSync(fakeRoot, escape + MKDTEMP_SENTINEL, "dir");    // 固定哨兵路径已存在、指向根内
+  const violations = [];
+  const guard = installMkdtempGuard({ root: fakeRoot, violations });
+  const before = new Set(fs.readdirSync(siblingDir));
+  try {
+    // 判据本身：哨兵那级是链接也不跟着走
+    assert.equal(insideRoot(escape, fakeRoot), false, "哨兵叶子是 symlink → 仍不在根内");
+    // 三路都拒：当场抛（sync），不把失败塞进 callback / rejected promise
+    assert.throws(() => fs.mkdtempSync(escape), /临时目录硬门/u, "sync");
+    assert.throws(() => fs.mkdtemp(escape, () => {}), /临时目录硬门/u, "callback");
+    assert.throws(() => fs.promises.mkdtemp(escape), /临时目录硬门/u, "promises");
+    assert.equal(violations.length, 3, "三路各记一条：" + JSON.stringify(violations.map((v) => v.target)));
+    // 零创建：父目录**前后集合比较**（Node 生成 basename + 6 位随机位，找字面 "XXXXXX" 找不到）
+    const added = fs.readdirSync(siblingDir).filter((n) => !before.has(n));
+    assert.deepEqual(added, [], "被拒时父目录里不许新增任何条目（含 escape-<6 位>）：" + JSON.stringify(added));
+    // 反向也钉：根内前缀的哨兵叶子指向根外 —— 那次创建其实落在**根内**，不许误拒
+    const inPrefix = path.join(fakeRoot, "in-");
+    fs.symlinkSync(siblingDir, inPrefix + MKDTEMP_SENTINEL, "dir");
+    const inMade = fs.mkdtempSync(inPrefix);
+    assert.equal(path.dirname(inMade), fakeRoot, "根内前缀 + 指向根外的哨兵叶子 → 照旧建在根内：" + inMade);
+    // 根内普通前缀照旧透传
+    assert.equal(insideRoot(path.join(fakeRoot, "ok-"), fakeRoot), true);
+    assert.equal(path.dirname(fs.mkdtempSync(path.join(fakeRoot, "ok-"))), fakeRoot);
+  } finally {
+    guard.restore();
+    fs.rmSync(escape + MKDTEMP_SENTINEL, { force: true });
+    fs.rmSync(path.join(fakeRoot, "in-") + MKDTEMP_SENTINEL, { force: true });
+  }
+});
+
+test("PK3-T2-fix3：私有根内的符号链接指向根外 → sync / callback / promises 三路都拒且零创建", () => {
+  // Codex 二轮反例：只按字面 path.resolve 比的话，root/jump -> 根外 就能绕过
+  // （mkdtempSync(root/jump/leak-) 被放行、目录真建在根外）。这条用真 symlink 验三路。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-symlink-"));
+  const fakeRoot = fs.realpathSync(base);
+  const hostTmp = SUITE_TMP.hostTmp;                 // 根外 = 真宿主 tmp
+  const jump = path.join(fakeRoot, "jump");
+  fs.symlinkSync(hostTmp, jump, "dir");
+  const violations = [];
+  const guard = installMkdtempGuard({ root: fakeRoot, violations });
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  const leftovers = () => fs.readdirSync(hostTmp).filter((n) => n.startsWith("t2-symlink-leak-" + uniq));
+  try {
+    let err = null;
+    assert.throws(() => fs.mkdtempSync(path.join(jump, "t2-symlink-leak-" + uniq + "-")), (e) => {
+      err = e; return /临时目录硬门/u.test(e.message);
+    });
+    assert.match(err.message, /解链接后/, "消息要说清是解链接后才越界的：" + err.message);
+    assert.equal(err.message.includes(hostTmp), true, "消息里要有解链接后的落点：" + err.message);
+    assert.throws(() => fs.mkdtemp(path.join(jump, "t2-symlink-leak-" + uniq + "-cb-"), () => {}), /临时目录硬门/u);
+    assert.throws(() => fs.promises.mkdtemp(path.join(jump, "t2-symlink-leak-" + uniq + "-pr-")), /临时目录硬门/u);
+    assert.equal(violations.length, 3, "三路各记一条：" + JSON.stringify(violations.map((v) => v.canonical)));
+    assert.deepEqual(leftovers(), [], "三路都不许在根外真的建出目录");
+    // 对照：同一张根内、不经链接的路径照旧透传（证明不是“见到 symlink 就拒”）
+    const ok = fs.mkdtempSync(path.join(fakeRoot, "t2-symlink-ok-"));
+    assert.ok(ok.startsWith(fakeRoot + path.sep), ok);
+  } finally {
+    guard.restore();
+    fs.rmSync(jump, { force: true });
+  }
+});
+
+test("PK3-T2：本轮套件自己的包装也在岗（越界一次 → violation 记下，本用例把它收回去）", () => {
+  // 上面那条验的是"包装的判据"（用自己的根与列表）；这条验**真套件里那个包装真的装上了**：
+  // 拿本轮宿主 tmp 当越界前缀必须抛。它记的那条 violation 会让退出硬门判红 —— 所以这里
+  // 记下长度再收回（故意制造的越界不该把整个套件搞红；退出码那件事由子进程用例验）。
+  const before = SUITE_TMP.violations.length;
+  const hostTmp = SUITE_TMP.hostTmp;
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  assert.throws(() => fs.mkdtempSync(path.join(hostTmp, "t2-real-guard-" + uniq + "-")), /临时目录硬门/u);
+  assert.equal(SUITE_TMP.violations.length, before + 1, "真包装也该记一条");
+  SUITE_TMP.violations.length = before;
+  assert.deepEqual(fs.readdirSync(hostTmp).filter((n) => n.startsWith("t2-real-guard-" + uniq)), []);
+});
+
+test("PK3-T2-fix2：别的用例把包装「还原成原函数」，也不影响后面的越界拦截（不依赖用例顺序）", () => {
+  // 验收反例：有人（在 checkout 里跑到这条时）把 fs.mkdtempSync 换回了**装之前那个原函数**，
+  // 于是后面两条用例看到的是"没有包装"。真实世界的写法就是这个：模块顶层先存一份原引用、
+  // 之后再赋回去。这里在**子进程**里原样重演，并断言：
+  //   （a）赋值被接住（记成 guard_reassigned，包装仍在）；（b）随后的越界照样被拦；
+  //   （c）退出时硬门把这件事判成非 0（包装被动过 = 本次结论不可信）。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-rearm-"));
+  const fakeHost = path.join(base, "host");
+  fs.mkdirSync(fakeHost);
+  const script = path.join(base, "t2-child.mjs");
+  fs.writeFileSync(script, `
+import fs from "node:fs";
+import path from "node:path";
+import { installSuiteTempRoot } from ${JSON.stringify(pathToFileURL(path.resolve("scripts", "test-support", "suite-temp-root.mjs")).href)};
+const hostTmp = process.argv[2];
+const rawSync = fs.mkdtempSync;          // ← 真实世界的"装之前存一份"
+installSuiteTempRoot();
+fs.mkdtempSync = rawSync;                // ← 模拟"别的用例把它还原成原函数"
+try {
+  fs.mkdtempSync(path.join(hostTmp, "leak-"));
+  process.stdout.write("NOT-INTERCEPTED\\n");
+} catch (err) {
+  process.stdout.write("INTERCEPTED:" + /临时目录硬门/u.test(err.message) + "\\n");
+}
+process.stdout.write("inner-is-raw:" + (fs.mkdtempSync !== rawSync) + "\\n");
+`, "utf-8");
+  const run = spawnSync(process.execPath, [script, fakeHost], {
+    encoding: "utf-8", env: { ...process.env, TMPDIR: fakeHost },
+  });
+  assert.match(run.stdout, /INTERCEPTED:true/u, run.stdout + run.stderr);
+  assert.match(run.stdout, /inner-is-raw:true/u, "赋值不该把包装整个换掉：" + run.stdout);
+  assert.match(run.stdout, /包装被重新赋值：mkdtempSync/u, run.stdout);
+  assert.match(run.stdout, /越界 mkdtemp：前缀 .*leak-/u, run.stdout);
+  assert.notEqual(run.status, 0, "包装被动过 → 硬门判本次结论不可信（非 0）：" + run.stdout + run.stderr);
+  assert.deepEqual(fs.readdirSync(fakeHost), [], "宿主 tmp 顶层不许留下东西");
+});
+
+test("PK3-T2：子进程越界 → 未捕获异常 + 退出非 0 + 硬门点名；不漏 → 0", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-spawn-"));
+  const fakeHost = path.join(base, "host");   // 驱动脚本放 base 里，host 只用来验"顶层收干净"
+  fs.mkdirSync(fakeHost);
+  const script = path.join(base, "t2-child.mjs");
+  fs.writeFileSync(script, `
+import fs from "node:fs";
+import path from "node:path";
+import { installSuiteTempRoot } from ${JSON.stringify(pathToFileURL(path.resolve("scripts", "test-support", "suite-temp-root.mjs")).href)};
+const hostTmp = process.argv[2];
+installSuiteTempRoot();
+if (process.argv[3] === "leak") fs.mkdtempSync(path.join(hostTmp, "leak-"));
+process.stdout.write("child-done\\n");
+`, "utf-8");
+  const run = (mode) => spawnSync(process.execPath, [script, fakeHost, mode], {
+    encoding: "utf-8", env: { ...process.env, TMPDIR: fakeHost },
+  });
+  // 对照：不漏 → 0，打出"通过"那行
+  const clean = run("clean");
+  assert.equal(clean.status, 0, clean.stdout + clean.stderr);
+  assert.match(clean.stdout, /临时目录硬门：本进程经 fs.mkdtemp\* 的调用都在私有根内、私有根已删/u, clean.stdout);
+  // 越界 → 用例红（未捕获异常）＋ 退出非 0 ＋ 硬门点名那条前缀
+  const leaked = run("leak");
+  assert.notEqual(leaked.status, 0, leaked.stdout + leaked.stderr);
+  assert.match(leaked.stdout, /临时目录硬门/u, leaked.stdout);
+  assert.match(leaked.stdout, /越界 mkdtemp：前缀 .*leak-/u, leaked.stdout);
+  assert.match(leaked.stderr, /临时目录硬门：mkdtemp 的前缀不在本轮私有根内/u, leaked.stderr);
+  // 拦住而不是先造后报：fakeHost 顶层不该有 leak-*（只有子进程那份私有根，且它退出时被清掉）
+  assert.deepEqual(fs.readdirSync(fakeHost).filter((n) => /^leak-/u.test(n)), []);
+  assert.deepEqual(fs.readdirSync(fakeHost), [], "子进程的私有根也要收干净");
+});
+
+test("PK3-T2：并行外部创建不得归责 —— 别的进程在宿主 tmp 造签名形状目录，本套件照旧绿", () => {
+  // Codex 点名的反例：宿主 tmp 是共享命名空间。第一版扫描会把这条算成"本轮泄漏"（随机红）。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-parallel-"));
+  const fakeHost = path.join(base, "host");
+  fs.mkdirSync(fakeHost);
+  const external = path.join(fakeHost, "external-abc123");   // 六位后缀，正是第一版认的"签名形状"
+  const script = path.join(base, "t2-child.mjs");
+  fs.writeFileSync(script, `
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { installSuiteTempRoot } from ${JSON.stringify(pathToFileURL(path.resolve("scripts", "test-support", "suite-temp-root.mjs")).href)};
+const hostTmp = process.argv[2];
+installSuiteTempRoot();
+// 另一个进程（不受本进程包装影响）在宿主 tmp 造一个目录 —— 归因只能落在它头上，跟本轮无关
+execFileSync(process.execPath, ["-e", "require('node:fs').mkdirSync(process.argv[1], { recursive: true })", path.join(hostTmp, "external-abc123")]);
+process.stdout.write("child-done\\n");
+`, "utf-8");
+  const run = spawnSync(process.execPath, [script, fakeHost], {
+    encoding: "utf-8", env: { ...process.env, TMPDIR: fakeHost },
+  });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.match(run.stdout, /临时目录硬门：本进程经 fs.mkdtemp\* 的调用都在私有根内、私有根已删/u, run.stdout);
+  assert.equal(/external-abc123|越界 mkdtemp/u.test(run.stdout + run.stderr), false,
+    "别人造的目录不许算到本套件头上：" + run.stdout + run.stderr);
+  assert.equal(fs.existsSync(external), true, "那个目录确实被造出来了（否则这条反例没验到东西）");
+});
+
+test("PK3-T2：linux-install.test 入口也有自己的私有根 —— 宿主 tmp 顶层不再多出 pk3*", () => {
+  // 修前实测：一次全量在这个目录的顶层新增 21 条 pk3*（pk3fix2-doctor ×7、pk3fix2-uninst ×6、
+  // pk3fix4-darwin ×4、pk3-linux-gate / pk3-sandbox / pk3-timer-absent / pk3fix2-node 各 1）。
+  const fakeHost = fs.mkdtempSync(path.join(os.tmpdir(), "t2-lihost-"));
+  const before = new Set(fs.readdirSync(fakeHost));
+  const run = spawnSync(process.execPath, ["--test", path.resolve("scripts", "linux-install.test.mjs")], {
+    encoding: "utf-8", env: { ...process.env, TMPDIR: fakeHost }, timeout: 300_000,
+  });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.match(run.stdout, /临时目录硬门：本进程经 fs.mkdtemp\* 的调用都在私有根内、私有根已删/u, run.stdout);
+  const added = fs.readdirSync(fakeHost).filter((n) => !before.has(n));
+  assert.deepEqual(added.filter((n) => n.startsWith("pk3")), [], "宿主 tmp 顶层不许新增 pk3*：" + JSON.stringify(added));
+  assert.deepEqual(added, [], "连私有根自己也要收干净：" + JSON.stringify(added));
 });
 
 test("PK3-T1-fix1：cpSync 必须被包，且 copy/rename/cp 的余量按**写入端**（args[1]）查", () => {

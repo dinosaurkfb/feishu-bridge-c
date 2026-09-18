@@ -7,13 +7,18 @@
  * 已属别人的话题静默改判，而「上一条进了 A、这一条进了 B」是最难查的一类故障。
  *
  * 用法：
+ *   node scripts/register-route.mjs --init-default --routes <表> --id <self|codex> --handler /abs/path.mjs [--note <说明>] [--apply]
  *   node scripts/register-route.mjs --id cc2cd --handler /abs/path.mjs --session <sid>
  *   node scripts/register-route.mjs --id cc2cd --handler /abs/path.mjs --session <sid> --apply
+ *
+ * 新机器的顺序（issue #222）：装机 → `--init-default` 首建本链默认路由 → 登记外部处理器。
+ * `--init-default` 的 `--routes` 必填：两条链各有一张表，环境变量兜底会把 codex 的默认写进 Claude 那张。
+ * 表里还没有默认路由时不许新增路由：那会把机器停在"有路由、但没有默认"的状态（未登记话题一律拒收）。
  */
 
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
-import { registerRouteBinding, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
+import { registerRouteBinding, initDefaultRoute, previewInitDefault, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const REASON_TEXT = {
@@ -25,6 +30,9 @@ const REASON_TEXT = {
   handler_not_a_file: "--handler 不是普通文件",
   handler_not_readable: "handler 不可读",
   no_session_id: "缺 --session",
+  no_default_route_yet: "表里还没有启用的默认路由 —— 直接登记外部处理器会让这台机器停在「有路由但没有默认」的状态：未登记话题一律拒收，本链自己也接不到待绑定认领（doctor 会报 ✗）；先用 --init-default 播种本链默认路由，再登记外部处理器",
+  default_route_exists: "表里已经有默认路由；要换默认处理器用 --restore-default（切权威路由，需 Frank 授权）",
+  routes_without_default: "表里已经有路由但都没标 default —— 给它们补默认等于改变未登记话题的去向（即 issue #222 说的那个坑），本命令不修：人工核对未登记话题该投给谁，Frank 定夺",
   no_default_route: "路由表里没有默认路由，无从恢复",
   no_expected_route_id: "缺 --id（本链默认路由的 id：Claude 是 self，Codex 是 codex）",
   default_route_id_mismatch: "表里的默认路由不是 --id 指定的那条；不改别人的路由，请人工核对",
@@ -65,7 +73,8 @@ function main() {
     }
     const file = routesArg;
     const table = loadRoutes(file);
-    const current = table.ok ? (table.routes.find((r) => r.isDefault) ?? (table.routes.length === 1 ? table.routes[0] : null)) : null;
+    // 只认显式 default（与 selectRoute / defaultRouteHandler 同一规则：单条非默认不算默认）
+    const current = table.ok ? (table.routes.find((r) => r.isDefault) ?? null) : null;
     console.log("路由表  ：" + file);
     console.log("默认路由：" + (current ? current.id + " → " + current.handler : "（没有）"));
     console.log("要求 id ：" + expectedRouteId + (current && current.id !== expectedRouteId ? "（不符，--apply 会拒绝）" : ""));
@@ -81,6 +90,33 @@ function main() {
   const session = arg("session");
   const note = arg("note") ?? null;
   const file = routesPath();
+
+  // --init-default：首建本链默认路由（issue #222）。表里已经有任何路由就拒 —— 本命令只在"还没有表/空表"这一步成立。
+  // 目标表**必须显式给**（与 --restore-default 一致）：两条链各有一张表，从 routesPath() / FEISHU_BRIDGE_ROUTES
+  // 兜底会把 --id codex 的首建写进 Claude 那张表（返修 P1：旧的 CLI 用例靠注入环境变量把这事掩盖了）。
+  if (process.argv.includes("--init-default")) {
+    const routesArg = arg("routes");
+    if (!id || !handler || !routesArg || !path.isAbsolute(routesArg)) {
+      console.error("用法：node scripts/register-route.mjs --init-default --routes <路由表绝对路径（Claude 链 ~/.claude/feishu-bridge/routes.json，Codex 链 ~/.codex/feishu-bridge/routes.json）> --id <本链默认路由 id：Claude 是 self，Codex 是 codex> --handler <处理器绝对路径> [--note <说明>] [--apply]");
+      process.exit(2);
+    }
+    // 预览与 --apply **同源**（judgeInitDefault 纯判定），且预览**只读**（PK3-R222-fix2）：
+    // 不 mkdir、不取锁、不写 —— "停用路由算不算已有路由"这种判据只写一处，
+    // 否则会出现"预览说没事、apply 说不行"（只有停用路由的表就是这样）。
+    const preview = previewInitDefault({ file: routesArg, id, handler, note });
+    console.log("路由表  ：" + routesArg);
+    console.log("将写入：" + JSON.stringify(note ? { id, handler, default: true, note } : { id, handler, default: true }));
+    if (!preview.ok) {
+      console.log("--apply 会拒（" + preview.reason + "）：" + (REASON_TEXT[preview.reason] ?? preview.reason) +
+        (preview.routes > 0 ? "【表里已有 " + preview.routes + " 条路由，含停用】" : ""));
+    }
+    if (!apply) { console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。"); process.exit(0); }
+    const r = initDefaultRoute({ file: routesArg, id, handler, note });
+    if (!r.ok) { console.error("没有写入：" + (REASON_TEXT[r.reason] ?? r.reason) + (r.error ? "：" + r.error : "")); process.exit(1); }
+    console.log("\n已写入：" + r.id + " → " + r.handler + "（default: true）");
+    console.log("接下来才能登记外部处理器 —— 表里有默认路由时，未登记话题不会落到别人的处理器上。");
+    process.exit(0);
+  }
 
   if (!id || !handler) {
     console.error("用法：node scripts/register-route.mjs --id <id> --handler <绝对路径> " +
@@ -98,6 +134,11 @@ function main() {
   console.log("路由表    " + file);
   console.log("路由      " + id + " → " + handler +
     (hasRoute ? "（已登记）" : "（新增）"));
+  // 新增路由 + 表里没有默认路由 = --apply 会被守卫拒（issue #222），预览时就说清楚。
+  if (!hasRoute && !before.routes.some((r) => r.isDefault)) {
+    console.log("注意      表里没有启用的默认路由 —— --apply 会拒（no_default_route_yet），" +
+      "先用 --init-default 播种本链默认路由。");
+  }
   if (session) {
     console.log("话题      " + session.slice(0, 12) + "… → " + id +
       (declared === id ? "（已登记）" : declared ? "（当前属于 " + declared + "）" : "（新增）"));

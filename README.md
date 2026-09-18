@@ -251,6 +251,19 @@ session 绑定。日常还可以使用：
 默认路由的 id 也要对（Claude `self` / Codex `codex`）：别的路由被标成默认是独立状态 `wrong_default`，不给自动恢复；
 改回用 `node scripts/register-route.mjs --restore-default --routes <该链的 routes.json> --handler <runtime/current 下的 inbound.mjs> --id <self|codex> [--apply]`
 （切权威路由，Frank 逐次授权；先备份整张表，只动默认那条）。
+**新机器的顺序（issue #222）**：装机 → 首建本链默认路由 → 再登记外部处理器。首建命令的目标表**必须显式给**（两条链各有一张表，靠环境变量兜底会把 Codex 的默认写进 Claude 那张，Codex 链把 `--routes` 换成 `~/.codex/feishu-bridge/routes.json`、`--id` 换成 `codex`）：
+
+```bash
+node scripts/register-route.mjs --init-default --routes ~/.claude/feishu-bridge/routes.json --id self --handler <runtime/current/scripts/inbound.mjs>   # 先看预览，确认后加 --apply
+```
+
+它只在表不存在、或表里还没有任何路由时成立。表不存在、或表里没有默认路由时，新增路由会被 `no_default_route_yet` 拒掉（只往已有路由登记话题不受影响）；
+「没有路由表」`doctor` 照旧判 ✓（分发器用运行时自带的默认处理器），而「表里有路由却没标 default」判 ✗。
+兜底只认显式 `default: true`：表里只有一条非默认路由**不再**被当默认（2026-09-18 之前在 omm 首装实测到的隐式规则会把那唯一一条变成全机兜底）；
+没有默认路由时未登记话题一律拒收，回执按 `no_default_route`（写明有几条启用路由、没有默认）与「一条启用路由都没有」的 `no_route_handler` 分开报。
+
+**升级说明（issue #222 返修）**：旧机器上如果是「表里只有一条路由、且没标 `default`」，升级后未登记话题从「投给那一条」变成**一律拒收**（`doctor` 的「路由表」项报 ✗）。
+已知 Mac 与 omm 两台的表里都有显式默认条目，**升级本身不需要做任何事**；真遇到这种表：人工核对未登记话题该投给谁，再由 Frank 定夺 —— **不是**跑 `--init-default`（它只对还没有表的机器成立，这种表上会被拒）。
 账本按封闭形状分族盘点锁家族：主锁 control_lock_held（不要手删，协议会回收）、reap 段锁 control_reap_lock（残骸交 repair-publish-lock）、
 维护锁 control_maint_lock（人确认后手删）、.reaped-<uuid> / .reap.quarantine-<…> 残骸（可直接删）；别的后缀是 unrecognized_entry。
 

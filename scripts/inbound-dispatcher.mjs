@@ -12,7 +12,7 @@ import path from "node:path";
 
 import { CANONICAL_EVENT_ENV, buildCanonicalEvent } from "./canonical-event.mjs";
 import { ENVELOPE_ENV, fetchTriggerEvent } from "./envelope.mjs";
-import { ROUTE_REJECT_TEXT, loadRoutes, selectRoute } from "./inbound-routes.mjs";
+import { routeRejectText, loadRoutes, selectRoute } from "./inbound-routes.mjs";
 
 const appendLog = (file, line) => {
   if (typeof file !== "string" || !file) return;
@@ -95,7 +95,7 @@ export function runInboundDispatcher({
     // 表读不出来 ≠ 本机没配路由。当成空表会落到默认 handler，
     // 于是本该属于别人的话题被投给了别人 —— 那不是降级，是投错。
     log("routes table unusable: " + table.reason);
-    return fail(ROUTE_REJECT_TEXT[table.reason] ?? table.reason, table.reason);
+    return fail(routeRejectText(table.reason), table.reason);
   }
   const fallback = defaultRoute && typeof defaultRoute.id === "string" &&
     typeof defaultRoute.handler === "string"
@@ -110,7 +110,8 @@ export function runInboundDispatcher({
   if (!picked.ok) {
     log("route selection failed: " + picked.reason +
       " session=" + diagnosticId(canonical.event.source.session_id));
-    return fail(ROUTE_REJECT_TEXT[picked.reason] ?? picked.reason, picked.reason);
+    // 带上候选条数："有 3 条路由但没默认" 与 "没有路由" 是两种故障，回执要说清（issue #222 返修 P2-3）。
+    return fail(routeRejectText(picked.reason, picked), picked.reason);
   }
 
   const handler = picked.route.handler;

@@ -24,10 +24,12 @@
  *   node scripts/codex/drain-service.mjs --disable --apply
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDirectRun } from "../direct-run.mjs";
+import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
 import {
   LAUNCHCTL_ENV, PHASE_TEXT, absentJob, loadedPhase as loadedPhaseOf, parseLaunchctlList, spawnLaunchctl,
 } from "../launchd-job.mjs";
@@ -94,17 +96,59 @@ const isExecutable = (p) => {
 };
 
 /**
- * `systemctl show -p Environment --value` 里某个变量的值（null = 没有这个变量）—— fix4 P1-2。
- * manager 打的是 `VAR=value` 一列；值里有空格 / 特殊字符时 systemd 会加引号或按 C 风格转义（`\x20`），
- * 两种都要还原 —— 否则含空格的桥根（比如 `…/My Codex Home/feishu-bridge`）会被误判成漂移。
+ * 把一个 shell 引号项里的转义还原（systemd 的 `shell_maybe_quote` 用的是 C 风格转义：`\xHH`，
+ * 以及 `\"` / `\\` 这种反斜杠单字符形式）。
+ */
+const unescapeSystemdWord = (s) => String(s ?? "")
+  .replace(/\\x([0-9a-fA-F]{2})/gu, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
+  .replace(/\\(.)/gu, "$1");
+
+/** 去掉恰好包住整个字符串的一对双引号（`"a b"` → `a b`；`a"b` 不动）。 */
+const stripOuterQuotes = (s) => (s.length >= 2 && s.startsWith("\"") && s.endsWith("\"") ? s.slice(1, -1) : s);
+
+/**
+ * 把 `systemctl show -p <某数组属性> --value` 的输出拆成**字符串项**：systemd 会对每个项调用
+ * `shell_maybe_quote`，所以**整条 `NAME=value` 可能被一对双引号包住**（`"FEISHU_CODEX_BRIDGE_HOME=/a b"`）。
+ * 双引号内允许 `\"` / `\\` / `\xHH`，解析时把转义序列**原样留着**，交给 unescapeSystemdWord 统一解。
+ * 官方语义见 systemd 源码 `src/shared/bus-print-properties.c`（shell_maybe_quote）与 `src/basic/escape.c`。
+ */
+export const shellQuoteItems = (text) => {
+  const items = [];
+  let cur = "";
+  let quoted = false;
+  const s = String(text ?? "");
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (quoted) {
+      if (ch === "\\" && i + 1 < s.length) { cur += ch + s[i + 1]; i += 1; continue; }
+      if (ch === "\"") { quoted = false; continue; }
+      cur += ch;
+      continue;
+    }
+    if (ch === "\"") { quoted = true; continue; }
+    if (/\s/u.test(ch)) { if (cur.length > 0) { items.push(cur); cur = ""; } continue; }
+    cur += ch;
+  }
+  if (cur.length > 0) items.push(cur);
+  return items;
+};
+
+/**
+ * `systemctl show -p Environment --value` 里某个变量的值（null = 没有这个变量）。
+ * 解析顺序（PK3-L7-fix5 P1-2）：**先按 shell 引号规则拆出每个字符串项**，再按**首个** `=` 分键值，
+ * 最后解 C 转义。四种真实形状都要认：
+ *   `NAME=/a/b`（裸值）、`"NAME=/a b"`（整条加引号）、`NAME="/a b"`、`NAME=/a\x20b`；也允许一条里多个变量并列。
+ * 旧版只认后两种中的一部分，含空格的合法桥根会被误判成漂移（enable 后误报 loaded_other 并 exit 1）。
  */
 export const systemdEnvValue = (text, name) => {
-  const m = new RegExp("(?:^|\\s)" + name + "=(\"[^\"]*\"|\\S*)", "u").exec(String(text ?? ""));
-  if (m === null) return null;
-  const raw = m[1];
-  const body = raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"") ? raw.slice(1, -1) : raw;
-  return body.replace(/\\x([0-9a-fA-F]{2})/gu, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
-    .replace(/\\(.)/gu, "$1");
+  for (const rawItem of shellQuoteItems(text)) {
+    const item = unescapeSystemdWord(stripOuterQuotes(rawItem));
+    const eq = item.indexOf("=");
+    if (eq <= 0) continue;
+    if (item.slice(0, eq) !== name) continue;
+    return unescapeSystemdWord(stripOuterQuotes(item.slice(eq + 1)));
+  }
+  return null;
 };
 
 /**
@@ -721,6 +765,35 @@ export function runDrainService(argv = process.argv.slice(2), {
         return exit(0);
       }
 
+      // 接下来才真的动东西（**写路径**）：先进安装面锁，再查门、重读现场。
+      // 取锁只自己直接跑 CLI 时做（被 uninstall.mjs 编排时走 HELD 继承）；被当库调（用例）时不代替调用方持锁。
+      {
+        const hook = process.env.FEISHU_BRIDGE_DRAIN_BEFORE_LOCK;
+        if (typeof hook === "string" && hook.length > 0) {
+          try { spawnSync(process.execPath, [hook], { encoding: "utf-8", env: process.env, timeout: 60_000 }); }
+          catch (err) { error("（取锁前的注入脚本跑不动：" + String(err?.message ?? err) + "）"); }
+        }
+      }
+      const surface = isDirectRun(import.meta.url) ? holdInstallSurfaceLockOrExit({ home, err: error }) : null;
+      const gateNow = gateBlocks();
+      if (gateNow.blocked) {
+        // 锁由 holdInstallSurfaceLockOrExit 挂的 exit 钩子交还（**不要**在这里手动 release：会释放两遍，
+        // 第二遍 lock_lost 反而把"零写拒绝"变成"锁丢了"）。
+        error("维护门开着（" + String(gateNow.text ?? "") + "）—— 锁内复核发现的，什么都没写。");
+        return exit(2);
+      }
+      // **锁内重读现场**（fix5 P1-3）：node 与单元现状都以此刻为准（上面那份是给预览/拒绝用的）。
+      {
+        let node2 = null;
+        let why = null;
+        try { node2 = pickNode("linux", home); } catch (err) { why = String(err?.message ?? err); }
+        if (why !== null) {
+          error("\n锁内重读发现 node 又解不出来了：" + why + "\n什么都没写。");
+          return exit(1);   // 锁由 exit 钩子交还
+        }
+        node = node2;
+      }
+
       const units = codexDrainSystemdUnits({ home, codexHome, bridge, node });
       fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(paths.service, units.service, { mode: 0o644 });
@@ -771,6 +844,14 @@ export function runDrainService(argv = process.argv.slice(2), {
       if (!apply) {
         log("\n[dry-run] 什么都没写。加 --apply 才生效。");
         return exit(0);
+      }
+
+      // PK3-L7-fix5 P1-3：停用也是写路径（停服务 + 删单元）—— 同一条纪律：锁 → 锁内查门 → 现场 → 写。
+      const surface = isDirectRun(import.meta.url) ? holdInstallSurfaceLockOrExit({ home, err: error }) : null;
+      const gateNow = gateBlocks();
+      if (gateNow.blocked) {
+        error("维护门开着（" + String(gateNow.text ?? "") + "）—— 锁内复核发现的，什么都没写。");
+        return exit(2);   // 锁由 exit 钩子交还（手动 release 会释放两遍 → lock_lost）
       }
 
       let plistUnreadable = null;

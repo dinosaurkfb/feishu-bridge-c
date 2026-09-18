@@ -7,6 +7,7 @@
  * migrate-auto-publish.mjs，这里只报数。
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { chatReplyPathStatus } from "../chat-reply.mjs";
 import os from "node:os";
@@ -79,13 +80,13 @@ const linuxDrainScene = () => {
   const hasFiles = fs.existsSync(spaths.service) || fs.existsSync(spaths.timer);
   return { spaths, hasFiles, look: systemdTimerLookup() };
 };
-const LINUX_DRAIN = uninstall ? linuxDrainScene() : null;
-const LINUX_DRAIN_PLAN = LINUX_DRAIN === null ? null : codexDrainRemovalPlan(LINUX_DRAIN);
-// 查不清就不动：**在动任何东西之前**拒绝（写在这是为了不让“钩子/技能已经删了、到定时器这步才拒”）。
-if (uninstall && apply && LINUX_DRAIN_PLAN.action === "refuse") {
-  console.error(LINUX_DRAIN_PLAN.text + "\n什么都没动（先查清 systemd --user 能不能用、里面到底有没有同名 timer，再卸载）。");
-  process.exit(1);
-}
+// **只在 linux 构造现场**（PK3-L7-fix5 P1-1）：darwin 真机上根本没有 systemd，这里连一次 systemctl
+// 都不该调 —— 旧版 `uninstall ? linuxDrainScene() : null` 会在 Mac 上把探询打成"查不清"，
+// 于是 --uninstall --apply 在任何卸载动作之前就 exit 1（真回归，隔离探针已复现）。
+const PFORM = timerPlatform({ home: os.homedir() });
+/** 预览用（锁外只读、算一份给人看）；apply 会在**锁内重算**（fix5 P1-3）。 */
+const PREVIEW_DRAIN = uninstall && PFORM === "linux" ? linuxDrainScene() : null;
+const PREVIEW_DRAIN_PLAN = PREVIEW_DRAIN === null ? null : codexDrainRemovalPlan(PREVIEW_DRAIN);
 
 
 // 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
@@ -167,11 +168,8 @@ if (!uninstall) {
 // **调度器不在这条命令里。**装了但没启用是默认态，不是某个检查碰巧生效的结果。
 // 评审的裁决：启用要是一条独立命令，否则仍可能误组合。
 if (uninstall) {
-  const pform = timerPlatform({ home: os.homedir() });
-  // fix4 P2-1：预览也查 manager（与 apply 同一份计划、同一句话），不再只看盘上文件。
-  console.log(LINUX_DRAIN_PLAN !== null && pform === "linux"
-    ? LINUX_DRAIN_PLAN.text
-    : "兜底排空    未启用（默认）");
+  // fix4 P2-1：预览也查 manager（与 apply 同一份计划、同一句话）—— 但**只在 linux**（fix5 P1-1）。
+  console.log(PREVIEW_DRAIN_PLAN !== null ? PREVIEW_DRAIN_PLAN.text : "兜底排空    未启用（默认）");
 } else {
   console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
 }
@@ -183,6 +181,15 @@ if (!apply) {
 
 // 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
 // 门检是瞬时的，锁才是原子准入（评审探针：过检后门才建立，安装器照写不误）。
+// 测试注入点（**只给用例用**，生产不设就是空转）：取锁前跑一次外部脚本（.mjs 绝对路径），
+// 用来确定性地复现"预览快照之后、锁内重读之前"的交错 —— 不靠 sleep 竞速。只在 linux 卸载这条写路径上跑。
+if (uninstall && PFORM === "linux") {
+  const hook = process.env.FEISHU_BRIDGE_CODEX_INSTALL_BEFORE_LOCK;
+  if (typeof hook === "string" && hook.length > 0) {
+    try { spawnSync(process.execPath, [hook], { encoding: "utf-8", env: process.env, timeout: 60_000 }); }
+    catch (err) { console.error("（取锁前的注入脚本跑不动：" + String(err?.message ?? err) + "）"); }
+  }
+}
 holdInstallSurfaceLockOrExit();
 {
   const g = gateBlocks();
@@ -297,7 +304,14 @@ if (uninstall) {
   // PK3-L7：若 linux 上单元存在（或 manager 里还有），按同纪律停并删
   // PK3-L7-fix3 P2：**不拿「盘上有文件」当前提** —— manager 里还有、盘上文件已丢的 orphan
   //   正是最容易被漏掉的一种（卸载会说「本来就没启用」，而那个 timer 可能还在跑）。
-  // PK3-L7-fix4 P2-1：用模块顶部算好的同一份现场与计划（预览/apply 不可能不一致）。
+  // PK3-L7-fix5 P1-3：**锁内重读现场**（旧版在模块顶部冻结，锁后不重读 → stale plan），
+  //   并且"查不清就拒绝"也挪到这里 —— 此时已持锁、还没写过任何东西。
+  const LINUX_DRAIN = PFORM === "linux" ? linuxDrainScene() : null;
+  const LINUX_DRAIN_PLAN = LINUX_DRAIN === null ? null : codexDrainRemovalPlan(LINUX_DRAIN);
+  if (LINUX_DRAIN_PLAN !== null && LINUX_DRAIN_PLAN.action === "refuse") {
+    console.error(LINUX_DRAIN_PLAN.text + "\n什么都没动（先查清 systemd --user 能不能用、里面到底有没有同名 timer，再卸载）。");
+    process.exit(1);
+  }
   if (LINUX_DRAIN !== null && LINUX_DRAIN_PLAN.action !== "none") {
     const { spaths, hasFiles, plan } = { spaths: LINUX_DRAIN.spaths, hasFiles: LINUX_DRAIN.hasFiles, plan: LINUX_DRAIN_PLAN };
     const disabled = systemctl(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });

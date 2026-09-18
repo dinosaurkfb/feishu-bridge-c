@@ -22,7 +22,7 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
   CODEX_DRAIN_SYSTEMD_UNIT, codexBridgeOf, codexDrainSystemdPaths, codexDrainSystemdUnits, serviceState, SYSTEMD_PHASE_TEXT,
-  pickNode as pickDrainNode, expectedJob, systemdEnvValue,
+  pickNode as pickDrainNode, expectedJob, shellQuoteItems, systemdEnvValue,
 } from "./drain-service.mjs";
 import { drainTimerCheck, drainTimerText, runDrainService } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台 / PK3-L2-fix3：模块函数入参测入口
 import {
@@ -10896,6 +10896,9 @@ test("PK3-L7：真实 env 残留 FEISHU_BRIDGE_PLATFORM=darwin + 显式 platform
 });
 
 // ── PK3-L7：Codex 侧兜底定时器 Linux systemd --user 深度用例 ──
+/** 路径是否存在（含断链的 symlink）—— 触发锁/单元文件的"在不在"。 */
+const lockPresent = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
+
 function linuxDrainFixture(prefix = "pk3l7-codex-", { codexHomeName = ".codex" } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const home = path.join(base, "home");
@@ -11298,6 +11301,10 @@ test("PK3-L7：codex/install.mjs --uninstall 在 Linux 上单元存在时按纪�
     const calls = fx.readLog();
     assert.deepEqual(calls, [
       // PK3-L7-fix3 P2：先问 manager（不拿「盘上有文件」当前提）
+      // PK3-L7-fix5 P1-3：问两遍 —— 一遍是锁外预览（fix4 P2-1 的诚实预览），一遍是**持锁后重读现场**
+      ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
+      ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
+      ["--user", "show", "feishu-bridge-codex-drain.timer", "-p", "LoadState", "--value"],
       ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
       ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
       ["--user", "show", "feishu-bridge-codex-drain.timer", "-p", "LoadState", "--value"],
@@ -11491,10 +11498,14 @@ test("PK3-L7-fix3 P2：卸载收 manager 里的孤儿 timer（盘上没文件也
     SYSTEMCTL_MOCK_IS_ENABLED: "disabled", SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "loaded",
   });
   assert.equal(r1.status, 0, r1.stdout + r1.stderr);
-  assert.deepEqual(orphan.readLog(), [
+  const probeCalls = [
     ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
     ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
     ["--user", "show", "feishu-bridge-codex-drain.timer", "-p", "LoadState", "--value"],
+  ];
+  assert.deepEqual(orphan.readLog(), [
+    // fix5 P1-3：探询**两遍**（锁外预览 + 持锁后重读现场）
+    ...probeCalls, ...probeCalls,
     ["--user", "disable", "--now", "feishu-bridge-codex-drain.timer"],
     ["--user", "daemon-reload"],
   ], "孤儿也要 disable --now 收干净：" + JSON.stringify(orphan.readLog()));
@@ -11733,6 +11744,155 @@ test("PK3-L7-fix4 P2-2：codexBridgeOf 不再有自调用的默认参数（不�
   assert.equal(codexBridgeOf({ codexHome: "/a/.codex", env: { FEISHU_CODEX_BRIDGE_HOME: "/explicit" } }), "/explicit");
   assert.throws(() => codexBridgeOf({ codexHome: "/a/.codex", env: { FEISHU_CODEX_BRIDGE_HOME: "relative/path" } }),
     /必须是绝对路径/u, "显式变量是相对路径 → 抛（与 bridgeHome 同一条纪律）");
+});
+
+// ── PK3-L7-fix5：Codex 三轮 3 P1 的常驻反例 ─────────────────────────────────────────
+
+// 拿掉哪行会红：把 `LINUX_DRAIN` 改回“uninstall 就构造”（模块级无条件），本用例会红在
+//   「darwin 预览/卸载退出 0」与「systemctl 调用次数 = 0」两处 —— 假 systemctl 一律失败，
+//   就像真 Mac 上没有 systemd 那样。
+test("PK3-L7-fix5 P1-1：darwin 卸载/预览一次 systemctl 都不调（Mac 真机回归）", () => {
+  const fx = linuxDrainFixture();
+  const counter = path.join(fx.base, "sys-count.txt");
+  const fake = path.join(fx.base, "sys-no-systemd");
+  fs.writeFileSync(fake,
+    "#!/bin/sh\necho x >> " + JSON.stringify(counter) + "\necho 'System has not been booted with systemd as init system' >&2\nexit 1\n",
+    { mode: 0o755 });
+  const baseEnv = { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
+    FEISHU_BRIDGE_SYSTEMCTL: fake };
+  const run = (args, extra) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), ...args],
+    { encoding: "utf-8", env: { ...baseEnv, ...extra } });
+
+  // ① darwin 预览：一次都不调 systemctl，退出 0
+  const dry = run(["--uninstall"], { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin" });
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.equal(fs.existsSync(counter), false, "darwin 预览不许调 systemctl：" + dry.stdout);
+  assert.match(dry.stdout, /兜底排空/u, dry.stdout);
+
+  // ② darwin 卸载：同样一次不调（旧版会因为 unverifiable 在任何动作前 exit 1）
+  const ap = run(["--uninstall", "--apply"], { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin" });
+  assert.equal(ap.status, 0, ap.stdout + ap.stderr);
+  assert.equal(fs.existsSync(counter), false, "darwin 卸载不许调 systemctl：" + ap.stdout + ap.stderr);
+  assert.match(ap.stdout, /已完成本地卸载/u, ap.stdout);
+
+  // ③ 对照：同一个夹具在 linux 下照旧问 manager（计数器证明这个假二进制确实会被调到）
+  const lx = run(["--uninstall"], { FEISHU_BRIDGE_TIMER_PLATFORM: "linux", SYSTEMCTL_MOCK_IS_ENABLED: "disabled",
+    SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "not-found" });
+  assert.equal(lx.status, 0, lx.stdout + lx.stderr);
+  assert.equal(fs.existsSync(counter), true, "linux 下应当真的去问 manager（对照）：" + lx.stdout);
+});
+
+// 拿掉哪行会红：把 systemdEnvValue 换回 fix4 的旧解析（只认 NAME=value / NAME="value" / \x20），
+//   「整条加引号」那条会返回 null（断言红），含空格合法桥根的 enable 也会红在 exit 1（误报 loaded_other）。
+test("PK3-L7-fix5 P1-2：Environment 按 systemd shell_maybe_quote 的真实形状解析（四种常驻 + 含空格桥根）", () => {
+  const NAME = "FEISHU_CODEX_BRIDGE_HOME";
+  const shapes = [
+    ["裸值", "PATH=/usr/bin " + NAME + "=/a/b/c", "/a/b/c"],
+    ["整条加引号（含空格）", '"' + NAME + '=/a b/c" PATH=/usr/bin', "/a b/c"],
+    ["NAME=\"value\"", NAME + '="/a b/c"', "/a b/c"],
+    ["\\x20 转义", NAME + "=/a\\x20b/c", "/a b/c"],
+    ["多变量并列 + 值里带 =", "PATH=/a=b " + NAME + "=/x", "/x"],
+    ["空值", NAME + "=", ""],
+    ["没有这个变量", "PATH=/usr/bin", null],
+  ];
+  for (const [label, text, want] of shapes) {
+    assert.equal(systemdEnvValue(text, NAME), want, label + "：" + JSON.stringify(text));
+  }
+  assert.deepEqual(shellQuoteItems('"A=1 2" B=3'), ["A=1 2", "B=3"], "拆项：整条加引号 + 裸值");
+
+  // 含空格的**合法桥根**：manager 报的是真实形状（整条加引号）→ 必须 loaded，不许 loaded_other
+  const fx = linuxDrainFixture("pk3l7-fix5-space-", { codexHomeName: "My Codex Home" });
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  const savedEnv = process.env.SYSTEMCTL_MOCK_ENVIRONMENT;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  process.env.SYSTEMCTL_MOCK_ENVIRONMENT = '"' + NAME + "=" + fx.bridge + '"';
+  try {
+    let out = "";
+    let exitCode = null;
+    runDrainService(["--enable", "--apply"], {
+      home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux",
+      log: (m) => { out += m + "\n"; }, error: (m) => { out += m + "\n"; }, exit: (c) => { exitCode = c; },
+    });
+    assert.equal(exitCode, 0, "含空格的合法桥根不许误报漂移：" + out);
+    assert.match(out, /已启用，定时器已加载/u, out);
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+    if (savedEnv === undefined) delete process.env.SYSTEMCTL_MOCK_ENVIRONMENT;
+    else process.env.SYSTEMCTL_MOCK_ENVIRONMENT = savedEnv;
+  }
+});
+
+// 拿掉哪行会红：删掉 drain-service 里那次 `holdInstallSurfaceLockOrExit`（回到 fix4 的“只查门不取锁”），
+//   ① 会红在「exit 2 零写」（它会写完单元再出口 0）；② 会红在 exit 2/busy（它根本不会去拿锁）。
+test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门 + 锁内重读现场）", () => {
+  const writeHook = (p, lines) => { fs.writeFileSync(p, lines.join("\n") + "\n"); return p; };
+  const drain = (fx, extra) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...extra } });
+  const drainLockPath = (fx) => path.join(fx.home, ".claude", "feishu-bridge", "install-surface.lock");
+
+  // ① 取锁前建维护门 → exit 2、零写、锁已交还
+  const a = linuxDrainFixture();
+  const gateFile = path.join(a.base, "maint.gate");
+  const hookGate = writeHook(path.join(a.base, "hook-gate.mjs"), [
+    "import { createGate } from " + JSON.stringify(pathToFileURL(path.resolve("scripts", "maintenance-gate-core.mjs")).href) + ";",
+    "createGate({ file: " + JSON.stringify(gateFile) + ", reason: \"交错反例：取锁前建门\" });",
+  ]);
+  const aRun = drain(a, { FEISHU_BRIDGE_SYSTEMCTL: a.fakeBin, FEISHU_BRIDGE_DRAIN_BEFORE_LOCK: hookGate,
+    FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile });
+  assert.equal(aRun.status, 2, aRun.stdout + aRun.stderr);
+  assert.match(aRun.stderr, /维护门/u, aRun.stderr);
+  assert.equal(fs.existsSync(codexDrainSystemdPaths(a.home).service), false, "① 拒了就零写：" + aRun.stdout);
+  assert.equal(lockPresent(drainLockPath(a)), false, "① 锁要交还（不许留 stale lock）");
+
+  // ② 锁被别人持有 → surface_install_busy exit 2 零写（enable 与 install --uninstall 两条写路径都受管）
+  const b = linuxDrainFixture();
+  fs.mkdirSync(path.dirname(drainLockPath(b)), { recursive: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "t" }), drainLockPath(b));
+  try {
+    const bRun = drain(b, { FEISHU_BRIDGE_SYSTEMCTL: b.fakeBin });
+    assert.equal(bRun.status, 2, bRun.stdout + bRun.stderr);
+    assert.match(bRun.stderr, /安装面锁拿不到/u, bRun.stderr);
+    assert.equal(fs.existsSync(codexDrainSystemdPaths(b.home).service), false, "② busy 也零写");
+    const cRun = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
+      { encoding: "utf-8", env: { ...process.env, HOME: b.home, CODEX_HOME: b.codexHome,
+        FEISHU_CODEX_BRIDGE_HOME: b.bridge, FEISHU_BRIDGE_SYSTEMCTL: b.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" } });
+    assert.equal(cRun.status, 2, "install 的 linux 写路径也要在锁里：" + cRun.stdout + cRun.stderr);
+    assert.match(cRun.stderr, /安装面锁拿不到/u, cRun.stderr);
+  } finally {
+    fs.rmSync(drainLockPath(b), { force: true });
+  }
+
+  // ③ 锁内重读现场：注入钩子在取锁前把两份 unit 放上去 → apply 必须看见并收掉（旧版拿预览快照会跳过）
+  const d = linuxDrainFixture();
+  const dPaths = codexDrainSystemdPaths(d.home);
+  fs.rmSync(dPaths.dir, { recursive: true, force: true });
+  const hookUnits = writeHook(path.join(d.base, "hook-units.mjs"), [
+    "import fs from \"node:fs\"; import path from \"node:path\";",
+    "fs.mkdirSync(" + JSON.stringify(dPaths.dir) + ", { recursive: true });",
+    "fs.writeFileSync(" + JSON.stringify(dPaths.service) + ", \"service\\n\");",
+    "fs.writeFileSync(" + JSON.stringify(dPaths.timer) + ", \"timer\\n\");",
+  ]);
+  const dRun = spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: d.home, CODEX_HOME: d.codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: d.bridge, FEISHU_BRIDGE_SYSTEMCTL: d.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
+      FEISHU_BRIDGE_CODEX_INSTALL_BEFORE_LOCK: hookUnits } });
+  assert.equal(dRun.status, 0, dRun.stdout + dRun.stderr);
+  assert.equal(fs.existsSync(dPaths.service), false, "③ 锁内重读必须看见锁前放上去的 unit：" + dRun.stdout);
+  assert.equal(fs.existsSync(dPaths.timer), false, "③ 同上（timer）");
+  assert.match(dRun.stdout, /已停用并删除 systemd 单元/u, dRun.stdout);
+
+  // 对照：正常路径（不注入）→ 0
+  const e = linuxDrainFixture();
+  const eRun = drain(e, { FEISHU_BRIDGE_SYSTEMCTL: e.fakeBin });
+  assert.equal(eRun.status, 0, eRun.stdout + eRun.stderr);
+  assert.match(eRun.stdout, /已启用，定时器已加载/u, eRun.stdout);
+  assert.equal(lockPresent(drainLockPath(e)), false, "对照：正常收尾也要交还锁");
 });
 
 test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {

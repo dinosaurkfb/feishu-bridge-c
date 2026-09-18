@@ -47,14 +47,37 @@ import { codexRuntimeRoot, verifyRuntime } from "../runtime-install.mjs";
 import { preflightTask } from "./publish-eligible.mjs";
 import { bridgeHome, loadRegistry, registryFile, taskPaths } from "./state.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
+import { systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent, timerPlatform, resolveNodeForHooks } from "../install-projection.mjs";
+import { systemctl } from "../timer-exec.mjs";
+import { SYSTEMCTL_STATE_WORDS } from "../maintenance/timers.mjs";
 
 const CHAIN = "codex";
 export const LAUNCH_LABEL = "com.frank.feishu-bridge-codex.drain";
+export const CODEX_DRAIN_SYSTEMD_UNIT = "feishu-bridge-codex-drain";
 
 export const plistPath = (home = os.homedir()) =>
   path.join(home, "Library", "LaunchAgents", LAUNCH_LABEL + ".plist");
 
-const pickNode = () => {
+export const codexDrainSystemdDir = (home = os.homedir()) =>
+  path.join(home, ".config", "systemd", "user");
+
+export const codexDrainSystemdPaths = (home = os.homedir()) => {
+  const dir = codexDrainSystemdDir(home);
+  return {
+    dir,
+    service: path.join(dir, CODEX_DRAIN_SYSTEMD_UNIT + ".service"),
+    timer: path.join(dir, CODEX_DRAIN_SYSTEMD_UNIT + ".timer"),
+  };
+};
+
+export const pickNode = (platform = process.platform, home = os.homedir()) => {
+  if (platform === "linux") {
+    try {
+      return resolveNodeForHooks({ homedir: home, platform: "linux" });
+    } catch {
+      return process.execPath;
+    }
+  }
   for (const file of ["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath]) {
     try { fs.accessSync(file, fs.constants.X_OK); return file; } catch { /* next */ }
   }
@@ -88,7 +111,7 @@ const xml = (text) => String(text)
 
 /** launchd 里**应该**跑的东西。跟 plist 同源 —— 各写一份就会漂。 */
 export function expectedJob({ home = os.homedir(), codexHome = codexHomeOf(home),
-  node = pickNode() } = {}) {
+  platform = process.platform, node = pickNode(platform, home) } = {}) {
   return { node, args: [node, drainScriptPath(home, codexHome)] };
 }
 
@@ -125,6 +148,52 @@ export function plistBody({ home = os.homedir(), node = pickNode(),
 `;
 }
 
+export function codexDrainSystemdUnits({
+  home = os.homedir(),
+  codexHome = codexHomeOf(home),
+  node = pickNode("linux", home),
+} = {}) {
+  const script = drainScriptPath(home, codexHome);
+  const workdir = path.join(codexRuntimeRoot(codexHome), "current");
+  const log = path.join(codexHome, "feishu-bridge", "drain.log");
+  const exec = systemdExecStartValue([node, script]);
+  const service = `[Unit]
+Description=feishu-bridge 兜底发布（Codex 链，drain-all）
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${workdir}
+ExecStart=${exec}
+StandardOutput=append:${log}
+StandardError=append:${log}
+`;
+  const timer = `[Unit]
+Description=feishu-bridge 兜底发布定时器（Codex 链，每 30 分钟）
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=${CODEX_DRAIN_SYSTEMD_UNIT}.service
+
+[Install]
+WantedBy=timers.target
+`;
+  return { service, timer };
+}
+
+export const SYSTEMD_PHASE_TEXT = {
+  absent: "未启用（安装后的默认态，不是故障）",
+  plist_unreadable: "**单元文件读不出来 —— 不知道它是什么状态，一律当成可能在跑**",
+  orphan: "**没有单元文件，但 systemd 里还有同名 timer 在 —— 它在按谁的配置跑说不清**",
+  stale: "单元文件与当前运行时对不上（要重装）",
+  installed_not_loaded: "**单元已写入但没被 systemd --user 加载 —— 定时器不会跑**",
+  loaded: "已加载，正在按计划跑",
+  loaded_other: "**同名 timer 在跑，但参数不是当前这份 —— 跑的多半是旧配置**",
+  unverifiable: "systemd --user 状态查不出来 —— 不等于没在跑",
+};
+
 /**
  * 数一遍还没处理的历史待发内容。
  *
@@ -156,7 +225,116 @@ export function classifyBacklog({ home = bridgeHome() } = {}) {
  * 把它报成故障，人就会去"修"一件本来就该这样的事。
  */
 export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
-  codexHome = codexHomeOf(home) } = {}) {
+  codexHome = codexHomeOf(home), platform = timerPlatform({ home }), systemctlFn = systemctl } = {}) {
+  if (platform === "linux") {
+    const runtime = verifyRuntime({ root: codexRuntimeRoot(codexHome) });
+    const paths = codexDrainSystemdPaths(home);
+    const units = codexDrainSystemdUnits({ home, codexHome });
+    const backlog = classifyBacklog({ home: bridge });
+    const scan = scanRunnable({ home: bridge });
+
+    let serviceContent = null;
+    let timerContent = null;
+    let plistUnreadable = null;
+    try {
+      serviceContent = fs.readFileSync(paths.service, "utf-8");
+    } catch (err) {
+      if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable";
+    }
+    try {
+      timerContent = fs.readFileSync(paths.timer, "utf-8");
+    } catch (err) {
+      if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable";
+    }
+
+    let phase = "unverifiable";
+    let phaseWhy = null;
+
+    if (plistUnreadable !== null) {
+      phase = "plist_unreadable";
+    } else {
+      const timerUnit = CODEX_DRAIN_SYSTEMD_UNIT + ".timer";
+      const serviceUnit = CODEX_DRAIN_SYSTEMD_UNIT + ".service";
+
+      const enabled = systemctlFn(["--user", "is-enabled", timerUnit], { tolerate: true });
+      const active = systemctlFn(["--user", "is-active", timerUnit], { tolerate: true });
+
+      if (enabled?.skipped || active?.skipped) {
+        phase = "unverifiable";
+        phaseWhy = "体检的 home 不是当前用户的家目录（沙箱），不碰真实 systemctl --user";
+      } else {
+        const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
+        const stateWord = (r) => {
+          const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+          return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
+        };
+        const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
+        const broken = (r) => !readable(r);
+
+        if (broken(enabled) || broken(active)) {
+          phase = "unverifiable";
+          phaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).slice(0, 120) + "）—— 查不清，不等于没在跑";
+        } else {
+          const hasFiles = serviceContent !== null || timerContent !== null;
+          const projected = serviceContent === units.service && timerContent === units.timer;
+          const isEnabled = String(enabled?.out ?? "").trim() === "enabled";
+          const isActive = String(active?.out ?? "").trim() === "active";
+
+          if (!hasFiles) {
+            if (isEnabled || isActive) {
+              phase = "orphan";
+              phaseWhy = "没有单元文件，但 systemd 里还有同名 timer 在";
+            } else {
+              phase = "absent";
+            }
+          } else if (serviceContent === null || timerContent === null) {
+            phase = "installed_not_loaded";
+            phaseWhy = "systemd 单元文件不完整";
+          } else if (!projected) {
+            phase = "stale";
+            phaseWhy = "单元文件与当前运行时对不上（要重装）";
+          } else if (isEnabled && isActive) {
+            const show = systemctlFn(["--user", "show", serviceUnit, "-p", "ExecStart", "--value"], { tolerate: true });
+            const expectedArgs = expectedJob({ home, codexHome, platform: "linux" }).args;
+            const loadedArgv = systemdShowExecArgv(String(show?.out ?? ""));
+            const sameExec = show?.ok === true && loadedArgv !== null &&
+              (loadedArgv === systemdExecStartValue(expectedArgs) || loadedArgv === expectedArgs.join(" "));
+            if (show?.ok !== true) {
+              phase = "unverifiable";
+              phaseWhy = "systemctl --user show 查不了（" + say(show).slice(0, 120) + "）—— 已加载的定义核不了，查不清";
+            } else if (!sameExec) {
+              phase = "loaded_other";
+              phaseWhy = "systemd manager 里已加载的 ExecStart 与当前配置不一致";
+            } else {
+              phase = "loaded";
+            }
+          } else {
+            phase = "installed_not_loaded";
+            phaseWhy = isEnabled ? "已 enable 但未 active" : isActive ? "在跑但没 enable" : "未启用且未在跑";
+          }
+        }
+      }
+    }
+
+    return {
+      platform: "linux",
+      scan,
+      runtimeOk: runtime.ok === true,
+      runtimeReason: runtime.ok ? null : (runtime.reason ?? "drift"),
+      plistUnreadable,
+      phase,
+      why: phaseWhy,
+      enabled: serviceContent !== null || timerContent !== null,
+      stale: phase === "stale",
+      plist: paths.timer,
+      timer: paths.timer,
+      service: paths.service,
+      paths,
+      units,
+      backlog,
+    };
+  }
+
   const runtime = verifyRuntime({ root: codexRuntimeRoot(codexHome) });
   const file = plistPath(home);
   // **只有 ENOENT 算"没装"。**上一版把所有读取错误都吞成"没装"——
@@ -171,6 +349,7 @@ export function serviceState({ home = os.homedir(), bridge = bridgeHome(),
   const backlog = classifyBacklog({ home: bridge });
   const scan = scanRunnable({ home: bridge });
   return {
+    platform: "darwin",
     scan,
     runtimeOk: runtime.ok === true,
     runtimeReason: runtime.ok ? null : (runtime.reason ?? "drift"),
@@ -253,16 +432,15 @@ const PHASE_BLOCKS = {
 };
 
 /** PK3-L2-fix1 P1 / fix2：兜底排空检查（可注入 platform 与 launchd 探测函数，doctor 与用例共用）。
- *  **非 darwin 不探测**：不读 LaunchAgents、不 spawn launchctl、不核 plist —— Codex 侧目前
- *  只有 darwin launchd 实现，直接报「尚未实现」（不是未启用、不是查不清），状态记 null。
- *  启停入口与无参状态入口同样在非 darwin 走 drainTimerCheck / 拒绝，不探 launchctl。 */
-export function drainTimerCheck({ platform = process.platform, serviceStateFn = serviceState } = {}) {
-  if (platform !== "darwin") {
+ *  非 darwin/linux 直接报「尚未实现」（不是未启用、不是查不清），状态记 null。
+ *  启停入口与无参状态入口同样在非 darwin/linux 走 drainTimerCheck / 拒绝。 */
+export function drainTimerCheck({ platform = timerPlatform({ home: os.homedir() }), serviceStateFn = serviceState } = {}) {
+  if (platform !== "darwin" && platform !== "linux") {
     return { name: "兜底排空", ok: null, phase: "unverifiable", detail: drainTimerText({ platform }), next: null };
   }
   let svc;
   try {
-    svc = serviceStateFn();
+    svc = serviceStateFn({ platform });
   } catch (err) {
     return { name: "兜底排空", ok: null, phase: "unverifiable", detail: "状态读不出来：" + (err?.message ?? err), next: null };
   }
@@ -274,22 +452,28 @@ export function drainTimerCheck({ platform = process.platform, serviceStateFn = 
   const backlogSuffix = svc.phase === "absent" && svc.backlog?.ok && svc.backlog.total > 0
     ? "；还有 " + svc.backlog.total + " 条历史积压未分类"
     : "";
-  return { name: "兜底排空", ok, phase: svc.phase, detail: (PHASE_TEXT[svc.phase] ?? svc.phase) + backlogSuffix, next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
+  const phaseTexts = platform === "linux" ? SYSTEMD_PHASE_TEXT : PHASE_TEXT;
+  return { name: "兜底排空", ok, phase: svc.phase, detail: (phaseTexts[svc.phase] ?? svc.phase) + backlogSuffix, next: ok === false ? "重跑 `node scripts/codex/drain-service.mjs --enable --apply`" : null };
 }
 
-export function drainTimerText({ platform = process.platform } = {}) {
-  // PK3-L2-fix1 P1：**只在 darwin 有 launchd 实现** —— 非 darwin 不许声称 systemd（那是 Claude 侧
-  //  的能力，Codex 侧没有），也不许探 launchd。Codex systemd 定时器另单实现。
-  if (platform !== "darwin") {
-    return "Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— 启停入口也已拒绝，不会去探 launchd";
+export function drainTimerText({ platform = timerPlatform({ home: os.homedir() }) } = {}) {
+  if (platform === "darwin") {
+    return "兜底定时器（launchd）—— " + PHASE_TEXT.unverifiable;
   }
-  return "兜底定时器（launchd）—— " + PHASE_TEXT.unverifiable;
+  if (platform === "linux") {
+    return "兜底定时器（systemd --user）—— " + SYSTEMD_PHASE_TEXT.unverifiable;
+  }
+  return "Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现、linux 有 systemd --user 实现）—— 启停入口也已拒绝，不会去探 launchd/systemd";
 }
 
 export function enableBlockers(state) {
   const blockers = [];
-  const phaseWhy = PHASE_BLOCKS[state.phase];
-  if (phaseWhy !== undefined) {
+  const phaseWhy = state.platform === "linux"
+    ? (state.phase === "plist_unreadable" ? "单元文件读不出来"
+      : state.phase === "unverifiable" ? "systemd --user 状态查不出来"
+      : null)
+    : PHASE_BLOCKS[state.phase];
+  if (phaseWhy) {
     blockers.push({ code: "phase_blocks", detail: phaseWhy });
   }
   if (state.scan && !state.scan.ok) {
@@ -311,10 +495,13 @@ export function enableBlockers(state) {
 }
 
 export function runDrainService(argv = process.argv.slice(2), {
-  platform = process.platform,
   home = os.homedir(),
+  codexHome = codexHomeOf(home),
+  bridge = path.join(codexHome, "feishu-bridge"),
+  platform = timerPlatform({ home }),
   serviceStateFn = serviceState,
   spawnLaunchctlFn = spawnLaunchctl,
+  spawnSystemctlFn = systemctl,
   log = console.log,
   error = console.error,
   exit = process.exit,
@@ -335,19 +522,167 @@ export function runDrainService(argv = process.argv.slice(2), {
     return exit(1);
   }
 
-  // PK3-L2-fix1 P1 / fix2 P1-1 / fix3 P1-1 / P2-1：非 darwin 在探测 launchd 之前短路 ——
-  //   Codex 侧没有 systemd 实现，启停在 Linux 上不可用；无参状态入口走 drainTimerCheck，不探 launchd。
-  //   平台只认显式入参，否则 process.platform（删掉对 FEISHU_BRIDGE_PLATFORM / FEISHU_BRIDGE_TIMER_PLATFORM 的读取）。
-  //   非 darwin 无参输出只说本平台没有启停实现，不再打印 --enable/--disable 指引（自相矛盾）。
-  if (platform !== "darwin") {
+  if (platform !== "darwin" && platform !== "linux") {
     if (enable || disable) {
-      error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现）—— enable / disable 在这里不可用。");
+      error("Codex 兜底定时器在本平台尚未实现（只在 darwin 有 launchd 实现、linux 有 systemd --user 实现）—— enable / disable 在这里不可用。");
       return exit(1);
     }
     const check = drainTimerCheck({ platform });
     log("状态      " + check.detail);
-    log("\n本平台没有启停实现（只在 darwin 有 launchd 实现）。");
+    log("\n本平台没有启停实现（只在 darwin 有 launchd 实现、linux 有 systemd --user 实现）。");
     return exit(0);
+  }
+
+  if (platform === "linux") {
+    const paths = codexDrainSystemdPaths(home);
+
+    if (!enable && !disable) {
+      const st = serviceStateFn({ home, codexHome, bridge, platform: "linux", systemctlFn: spawnSystemctlFn });
+
+      log("调度器    " + paths.timer);
+      log("状态      " + (SYSTEMD_PHASE_TEXT[st.phase] ?? st.phase));
+      log("运行时    " + (st.runtimeOk
+        ? "校验通过" : "**校验不过**（" + st.runtimeReason + "）"));
+      log("排空脚本  " + drainScriptPath(home, codexHome));
+      if (st.backlog.ok && (st.backlog.unreadable ?? 0) > 0) {
+        log("损坏文件  **" + st.backlog.unreadable + " 个读不出来**（不计入待发数）");
+      }
+      log("链路预检  " + (st.scan.ok
+        ? "通过（" + st.scan.tasks + " 个 task 走真实发布前置检查）"
+        : "**跑不通**（" + st.scan.reason + "）"));
+      if (st.backlog.ok) {
+        log("历史积压  " + st.backlog.total + " 条" +
+          (st.backlog.total > 0 ? "（分布在 " + st.backlog.tasks.length + " 个 task）" : ""));
+      } else {
+        log("历史积压  读不出来（" + st.backlog.reason + "）");
+      }
+
+      log("\n只报状态。要动它加 --enable --apply 或 --disable --apply。");
+      return exit(0);
+    }
+
+    if (enable) {
+      const runtime = verifyRuntime({ root: codexRuntimeRoot(codexHome) });
+      const scan = scanRunnable({ home: bridge });
+      const backlog = classifyBacklog({ home: bridge });
+      let plistUnreadable = null;
+      for (const p of [paths.service, paths.timer]) {
+        try { fs.readFileSync(p, "utf-8"); }
+        catch (err) {
+          if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable";
+        }
+      }
+      const blockers = enableBlockers({
+        platform: "linux",
+        phase: plistUnreadable ? "plist_unreadable" : "absent",
+        scan,
+        runtimeOk: runtime.ok === true,
+        runtimeReason: runtime.ok ? null : (runtime.reason ?? "drift"),
+        backlog,
+      });
+
+      if (blockers.length > 0) {
+        error("\n不能启用，什么都没写：");
+        for (const b of blockers) {
+          if (b.code === "backlog_unclassified") {
+            error("  · 还有 " + b.detail + " 没处理。**定时器一启用它们就会被发出去** ——");
+            error("    先决定这批内容是发还是停（scripts/codex/suppress-outbox.mjs），");
+            error("    再回来启用。这一步不许省：省掉它就是替人做了一个不可逆的决定。");
+          } else if (b.code === "phase_blocks") {
+            error("  · " + b.detail + " —— **什么都没动**（没有 daemon-reload、没有写盘）。");
+            error("    先把它查清楚：动过控制面之后再失败，比现在难收拾。");
+          } else if (b.code === "backlog_corrupt") {
+            error("  · outbox 里有 " + b.detail + "。**读不出来不等于没有** ——");
+            error("    这些文件是什么内容谁也不知道，不能当成「没有积压」放行。");
+          } else if (b.code === "scan_failed") {
+            error("  · eligible-only 扫描跑不通（" + b.detail + "）——");
+            error("    定时器要跑的就是它，跑不通就不能装。");
+          } else if (b.code === "runtime_unverified") {
+            error("  · 运行时校验不过（" + b.detail + "）—— 先跑 scripts/codex/install.mjs --apply。");
+          } else {
+            error("  · " + b.code + "（" + b.detail + "）");
+          }
+        }
+        return exit(1);
+      }
+
+      if (!apply) {
+        log("\n[dry-run] 什么都没写。加 --apply 才生效。");
+        return exit(0);
+      }
+
+      const units = codexDrainSystemdUnits({ home, codexHome });
+      fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(paths.service, units.service, { mode: 0o644 });
+      fs.writeFileSync(paths.timer, units.timer, { mode: 0o644 });
+
+      const reload = spawnSystemctlFn(["--user", "daemon-reload"]);
+      if (reload.skipped) {
+        log("\n单元已写入，但跳过真实 systemd --user（HOME 被重定向到 " + home + "）。");
+        return exit(0);
+      }
+      if (!reload.ok) {
+        error("\n单元已写入，但 systemctl --user daemon-reload 失败：" + (reload.text || reload.err || ""));
+        error("**定时器现在不会跑。**修好后重跑本命令。");
+        return exit(1);
+      }
+
+      const start = spawnSystemctlFn(["--user", "enable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"]);
+      if (start.skipped) {
+        log("\n单元已写入，但跳过真实 systemd --user（HOME 被重定向到 " + home + "）。");
+        return exit(0);
+      }
+      if (!start.ok) {
+        error("\n单元已写入，但 systemctl --user enable --now 失败：" + (start.text || start.err || ""));
+        error("**定时器现在不会跑。**修好后重跑本命令。");
+        return exit(1);
+      }
+
+      log("\n已启用，定时器已加载。");
+      log("每 30 分钟扫一次全部登记 task；**只发已取得发布资格的内容**。");
+      return exit(0);
+    }
+
+    if (disable) {
+      if (!apply) {
+        log("\n[dry-run] 什么都没写。加 --apply 才生效。");
+        return exit(0);
+      }
+
+      let plistUnreadable = null;
+      for (const p of [paths.service, paths.timer]) {
+        try { fs.readFileSync(p, "utf-8"); }
+        catch (err) {
+          if (err.code !== "ENOENT") plistUnreadable = err.code ?? "unreadable";
+        }
+      }
+      if (plistUnreadable !== null) {
+        error("\n单元文件读不出来（" + plistUnreadable + "），**不知道它是什么状态**。");
+        error("什么都没动 —— 先把那个文件处理掉再来。");
+        return exit(1);
+      }
+
+      const out = spawnSystemctlFn(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
+      if (!out.ok && !out.skipped && !out.absent) {
+        error("\n卸载失败：" + (out.text || out.err || "退出码非零"));
+        error("**单元文件没有删。**删了的话，下次查状态会把一个可能还在跑的");
+        error("定时器报成「未启用」—— 先把它停掉再来。");
+        return exit(1);
+      }
+      fs.rmSync(paths.service, { force: true });
+      fs.rmSync(paths.timer, { force: true });
+      const reloaded = spawnSystemctlFn(["--user", "daemon-reload"], { tolerate: true });
+      if (!reloaded.ok && !reloaded.skipped) {
+        error("\n已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text || reloaded.err || "说不清") + "；请手工执行 systemctl --user daemon-reload");
+        return exit(1);
+      }
+      if (out.skipped) {
+        log("\n单元文件已删，但真实 systemd --user 未动（HOME 被重定向到 " + home + "）。");
+      } else {
+        log("\n已停用。systemd --user 里确认没有它了，单元文件也已删除。");
+      }
+      return exit(0);
+    }
   }
 
   const st = serviceStateFn({ home });

@@ -410,7 +410,7 @@ npm run doctor:codex
 
 ### 7.2 Linux 环境下的已知 `?` 项说明
 - **`⑧′ 机器人发送凭据（lark-cli 密钥）`**：在 Linux 上必须为 **`✓`**。如果为 `✗`，说明 aily 未生成密钥或 `LARKSUITE_CLI_DATA_DIR` 配置缺失。
-- **`⑥ 积压有人发（Codex 侧）`**：在 Linux 上显示为 **`?`**。这是已知正常表现：Codex 兜底定时器当前仅实现了 macOS 的 `launchd`，Linux 上的 `systemd` 定时器尚未移植；体检明确说明「Codex 兜底定时器在本平台尚未实现」，不影响日常由 task 正常触发的结果发布。
+- **`⑥ 积压有人发（Codex 侧）`**：新装后默认显示为 **`?`**（「未启用（安装后的默认态，不是故障）」）。Codex 链兜底定时器在 Linux 上基于 `systemd --user` 实现，属于可选启用项；安装后默认未启用，日常由 task 正常触发发布。若需启用 30 分钟兜底排空，执行 `node scripts/codex/drain-service.mjs --enable --apply`，启用后该项将变为 **`✓`**；停用执行 `node scripts/codex/drain-service.mjs --disable --apply`。
 - **`hook 信任（Codex 侧）`**：显示为 **`?`**。Codex 的 hook 安全确认需人工在交互界面核准，命令行无法代劳。
 
 除上述已知 `?` 外，其余项在正式投入使用前均应为 `✓`。
@@ -431,7 +431,7 @@ node scripts/install-inbound.mjs --uninstall --apply
 # 2. 卸载出站 hooks、技能、并注销 systemd 用户定时器
 node scripts/install-outbound.mjs --uninstall --apply
 
-# 3. 卸载 Codex 侧 hooks 与技能（若安装过）
+# 3. 卸载 Codex 侧 hooks、技能及 systemd 单元（若安装或启用过）
 node scripts/codex/install.mjs --uninstall --apply
 ```
 
@@ -445,8 +445,9 @@ node scripts/codex/install.mjs --uninstall --apply
 ### 8.3 卸后验证
 ```bash
 # 1. 确认 systemd 定时器已停止并注销
-systemctl --user is-active feishu-bridge-cc-drain.timer  # 应显示 inactive 或 unknown
-systemctl --user list-unit-files | grep feishu-bridge    # 应输出为空
+systemctl --user is-active feishu-bridge-cc-drain.timer     # 应显示 inactive 或 not-found
+systemctl --user is-active feishu-bridge-codex-drain.timer  # 应显示 inactive 或 not-found
+systemctl --user list-unit-files | grep feishu-bridge       # 应输出为空
 
 # 2. 运行 doctor，应提示 hooks/技能未安装
 node scripts/doctor.mjs
@@ -463,11 +464,9 @@ node scripts/doctor.mjs
 
 1. **外部处理器话题不自动回复**：
    通过 `routes.json` 路由转交给外部系统（如 `cc2cd`）的话题，其后续回复完全由外部处理程序接管；本桥分发器不会越权向该话题回发卡片。
-2. **Codex 侧兜底排空定时器在 Linux 上尚未实现**：
-   当前 `scripts/codex/drain-service.mjs` 仅支持 macOS `launchd` 服务注册；Linux 环境下调用启停会被拒绝，doctor 标记为 `?`。日常消息发布依赖任务完成时的内部触发。
-3. **aily daemon 服务化需配置**：
+2. **aily daemon 服务化需配置**：
    仓库不负责将 `aily-cli daemon` 包装为系统级驻留服务，Linux 上须通过前置步骤 0 配置 `systemd --user` 并开启 linger 保证后台常驻。
-4. **单授权人类边界**：
+3. **单授权人类边界**：
    当前架构授权单一 `frank_sender_id`，非授权用户的 @mention 会被拒绝，暂不适用于开放式多租户团队协作。
 
 □ 在 omm 复核于 ____________________

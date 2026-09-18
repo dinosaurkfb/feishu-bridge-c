@@ -377,9 +377,12 @@
       "referencedRuntimeScripts",
       "renderClaudeSettings",
       "renderClaudeSkill",
+      "resolveNodeForHooks",
       "systemdExecStartValue",
       "systemdShowExecArgv",
-      "systemdUnitAbsent"
+      "systemdUnitAbsent",
+      "timerKindFor",
+      "timerPlatform"
     ],
     "install-surface-lock.mjs": [
       "INSTALL_SURFACE_LOCK_ENV",
@@ -740,6 +743,11 @@
       "installUnhandledRejectionGuard",
       "setSuiteInvariants",
       "treeDriftProblem"
+    ],
+    "timer-exec.mjs": [
+      "launchctl",
+      "systemctl",
+      "timerCmd"
     ],
     "topic-agent-ledger.mjs": [
       "AILY_SESSION_SHAPE",

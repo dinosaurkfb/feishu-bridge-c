@@ -15,10 +15,12 @@ import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
-import { referencedRuntimeScripts } from "../install-projection.mjs";
+import { referencedRuntimeScripts, timerPlatform } from "../install-projection.mjs";
+import { systemctl } from "../timer-exec.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
+import { CODEX_DRAIN_SYSTEMD_UNIT, codexDrainSystemdPaths } from "./drain-service.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -113,7 +115,17 @@ if (!uninstall) {
 }
 // **调度器不在这条命令里。**装了但没启用是默认态，不是某个检查碰巧生效的结果。
 // 评审的裁决：启用要是一条独立命令，否则仍可能误组合。
-console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
+if (uninstall) {
+  const pform = timerPlatform({ home: os.homedir() });
+  const spaths = codexDrainSystemdPaths(os.homedir());
+  if (pform === "linux" && (fs.existsSync(spaths.service) || fs.existsSync(spaths.timer))) {
+    console.log("兜底排空    待停用并删除 systemd 单元");
+  } else {
+    console.log("兜底排空    未启用（默认）");
+  }
+} else {
+  console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
+}
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
@@ -232,6 +244,30 @@ if (!uninstall) {
 if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
 }
+if (uninstall) {
+  // PK3-L7：若 linux 上 unit 存在，按同纪律停并删（装机不自动启用，卸载要能收干净）
+  const pform = timerPlatform({ home: os.homedir() });
+  if (pform === "linux") {
+    const spaths = codexDrainSystemdPaths(os.homedir());
+    if (fs.existsSync(spaths.service) || fs.existsSync(spaths.timer)) {
+      const disabled = systemctl(["--user", "disable", "--now", CODEX_DRAIN_SYSTEMD_UNIT + ".timer"], { tolerate: true });
+      if (!disabled.ok && !disabled.skipped && !disabled.absent) {
+        console.error("兜底定时器停用失败：" + (disabled.text ?? "说不清") + "，单元文件未删。");
+        process.exit(1);
+      }
+      fs.rmSync(spaths.service, { force: true });
+      fs.rmSync(spaths.timer, { force: true });
+      const reloaded = systemctl(["--user", "daemon-reload"], { tolerate: true });
+      if (!reloaded.ok && !reloaded.skipped) {
+        console.error("已停止、单元文件已删，但 systemd --user daemon-reload 失败：" + (reloaded.text ?? "说不清"));
+        process.exit(1);
+      }
+      const skipped = disabled.skipped;
+      console.log("兜底排空    " + (skipped ? "systemd 单元已删，但真实 systemd --user 未动（HOME 被重定向）" : "已停用并删除 systemd 单元"));
+    }
+  }
+}
+
 if (!uninstall) {
   // task 尚未路由成功时的脱敏错误回执使用这个目录；提前创建，避免首个错误路径才 mkdir。
   fs.mkdirSync(path.join(home, "receipts"), { recursive: true, mode: 0o700 });
@@ -243,4 +279,8 @@ if (!uninstall) {
       "要迁移请显式运行 scripts/codex/migrate-auto-publish.mjs --apply");
   }
 }
-console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
+if (uninstall) {
+  console.log("\n已完成本地卸载。");
+} else {
+  console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
+}

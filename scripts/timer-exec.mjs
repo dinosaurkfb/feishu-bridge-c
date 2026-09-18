@@ -65,13 +65,13 @@ export const systemctl = (args, { tolerate = false } = {}) => {
   if (SANDBOXED && !injected) return { ok: false, skipped: true };
   const bin = injected || "systemctl";
   try {
-    execFileSync(bin, args, { stdio: "pipe", timeout: 15_000 });
-    return { ok: true };
+    const res = execFileSync(bin, args, { stdio: "pipe", timeout: 15_000, encoding: "utf-8" });
+    return { ok: true, out: res ?? "" };
   } catch (err) {
     const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
     if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + text);
     // `absent`："本来就没有这个单元" —— 干净卸载的常见形态，不箿成失败（判据与 doctor 共用一份）。
-    return { ok: false, text, absent: systemdUnitAbsent(text) };
+    return { ok: false, text, out: String(err.stdout ?? ""), err: String(err.stderr ?? ""), absent: systemdUnitAbsent(text) };
   }
 };
 

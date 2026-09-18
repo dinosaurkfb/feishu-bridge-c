@@ -10,6 +10,9 @@ import { pathToFileURL } from "node:url";
 import { moduleRoot } from "../direct-run.mjs";
 // 两套件共用一份注册器（R59）：async 用例拒绝、汇总/退出码一致都在那里
 import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsolation } from "../test-harness.mjs";
+// PK3-T1：本轮临时目录根 + 写盘失败翻译 —— 从 test-support/ 取（不动共用面 test-harness.mjs 的导出）
+import { installSuiteTempRoot } from "../test-support/suite-temp-root.mjs";
+import { installWriteDiagnosis } from "../test-support/write-diagnosis.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -130,6 +133,12 @@ import {
 } from "../dialogue-shadow-readiness.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
+
+// PK3-T1：**在任何 mkdtemp 之前**建本轮私有临时根并接管 TMPDIR —— 下面那个假 launchctl 目录、
+// 每条用例的夹具、SUITE_HOME 全部落进这棵树；用例结束回收、套件退出整棵清掉。
+// 同一行接上写盘失败的翻译（ENOSPC / UNKNOWN → 带上 TMPDIR 与剩余空间）。
+installSuiteTempRoot();
+installWriteDiagnosis();
 
 /**
  * **所有测试一律走假的 launchctl，永不读真实控制面。**

@@ -63,6 +63,8 @@ import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-sched
 import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
 // PK3-T1：本轮临时目录根 + 写盘失败翻译（都在 test-support/ 下：不动共用面 test-harness.mjs 的导出）
 import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
+// PK3-T4：夹具基准钟（相对当前时间）+「别把写死日期当 now」的守卫判据
+import { fixtureNow, isoAt, assertFreshFixtureClock, FIXTURE_CLOCK_MAX_SKEW_MS } from "./test-support/fixture-clock.mjs";
 import { freeBytesOf, installWriteDiagnosis, writeFailureMessage } from "./test-support/write-diagnosis.mjs";
 import { resumeHint, describeStatus as describeStatusCtl } from "./feishu-control.mjs"; // PK2-W3-fix8：恢复提示一处分流
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
@@ -8221,6 +8223,28 @@ test("PK3-T1 后一条：上一条用例造的临时目录**已被逐用例回�
   // 这条依赖"上一条"先跑（注册器顺序执行）。真有人依赖跨用例的临时目录，就会在这里当场红 —— 响亮。
   assert.equal(fs.existsSync(T1_RECLAIM_PROBE), false, "上一条用例的临时目录该被收回了：" + T1_RECLAIM_PROBE);
   assert.ok(fs.existsSync(SUITE_TMP.root), "本轮根本身还在（只在套件退出时清）");
+});
+
+// ── PK3-T4：夹具基准钟不许写死日期（时钟炸弹）──────────────────────────────────────────
+// 事实：R57b/R57d 夹具写死 T0B = 2026-09-11T09:00:00Z，而 reaffirm handle 的 TTL 是 7 天 ——
+// 2026-09-18T09:00Z 起干净 main 全量恒红 10 条，reason 形如 reaffirm_intent_expired /
+// intent_cleanup_unclean / selection_plan_context_missing，且与任何代码改动无关。
+
+test("PK3-T4 守卫（运行时不变量）：夹具基准钟必须就在当下——写死日期配相对 TTL 当天就红，不靠扫源码", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  // ① 相对量：fixtureNow() 通过并原样返回毫秒；ISO 字符串也接受
+  const base = fixtureNow();
+  assert.equal(assertFreshFixtureClock(base, { label: "T0B" }), base);
+  assert.equal(assertFreshFixtureClock(isoAt(base), { label: "ISO0B" }), base);
+  // ② 这次炸弹的原形：写死 2026-09-11T09:00Z，在 2026-09-18T09:00Z 那一刻（也在写下当天 +1h 之后）都红
+  const literal = Date.parse("2026-09-11T09:00:00.000Z");
+  assert.throws(() => assertFreshFixtureClock(literal, { now: literal + 7 * DAY, label: "T0B" }), /T0B 离现在 \d+ 分钟.*时钟炸弹/u);
+  assert.throws(() => assertFreshFixtureClock(literal, { now: literal + FIXTURE_CLOCK_MAX_SKEW_MS + 1, label: "T0B" }), /时钟炸弹/u);
+  // ③ 边界：恰好 maxSkewMs 通过；超 1ms 红；未来方向同样红
+  assert.equal(assertFreshFixtureClock(literal, { now: literal + FIXTURE_CLOCK_MAX_SKEW_MS }), literal);
+  assert.throws(() => assertFreshFixtureClock(literal, { now: literal - FIXTURE_CLOCK_MAX_SKEW_MS - 1 }), /时钟炸弹/u);
+  // ④ 不是时间 → 红且说明
+  assert.throws(() => assertFreshFixtureClock("not-a-date", { label: "T0" }), /T0 不是时间/u);
 });
 
 test("PK3-T1-fix1：cpSync 必须被包，且 copy/rename/cp 的余量按**写入端**（args[1]）查", () => {
@@ -38344,7 +38368,8 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
 {
   // R51 公共构造器：手工 1.1-transition 形状记录（17 键）与封闭 proof 形状，只给本段测试用。
   const EP51 = "endpoint_" + "1".repeat(24);
-  const T0 = "2026-09-07T10:00:00.000Z";
+  const T0 = isoAt(fixtureNow());   // PK3-T4：相对当前时间（写死日期 + 相对 TTL = 时钟炸弹）
+  assertFreshFixtureClock(T0, { label: "T0" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const R51_OP = "01234567-89ab-4def-8012-3456789abcde";
   const R51_TGT = { runtime: "claude", project_root: "/p/r51", claude_session_id: "00000000-0000-4000-8000-0000000000aa" };
   const r51Live = (id, facts, extra = {}) => ({
@@ -39254,7 +39279,8 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   const EP52B = "endpoint_" + "b".repeat(24);
   const r52Uuid = (n) => (String(n).repeat(8) + "-2222-4222-8222-222222222222").slice(0, 36);
   const r52Sha = (c) => c.repeat(64);
-  const T052 = "2026-09-07T10:00:00.000Z";
+  const T052 = isoAt(fixtureNow());   // PK3-T4：相对当前时间（同上）
+  assertFreshFixtureClock(T052, { label: "T052" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const r52ShaOf = (s) => crypto.createHash("sha256").update(s).digest("hex");
   // 1.0 shadow 账本（init + seed 各一笔，B1 13 键）——R52 各测试共用形状。
   const r52Doc10 = (endpointId, liveIds) => {
@@ -44083,8 +44109,9 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
 {
   const EP57 = "endpoint_" + "7".repeat(24);
-  const T0 = Date.parse("2026-09-10T08:00:00.000Z");
-  const T0_PLUS_TTL = "2026-10-10T08:00:00.000Z"; // T0 + OWNER_SELECT_HANDLE_TTL_MS（30 天）
+  const T0 = fixtureNow();   // PK3-T4：相对当前时间（原来写死 2026-09-10T08:00Z + 30 天 TTL）
+  assertFreshFixtureClock(T0, { label: "T0" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
+  const T0_PLUS_TTL = isoAt(T0 + TAL.OWNER_SELECT_HANDLE_TTL_MS); // T0 + 30 天（相对量，不写死日期）
   const TGT57 = (n) => ({ runtime: "claude", project_root: "/p/r57", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
   const CLAIM57 = (c) => c.repeat(64);
   const F457 = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
@@ -44217,7 +44244,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const re = talOk(TAL.reissueSelectionHandle({ endpointId: EP57, requestKey: "r57_re_1", targetId: b1.result.created_id, expectedHandle: oldHandle, expectedExpiresAt: b1.result.handle_expires_at, clock: () => T0 + 1000 }), "reissue");
     assert.match(re.result.new_handle, /^osh_[0-9a-f]{32}$/u);
     assert.notEqual(re.result.new_handle, oldHandle, "换发了新 handle");
-    assert.equal(re.result.new_expires_at, "2026-10-10T08:00:01.000Z", "new_expires_at = now+TTL");
+    assert.equal(re.result.new_expires_at, isoAt(T0 + TAL.OWNER_SELECT_HANDLE_TTL_MS + 1000), "new_expires_at = now+TTL");
     assert.deepEqual(re.result.affected_live_ids_after_commit, [b1.result.created_id]);
     assert.deepEqual(re.result.proof_effects, [], "§6 B1 行：B1 proof 皆 null → 恰为空数组");
     assert.equal("anchor_candidate" in re.result, false, "B1 结果无 anchor_candidate 键");
@@ -44244,7 +44271,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     upDoc.revision += 1;
     const seedOp = "00000000-0000-4000-8000-00000000000a";
     upDoc.operations[seedOp] = { op_type: "seed", terminal_kind: "seed", request_key: "r57_seed_null", fingerprint: TAL.fingerprintOf("seed", { request_key: "r57_seed_null", candidates: [id] }), result_revision: upDoc.revision, result: { seeded_ids: [id] } };
-    upDoc.records[id] = { kind: "live", topic_agent_id: id, chat_id: "oc_r57", aliases: { session_id: null, root_om: "om_null57" }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, binding_target: TGT57(13), binding_proof: null, locator_link_proof_ref: null, generation_lineage_id: "lin_null", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: seedOp, created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z" };
+    upDoc.records[id] = { kind: "live", topic_agent_id: id, chat_id: "oc_r57", aliases: { session_id: null, root_om: "om_null57" }, facts: { binding: "pending", session: "absent", anchor: "present", locator_link_proof: "absent", generation: "pending" }, binding_target: TGT57(13), binding_proof: null, locator_link_proof_ref: null, generation_lineage_id: "lin_null", anchor_candidate: null, selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null, origin_operation_id: seedOp, created_at: isoAt(T0), updated_at: isoAt(T0) };
     fs.writeFileSync(path.join(dir, "ledger.json"), JSON.stringify(upDoc, null, 2) + "\n", { mode: 0o600 });
     assert.equal(TAL.validateLedger(upDoc, { endpointId: EP57 }).ok, true, "null-B1 账本自洽");
     const re = talOk(TAL.reissueSelectionHandle({ endpointId: EP57, requestKey: "r57_re_3", targetId: id, expectedHandle: null, expectedExpiresAt: null, clock: () => T0 }), "null-B1 换发");
@@ -44426,7 +44453,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   test("R57a 校验器 G11′：A2 有 handle 而 anchor_candidate 为 null → ledger_corrupt（半有半无）", () => {
     const id = "ta_" + "c".repeat(32);
     const opId = "00000000-0000-4000-8000-0000000000c1";
-    const rec = { kind: "live", topic_agent_id: id, chat_id: "oc_r57", aliases: { session_id: "sess-r57-o", root_om: null }, facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: TGT57(31), binding_proof: { kind: "attach", authorized_by: "ou_r57", authorized_at: "2026-09-10T08:00:00.000Z", claim_key: CLAIM57("d") }, locator_link_proof_ref: null, generation_lineage_id: null, anchor_candidate: null, selection_handle: "osh_" + "d".repeat(32), handle_expires_at: "2026-10-10T08:00:00.000Z", rebind_handle: null, rebind_expires_at: null, origin_operation_id: opId, created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z" };
+    const rec = { kind: "live", topic_agent_id: id, chat_id: "oc_r57", aliases: { session_id: "sess-r57-o", root_om: null }, facts: { binding: "active", session: "present", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: TGT57(31), binding_proof: { kind: "attach", authorized_by: "ou_r57", authorized_at: isoAt(T0), claim_key: CLAIM57("d") }, locator_link_proof_ref: null, generation_lineage_id: null, anchor_candidate: null, selection_handle: "osh_" + "d".repeat(32), handle_expires_at: T0_PLUS_TTL, rebind_handle: null, rebind_expires_at: null, origin_operation_id: opId, created_at: isoAt(T0), updated_at: isoAt(T0) };
     const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 3, operations: {
       "00000000-0000-4000-8000-0000000000a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57_gv_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
       "00000000-0000-4000-8000-0000000000b1": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57_gv_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57_gv_up", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
@@ -44446,8 +44473,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const id = "ta_" + "d".repeat(32);
     const seedOp = "00000000-0000-4000-8000-0000000000d1";
     const rbOp = "00000000-0000-4000-8000-0000000000d2";
-    const ISO0 = "2026-09-10T08:00:00.000Z";
-    const H = "orh_" + "e".repeat(32), EXP = "2026-10-10T08:00:00.000Z";
+    const ISO0 = isoAt(T0);
+    const H = "orh_" + "e".repeat(32), EXP = T0_PLUS_TTL;
     const baseOps = {
       "00000000-0000-4000-8000-0000000000a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "r57_g11_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
       "00000000-0000-4000-8000-0000000000b1": { op_type: "schema_upgrade", terminal_kind: "schema_upgrade", request_key: "r57_g11_up", fingerprint: TAL.fingerprintOf("schema_upgrade", { request_key: "r57_g11_up", endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" }), result_revision: 2, result: { endpoint: EP57, from_schema: "1.0", to_schema: "1.1-transition" } },
@@ -44516,7 +44543,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   test("R57a 返修一 P1-3：G-handle 反向不变量——已铸 handle 被手术成 null 而产生 op 未被消费 → ledger_corrupt；RESULT_SHAPE 新形 attach_a2 不再容双 null", () => {
     const id = "ta_" + "b".repeat(32);
     const b1Op = "00000000-0000-4000-8000-0000000003a1";
-    const ISO = "2026-09-10T08:00:00.000Z";
+    const ISO = isoAt(T0);
     const H = "osh_" + "c".repeat(32);
     const mkDoc = (recordHandle) => ({ schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 3, operations: {
       "00000000-0000-4000-8000-0000000001a1": { op_type: "initialize_shadow", terminal_kind: "initialize_shadow", request_key: "fx_init", fingerprint: TAL.fingerprintOf("initialize_shadow", { endpoint_id: EP57, chain: "claude" }), result_revision: 1, result: { revision: 1 } },
@@ -44754,8 +44781,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       [a1Op]: { op_type: "create_a1", terminal_kind: "create_a1", request_key: "r_a1", fingerprint: TAL.fingerprintOf("create_a1", { request_key: "r_a1", topic_agent_id: a1Id }), result_revision: 3, result: { created_id: a1Id } },
       [a2Op]: { op_type: "attach_a2", terminal_kind: "attach_a2", request_key: "r_att", fingerprint: TAL.fingerprintOf("attach_a2", { request_key: "r_att", topic_agent_id: a2Id, target: TGT57(3), claim_key: CLAIM57("c"), root_om: null, matched_om: null }), result_revision: 4, result: { affected_id: a2Id, terminal_family: "A2" } },
     };
-    const recA2 = { kind: "live", topic_agent_id: a2Id, chat_id: "oc_r", aliases: { session_id: null, root_om: null }, facts: { binding: "active", session: "absent", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: TGT57(4), binding_proof: { kind: "attach", authorized_by: "ou_a", authorized_at: "2026-09-10T08:00:00.000Z", claim_key: CLAIM57("c") }, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: a2Op, created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z", selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null };
-    const recA1 = { kind: "live", topic_agent_id: a1Id, chat_id: "oc_r", aliases: { session_id: null, root_om: null }, facts: { generation: "n/a", binding: "pending", anchor: "absent", locator_link_proof: "absent" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, origin_operation_id: a1Op, created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z" };
+    const recA2 = { kind: "live", topic_agent_id: a2Id, chat_id: "oc_r", aliases: { session_id: null, root_om: null }, facts: { binding: "active", session: "absent", anchor: "absent", locator_link_proof: "absent", generation: "n/a" }, binding_target: TGT57(4), binding_proof: { kind: "attach", authorized_by: "ou_a", authorized_at: isoAt(T0), claim_key: CLAIM57("c") }, locator_link_proof_ref: null, anchor_candidate: null, generation_lineage_id: null, origin_operation_id: a2Op, created_at: isoAt(T0), updated_at: isoAt(T0), selection_handle: null, handle_expires_at: null, rebind_handle: null, rebind_expires_at: null };
+    const recA1 = { kind: "live", topic_agent_id: a1Id, chat_id: "oc_r", aliases: { session_id: null, root_om: null }, facts: { generation: "n/a", binding: "pending", anchor: "absent", locator_link_proof: "absent" }, binding_target: null, binding_proof: null, locator_link_proof_ref: null, origin_operation_id: a1Op, created_at: isoAt(T0), updated_at: isoAt(T0) };
     const doc = { schema_version: "1.1-transition", artifact_type: "feishu_bridge_topic_agent_ledger", endpoint_id: EP57, chain: "claude", authority_mode: "shadow", revision: 4, operations: ops, records: { [a1Id]: recA1, [a2Id]: recA2 } };
     const v = TAL.validateLedger(doc, { endpointId: EP57 });
     assert.equal(v.ok, false, "边界后 attach_a2 旧形必拒");
@@ -44933,8 +44960,11 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
 {
   const EP57B = legacyEndpointId({ runtime: "claude", agentUid: "agent_b" });
-  const T0B = Date.parse("2026-09-11T09:00:00.000Z");
-  const ISO0B = "2026-09-11T09:00:00.000Z";
+  const T0B = fixtureNow();   // PK3-T4：相对当前时间（原来写死日期 + 7 天 TTL → 到期那天全红）
+  assertFreshFixtureClock(T0B, { label: "T0B" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
+  const ISO0B = isoAt(T0B);
+  // 签发 + 7 天（reaffirm TTL）：**相对量**，不写死日期
+  const ISO_TTLB = isoAt(T0B + TAL.OWNER_SELECT_REAFFIRM_TTL_MS);
   const TGTB = (n) => ({ runtime: "claude", project_root: "/p/r57b", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
   const CLAIMB = (c) => c.repeat(64);
   const talOkB = (r, m) => { assert.ok(r.ok, m + "：" + JSON.stringify(r)); return r; };
@@ -44989,7 +45019,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     : null;
   // R57b 返修五：真实 claim 写方在账本提交前把 selection plan 落盘到 claims/<key>.selection-plan.json；
   //   测试手写 plan 用同一叶子函数（writeSelectionPlan），与真实链路同源。
-  const writePlanB = (claimsDir, key, handle, target, expiresAt = "2026-09-18T09:00:00.000Z") => {
+  const writePlanB = (claimsDir, key, handle, target, expiresAt = ISO_TTLB) => {
     const wp = SP.writeSelectionPlan({ claimsDir, key, plan: {
       schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: target, basis: "reaffirm", handle, kind: "rfh", claim_key: key,
       cas: { intent_id: handle, expected_expires_at: expiresAt },
@@ -45022,7 +45052,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     assert.equal(e.endpoint, EP57B);
     assert.equal(e.chat_id, "oc_r57b");
     assert.equal(e.issued_at, ISO0B);
-    assert.equal(e.expires_at, "2026-09-18T09:00:00.000Z", "expires_at = issued_at + 7 天 TTL");
+    assert.equal(e.expires_at, ISO_TTLB, "expires_at = issued_at + 7 天 TTL");
     // digest 公式：手工按 §8.1 重算并比对（family、双 proof、关联 tombstone 全在摘要内）
     const l = loadOkB(dir);
     const rec = l.records[b3];
@@ -45325,7 +45355,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
         endpoint: EP57B,
         chat_id: "oc_chat",
         issued_at: ISO0B,
-        expires_at: "2026-09-18T09:00:00.000Z",
+        expires_at: ISO_TTLB,
         expected_old_proof_closure_digest: "0".repeat(64),
       };
     }
@@ -45919,7 +45949,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const key = "a".repeat(64);
     const handle = "rfh_" + "1".repeat(32);
     const target = "ta_" + "2".repeat(32);
-    const mkPlan = (over = {}) => ({ schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: target, basis: "reaffirm", handle, kind: "rfh", claim_key: key, cas: { intent_id: handle, expected_expires_at: "2026-09-18T09:00:00.000Z" }, ...over });
+    const mkPlan = (over = {}) => ({ schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: target, basis: "reaffirm", handle, kind: "rfh", claim_key: key, cas: { intent_id: handle, expected_expires_at: ISO_TTLB }, ...over });
 
     // ① 反例：路径型 key 拒（非 64hex）。
     assert.equal(SP.writeSelectionPlan({ claimsDir, key: "../evil", plan: mkPlan() }).reason, "selection_plan_key_invalid", "路径型 key 拒");
@@ -45991,7 +46021,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     const key6 = "c".repeat(64);
     const w6 = SP.writeSelectionPlan({ claimsDir, key: key6, plan: mkPlan({ claim_key: key6 }) });
     assert.equal(w6.ok, true, "key6 写成");
-    const reordered = { ...mkPlan({ claim_key: key6 }), cas: { expected_expires_at: "2026-09-18T09:00:00.000Z", intent_id: handle } };
+    const reordered = { ...mkPlan({ claim_key: key6 }), cas: { expected_expires_at: ISO_TTLB, intent_id: handle } };
     const w6r = SP.writeSelectionPlan({ claimsDir, key: key6, plan: reordered });
     assert.equal(w6r.ok, true, "同内容不同键序 → reused");
     assert.equal(w6r.reused, true, "reused:true（canonKey 深层全符）");
@@ -46215,7 +46245,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     // ① 反例：plan.handle ≠ claim.handle（同 key 写 plan 手改 handle）→ 拒。
     //   writeSelectionPlan 不可覆盖——先删掉真实 plan 再写 handle 不同的 plan。
     fs.rmSync(path.join(ck.claimsDir, ck.key + ".selection-plan.json"), { force: true });
-    const wp = SP.writeSelectionPlan({ claimsDir: ck.claimsDir, key: ck.key, plan: { schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: b3, basis: "reaffirm", handle: "rfh_" + "9".repeat(32), kind: "rfh", claim_key: ck.key, cas: { intent_id: "rfh_" + "9".repeat(32), expected_expires_at: "2026-09-18T09:00:00.000Z" } } });
+    const wp = SP.writeSelectionPlan({ claimsDir: ck.claimsDir, key: ck.key, plan: { schema_version: SP.SELECTION_PLAN_SCHEMA, action: "reaffirm", target_id: b3, basis: "reaffirm", handle: "rfh_" + "9".repeat(32), kind: "rfh", claim_key: ck.key, cas: { intent_id: "rfh_" + "9".repeat(32), expected_expires_at: ISO_TTLB } } });
     assert.equal(wp.ok, true, "写入 handle 不同的 plan：" + JSON.stringify(wp));
     const repHandle = repairControlCommittedUnclean({
       claim: mkClaim(intent.reaffirm_handle),
@@ -46698,7 +46728,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     writeTpl();
 
     const mkDoneInitJournal = (tok, ep) => {
-      const ats = "2026-09-11T09:00:00.000Z";
+      const ats = isoAt(T0B);
       const sha = "b".repeat(64);
       const initState = (over = {}) => ({ endpoint_id: ep, operation_id: tok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
       const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
@@ -46840,7 +46870,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
 {
   const EP57C = "endpoint_" + "9".repeat(24);
-  const T0C = Date.parse("2026-09-12T09:00:00.000Z");
+  const T0C = fixtureNow();   // PK3-T4：相对当前时间（同上）
+  assertFreshFixtureClock(T0C, { label: "T0C" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const FUTC = "2099-01-01T00:00:00.000Z";
   const TGTC = (n) => ({ runtime: "claude", project_root: "/p/r57c", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
   const F4C = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
@@ -47348,7 +47379,8 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 
 {
   const EP57D = "endpoint_" + "d".repeat(24).replace(/d/g, "d");
-  const T0D = Date.parse("2026-09-13T09:00:00.000Z");
+  const T0D = fixtureNow();   // PK3-T4：相对当前时间（同上）
+  assertFreshFixtureClock(T0D, { label: "T0D" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const SESSION_D = "aily_r57d";
   const CHAT_D = "oc_r57d";
   const ROOT_D = "om_root57d";
@@ -48158,6 +48190,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
   // ── R66 返修一 P2：真入口行为钉（aily-inbound 全流程，替换源码字符串断言）──
 
   test("R66 返修一 P2 真入口（T7-T11）：收据四态 × 账本模式 × 项目根等式——拒收/legacy 行为从入口跑出来", () => {
+  const r66Now = fixtureNow(); assertFreshFixtureClock(r66Now, { label: "r66Now" });   // PK3-T4 二轮 P2：R66 注入钟也过不变量
     const local = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r66entry-")));
     const root = path.join(local, "project"); const bin = path.join(local, "bin");
     fs.mkdirSync(root, { recursive: true }); fs.mkdirSync(bin, { recursive: true });
@@ -48180,7 +48213,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
     fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
     const savedLedger = process.env.FEISHU_BRIDGE_LEDGER_DIR;
     process.env.FEISHU_BRIDGE_LEDGER_DIR = ledgerDir;
-    const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => Date.parse("2026-09-20T00:00:00.000Z") });
+    const b1 = TAL.createB1({ endpointId: endpoint, requestKey: "r66_b1", chatId: "oc_r66", rootOm: "om_r66", lineageId: "lin_r66", bindingTarget: { runtime: "claude", project_root: root, claude_session_id: sid }, clock: () => r66Now });
     if (savedLedger === undefined) delete process.env.FEISHU_BRIDGE_LEDGER_DIR; else process.env.FEISHU_BRIDGE_LEDGER_DIR = savedLedger;
     assert.ok(b1.ok, "B1 夹具：" + JSON.stringify(b1));
     // PK2-I2-fix1 P1-1：cutover 之后 expiry.json 必须在场、且覆盖每条 live B —— 这份夹具少了它，
@@ -48189,7 +48222,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
       schema_version: "expiry-1", endpoint_id: endpoint, entries: { [b1.result.created_id]: "2099-01-01T00:00:00.000Z" } }, null, 2) + "\n", { mode: 0o600 });
     // 收据夹具：init journal（终态）→ 恰好 init-only；surgeryCutoverJournal 造 cutover 终态
     const initTok = "00000000-0000-4000-8000-0000000006e1";
-    const ats = "2026-09-20T00:00:00.000Z"; const sha = "b".repeat(64);
+    const ats = isoAt(fixtureNow()); const sha = "b".repeat(64);   // PK3-T4：相对当前时间
     const initDoc = () => {
       const initState = (over = {}) => ({ endpoint_id: endpoint, operation_id: initTok, fingerprint: sha, authority_mode: null, revision: null, ledger_sha256: null, ...over });
       const tDone = (c) => ({ id: "timer:" + c, kind: "timer", target: "label", before: { phase: "loaded", plist: "/p" }, backup: "/b", backup_sha256: sha, backup_bytes: 1, intended_after: { phase: "installed_not_loaded" }, state: "done", after: { phase: "installed_not_loaded" }, at: ats, chain: null });
@@ -55247,6 +55280,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   });
 
   test("PK2-W2-fix2 P1-1②：1.1-transition 账本上 void(expired) 的**双键 CAS** —— 传错任一键拒、正确双键通过（零写 / 真作废）", () => {
+  const w2Now = fixtureNow(); assertFreshFixtureClock(w2Now, { label: "w2Now" });   // PK3-T4 二轮 P2：W2 注入钟也过不变量
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "w2f2-")));
     const ledgerRoot = path.join(base, "ledger");
     const EP = "endpoint_" + "5".repeat(24);
@@ -55263,7 +55297,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
         }, records: {} };
       fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc0, null, 2) + "\n", { mode: 0o600 });
       const b1 = TAL.createB1({ endpointId: EP, requestKey: "f2_b1", chatId: TPL.chat_id, rootOm: "om_f2", lineageId: "lin_f2",
-        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => Date.parse("2026-09-20T00:00:00.000Z") });
+        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => w2Now });
       assert.equal(b1.ok, true, "1.1-transition 下 create_b1（签 handle）：" + JSON.stringify(b1).slice(0, 240));
       const id = b1.result.created_id;
       const handle = b1.result.selection_handle;

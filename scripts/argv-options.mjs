@@ -9,6 +9,10 @@
  */
 export function parseArgvOptions(argv, { booleanFlags, valueFlags } = {}) {
   const options = {};
+  // PK3-C220-fix2：同一 flag 出现两次一律拒（kind: duplicate）——不许"后者覆盖"或"前者生效"这种靠位置定结果的合同，
+  // frank_sender_id 这类授权敏感字段尤其不能；--apply --apply 同样拒，别让共享解析器以后漂移。
+  const seen = new Set();
+  const dup = (flag) => ({ ok: false, kind: "duplicate", flag, message: flag + " 重复出现（分离/等号形式混用也算）" });
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (!a.startsWith("--")) {
@@ -18,10 +22,14 @@ export function parseArgvOptions(argv, { booleanFlags, valueFlags } = {}) {
     const flag = eq >= 0 ? a.slice(0, eq) : a;
     if (booleanFlags.has(flag)) {
       if (eq >= 0) return { ok: false, kind: "boolean_assign", flag, message: "参数不接受赋值：" + a };
+      if (seen.has(flag)) return dup(flag);
+      seen.add(flag);
       options[flag.slice(2)] = true;
       continue;
     }
     if (valueFlags.has(flag)) {
+      if (seen.has(flag)) return dup(flag);
+      seen.add(flag);
       if (eq >= 0) {
         const v = a.slice(eq + 1);
         if (v.length === 0) return { ok: false, kind: "missing_value", flag, message: flag + " 缺值" };
@@ -29,7 +37,8 @@ export function parseArgvOptions(argv, { booleanFlags, valueFlags } = {}) {
         continue;
       }
       const next = argv[i + 1];
-      if (next === undefined || next.startsWith("--")) {
+      // PK3-C220-fix2：分离形式的空串与等号形式的 --k= 同判缺值——空串会被写进模板而 ?? 默认值又不回退，等于写坏配置
+      if (next === undefined || next === "" || next.startsWith("--")) {
         return { ok: false, kind: "missing_value", flag, message: flag + " 缺值" };
       }
       options[flag.slice(2)] = next;

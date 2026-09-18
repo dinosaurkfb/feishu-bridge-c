@@ -58071,7 +58071,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     // PK3-C220-fix1 ⑤：`--k=v` 等号形式**真正生效**（旧 arg() 只认分离形式，等号被接受却忽略）
     const rEq = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--default-freshness-ms=123", "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--default-freshness-ms" && arr[k - 1] !== "--default-freshness-ms"),   // PK3-C220-fix2：等号形式单独给，避免与分离形式重复 "--default-freshness-ms=123", "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rEq.status, 0, "等号形式退出 0：" + rEq.stdout + rEq.stderr);
@@ -58105,6 +58105,48 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
       ? crypto.createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
       : null;
     assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 ~/.codex/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+  }
+});
+
+test("PK3-C220-fix2: Claude init 空值与重复 flag → 退出 2、零写（可选字段空串、分离/等号混用重复、--apply --apply）", () => {
+  const realClaudeTpl = path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "chain-config.json");
+  const realClaudeShaBefore = fs.existsSync(realClaudeTpl)
+    ? crypto.createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex") : null;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "c220f2-claude-"));
+  const tplFile = path.join(home, ".claude", "feishu-bridge", "chain-config.json");
+  const env = { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile };
+  const initArgs = [
+    "--chain", "claude", "--transport-agent-name", "T", "--transport-app-id", "cli_x", "--transport-open-id", "ou_t",
+    "--outbound-agent-name", "O", "--outbound-app-id", "cli_y", "--outbound-open-id", "ou_o",
+    "--lark-cli-profile", "claude", "--lark-cli-bin", "/bin/lark", "--lark-cli-home", "/home/lark",
+    "--frank-sender-id", "12345", "--chat-name", "群", "--chat-id", "oc_abc", "--default-freshness-ms", "900000", "--agent-uid", "agent_x",
+  ];
+  const run = (extra) => spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, ...extra], { encoding: "utf-8", env });
+  try {
+    // ① 可选字段分离形式给空串 → 缺值、退出 2、零写（否则空串会被写进模板而 ?? 默认值不回退）
+    const rEmpty = run(["--lark-cli-config-base", "", "--apply"]);
+    assert.equal(rEmpty.status, 2, "空串应退出 2：" + rEmpty.stdout + rEmpty.stderr);
+    assert.match(rEmpty.stderr, /--lark-cli-config-base 缺值/u);
+    assert.ok(!fs.existsSync(tplFile), "空串不得写模板");
+    // ② 重复 flag（分离 + 等号混用，且是授权敏感字段）→ duplicate、退出 2、零写
+    const rDup = run(["--frank-sender-id=222", "--apply"]);
+    assert.equal(rDup.status, 2, "重复 flag 应退出 2：" + rDup.stdout + rDup.stderr);
+    assert.match(rDup.stderr, /--frank-sender-id 重复出现/u);
+    assert.ok(!fs.existsSync(tplFile), "重复 flag 不得写模板");
+    // ③ --apply --apply 也拒（钉住合同：重复一律拒，不做幂等）
+    const rApply2 = run(["--apply", "--apply"]);
+    assert.equal(rApply2.status, 2, "--apply --apply 应退出 2：" + rApply2.stdout + rApply2.stderr);
+    assert.match(rApply2.stderr, /--apply 重复出现/u);
+    assert.ok(!fs.existsSync(tplFile));
+    // ④ 对照：合法参数 --apply → 退出 0、模板生成
+    const rOk = run(["--apply"]);
+    assert.equal(rOk.status, 0, "合法参数应退出 0：" + rOk.stdout + rOk.stderr);
+    assert.ok(fs.existsSync(tplFile), "合法参数应写模板");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    const realClaudeShaAfter = fs.existsSync(realClaudeTpl)
+      ? crypto.createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex") : null;
+    assert.equal(realClaudeShaAfter, realClaudeShaBefore, "真实 Claude 模板不得被触碰");
   }
 });
 

@@ -5339,7 +5339,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
     assert.equal(parsed.bridge_root, ROOT);
     // PK3-C220-fix1 ⑤：`--k=v` 等号形式真正生效（旧 arg() 接受却忽略，仍写 M5Codex）
     const rEq = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--transport-agent-name=mmcdx", "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--transport-agent-name" && arr[k - 1] !== "--transport-agent-name"),   // PK3-C220-fix2：等号形式单独给，避免与分离形式重复 "--transport-agent-name=mmcdx", "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rEq.status, 0, "等号形式退出 0：" + rEq.stdout + rEq.stderr);
     assert.equal(JSON.parse(fs.readFileSync(tplFile, "utf-8")).transport_agent_name, "mmcdx",
@@ -5367,6 +5367,43 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
       ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
       : null;
     assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 ~/.codex/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+  }
+});
+
+test("PK3-C220-fix2: codex init 空值与重复 flag → 退出 2、零写（可选字段空串、分离/等号混用重复、--apply --apply）", () => {
+  const realCodexTpl = path.join(os.userInfo().homedir, ".codex", "feishu-bridge", "chain-config.json");
+  const realCodexShaBefore = fs.existsSync(realCodexTpl)
+    ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex") : null;
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const bridgeHomeDir = path.join(dir, "bridge-home");
+  const tplFile = path.join(bridgeHomeDir, "chain-config.json");
+  const initArgs = [
+    "--agent-uid", "agent_codex_test", "--transport-agent-name", "M5Codex", "--transport-app-id", "cli_test",
+    "--transport-open-id", "ou_test", "--frank-sender-id", "1234567890", "--chat-id", "oc_test123", "--chat-name", "测试群", "--lark-cli-bin", "/bin/lark-cli",
+  ];
+  const env = isolatedEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
+  const run = (extra) => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, ...extra], { encoding: "utf-8", env });
+  try {
+    const rEmpty = run(["--lark-cli-config-base", "", "--apply"]);
+    assert.equal(rEmpty.status, 2, "空串应退出 2：" + rEmpty.stdout + rEmpty.stderr);
+    assert.match(rEmpty.stderr, /--lark-cli-config-base 缺值/u);
+    assert.ok(!fs.existsSync(tplFile), "空串不得写模板");
+    const rDup = run(["--frank-sender-id=222", "--apply"]);
+    assert.equal(rDup.status, 2, "重复 flag 应退出 2：" + rDup.stdout + rDup.stderr);
+    assert.match(rDup.stderr, /--frank-sender-id 重复出现/u);
+    assert.ok(!fs.existsSync(tplFile), "重复 flag 不得写模板");
+    const rApply2 = run(["--apply", "--apply"]);
+    assert.equal(rApply2.status, 2, "--apply --apply 应退出 2：" + rApply2.stdout + rApply2.stderr);
+    assert.match(rApply2.stderr, /--apply 重复出现/u);
+    assert.ok(!fs.existsSync(tplFile));
+    const rOk = run(["--apply"]);
+    assert.equal(rOk.status, 0, "合法参数应退出 0：" + rOk.stdout + rOk.stderr);
+    assert.ok(fs.existsSync(tplFile), "合法参数应写模板");
+  } finally {
+    const realCodexShaAfter = fs.existsSync(realCodexTpl)
+      ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex") : null;
+    assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 Codex 模板不得被触碰");
   }
 });
 

@@ -58158,11 +58158,12 @@ test("PK3-C220-fix2: Claude init 空值与重复 flag → 退出 2、零写（�
 });
 
 // ── PK3-T3：套件级安装面卫兵（issue #233）──
-test("PK3-T3 单元：权威路径解析与默认 8 个文件清单", () => {
-  assert.equal(DEFAULT_AUTHORITATIVE_FILES.length, 8, "默认 8 个权威文件");
+test("PK3-T3 单元：权威路径解析与默认 7 个文件清单（registry.json 是活账本，不在内）", () => {
+  assert.equal(DEFAULT_AUTHORITATIVE_FILES.length, 7, "默认 7 个权威文件（不含活账本 registry.json）");
   const dummyHome = "/tmp/mock-user-home-pk3-t3";
   const resolved = resolveAuthoritativePaths({ home: dummyHome });
-  assert.equal(resolved.length, 8);
+  assert.equal(resolved.length, 7);
+  assert.ok(!resolved.some((p) => p.endsWith("registry.json")), "registry.json 是活账本（出站每发一条就改 message_count），不能进安装面卫兵");
   for (const p of resolved) {
     assert.ok(p.startsWith(dummyHome + path.sep), "路径必须基于传入的 home：" + p);
   }

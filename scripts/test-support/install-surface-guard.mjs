@@ -22,9 +22,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// PK3-T3-fix1：registry.json **不在**清单里——它是活账本（出站发布器 / stop hook 每发一条就改 message_count），
+// 开发机上套件跑着的同时线上桥也在跑，2026-09-18 11:41Z 一次验收就把我自己回复被发布时的账本更新算到了
+// 「矩阵[claude-drain·migrated]」头上。安装面卫兵只守**装机才写**的文件；活账本的污染由 doctor 的账本自洽项管。
 export const DEFAULT_AUTHORITATIVE_FILES = Object.freeze([
   path.join(".claude", "feishu-bridge", "chain-config.json"),
-  path.join(".claude", "feishu-bridge", "registry.json"),
   path.join(".claude", "feishu-bridge", "routes.json"),
   path.join(".claude", "feishu-bridge", "status-providers.json"),
   path.join(".claude", "feishu-bridge", "subscriptions.json"),

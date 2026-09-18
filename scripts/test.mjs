@@ -8324,20 +8324,32 @@ test("PK3-T2-fix4：判据按「可能生成的名字」——四类边界（三
   const fakeRoot = fs.realpathSync(base);
   const hostTmp = SUITE_TMP.hostTmp;
   const violations = [];
+  // 装包装**之前**的原函数：正控需要一个“真 Node 生成的名字”，而装之后在假根之外造东西会被硬门拦（那正是被测的行为）
+  const rawMkdtempSync = fs.mkdtempSync;
   const guard = installMkdtempGuard({ root: fakeRoot, violations });
   const uniq = process.pid + "-" + Date.now().toString(36);
-  const siblingStem = "t2-fix4-sib-" + uniq + "-";
   const leftover = (stem) => fs.readdirSync(hostTmp).filter((n) => n.startsWith(stem));
   try {
     // ① mkdtempSync(根) 必须拒，且根的**兄弟**零创建（三路都覆盖）
-    const siblingPrefix = path.join(hostTmp, siblingStem).slice(0, -1);   // 故意让"生成名"落在 hostTmp 顶层
+    //    断言按**前后目录集合比较** —— Node 生成的是 `basename(根) + 6 位 [A-Za-z0-9]`，
+    //    找字面 "XXXXXX" 永远找不到（Codex 四轮 P2：旧断言因此是空转的）。匹配器另配正控。
+    const siblingDir = path.dirname(fakeRoot);
+    const sibSig = (base) => (n) => n.startsWith(base) && /^[A-Za-z0-9]{6}$/u.test(n.slice(base.length));
+    const sibOfRoot = sibSig(path.basename(fakeRoot));
+    // 正控：用装包装前的原函数真造一个“根的兄弟”（就是这条断言要抓的那个形状），断言匹配器认得出它，
+    // 随后再清掉 —— 否则下面那条 [] 是空的（空转的断言改坏了也照样绿）。
+    const fakeSibling = rawMkdtempSync(path.join(siblingDir, path.basename(fakeRoot)));
+    assert.deepEqual(fs.readdirSync(siblingDir).filter(sibOfRoot), [path.basename(fakeSibling)],
+      "正控：匹配器必须认得 Node 生成的 basename(根) + 六位后缀");
+    fs.rmSync(fakeSibling, { recursive: true, force: true });
+    assert.deepEqual(fs.readdirSync(siblingDir).filter(sibOfRoot), [], "正控清掉之后根没有兄弟");
+    const beforeSiblings = new Set(fs.readdirSync(siblingDir));
     assert.throws(() => fs.mkdtempSync(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "sync：mkdtempSync(根) 要拒");
     assert.throws(() => fs.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot)), () => {}), /临时目录硬门/u, "callback：同样拒");
     assert.throws(() => fs.promises.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "promises：同样拒");
-    assert.deepEqual(fs.readdirSync(path.dirname(fakeRoot)).filter((n) => n.startsWith(path.basename(fakeRoot) + "XXXXXX")), [],
-      "被拒时一个兄弟目录都不许建出来");
-    void siblingPrefix;
-
+    const addedSiblings = fs.readdirSync(siblingDir).filter((n) => !beforeSiblings.has(n));
+    assert.deepEqual(addedSiblings, [], "被拒时父目录里不许有任何新增条目：" + JSON.stringify(addedSiblings));
+    assert.deepEqual(addedSiblings.filter(sibOfRoot), [], "尤其不许有 basename(根) + 六位 的兄弟");
     // ② 根 + 分隔符 → 允许，且真的建在根内
     const ok = fs.mkdtempSync(fakeRoot + path.sep);
     assert.equal(path.dirname(ok), fakeRoot, "建在根内：" + ok);
@@ -8376,6 +8388,46 @@ test("PK3-T2-fix4：判据按「可能生成的名字」——四类边界（三
     ], [false, true, false, true, true], "四条边界：" + JSON.stringify(violations.map((v) => v.target)));
   } finally {
     guard.restore();
+  }
+});
+
+test("PK3-T2-fix5：固定哨兵路径已存在且是 symlink → 仍按“这次会造出的名字”判（三路 + 真假两头都钉）", () => {
+  // Codex 四轮 P1：判据会 realpath 那个**固定**哨兵叶子（prefix + "XXXXXX"）。那只是个占位名 ——
+  // Node 最终用的随机名必定还不存在，所以盘上有没有同名链接跟这次创建落到哪里**无关**：
+  // 跟着它走就会两头都错。根外前缀 escape- 上建 escape-XXXXXX -> 根内 的时候，
+  // 旧判据说“在根内”放行，而真实 mkdtempSync(escape-) 在**根外**建出 escape-<6 位>。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-fix5-"));
+  const fakeRoot = fs.realpathSync(fs.mkdtempSync(path.join(base, "root-")));
+  const siblingDir = path.dirname(fakeRoot);                    // = base：根外
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  const escape = path.join(siblingDir, "escape-" + uniq + "-");
+  fs.symlinkSync(fakeRoot, escape + MKDTEMP_SENTINEL, "dir");    // 固定哨兵路径已存在、指向根内
+  const violations = [];
+  const guard = installMkdtempGuard({ root: fakeRoot, violations });
+  const before = new Set(fs.readdirSync(siblingDir));
+  try {
+    // 判据本身：哨兵那级是链接也不跟着走
+    assert.equal(insideRoot(escape, fakeRoot), false, "哨兵叶子是 symlink → 仍不在根内");
+    // 三路都拒：当场抛（sync），不把失败塞进 callback / rejected promise
+    assert.throws(() => fs.mkdtempSync(escape), /临时目录硬门/u, "sync");
+    assert.throws(() => fs.mkdtemp(escape, () => {}), /临时目录硬门/u, "callback");
+    assert.throws(() => fs.promises.mkdtemp(escape), /临时目录硬门/u, "promises");
+    assert.equal(violations.length, 3, "三路各记一条：" + JSON.stringify(violations.map((v) => v.target)));
+    // 零创建：父目录**前后集合比较**（Node 生成 basename + 6 位随机位，找字面 "XXXXXX" 找不到）
+    const added = fs.readdirSync(siblingDir).filter((n) => !before.has(n));
+    assert.deepEqual(added, [], "被拒时父目录里不许新增任何条目（含 escape-<6 位>）：" + JSON.stringify(added));
+    // 反向也钉：根内前缀的哨兵叶子指向根外 —— 那次创建其实落在**根内**，不许误拒
+    const inPrefix = path.join(fakeRoot, "in-");
+    fs.symlinkSync(siblingDir, inPrefix + MKDTEMP_SENTINEL, "dir");
+    const inMade = fs.mkdtempSync(inPrefix);
+    assert.equal(path.dirname(inMade), fakeRoot, "根内前缀 + 指向根外的哨兵叶子 → 照旧建在根内：" + inMade);
+    // 根内普通前缀照旧透传
+    assert.equal(insideRoot(path.join(fakeRoot, "ok-"), fakeRoot), true);
+    assert.equal(path.dirname(fs.mkdtempSync(path.join(fakeRoot, "ok-"))), fakeRoot);
+  } finally {
+    guard.restore();
+    fs.rmSync(escape + MKDTEMP_SENTINEL, { force: true });
+    fs.rmSync(path.join(fakeRoot, "in-") + MKDTEMP_SENTINEL, { force: true });
   }
 });
 

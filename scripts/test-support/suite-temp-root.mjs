@@ -96,7 +96,19 @@ export const formatSuiteTempReport = (r) =>
 export const MKDTEMP_SENTINEL = "XXXXXX";
 
 /**
- * 「这次 mkdtemp 会造出来的那个名字」在不在本轮私有根之内。四道都比：
+ * 候选名（`prefix + 哨兵后缀`）的规范形：**只 realpath 它的父目录，叶子原样拼回**（PK3-T2-fix5）。
+ * 哨兵那一段只是「Node 会用的那个随机名」的占位，而那个随机名**必定还不存在** —— 所以盘上
+ * 有没有同名链接跟这次创建会落到哪里无关；跟着它走反而会被它骗过去（`escape-XXXXXX -> 根内`
+ * 时判据说“在根内”，真实 `mkdtempSync("escape-")` 却在根外建出 `escape-<6 位>`）。
+ */
+function canonicalizeCandidate(p) {
+  const dir = path.dirname(p);
+  const base = path.basename(p);
+  return path.join(canonicalizeOr(dir, dir), base);
+}
+
+/**
+ * 「这次 mkdtemp 会造出来的那个名字」在不在本轮私有根之内。五道都比：
  *   1. **按可能生成的名字算（PK3-T2-fix4）**：mkdtemp 造的是 `prefix + 6 位随机后缀`，不是 prefix 本身。
  *      不先补后缀就会两头都错：`mkdtempSync(<root>)` 生成的是 `<root>XXXXXX`（根的**兄弟**，
  *      在根外）却被放行；而 prefix 最后一段本身是 symlink 时（`mkdtempSync(<root>/jump)`）实际上
@@ -106,15 +118,16 @@ export const MKDTEMP_SENTINEL = "XXXXXX";
  *   3. **符号链接按 realpath 算（PK3-T2-fix3）**：要造的名字还不存在，所以逐级往上找
  *      **最近的现存祖先**做 realpath，再把剩下那几段拼回去 —— 否则 `root/jump -> 根外` 时
  *      `mkdtempSync(root/jump/leak-)` 会被放行、目录真建在根外。
- *   4. 边界按 `path.sep` 判 —— 否则 `/tmp/root-abc` 会冒充 `/tmp/root`。
+ *   4. **只解祖先、不解那最后一段（PK3-T2-fix5）**：③ 里 realpath 的是 `dirname(候选名)`，
+ *      `basename(候选名)` 原样拼回 —— 理由见 canonicalizeCandidate（哨兵叶子是占位，不是这次要建的目录）；
+ *   5. 边界按 `path.sep` 判 —— 否则 `/tmp/root-abc` 会冒充 `/tmp/root`。
  *
  * 不管的是 TOCTOU（判完到建之间有人把目录换成链接）—— 这是测试面的守卫，不是安全边界。
  */
 export const insideRoot = (prefix, root) => {
-  const created = path.resolve(String(prefix) + MKDTEMP_SENTINEL);   // ① 可能生成的名字
+  const created = canonicalizeCandidate(path.resolve(String(prefix) + MKDTEMP_SENTINEL));   // ① + ④
   const r = canonicalizeOr(path.resolve(root), path.resolve(root));
-  const c = canonicalizeOr(created, created);
-  return c === r || c.startsWith(r + path.sep);
+  return created === r || created.startsWith(r + path.sep);
 };
 
 /**
@@ -166,7 +179,7 @@ export function installMkdtempGuard({ root, violations }) {
     if (insideRoot(prefix, root)) return;
     // 记的与报的都是**可能生成的那个名字**（prefix + 哨兵后缀）：那才是这套判据的对象。
     const target = path.resolve(String(prefix) + MKDTEMP_SENTINEL);
-    const canonical = canonicalizeOr(target, target);
+    const canonical = canonicalizeCandidate(target);   // 与判据同一个对象（fix5：叶子不跟链接走）
     const v = { prefix: String(prefix), target, canonical, root, frame: blamelessFrame() };
     violations.push(v);
     throw new Error("临时目录硬门：mkdtemp 的前缀不在本轮私有根内 —— 这个临时目录会落在宿主 tmp 上、本轮收不回来\n" +

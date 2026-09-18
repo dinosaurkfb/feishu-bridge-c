@@ -147,7 +147,7 @@ import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
-import { ROUTE_REJECT, ROUTE_REJECT_TEXT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute, routeRejectText } from "./inbound-routes.mjs";
+import { ROUTE_REJECT, ROUTE_REJECT_TEXT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute, judgeInitDefault, previewInitDefault, routeRejectText } from "./inbound-routes.mjs";
 import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
@@ -6710,6 +6710,41 @@ test("issue #222 返修 P1：--init-default 的目标表必须显式给 —— �
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(codexTable, "utf-8")).routes, [{ id: "codex", handler: h, default: true }]);
   assert.equal(fs.readFileSync(claudeTable, "utf-8"), claudeBefore, "Claude 表逐字不变");
+});
+
+test("PK3-R222-fix2 P1：--init-default 预览只读 —— 父目录不存在时预览不建目录、不取锁、不落任何文件", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cc-222p2-"));
+  const parent = path.join(dir, "deep", "nest");
+  const f = path.join(parent, "routes.json");
+  const h = process.execPath;
+  const run = (args) => spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"), ...args], {
+    encoding: "utf-8", env: { ...process.env, HOME: dir },
+  });
+  // 预览：父目录都不存在 —— 旧版在 dryRun 判定前就 mkdir + 取锁，父目录与锁永久留下
+  const dry = run(["--init-default", "--routes", f, "--id", "self", "--handler", h]);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /什么都没写/u, dry.stdout);
+  assert.match(dry.stdout, /路由表  ：/u, "判定结果照常打印：" + dry.stdout);
+  assert.equal(fs.existsSync(parent), false, "预览不得创建父目录：" + dry.stdout.slice(0, 200));
+  assert.equal(fs.existsSync(f), false, "预览不建表");
+  assert.equal(fs.existsSync(f + ".lock"), false, "预览不取锁（<表>.lock 不存在）");
+  // 预览结论 = 首建可写；随后 --apply 正常（父目录此时才被创建），且写完锁已释放
+  const applied = run(["--init-default", "--routes", f, "--id", "self", "--handler", h, "--apply"]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf-8")).routes, [{ id: "self", handler: h, default: true }]);
+  assert.equal(fs.existsSync(f + ".lock"), false, "apply 成功后锁已释放");
+});
+
+test("PK3-R222-fix2：judgeInitDefault 纯判定三态（不碰文件系统）—— 停用表/有默认表/空 doc，预览与 apply 同源", () => {
+  // 停用路由的表：算「已有路由、没默认」（与 apply 的拒因一致 —— P2-1 用例的纯判定版）
+  assert.deepEqual(judgeInitDefault({ doc: { routes: [{ id: "off", handler: "h", enabled: false }], sessions: {} }, id: "self" }),
+    { ok: false, reason: "routes_without_default", routes: 1 });
+  // 有默认的表
+  assert.deepEqual(judgeInitDefault({ doc: { routes: [{ id: "self", handler: "h", default: true }], sessions: {} }, id: "self" }),
+    { ok: false, reason: "default_route_exists", routes: 1 });
+  // 表不存在（doc=null）→ 可首建；非法 id 照拒
+  assert.deepEqual(judgeInitDefault({ doc: null, id: "self" }), { ok: true, id: "self", routes: 0 });
+  assert.equal(judgeInitDefault({ doc: null, id: "" }).reason, "no_route_id");
 });
 
 test("issue #222 返修 P2-1：只有停用路由的表，预览与 apply 同一份判据", () => {

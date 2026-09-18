@@ -294,8 +294,22 @@ export function registerRouteBinding({ id, handler, note = null, sessionId = nul
  * `dryRun: true`：**同一份判据、同一把锁**走完校验，不写盘，把"会不会写 / 为什么拒"交回调用方。
  * 预览必须与 --apply 同源 —— 否则会出现"预览说没事、apply 说不行"（只有停用路由的表就是这样）。
  */
-export function initDefaultRoute({ file = routesPath(), id, handler, note = null, dryRun = false } = {}) {
+/** PK3-R222-fix2：--init-default 的**纯判定**（不碰文件系统）：doc 可为 null（表不存在 = 可首建）。
+ *  预览（previewInitDefault）与 apply（initDefaultRoute）都调它 —— 预览结论与 apply 结论同源。
+ *  handler 的存在性/可读性校验要 stat 文件，不在这里（调用方各自做，同一份 initDefaultHandlerCheck）。 */
+export function judgeInitDefault({ doc, id } = {}) {
   if (typeof id !== "string" || !id) return { ok: false, reason: "no_route_id" };
+  const routes = Array.isArray(doc?.routes) ? doc.routes : [];
+  if (routes.length > 0) {
+    // 有默认还是没默认只影响理由与指路，两种都不写：这张表已经不是「首建」了。
+    const hasDefault = routes.some((r) => isPlainObject(r) && r.default === true && r.enabled !== false);
+    return { ok: false, reason: hasDefault ? "default_route_exists" : "routes_without_default", routes: routes.length };
+  }
+  return { ok: true, id, routes: 0 };
+}
+
+/** --init-default 的 handler 校验（读 stat，只读；initDefaultRoute 与 previewInitDefault 共用）。 */
+const initDefaultHandlerCheck = (handler) => {
   if (typeof handler !== "string" || !path.isAbsolute(handler)) {
     return { ok: false, reason: "handler_not_absolute" };
   }
@@ -306,23 +320,39 @@ export function initDefaultRoute({ file = routesPath(), id, handler, note = null
   try { fs.accessSync(handler, fs.constants.R_OK); } catch {
     return { ok: false, reason: "handler_not_readable", handler };
   }
+  return null;
+};
 
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+/** PK3-R222-fix2：--init-default 的**只读预览** —— handler 校验（stat 只读）+ readRoutesDoc（只读）
+ *  + 纯判定。**不 mkdir、不取锁、不写**：预览不该取得写锁，apply 本来就会重新取锁复核。 */
+export function previewInitDefault({ file = routesPath(), id, handler, note = null } = {}) {
+  const bad = initDefaultHandlerCheck(handler);
+  if (bad) return bad;
+  const read = readRoutesDoc(file);
+  if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
+  const judged = judgeInitDefault({ doc: read.doc, id });
+  if (!judged.ok) return judged;
+  return { ok: true, dryRun: true, id, handler, note: note ?? null, routes: 0 };
+}
+
+export function initDefaultRoute({ file = routesPath(), id, handler, note = null } = {}) {
+  const bad = initDefaultHandlerCheck(handler);
+  if (bad) return bad;
+  if (typeof id !== "string" || !id) return { ok: false, reason: "no_route_id" };
   const lockDir = routesLockDir(file);
   const lock = acquirePublishLock(lockDir);
   if (!lock.ok) return { ok: false, reason: "routes_busy" };
   try {
+    // 取锁**之后**重读、纯判定 —— mkdir 推迟到判定通过、真要写之前（PK3-R222-fix2：预览不建目录，
+    //   apply 也不在判定前就动文件系统）。
     const read = readRoutesDoc(file);
     if (!read.ok) return { ok: false, reason: read.reason, error: read.error };
+    const judged = judgeInitDefault({ doc: read.doc, id });
+    if (!judged.ok) return judged;
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     const doc = read.doc ?? { schema_version: "1.0", routes: [], sessions: {} };
     if (!Array.isArray(doc.routes)) doc.routes = [];
     if (!isPlainObject(doc.sessions)) doc.sessions = {};
-    if (doc.routes.length > 0) {
-      // 有默认还是没默认只影响理由与指路，两种都不写：这张表已经不是「首建」了。
-      const hasDefault = doc.routes.some((r) => isPlainObject(r) && r.default === true && r.enabled !== false);
-      return { ok: false, reason: hasDefault ? "default_route_exists" : "routes_without_default", routes: doc.routes.length };
-    }
-    if (dryRun) return { ok: true, dryRun: true, id, handler, routes: 0 };
     doc.routes.push(note ? { id, handler, default: true, note } : { id, handler, default: true });
     const wrote = writeRoutesDoc(doc, file);
     if (!wrote.ok) return wrote;

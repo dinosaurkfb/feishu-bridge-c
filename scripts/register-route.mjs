@@ -18,7 +18,7 @@
 
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
-import { registerRouteBinding, initDefaultRoute, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
+import { registerRouteBinding, initDefaultRoute, previewInitDefault, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const REASON_TEXT = {
@@ -100,9 +100,10 @@ function main() {
       console.error("用法：node scripts/register-route.mjs --init-default --routes <路由表绝对路径（Claude 链 ~/.claude/feishu-bridge/routes.json，Codex 链 ~/.codex/feishu-bridge/routes.json）> --id <本链默认路由 id：Claude 是 self，Codex 是 codex> --handler <处理器绝对路径> [--note <说明>] [--apply]");
       process.exit(2);
     }
-    // 预览与 --apply **同源**（initDefaultRoute dryRun）："停用路由算不算已有路由"这种判据只写一处，
+    // 预览与 --apply **同源**（judgeInitDefault 纯判定），且预览**只读**（PK3-R222-fix2）：
+    // 不 mkdir、不取锁、不写 —— "停用路由算不算已有路由"这种判据只写一处，
     // 否则会出现"预览说没事、apply 说不行"（只有停用路由的表就是这样）。
-    const preview = initDefaultRoute({ file: routesArg, id, handler, note, dryRun: true });
+    const preview = previewInitDefault({ file: routesArg, id, handler, note });
     console.log("路由表  ：" + routesArg);
     console.log("将写入：" + JSON.stringify(note ? { id, handler, default: true, note } : { id, handler, default: true }));
     if (!preview.ok) {

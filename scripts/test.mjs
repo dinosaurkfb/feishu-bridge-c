@@ -21663,12 +21663,12 @@ test("发送者角色表（第 1 层）：唯一判据、模板交叉校验、�
   assert.deepEqual([busyCli.status, /template_busy/u.test(busyCli.stdout)], [1, true], busyCli.stdout + busyCli.stderr);
   const initArgs = ["--chain", "claude", "--transport-agent-name", "T", "--transport-app-id", "cli_x", "--transport-open-id", "ou_t", "--outbound-agent-name", "O", "--outbound-app-id", "cli_y", "--outbound-open-id", "ou_o",
     "--lark-cli-profile", "claude", "--lark-cli-bin", "/bin/lark", "--lark-cli-home", "/home/lark", "--frank-sender-id", "12345", "--chat-name", "群", "--chat-id", "oc_abc", "--default-freshness-ms", "900000", "--agent-uid", "agent_x"];
-  const initBusy = spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
+  const initBusy = spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--apply" && arr[k - 1] !== "--apply") /* fix2：去掉同名 flag 再测 */, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
   assert.notEqual(initBusy.status, 0, "初始化器也走同一把锁：" + initBusy.stdout + initBusy.stderr);
   assert.match(initBusy.stderr, /template_busy/u, initBusy.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(tplFile, "utf-8")), TPL, "持锁期间没有任何写方改到模板");
   assert.equal(releasePublishLock(lockPath).ok, true);
-  const initOk = spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
+  const initOk = spawnSync(process.execPath, [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--apply" && arr[k - 1] !== "--apply") /* fix2：去掉同名 flag 再测 */, "--apply"], { encoding: "utf-8", env: { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
   assert.equal(initOk.status, 0, initOk.stdout + initOk.stderr);
   assert.ok(fs.existsSync(tplFile + ".prev"), "初始化器保留 .prev 备份语义");
   // 取得锁失败按真实原因报：锁路径不可创建（父目录只读）→ template_lock_unavailable，不是 template_busy
@@ -58025,7 +58025,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     // ① 带 --bridge-root x --apply → 退出 2、stderr 含「bridge_root 由安装器维护」、模板未生成
     const rBridge = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--bridge-root" && arr[k - 1] !== "--bridge-root") /* fix2：去掉同名 flag 再测 */, "--bridge-root", "/custom/path", "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rBridge.status, 2, "带 --bridge-root 退出 2：" + rBridge.stdout + rBridge.stderr);
@@ -58039,7 +58039,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     fs.writeFileSync(tplFile, originalContent);
     const rBridgeExisting = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--bridge-root" && arr[k - 1] !== "--bridge-root") /* fix2：去掉同名 flag 再测 */, "--bridge-root", "/custom/path", "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rBridgeExisting.status, 2, "已有模板时带 --bridge-root 退出 2：" + rBridgeExisting.stdout + rBridgeExisting.stderr);
@@ -58049,7 +58049,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     // ③ 带未知 flag → 退出 2，且不含 bridge_root 专有提示
     const rUnknown = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--whatever-unknown", "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--whatever-unknown" && arr[k - 1] !== "--whatever-unknown") /* fix2：该 flag 已在 initArgs 里，去掉再测缺值 */, "--whatever-unknown", "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rUnknown.status, 2, "带未知 flag 退出 2：" + rUnknown.stdout + rUnknown.stderr);
@@ -58060,7 +58060,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     // ④ 正常参数 --apply → 退出 0、模板成功生成
     const rNormal = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--apply" && arr[k - 1] !== "--apply") /* fix2：去掉同名 flag 再测 */, "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rNormal.status, 0, "合法参数成功退出 0：" + rNormal.stdout + rNormal.stderr);
@@ -58071,7 +58071,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     // PK3-C220-fix1 ⑤：`--k=v` 等号形式**真正生效**（旧 arg() 只认分离形式，等号被接受却忽略）
     const rEq = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--default-freshness-ms" && arr[k - 1] !== "--default-freshness-ms"),   // PK3-C220-fix2：等号形式单独给，避免与分离形式重复 "--default-freshness-ms=123", "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--default-freshness-ms" && arr[k - 1] !== "--default-freshness-ms") /* PK3-C220-fix2：等号形式单独给，避免与分离形式重复 */, "--default-freshness-ms=123", "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rEq.status, 0, "等号形式退出 0：" + rEq.stdout + rEq.stderr);
@@ -58081,7 +58081,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     const beforeMissing = fs.readFileSync(tplFile, "utf-8");
     const rMissing = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--lark-cli-profile", "--apply"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--lark-cli-profile" && arr[k - 1] !== "--lark-cli-profile") /* fix2：该 flag 已在 initArgs 里，去掉再测缺值 */, "--lark-cli-profile", "--apply"],
       { encoding: "utf-8", env },
     );
     assert.equal(rMissing.status, 2, "取值 flag 缺值退出 2：" + rMissing.stdout + rMissing.stderr);
@@ -58090,7 +58090,7 @@ test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root
     // ⑦ 取值 flag 在末尾（无下一项）→ 缺值，exit 2
     const rTail = spawnSync(
       process.execPath,
-      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--lark-cli-profile"],
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--lark-cli-profile" && arr[k - 1] !== "--lark-cli-profile") /* fix2：去掉同名 flag 再测 */, "--lark-cli-profile"],
       { encoding: "utf-8", env },
     );
     assert.equal(rTail.status, 2, "末尾缺值退出 2：" + rTail.stdout + rTail.stderr);

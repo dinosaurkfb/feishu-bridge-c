@@ -5301,7 +5301,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
   try {
     // ① --bridge-root x --apply → 退出 2、stderr 含「bridge_root 由安装器维护」、模板未生成
     const rBridge = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--bridge-root" && arr[k - 1] !== "--bridge-root") /* fix2：去掉同名 flag 再测 */, "--bridge-root", "/custom/path", "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rBridge.status, 2, "带 --bridge-root 退出 2：" + rBridge.stdout + rBridge.stderr);
     assert.match(rBridge.stderr, /不认识的参数：--bridge-root/u);
@@ -5313,7 +5313,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
     const originalContent = JSON.stringify({ sentinel: "c220-codex-untouched" });
     fs.writeFileSync(tplFile, originalContent);
     const rBridgeExisting = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--bridge-root" && arr[k - 1] !== "--bridge-root") /* fix2：去掉同名 flag 再测 */, "--bridge-root", "/custom/path", "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rBridgeExisting.status, 2, "已有模板时带 --bridge-root 退出 2：" + rBridgeExisting.stdout + rBridgeExisting.stderr);
     assert.equal(fs.readFileSync(tplFile, "utf-8"), originalContent, "既有模板内容不得改变");
@@ -5321,7 +5321,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
 
     // ③ 未知 flag → 退出 2，且不含 bridge_root 专有提示
     const rUnknown = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--unknown-arg", "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--unknown-arg" && arr[k - 1] !== "--unknown-arg") /* fix2：该 flag 已在 initArgs 里，去掉再测缺值 */, "--unknown-arg", "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rUnknown.status, 2, "带未知 flag 退出 2：" + rUnknown.stdout + rUnknown.stderr);
     assert.match(rUnknown.stderr, /不认识的参数：--unknown-arg/u);
@@ -5330,7 +5330,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
 
     // ④ 正常参数 --apply → 退出 0、模板成功生成且 bridge_root 指向 ROOT
     const rNormal = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--apply" && arr[k - 1] !== "--apply") /* fix2：去掉同名 flag 再测 */, "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rNormal.status, 0, "合法参数成功退出 0：" + rNormal.stdout + rNormal.stderr);
     assert.ok(fs.existsSync(tplFile), "合法参数模板成功生成");
@@ -5339,7 +5339,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
     assert.equal(parsed.bridge_root, ROOT);
     // PK3-C220-fix1 ⑤：`--k=v` 等号形式真正生效（旧 arg() 接受却忽略，仍写 M5Codex）
     const rEq = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--transport-agent-name" && arr[k - 1] !== "--transport-agent-name"),   // PK3-C220-fix2：等号形式单独给，避免与分离形式重复 "--transport-agent-name=mmcdx", "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--transport-agent-name" && arr[k - 1] !== "--transport-agent-name") /* PK3-C220-fix2：等号形式单独给，避免与分离形式重复 */, "--transport-agent-name=mmcdx", "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rEq.status, 0, "等号形式退出 0：" + rEq.stdout + rEq.stderr);
     assert.equal(JSON.parse(fs.readFileSync(tplFile, "utf-8")).transport_agent_name, "mmcdx",
@@ -5347,14 +5347,14 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
     // ⑥ 取值 flag 的下一项是 --apply → 缺值，exit 2、零写
     const beforeMissing = fs.readFileSync(tplFile, "utf-8");
     const rMissing = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--lark-cli-profile", "--apply"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--lark-cli-profile" && arr[k - 1] !== "--lark-cli-profile") /* fix2：该 flag 已在 initArgs 里，去掉再测缺值 */, "--lark-cli-profile", "--apply"],
       { encoding: "utf-8", env });
     assert.equal(rMissing.status, 2, "取值 flag 缺值退出 2：" + rMissing.stdout + rMissing.stderr);
     assert.match(rMissing.stderr, /--lark-cli-profile 缺值/u, rMissing.stderr);
     assert.equal(fs.readFileSync(tplFile, "utf-8"), beforeMissing, "缺值拒绝零写入");
     // ⑦ 取值 flag 在末尾（无下一项）→ 缺值，exit 2
     const rTail = spawnSync(process.execPath,
-      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--chat-name"],
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs.filter((a, k, arr) => a !== "--chat-name" && arr[k - 1] !== "--chat-name") /* fix2：去掉同名 flag 再测 */, "--chat-name"],
       { encoding: "utf-8", env });
     assert.equal(rTail.status, 2, "末尾缺值退出 2：" + rTail.stdout + rTail.stderr);
     assert.match(rTail.stderr, /--chat-name 缺值/u, rTail.stderr);

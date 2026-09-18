@@ -8818,20 +8818,31 @@ test("登记命令：-- 之后的参数不得越过授权闸门", () => {
   const script = path.resolve("scripts", "group-binding-status.mjs");
   // 控制面和数据面混在同一个 argv 里，"整个数组里搜 --apply"就会把
   // 一个透传给 provider 的参数当成授权。
+  // PK3-L6：-- 之后的 token 若等于本命令自己的 flag（如 --apply / --id），直接报错退出非 0 并拦截落盘
   const run = spawnSync(process.execPath, [
     path.resolve("scripts", "register-status-provider.mjs"),
     "--id", "cc2cd", "--script", script, "--", "--apply",
   ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
-  assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stdout, /dry-run/u);
+  assert.notEqual(run.status, 0, "透传段出现 --apply 必须报错退出");
+  assert.match(run.stderr, /本命令的参数放在 -- 之前/u);
   assert.equal(fs.existsSync(file), false, "透传参数不得触发落盘");
 
-  // --id 之类也一样：控制参数只从 -- 前半段读。
+  // --id 之类也一样：控制参数不得放在 -- 之后
   const spoof = spawnSync(process.execPath, [
     path.resolve("scripts", "register-status-provider.mjs"),
     "--script", script, "--apply", "--", "--id", "sneaky",
   ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
-  assert.equal(spoof.status, 2, "缺 --id 就该报用法，而不是从透传段捡一个");
+  assert.notEqual(spoof.status, 0, "--id 放在 -- 之后必须报错");
+  assert.match(spoof.stderr, /本命令的参数放在 -- 之前/u);
+
+  // 正向：合法透传参数 --provider-id 正常放行并成功落盘
+  const okRun = spawnSync(process.execPath, [
+    path.resolve("scripts", "register-status-provider.mjs"),
+    "--id", "cc2cd", "--script", script, "--apply", "--", "--provider-id", "x",
+  ], { encoding: "utf-8", env: { ...process.env, FEISHU_BRIDGE_STATUS_PROVIDERS: file } });
+  assert.equal(okRun.status, 0, okRun.stderr);
+  assert.equal(fs.existsSync(file), true, "合法透传参数正常落盘");
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")).providers[0].args, ["--provider-id", "x"]);
 });
 
 test("登记命令：任一字段不同都不许报「无变化」", () => {

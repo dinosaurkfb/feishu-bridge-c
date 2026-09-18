@@ -566,9 +566,10 @@ export function runDoctor({
   const injected = typeof launchctl === "function" || Boolean(process.env[LAUNCHCTL_ENV]);
   const systemctlInjected = typeof systemctl === "function" || Boolean(process.env[SYSTEMCTL_ENV]);
   const systemctlFn = (args) => {
-    if (typeof systemctl === "function") return systemctl(args);
+    const fullArgs = args[0] === "--user" ? args : ["--user", ...args];
+    if (typeof systemctl === "function") return systemctl(fullArgs);
     const bin = process.env[SYSTEMCTL_ENV] || "systemctl";
-    try { return { ok: true, out: execFileSync(bin, args, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }) }; }
+    try { return { ok: true, out: execFileSync(bin, fullArgs, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }) }; }
     catch (err) { return { ok: false, out: String(err?.stdout ?? ""), err: String(err?.stderr ?? err?.message ?? err) }; }
   };
   const timerKind = timerKindFor(platform);

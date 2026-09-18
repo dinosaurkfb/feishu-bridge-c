@@ -602,6 +602,17 @@ export function runDoctor({
     try { return { ok: true, out: execFileSync(bin, fullArgs, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }) }; }
     catch (err) { return { ok: false, out: String(err?.stdout ?? ""), err: String(err?.stderr ?? err?.message ?? err) }; }
   };
+  // systemctl 结果的**三态判据**（整份 doctor 只此一处，两个 systemd 项共用）：
+  //   readable = 「读到了」（命令成功 / stdout 是已知状态词 / 说的是"本来就没有这个单元"）
+  //   broken   = systemctl 自己不可用（命令不在、连不上 manager、权限不行）—— 与"没装"必须分开
+  const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
+  const stateWord = (r) => {
+    const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+    return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
+  };
+  //「本来就没有这个单元」的判据与安装侧卸载**共用一份**（systemdUnitAbsent），不各写一遍。
+  const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
+  const broken = (r) => !readable(r);
   const timerKind = timerKindFor(platform);
   // 「现有安装里那个 node」（PK3-L1-fix2 P1-1）：与安装器同一份接线（收据 + 桥 hook + 现有 plist/unit）。
   // doctor 要核的是**线上那份配置的参数**，不是"当前偏好顺序会写成什么"—— 后者会把一个本来在跑的 job
@@ -626,16 +637,6 @@ export function runDoctor({
     const service = CLAUDE_DRAIN_SYSTEMD_UNIT + ".service";
     const enabled = systemctlFn(["is-enabled", unit]);
     const active = systemctlFn(["is-active", unit]);
-    const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
-    // P2（fix2）：已知状态词算"读到了"，不是"查不清"。只有命令不在 / 连不上 manager 才是查不清。
-    const stateWord = (r) => {
-      const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
-      return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
-    };
-    // systemctl 自己不可用（命令不在、实例连不上、权限不行）≠ 没装 —— 必须与 not_installed 分开。
-    //「本来就没有这个单元」的判据与安装侧卸载**共用一份**（systemdUnitAbsent），不各写一遍。
-    const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
-    const broken = (r) => !readable(r);
     if (broken(enabled) || broken(active)) {
       claudePhaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).slice(0, 120) + "）—— 查不清，不等于没在跑";
     } else {
@@ -722,13 +723,26 @@ export function runDoctor({
     const canAskManager = !(sandboxed && !systemctlInjected);
     const enabled = canAskManager ? systemctlFn(["is-enabled", "feishu-bridge-aily.service"]) : null;
     const active = canAskManager ? systemctlFn(["is-active", "feishu-bridge-aily.service"]) : null;
+    const enabledWord = enabled === null ? null : stateWord(enabled);
+    const activeWord = active === null ? null : stateWord(active);
     const enabledText = enabled === null ? "" : String(enabled.ok ? enabled.out : enabled.err ?? enabled.out ?? "").trim();
     const activeText = active === null ? "" : String(active.ok ? active.out : active.err ?? active.out ?? "").trim();
-    const absent = canAskManager ? systemdUnitAbsent(enabledText + activeText) : null;   // null = 没问
     const diskPresent = fs.existsSync(ailyPath);
-    // 「manager 里还认它」：enabled 或 active 任一。只有**磁盘不在**时这一条才叫孤儿（下面是分开的两个分支）。
-    const knownToManager = absent === false && (enabledText.startsWith("enabled") || activeText === "active");
-    if (canAskManager && !diskPresent && knownToManager) {
+    // **manager 三态**（PK3-U1-fix5 P1-3，与上面 Claude timer 同一套 readable / 已知状态词判据）：
+    //   present      = manager 里认它（enabled 或 active）
+    //   absent       = 两个探针都"读到了"、且说的是"本来就没有 / 没启用没在跑"
+    //   unverifiable = systemctl 自己不可用（命令不在、`Failed to connect to bus: Permission denied`、
+    //                  非 0 且不是 not-found 类）—— **查不清就是查不清，不许折成 absent**
+    // 旧版只在磁盘有 unit 时才问 manager，磁盘没有就直接按"两边都不在"报 ok:true，正文还谎称
+    // 「manager 报 absent / not-found」；bus 连不上时那一句是假的（探针实测）。
+    const managerPresent = enabledWord === "enabled" || activeWord === "active";
+    const managerUnverifiable = canAskManager && !managerPresent && (broken(enabled) || broken(active));
+    const managerAbsent = canAskManager && !managerPresent && !managerUnverifiable &&
+      (systemdUnitAbsent(say(enabled) + " " + say(active)) ||
+        [enabledWord, activeWord].some((w) => w === "disabled" || w === "inactive" || w === "unknown"));
+    const managerState = !canAskManager ? "unasked" : managerPresent ? "present" : managerUnverifiable ? "unverifiable" : managerAbsent ? "absent" : "unverifiable";
+    const managerWhy = managerUnverifiable ? say(broken(enabled) ? enabled : active).slice(0, 120) : null;
+    if (!diskPresent && managerState === "present") {
       // **磁盘缺失 + manager 还在**（fix4 P1-3 的第四象限）：单元文件被删了（一次失败的手工卸载、或只删了文件
       // 没 disable），systemd --user 里却还留着它 —— 入站运输会由一个磁盘上已经没有的单元继续起。
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", false,
@@ -754,26 +768,34 @@ export function runDoctor({
           : null;
       const unaudited = artifact === null;
       // PK3-U1-fix3 P1-3：**磁盘有、manager 不认 = 没加载**（installed_not_loaded），不是 ✓。
-      const stateOk = enabledText.startsWith("enabled") && activeText === "active" ? true
-        : absent === true ? false : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
+      const stateOk = managerState === "present" && enabledWord === "enabled" && activeWord === "active" ? true
+        : managerState === "present" ? false      // 认它但不健康（enabled 没 active / 只 active 没 enabled）
+          : managerState === "absent" ? false     // 磁盘有、manager 说没有 = 没加载（fix3 P1-3）
+            : null;                                // unverifiable / unasked = 查不清
       // false 优先（真有故障就报），其次才是“收据里没有”→ unknown；只有对过账的才可能绿。
       const ok = contentProblem !== null ? false : stateOk === false ? false : unaudited ? null : stateOk;
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
         contentProblem !== null ? contentProblem + "（重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并 enable --now）" + foreignText
           : ok === true ? "已启用且在跑，内容与投影/收据一致（" + ailyPath + "）" + foreignText
             : unaudited && ok === null ? "单元在、ExecStart 形状对，但**安装收据里没有这条制品（或收据读不出来）** —— 只核了形状，无法与收据对账（判 ?）。重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并记收据" + foreignText
-              : absent === true ? "单元已写入但**没被 systemd --user 加载**（manager 报 absent / not-found）："
+              : managerState === "absent" ? "单元已写入但**没被 systemd --user 加载**（manager 报 absent / not-found）："
                 + "enable --now 没生效或没跑过（重跑 `node scripts/install-outbound.mjs --apply`）" + foreignText
                 : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") +
                   "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
-                  : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
+                  : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") +
+                    (managerWhy ? "（systemctl --user 说：" + managerWhy + "）—— 查不清，不等于没装、也不等于没在跑" : "") + foreignText,
         ok === false ? PREVIEW.installOutbound : null);
     } else {
-      // 磁盘不在。两边都不在（或沙箱里没问过 manager）→ **中性**：没装不是故障。
-      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", absent === null ? null : true,
-        "磁盘上没有本桥写的单元" + (absent === null
-          ? "；沙箱里不碰真实 systemd --user，manager 里有没有查不清（判 ?）"
-          : "，systemd --user 里也没有（manager 报 absent / not-found）") +
+      // 磁盘不在。三种 manager 态分开说：absent → **中性**（没装不是故障）；unasked → 中性但标 ?
+      // （沙箱里没问）；**unverifiable → ok:null**（fix5 P1-3：查不清就说查不清，
+      // 不许把 `Failed to connect to bus: Permission denied` 说成「manager 报 absent / not-found」）。
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", managerState === "absent" || managerState === "unasked" ? true : null,
+        "磁盘上没有本桥写的单元" + (managerState === "absent"
+          ? "，systemd --user 里也没有（manager 报 absent / not-found）"
+          : managerState === "unasked"
+            ? "；沙箱里不碰真实 systemd --user，manager 里有没有查不清（判 ?）"
+            : "；**manager 查不清**（" + (managerWhy ?? "说不清") + "）—— systemctl 不可用 / 连不上 systemd --user / 权限不行时" +
+              "不许当成「本来就没有」，请人工核一下 manager 里到底有没有这个单元（判 ?）") +
         " —— 入站运输靠 aily-cli 自己起的 daemon（本桥不接管）" + foreignText, null);
     }
   }

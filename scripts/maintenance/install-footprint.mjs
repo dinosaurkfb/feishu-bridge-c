@@ -27,7 +27,7 @@ import { codexRuntimeRoot, runtimeRoot } from "../runtime-install.mjs";
 import { SKILLS as CODEX_SKILLS } from "../codex/skill-content.mjs";
 import { codexHooksOwnedEntries } from "../codex/hook-command.mjs";
 import {
-  bridgeHome, codexHomeOf as codexHomeOfValidated, hookLogFile, inboundCrashLogFile, migrationsFile,
+  bridgeHome, codexHomeOf as codexHomeOfValidated, hookLogFile, inboundCrashLogFile, inboundDir, migrationsFile,
   receiptsDir, registryFile, registryLockPath, routesFile, dispatcherLogFile, tasksDir, templateFile, threadsDir,
 } from "../codex/state.mjs";
 import { intentDir } from "../codex/intent.mjs";
@@ -60,31 +60,90 @@ export const codexBridgeRoot = ({ home = os.homedir(), env = process.env } = {})
   bridgeHome({ ...env, CODEX_HOME: codexHomeOf({ home, env }) });
 
 /**
- * “这个位置在用户自己的可写命名空间里”的判据（fix4 P1-2 的显式桥根边界）：home、系统临时目录、`/tmp`
- * （macOS 上它是 `/private/tmp` 的符号链接）。两边都取**字符串形式与 realpath 两种写法**：
- * 夹具路径常常是 `/var/...` 而 realpath 给 `/private/var/...`，只比一种会把合法目标误拒。
+ * 允许显式桥根落脚的命名空间：**home** 与**系统临时目录**（`/tmp` 在 macOS 上是 `/private/tmp` 的符号链接）。
+ * 两种写法都收：夹具路径常常是 `/var/…` 而 realpath 给 `/private/var/…`，只认一种会把合法目标误拒。
  */
-const userSpaceBases = (homeNorm) => {
-  const out = new Set();
-  for (const base of [homeNorm, os.tmpdir(), "/tmp"]) {
+const namespaceRoots = (homeNorm) => {
+  const out = new Set([path.resolve(homeNorm)]);
+  try { out.add(fs.realpathSync(homeNorm)); } catch { /* 取不到就不加这一种写法 */ }
+  for (const base of [os.tmpdir(), "/tmp"]) {
     out.add(path.resolve(base));
-    try { out.add(fs.realpathSync(base)); } catch { /* 取不到就不加这一种写法 */ }
+    try { out.add(fs.realpathSync(base)); } catch { /* 同上 */ }
   }
   return [...out];
 };
-export const isInUserSpace = (p, homeNorm) => {
-  const cands = new Set([path.resolve(p)]);
-  try { cands.add(fs.realpathSync(p)); } catch { /* 目标多半不存在：只有字符串形式 */ }
-  return [...cands].some((c) => userSpaceBases(homeNorm).some((b) => c === b || c.startsWith(b + path.sep)));
+
+/** 系统临时目录的**根本身**（`os.tmpdir()` / `/tmp` 及其真实位置）—— 显式桥根指向它们一律拒绝。 */
+const tmpRoots = () => {
+  const out = new Set();
+  for (const base of [os.tmpdir(), "/tmp"]) {
+    out.add(path.resolve(base));
+    try { out.add(fs.realpathSync(base)); } catch { /* 同上 */ }
+  }
+  return [...out];
 };
+
+/**
+ * **canonical 路径**：对最近的**存在**祖先做 realpath，再把剩下的段拼回去（目标自己可能还不存在）。
+ * 断链 / 符号链接环 / 解不动 → `null`（调用方按"说不清"拒绝，fail-closed）。
+ *
+ * 为什么不能只 `fs.realpathSync(p)`：桥根在**首次安装前**根本不存在，那个调用直接 ENOENT ——
+ * 于是"canonical 这一半"被静默跳过，边界又变回只看词法。
+ */
+export function canonicalPath(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync(cur), ...[...rest].reverse()); }
+    catch (err) {
+      if (err?.code !== "ENOENT") return null;                     // 权限 / 环等：说不清
+      const st = fs.lstatSync(cur, { throwIfNoEntry: false });
+      if (st !== undefined && st.isSymbolicLink()) return null;    // 断链：真实去向说不清
+      const parent = path.dirname(cur);
+      if (parent === cur) return null;
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/**
+ * 显式桥根（`FEISHU_CODEX_BRIDGE_HOME`）的**强边界**（PK3-U1-fix5 P1-1）：词法路径**且** canonical 路径
+ * 都必须落在允许的命名空间里，且都不是"根本身"。返回 null = 通过，否则返回一句为什么。
+ *
+ * 旧版是"任一安全即通过"（some）—— 于是 `<home>/bridge-link -> /etc` 只用词法那一条就过了，
+ * 随后删 `bridge-link/tasks` 会沿父链删到 `/etc/tasks`（只读探针实测）。现在两条都要过：
+ * 词法在 home 外与 canonical 在 home 外**都拒**。
+ *
+ * `os.tmpdir()` / `/tmp` / `/private/tmp` 的**根本身**一律拒绝，其下的子目录允许 —— 判据是"能不能证明
+ * 这是本桥专用的位置"：一个目录里的子目录可以只属于本桥，而临时目录根本身是所有进程共用的，删它就等于
+ * 删别人还在用的东西（测试夹具正是"临时目录下的子目录"，所以不能把 tmp 整片禁掉）。
+ */
+export function explicitBridgeRootProblem(candidate, homeNorm) {
+  const lexical = path.resolve(candidate);
+  const canonical = canonicalPath(candidate);
+  const bases = namespaceRoots(homeNorm);
+  const under = (q) => bases.some((b) => q === b || q.startsWith(b + path.sep));
+  if (!under(lexical)) return "词法路径不在 home 也不在系统临时目录下";
+  if (canonical === null) return "路径解析不出真实去向（断链 / 符号链接环）—— 说不清就不动";
+  if (!under(canonical)) {
+    return "canonical 路径 " + canonical + " 在 home 与系统临时目录之外（词法在 " + lexical +
+      "，指向 home 外的符号链接会把删除带出去）";
+  }
+  if (tmpRoots().some((t) => lexical === t || canonical === t)) {
+    return "是系统临时目录根本身（其下的子目录可以，根部不行 —— 那是所有进程共用的位置）";
+  }
+  return null;
+}
 
 /**
  * `--purge` 删除目标的**形状校验**（fix3 P1-2，fail-closed）：任何写入前必须过。
  * 只允许三类桥根及其下（`<home>/.claude/feishu-bridge` / `<codexHome>/feishu-bridge` / 显式
  * `FEISHU_CODEX_BRIDGE_HOME`）；覆盖点文件必须是绝对路径。拒绝：非绝对、文件系统根、`<home>` 本身、
  * `<home>/.claude` 与 `<home>/.codex` 这类父层，以及**任何桥根的严格祖先**（`/` 与 home 都属于这一类）。
- * **fix4 P1-2 新增**：标了 `boundary:"explicit-bridge-root"` 的候选（就是显式 `FEISHU_CODEX_BRIDGE_HOME`）
- * 还必须在用户自己的命名空间里（home / 临时目录）—— 见 machinePurgeTargets 里的理由。
+ * **fix4 P1-2 新增 / fix5 P1-1 收紧**：标了 `boundary:"explicit-bridge-root"` 的候选（就是显式
+ * `FEISHU_CODEX_BRIDGE_HOME`）还要过**强边界**：词法**且** canonical 都在 home / 临时目录下、不是 tmp 根
+ * 本身 —— 见 explicitBridgeRootProblem 里的理由。
  */
 export function purgeTargetProblems({ candidates = [], roots = [], home = os.homedir() } = {}) {
   const problems = [];
@@ -104,10 +163,13 @@ export function purgeTargetProblems({ candidates = [], roots = [], home = os.hom
       push("是某个桥根的父目录（只允许桥根本身及其下）");
       continue;
     }
-    if (c.boundary === "explicit-bridge-root" && !isInUserSpace(n, homeNorm)) {
-      push("不在 home 也不在系统临时目录下 —— 显式桥根可能指向系统目录或共享挂载，无法从环境变量证明它是本桥的专用目录；" +
-        "要卸它请把它指回 home 下，或手工处置");
-      continue;
+    if (c.boundary === "explicit-bridge-root") {
+      const boundary = explicitBridgeRootProblem(v, homeNorm);
+      if (boundary !== null) {
+        push(boundary + " —— 显式桥根必须能证明是本桥专用的位置（双确认授权的是删桥数据，不是删环境变量指到的任何地方）；" +
+          "要卸它请把它指回 home 下，或手工处置");
+        continue;
+      }
     }
   }
   return problems;
@@ -135,7 +197,7 @@ export function codexBridgeKnownEntries({ codexBridgeHome } = {}) {
     // 传空 env 拿默认位置）。
     installedSurfacePath({ chain: "codex", codexBridgeHome: root, env: {} }),
   ].filter((p) => typeof p === "string" && p.length > 0);
-  const dirs = [tasksDir(root), receiptsDir(root), intentDir(root), threadsDir(root)];
+  const dirs = [tasksDir(root), receiptsDir(root), intentDir(root), threadsDir(root), inboundDir(root)];
   return { files: [...new Set(files)], dirs: [...new Set(dirs)] };
 }
 

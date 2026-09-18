@@ -79,6 +79,10 @@ export const receiptsDir = (home = bridgeHome()) => path.join(home, "receipts");
 export const threadsDir = (home = bridgeHome()) => path.join(home, "threads");
 /** Codex 链的入站路由表（codex/doctor.mjs 与 codex/feishu-status.mjs 读）。 */
 export const routesFile = (home = bridgeHome()) => path.join(home, "routes.json");
+/** 入站审计与认领账本目录（`channel-samples.jsonl` 与 `chat-claims/` 都在它下面；codex/inbound.mjs 写）。
+ * **唯一派生**（PK3-U1-fix5 P1-2）：以前这两处在 inbound.mjs 里各拼一遍 `path.join(HOME, "inbound", …)`，
+ * 而卸载的封闭清单漏了整个 inbound/ —— 显式桥根 purge 后会留下入站审计与 claim 数据。 */
+export const inboundDir = (home = bridgeHome()) => path.join(home, "inbound");
 /** 入站分发日志（codex/feishu-status.mjs 读、dispatcher 写）。 */
 export const dispatcherLogFile = (home = bridgeHome()) => path.join(home, "dispatcher.log");
 /** 入站崩溃日志（codex/inbound.mjs 写）。 */

@@ -256,7 +256,7 @@ import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VE
 import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, classifySubscriptionAuditPending, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, resolveSubscriptionAuditConflict, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
-import { claudeBridgeRoot, codexBridgeRoot, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
+import { claudeBridgeRoot, codexBridgeRoot, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
@@ -8623,6 +8623,83 @@ test("PK3-U1-fix4 P1-3：aily 磁盘态与 manager 态各自独立 —— 磁盘
   const notFound = () => ({ ok: false, out: "", err: "Failed to get unit file state for feishu-bridge-aily.service: No such file or directory" });
   const c2 = runDoctor({ home, platform: "linux", systemctl: notFound }).checks.find((x) => x.id === "aily_daemon");
   assert.deepEqual([c2.ok, c2.next, /没有本桥写的单元/u.test(c2.detail)], [true, null, true], JSON.stringify(c2));
+});
+
+// 拿掉哪行会红（三条都**实测**过）：
+//   · 把 canonical 那半去掉（回到 fix4 的"任一安全即通过"）→ ① 红在 status（期望 2、实得 0 ——
+//     它会接着去删 bridge-link/tasks，也就是 /etc/tasks）；
+//   · 把 tmp 根那一句去掉 → ② 红在「os.tmpdir() 根本身要拒」（/private/tmp 那条也不再退出 2）；
+test("PK3-U1-fix5 P1-1：显式桥根边界词法与 canonical 都要过 —— home 外的 symlink 与临时目录根一律拒", () => {
+  // ① 反例：<home>/bridge-link -> /etc（词法在 home 里、真实去向在 home 与临时目录之外）→ 拒。
+  //   探针里的伤害形状是「删 bridge-link/tasks」= 沿父链删到 /etc/tasks：所以除了 exit 2，
+  //   还要断言 /etc 下那两个名字**根本没被碰过**（fix4 的"任一安全即通过"会走到删那一步）。
+  const homeA = u1Home();
+  fs.symlinkSync("/etc", path.join(homeA, "bridge-link"));
+  const beforeA = u1Snapshot(homeA);
+  for (const args of [["--purge", "--yes-delete-data"], ["--purge", "--yes-delete-data", "--apply"]]) {
+    const r = u1Run(homeA, "uninstall.mjs", args, { CODEX_HOME: path.join(homeA, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(homeA, "bridge-link") });
+    assert.equal(r.status, 2, "指向 home 外的符号链接必须拒：" + r.stdout + r.stderr);
+    assert.match(r.stderr, /canonical|符号链接/u, "要点名是 canonical 那一半不过：" + r.stderr);
+    assert.match(r.stderr, /FEISHU_CODEX_BRIDGE_HOME/u, r.stderr);
+  }
+  assert.equal(u1Snapshot(homeA), beforeA, "拒了就零写");
+  assert.equal(fs.existsSync("/etc/tasks"), false, "不许沿父链在 /etc 下动 tasks/");
+  assert.equal(fs.existsSync("/etc/registry.json"), false, "也不许碰 /etc/registry.json");
+  assert.equal(fs.existsSync("/etc/installed-surface.json"), false, "/etc 下一个字节都不该多");
+
+  // ② 反例：系统临时目录的**根本身** → 拒（其下的子目录才允许）。
+  //    套件里夹具 HOME 就住在 tmp 根之下，所以"它是某个桥根的父目录"那条会先命中（同样拒绝，
+  //    但钉不住这条新规则）—— 先用受验函数把**这一条**逐字钉住，再跑一次真入口证明它真的退出 2。
+  const ruleHome = path.join(os.tmpdir(), "u1f5-norm-home");
+  assert.match(String(explicitBridgeRootProblem(os.tmpdir(), ruleHome)), /临时目录根本身/u, "os.tmpdir() 根本身要拒");
+  assert.match(String(explicitBridgeRootProblem("/tmp", ruleHome)), /临时目录根本身/u, "/tmp 根本身要拒");
+  assert.equal(explicitBridgeRootProblem(path.join("/private", "tmp", "u1f5", "bridge"), ruleHome), null,
+    "对照：tmp 下的子目录允许（夹具就住在那儿）");
+  const homeB = u1Home();
+  const rootRun = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeB, ".codex"), FEISHU_CODEX_BRIDGE_HOME: "/private/tmp" });
+  assert.equal(rootRun.status, 2, "/private/tmp 是临时目录根本身，必须拒：" + rootRun.stdout + rootRun.stderr);
+
+  // ③ 对照：临时目录**下面**的子目录照常（夹具就住在那儿）
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f5-inside-"));
+  const bridge = path.join(base, "elsewhere", "feishu-bridge");
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.writeFileSync(path.join(bridge, "registry.json"), "{}\n");
+  const homeC = u1Home();
+  const runC = u1Run(homeC, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeC, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge });
+  assert.equal(runC.status, 0, "临时目录下的子目录允许：" + runC.stdout + runC.stderr);
+  assert.equal(fs.existsSync(path.join(bridge, "registry.json")), false, runC.stdout);
+
+  // ④ 对照：home 下的普通目录（不是符号链接）照常
+  const homeD = u1Home();
+  const insideHome = path.join(homeD, "custom-codex-bridge");
+  fs.mkdirSync(insideHome, { recursive: true });
+  fs.writeFileSync(path.join(insideHome, "registry.json"), "{}\n");
+  const runD = u1Run(homeD, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeD, ".codex"), FEISHU_CODEX_BRIDGE_HOME: insideHome });
+  assert.equal(runD.status, 0, runD.stdout + runD.stderr);
+  assert.equal(fs.existsSync(path.join(insideHome, "registry.json")), false, runD.stdout);
+});
+
+// 拿掉哪行会红：把 manager 三态里的 `managerUnverifiable ? "unverifiable"` 折成 `"absent"`
+//   （回到 fix4 的"磁盘不在就当两边都不在"）→ 第一条红在 c.ok（期望 null、实得 true），
+//   正文还会谎称「manager 报 absent / not-found」（实测）。
+test("PK3-U1-fix5 P1-3：aily 磁盘无 unit + manager 查不清（连不上 bus）→ ok:null，不许说「manager 报 absent」", () => {
+  const home = u1Home();   // 磁盘上**没有** unit
+  const denied = () => ({ ok: false, out: "", err: "Failed to connect to bus: Permission denied" });
+  const c = runDoctor({ home, platform: "linux", systemctl: denied }).checks.find((x) => x.id === "aily_daemon");
+  assert.equal(c.ok, null, "查不清必须是 ?（不许当'没装'）：" + JSON.stringify(c));
+  assert.match(c.detail, /查不清/u, c.detail);
+  assert.match(c.detail, /Permission denied/u, "要把 systemctl 的原话带出来：" + c.detail);
+  assert.doesNotMatch(c.detail, /manager 报 absent|not-found/u, "系统目录连不上时不许谎称 manager 说没有：" + c.detail);
+  assert.equal(c.next, null, "查不清不给动作：" + JSON.stringify(c.next));
+
+  // 对照：manager 真说"本来就没有" → 中性（ok:true、无 next）
+  const notFound = () => ({ ok: false, out: "", err: "Failed to get unit file state for feishu-bridge-aily.service: No such file or directory" });
+  const c2 = runDoctor({ home, platform: "linux", systemctl: notFound }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([c2.ok, c2.next], [true, null], JSON.stringify(c2));
+  assert.match(c2.detail, /manager 报 absent \/ not-found/u, c2.detail);
 });
 
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {

@@ -40,7 +40,7 @@ import {
   appendConsumed, bridgeHome, buildCodexSubscriptionProjection, closeTaskTopicRotation,
   evaluatePromotion, findPendingTask,
   finalizeTaskDialogueTurn, findTaskForFeishuSession, interactionPolicyForTask,
-  inboundCrashLogFile,
+  inboundCrashLogFile, inboundDir,
   isThreadBusy, loadCodexTemplate, loadRegistry, promoteTask, registryFile, reserveTaskDialogueTurn, setTaskInteractionMode,
   topicStateForTask,
   shadowCodexFirstClaim, taskPaths,
@@ -147,7 +147,7 @@ const BRIDGE_ROOT = moduleRoot(import.meta.url, "../..");
 const HOME = bridgeHome();
 let receiptDir = path.join(HOME, "receipts");
 // 采样旁路文件：机器级 codex inbound 目录（跟随 FEISHU_CODEX_BRIDGE_HOME）。
-const CHANNEL_SAMPLES_FILE = path.join(HOME, "inbound", "channel-samples.jsonl");
+const CHANNEL_SAMPLES_FILE = path.join(inboundDir(HOME), "channel-samples.jsonl");
 const template = loadCodexTemplate();
 const transportAgentName = template.ok ? (template.template.transport_agent_name || "运输 agent") : "运输 agent";
 
@@ -367,7 +367,7 @@ if (!routed.ok) {
   // 闸已对私聊豁免），所有出口都 finish，不会落到下面的认领路径；登记表缺失/空或 chat 未登记时恒
   // false，按群处理。与 Claude 链同一份判据。
   if (isPrivateChatTurn({ template: template.template, env: process.env })) {
-    chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(HOME, "inbound", "chat-claims") });
+    chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(inboundDir(HOME), "chat-claims") });
   }
   const promotionNow = Date.now();
   const pending = findPendingTask({ home: HOME, content: event.content, now: promotionNow });
@@ -421,7 +421,7 @@ if (!routed.ok) {
     now: promotionNow,
   });
   // 绑定没成不等于该拒：落进 chat 默认态重新判（与 Claude 链同一份判据）
-  if (!promotion.ok && CHAT_FALLBACK_REASONS.includes(promotion.reason)) chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(HOME, "inbound", "chat-claims") });
+  if (!promotion.ok && CHAT_FALLBACK_REASONS.includes(promotion.reason)) chatTurn({ chain: "codex", template: template.template, event, dryRun, ledgerDir: path.join(inboundDir(HOME), "chat-claims") });
 
   if (!promotion.ok) {
     // 评审 PR #111 P2：off-template 的诊断 hint 曾被本地重建文案丢掉 —— 保留 Codex 化的

@@ -55280,7 +55280,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   });
 
   test("PK2-W2-fix2 P1-1②：1.1-transition 账本上 void(expired) 的**双键 CAS** —— 传错任一键拒、正确双键通过（零写 / 真作废）", () => {
-  const r66Now = fixtureNow(); assertFreshFixtureClock(r66Now, { label: "r66Now" });   // PK3-T4 二轮 P2：R66 注入钟也过不变量
+  const w2Now = fixtureNow(); assertFreshFixtureClock(w2Now, { label: "w2Now" });   // PK3-T4 二轮 P2：W2 注入钟也过不变量
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "w2f2-")));
     const ledgerRoot = path.join(base, "ledger");
     const EP = "endpoint_" + "5".repeat(24);
@@ -55297,7 +55297,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
         }, records: {} };
       fs.writeFileSync(path.join(epDir, "ledger.json"), JSON.stringify(doc0, null, 2) + "\n", { mode: 0o600 });
       const b1 = TAL.createB1({ endpointId: EP, requestKey: "f2_b1", chatId: TPL.chat_id, rootOm: "om_f2", lineageId: "lin_f2",
-        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => r66Now });
+        bindingTarget: { runtime: "claude", project_root: base, claude_session_id: null }, clock: () => w2Now });
       assert.equal(b1.ok, true, "1.1-transition 下 create_b1（签 handle）：" + JSON.stringify(b1).slice(0, 240));
       const id = b1.result.created_id;
       const handle = b1.result.selection_handle;

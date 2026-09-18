@@ -46,6 +46,7 @@ import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
 import * as CODEX from "./inbound.mjs";
+import { topicHandlerKind } from "../inbound-routes.mjs";
 import { ackText, selectLegacyUpdate } from "./inbound.mjs";
 import { dispatchControlRepair } from "../repair-control-claim.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
@@ -10986,6 +10987,39 @@ test("PK3-W232-fix2（Codex 链）：bind-task 的 compose 路径根消息中性
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("PK3-W232-fix4（Codex 链）：真实 bound 回执不传 routesFile 时默认读 Codex 自己的表（bridgeHome()/routes.json），不受 Claude 表影响", () => {
+  // 拿掉哪行会红：codex/inbound.mjs 的 bound 分支把 routesFile 默认改回 undefined（走共享 routesPath），
+  //   本用例会红在"不含外部处理器 c2c-inbound 接管"（Claude 表说 external，Codex 表说 local）。
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-w232-two-tables-"));
+  const saved = { codexHome: process.env.FEISHU_CODEX_BRIDGE_HOME, claudeRoutes: process.env.FEISHU_BRIDGE_ROUTES };
+  try {
+    // Claude 链的表：话题登记给外部处理器
+    const claudeRoutes = path.join(tmp, "claude-routes.json");
+    fs.writeFileSync(claudeRoutes, JSON.stringify({ schema_version: "1.0",
+      routes: [{ id: "self", handler: "/opt/fake/inbound.mjs", default: true }, { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" }],
+      sessions: { "session_two_tables": "c2c-inbound" } }, null, 2) + "\n");
+    // Codex 链的表：同一话题未登记 → 默认路由 codex（本链）
+    const codexHome = path.join(tmp, "codex-bridge");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "routes.json"), JSON.stringify({ schema_version: "1.0",
+      routes: [{ id: "codex", handler: "/opt/fake/codex/inbound.mjs", default: true }], sessions: {} }, null, 2) + "\n");
+    process.env.FEISHU_CODEX_BRIDGE_HOME = codexHome;
+    process.env.FEISHU_BRIDGE_ROUTES = claudeRoutes;
+    // 两张表结论相反（前提）
+    assert.equal(topicHandlerKind({ sessionId: "session_two_tables", routesFile: claudeRoutes }).kind, "external");
+    assert.equal(topicHandlerKind({ sessionId: "session_two_tables", routesFile: path.join(codexHome, "routes.json") }).kind, "local");
+    // 真实入口形状：只有 taskName + sessionId，不传 routesFile
+    const ack = CODEX.ackText("bound", { taskName: "codex-task", sessionId: "session_two_tables" });
+    assert.doesNotMatch(ack, /外部处理器 c2c-inbound 接管/u, "Codex 回执不得受 Claude 表影响：" + ack);
+    assert.doesNotMatch(ack, /判不了/u, ack);
+    assert.match(ack, /这个话题现在精确通向一个 Codex task/u, ack);
+  } finally {
+    if (saved.codexHome === undefined) delete process.env.FEISHU_CODEX_BRIDGE_HOME; else process.env.FEISHU_CODEX_BRIDGE_HOME = saved.codexHome;
+    if (saved.claudeRoutes === undefined) delete process.env.FEISHU_BRIDGE_ROUTES; else process.env.FEISHU_BRIDGE_ROUTES = saved.claudeRoutes;
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
 

@@ -115,8 +115,10 @@ export function ackText(kind, detail, { transportAgentName } = {}) {
     // PK3-W232-fix2 P1-1：三态判定只有一份（inbound-routes.topicHandlerKind）。能走到这里说明本链自己接管；
     // external 防御性、**unavailable 不落旧承诺**（说清判不了，去 doctor）。
     // fix3：带上本链默认路由（id codex，与 codex/aily-inbound 给 dispatcher 的同形），表空时判 local。
+    // fix4（Codex 三轮 P1）：真实 bound 入口不传 routesFile —— 默认必须取 **Codex 自己的表**（bridgeHome()/routes.json，
+    // 与 codex/aily-inbound 给 dispatcher 的同一张），不能落到共享 routesPath()（那是 Claude 链的表）。
     const handler = detail?.topicHandler ?? topicHandlerKind({
-      sessionId: detail?.sessionId, routesFile: detail?.routesFile,
+      sessionId: detail?.sessionId, routesFile: detail?.routesFile ?? path.join(bridgeHome(), "routes.json"),
       defaultRoute: { id: "codex", handler: fileURLToPath(import.meta.url) },
     });
     const tail = topicHandlerText(handler)

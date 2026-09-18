@@ -32,10 +32,55 @@ import {
 
 /** 模板认识的全部字段。**派生、命令行覆盖、预览必须用同一个集合**，否则只会改一半。 */
 const TEMPLATE_FIELDS = [...CHAIN_FIELDS, ...OPTIONAL_CHAIN_FIELDS];
+const CLI_ALLOWED_FIELDS = TEMPLATE_FIELDS.filter((f) => f !== "bridge_root");
 import { moduleRoot } from "./direct-run.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
+
+/** 字段名 → 命令行开关名。用短横线是为了敲起来顺手，映射只此一处。 */
+const flagOf = (field) => field.replace(/_/g, "-");
+
+const USAGE = "用法：\n" +
+  "  node scripts/init-chain-template.mjs \\\n" +
+  "    --agent-uid agent_xxx --transport-app-id cli_xxx --transport-open-id ou_xxx \\\n" +
+  "    --frank-sender-id 762... --chat-id oc_xxx --chat-name \"群名\" [--apply]\n\n" +
+  "  node scripts/init-chain-template.mjs --from /path/to/old-project --chat-id oc_xxx [--apply]";
+
+const KNOWN_BOOLEAN_FLAGS = new Set(["--apply"]);
+const KNOWN_VALUE_FLAGS = new Set([
+  "--from",
+  ...CLI_ALLOWED_FIELDS.map((f) => "--" + flagOf(f)),
+]);
+
+for (let i = 2; i < process.argv.length; i += 1) {
+  const a = process.argv[i];
+  if (!a.startsWith("--")) {
+    console.error("不认识的参数：" + a + "\n\n" + USAGE);
+    process.exit(2);
+  }
+  const eq = a.indexOf("=");
+  const flag = eq >= 0 ? a.slice(0, eq) : a;
+  if (KNOWN_BOOLEAN_FLAGS.has(flag)) {
+    if (eq >= 0) {
+      console.error("参数不接受赋值：" + a + "\n\n" + USAGE);
+      process.exit(2);
+    }
+    continue;
+  }
+  if (KNOWN_VALUE_FLAGS.has(flag)) {
+    if (eq < 0) {
+      i += 1;
+    }
+    continue;
+  }
+  console.error("不认识的参数：" + flag);
+  if (flag === "--bridge-root") {
+    console.error("bridge_root 由安装器维护：Codex 链装机时改写为 runtime/current，Claude 链仅作标志；先写模板再跑安装器");
+  }
+  console.error("\n" + USAGE);
+  process.exit(2);
+}
 
 const arg = (n) => {
   const i = process.argv.indexOf("--" + n);
@@ -43,9 +88,6 @@ const arg = (n) => {
 };
 const apply = process.argv.includes("--apply");
 if (apply) { const gate = gateBlocks(); if (gate.blocked) exitForGate("cli", gate); } // 维护门（issue #81）：窗口内不改任何桥状态
-
-/** 字段名 → 命令行开关名。用短横线是为了敲起来顺手，映射只此一处。 */
-const flagOf = (field) => field.replace(/_/g, "-");
 
 // ---------- 1. 先从项目派生（如果指定了） ----------
 
@@ -78,6 +120,7 @@ const tpl = { schema_version: "1.0", ...derived };
 // 往 OPTIONAL_CHAIN_FIELDS 里加了字段（如 aily_cli_bin），写入器却接不了，
 // 于是「模板支持这个字段」这句话只在读的那一侧成立。
 for (const f of TEMPLATE_FIELDS) {
+  if (f === "bridge_root") continue;
   const v = arg(flagOf(f));
   if (v === undefined) continue;
   // 数字字段要转，否则形状校验会把 "900000" 判成配错（那正是它该做的）。

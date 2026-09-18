@@ -57990,6 +57990,97 @@ test("PK3-A1-fix1 P2-2：inbound 先写 accepted 回执落盘可读后再起 for
   }
 });
 
+test("PK3-C220: Claude init-chain-template 拒绝未知 flag（含 --bridge-root）退出 2，不写模板", () => {
+  // 卫兵：用例开始时记录真实 ~/.claude/... 与 ~/.codex/... 模板 sha256，结束时断言绝未被修改
+  const realClaudeTpl = path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "chain-config.json");
+  const realClaudeShaBefore = fs.existsSync(realClaudeTpl)
+    ? crypto.createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex")
+    : null;
+  const realCodexTpl = path.join(os.userInfo().homedir, ".codex", "feishu-bridge", "chain-config.json");
+  const realCodexShaBefore = fs.existsSync(realCodexTpl)
+    ? crypto.createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
+    : null;
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "c220-claude-"));
+  const tplFile = path.join(home, ".claude", "feishu-bridge", "chain-config.json");
+  const env = { ...process.env, HOME: home, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile };
+  const initArgs = [
+    "--chain", "claude",
+    "--transport-agent-name", "T",
+    "--transport-app-id", "cli_x",
+    "--transport-open-id", "ou_t",
+    "--outbound-agent-name", "O",
+    "--outbound-app-id", "cli_y",
+    "--outbound-open-id", "ou_o",
+    "--lark-cli-profile", "claude",
+    "--lark-cli-bin", "/bin/lark",
+    "--lark-cli-home", "/home/lark",
+    "--frank-sender-id", "12345",
+    "--chat-name", "群",
+    "--chat-id", "oc_abc",
+    "--default-freshness-ms", "900000",
+    "--agent-uid", "agent_x",
+  ];
+  try {
+    // ① 带 --bridge-root x --apply → 退出 2、stderr 含「bridge_root 由安装器维护」、模板未生成
+    const rBridge = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rBridge.status, 2, "带 --bridge-root 退出 2：" + rBridge.stdout + rBridge.stderr);
+    assert.match(rBridge.stderr, /不认识的参数：--bridge-root/u);
+    assert.match(rBridge.stderr, /bridge_root 由安装器维护：Codex 链装机时改写为 runtime\/current，Claude 链仅作标志；先写模板再跑安装器/u);
+    assert.ok(!fs.existsSync(tplFile), "模板文件不得生成");
+
+    // ② 既有模板未变：若模板已存在，带 --bridge-root 退出 2 且文件内容一字未动
+    fs.mkdirSync(path.dirname(tplFile), { recursive: true });
+    const originalContent = JSON.stringify({ sentinel: "c220-untouched" });
+    fs.writeFileSync(tplFile, originalContent);
+    const rBridgeExisting = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rBridgeExisting.status, 2, "已有模板时带 --bridge-root 退出 2：" + rBridgeExisting.stdout + rBridgeExisting.stderr);
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), originalContent, "既有模板内容不得改变");
+    fs.rmSync(tplFile);
+
+    // ③ 带未知 flag → 退出 2，且不含 bridge_root 专有提示
+    const rUnknown = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--whatever-unknown", "--apply"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rUnknown.status, 2, "带未知 flag 退出 2：" + rUnknown.stdout + rUnknown.stderr);
+    assert.match(rUnknown.stderr, /不认识的参数：--whatever-unknown/u);
+    assert.doesNotMatch(rUnknown.stderr, /bridge_root 由安装器维护/u);
+    assert.ok(!fs.existsSync(tplFile), "模板文件不得生成");
+
+    // ④ 正常参数 --apply → 退出 0、模板成功生成
+    const rNormal = spawnSync(
+      process.execPath,
+      [path.resolve("scripts", "init-chain-template.mjs"), ...initArgs, "--apply"],
+      { encoding: "utf-8", env },
+    );
+    assert.equal(rNormal.status, 0, "合法参数成功退出 0：" + rNormal.stdout + rNormal.stderr);
+    assert.ok(fs.existsSync(tplFile), "合法参数模板成功生成");
+    const parsed = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+    assert.equal(parsed.agent_uid, "agent_x");
+    assert.equal(parsed.bridge_root, path.resolve("."));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    const realClaudeShaAfter = fs.existsSync(realClaudeTpl)
+      ? crypto.createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex")
+      : null;
+    assert.equal(realClaudeShaAfter, realClaudeShaBefore, "真实 ~/.claude/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+    const realCodexShaAfter = fs.existsSync(realCodexTpl)
+      ? crypto.createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
+      : null;
+    assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 ~/.codex/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+  }
+});
+
 sealSummary();
 
 printSummary({ printFailures: true });

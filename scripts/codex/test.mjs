@@ -5271,6 +5271,84 @@ test("安装器要把模板的 bridge_root 更新到 runtime/current", () => {
   assert.equal(afterCheck.ok, true, "装完必须一致：" + afterCheck.detail);
 });
 
+test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root）退出 2，不写模板", () => {
+  // 卫兵：用例开始时记录真实 ~/.claude/... 与 ~/.codex/... 模板 sha256，结束时断言绝未被修改
+  const realClaudeTpl = path.join(os.userInfo().homedir, ".claude", "feishu-bridge", "chain-config.json");
+  const realClaudeShaBefore = fs.existsSync(realClaudeTpl)
+    ? createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex")
+    : null;
+  const realCodexTpl = path.join(os.userInfo().homedir, ".codex", "feishu-bridge", "chain-config.json");
+  const realCodexShaBefore = fs.existsSync(realCodexTpl)
+    ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
+    : null;
+
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  const bridgeHomeDir = path.join(dir, "bridge-home");
+  const tplFile = path.join(bridgeHomeDir, "chain-config.json");
+  const initArgs = [
+    "--agent-uid", "agent_codex_test",
+    "--transport-agent-name", "M5Codex",
+    "--transport-app-id", "cli_test",
+    "--transport-open-id", "ou_test",
+    "--frank-sender-id", "1234567890",
+    "--chat-id", "oc_test123",
+    "--chat-name", "测试群",
+    "--lark-cli-bin", "/bin/lark-cli",
+  ];
+  const env = isolatedEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
+
+  try {
+    // ① --bridge-root x --apply → 退出 2、stderr 含「bridge_root 由安装器维护」、模板未生成
+    const rBridge = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rBridge.status, 2, "带 --bridge-root 退出 2：" + rBridge.stdout + rBridge.stderr);
+    assert.match(rBridge.stderr, /不认识的参数：--bridge-root/u);
+    assert.match(rBridge.stderr, /bridge_root 由安装器维护：Codex 链装机时改写为 runtime\/current，Claude 链仅作标志；先写模板再跑安装器/u);
+    assert.ok(!fs.existsSync(tplFile), "模板文件不得生成");
+
+    // ② 既有模板未变：若模板已存在，带 --bridge-root 退出 2 且文件内容一字未动
+    fs.mkdirSync(bridgeHomeDir, { recursive: true });
+    const originalContent = JSON.stringify({ sentinel: "c220-codex-untouched" });
+    fs.writeFileSync(tplFile, originalContent);
+    const rBridgeExisting = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--bridge-root", "/custom/path", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rBridgeExisting.status, 2, "已有模板时带 --bridge-root 退出 2：" + rBridgeExisting.stdout + rBridgeExisting.stderr);
+    assert.equal(fs.readFileSync(tplFile, "utf-8"), originalContent, "既有模板内容不得改变");
+    fs.rmSync(tplFile);
+
+    // ③ 未知 flag → 退出 2，且不含 bridge_root 专有提示
+    const rUnknown = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--unknown-arg", "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rUnknown.status, 2, "带未知 flag 退出 2：" + rUnknown.stdout + rUnknown.stderr);
+    assert.match(rUnknown.stderr, /不认识的参数：--unknown-arg/u);
+    assert.doesNotMatch(rUnknown.stderr, /bridge_root 由安装器维护/u);
+    assert.ok(!fs.existsSync(tplFile), "模板文件不得生成");
+
+    // ④ 正常参数 --apply → 退出 0、模板成功生成且 bridge_root 指向 ROOT
+    const rNormal = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, "--apply"],
+      { encoding: "utf-8", env });
+    assert.equal(rNormal.status, 0, "合法参数成功退出 0：" + rNormal.stdout + rNormal.stderr);
+    assert.ok(fs.existsSync(tplFile), "合法参数模板成功生成");
+    const parsed = JSON.parse(fs.readFileSync(tplFile, "utf-8"));
+    assert.equal(parsed.agent_uid, "agent_codex_test");
+    assert.equal(parsed.bridge_root, ROOT);
+  } finally {
+    const realClaudeShaAfter = fs.existsSync(realClaudeTpl)
+      ? createHash("sha256").update(fs.readFileSync(realClaudeTpl)).digest("hex")
+      : null;
+    assert.equal(realClaudeShaAfter, realClaudeShaBefore, "真实 ~/.claude/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+    const realCodexShaAfter = fs.existsSync(realCodexTpl)
+      ? createHash("sha256").update(fs.readFileSync(realCodexTpl)).digest("hex")
+      : null;
+    assert.equal(realCodexShaAfter, realCodexShaBefore, "真实 ~/.codex/feishu-bridge/chain-config.json 不得被用例触碰或修改");
+  }
+});
+
 test("doctor 的 bridge_root 判据不许写成「永远通过」", () => {
   // **判据本身也要被验。**上一版加完之后我做变异，把它改成恒 true —— 全绿。
   // 那说明那条判据当时一条守卫都没有：加了个看起来对的东西，坏了也没人知道。

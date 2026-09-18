@@ -148,6 +148,8 @@ profile 名。
 > 它是 **Aily 平台的 user id**，不是飞书的 `ou_`。填成 `ou_` 会被形状校验挡下（全拒，
 > 你立刻发现）；但**填成另一个人的 Aily user id，形状完全合法，而后果是那个人从此
 > 能驱动你机器上的长期任务，且没有任何提示**。这一条只能靠抄对，代码救不了。
+>
+> ⚠️ **装机顺序与 bridge_root 维护**：必须**先写模板（第 3 步 init-chain-template），再跑安装器（第 4 步 install-outbound）**。`bridge_root` 由安装器维护（Codex 链装机时改写为 `runtime/current` 隔离运行时，Claude 链作为配过桥的标志），**不要手工指定 `--bridge-root`**，初始化脚本会明确拒绝该参数。
 
 ### 4. 装本机的机制
 

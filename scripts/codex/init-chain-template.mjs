@@ -11,6 +11,63 @@ import { moduleRoot } from "../direct-run.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
+
+const USAGE = "用法：\n" +
+  "  node scripts/codex/init-chain-template.mjs \\\n" +
+  "    --agent-uid agent_xxx \\\n" +
+  "    --transport-agent-name M5Codex \\\n" +
+  "    --transport-app-id cli_xxx \\\n" +
+  "    --transport-open-id ou_xxx \\\n" +
+  "    --frank-sender-id 0000000000000000000 \\\n" +
+  "    --chat-id oc_xxx \\\n" +
+  "    --chat-name \"目标群\" \\\n" +
+  "    [--apply]";
+
+const KNOWN_BOOLEAN_FLAGS = new Set(["--apply"]);
+const KNOWN_VALUE_FLAGS = new Set([
+  "--transport-agent-name",
+  "--transport-app-id",
+  "--transport-open-id",
+  "--lark-cli-profile",
+  "--lark-cli-bin",
+  "--lark-cli-home",
+  "--lark-cli-config-base",
+  "--frank-sender-id",
+  "--chat-name",
+  "--chat-id",
+  "--default-freshness-ms",
+  "--agent-uid",
+]);
+
+for (let i = 2; i < process.argv.length; i += 1) {
+  const a = process.argv[i];
+  if (!a.startsWith("--")) {
+    console.error("不认识的参数：" + a + "\n\n" + USAGE);
+    process.exit(2);
+  }
+  const eq = a.indexOf("=");
+  const flag = eq >= 0 ? a.slice(0, eq) : a;
+  if (KNOWN_BOOLEAN_FLAGS.has(flag)) {
+    if (eq >= 0) {
+      console.error("参数不接受赋值：" + a + "\n\n" + USAGE);
+      process.exit(2);
+    }
+    continue;
+  }
+  if (KNOWN_VALUE_FLAGS.has(flag)) {
+    if (eq < 0) {
+      i += 1;
+    }
+    continue;
+  }
+  console.error("不认识的参数：" + flag);
+  if (flag === "--bridge-root") {
+    console.error("bridge_root 由安装器维护：Codex 链装机时改写为 runtime/current，Claude 链仅作标志；先写模板再跑安装器");
+  }
+  console.error("\n" + USAGE);
+  process.exit(2);
+}
+
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
   return at >= 0 ? process.argv[at + 1] : undefined;

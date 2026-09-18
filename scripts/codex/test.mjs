@@ -22,7 +22,7 @@ import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
   CODEX_DRAIN_SYSTEMD_UNIT, codexDrainSystemdPaths, codexDrainSystemdUnits, serviceState, SYSTEMD_PHASE_TEXT,
-  pickNode as pickDrainNode,
+  pickNode as pickDrainNode, expectedJob,
 } from "./drain-service.mjs";
 import { drainTimerCheck, drainTimerText, runDrainService } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台 / PK3-L2-fix3：模块函数入参测入口
 import {
@@ -129,7 +129,7 @@ import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs
 import { shellQuote } from "../shell-quote.mjs";
 import { createGate } from "../maintenance-gate-core.mjs";
 import { compareInstalledSurface, readInstalledSurface } from "../installed-surface.mjs";
-import { referencedRuntimeScripts } from "../install-projection.mjs";
+import { referencedRuntimeScripts, resolveNodeForHooks } from "../install-projection.mjs";
 import { maintenanceEntryManifest } from "../maintenance/maintenance-entries.mjs";
 import {
   DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
@@ -10911,6 +10911,13 @@ function linuxDrainFixture(prefix = "pk3l7-codex-") {
   fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }));
   fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
 
+  // PK3-L7-fix2：在沙箱 home 构造 ~/.local/share/mise/shims/node，
+  // 确保 resolveNodeForHooks 在 Linux 下优先命中 mise shim（钉住 ExecStart 的 node 路径）
+  const shimDir = path.join(home, ".local", "share", "mise", "shims");
+  fs.mkdirSync(shimDir, { recursive: true });
+  const shimNode = path.join(shimDir, "node");
+  fs.writeFileSync(shimNode, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
   const logFile = path.join(base, "systemctl.log");
   const fakeBin = path.join(base, "fake-systemctl");
   const script = `#!/bin/sh
@@ -10968,7 +10975,7 @@ exit 0
       return [];
     }
   };
-  return { base, home, codexHome, bridge, runtimeRoot, logFile, fakeBin, readLog };
+  return { base, home, codexHome, bridge, runtimeRoot, logFile, fakeBin, readLog, shimNode };
 }
 
 test("PK3-L7：enable 写两份 unit 且 argv 序列逐字（daemon-reload → enable --now …，首项 --user）", () => {
@@ -10995,6 +11002,26 @@ test("PK3-L7：enable 写两份 unit 且 argv 序列逐字（daemon-reload → e
     assert.match(sContent, /Type=oneshot/u);
     assert.match(sContent, /ExecStart=.*drain-all\.mjs/u);
     assert.match(sContent, /StandardOutput=append:.*drain\.log/u);
+
+    // PK3-L7-fix2：断言 .service 的 ExecStart 首段等于 resolveNodeForHooks(linux) 的结果（钉住 mise shim）
+    const expectedLinuxNode = resolveNodeForHooks({ homedir: fx.home, platform: "linux" });
+    assert.equal(expectedLinuxNode, fx.shimNode, "linux 下必须优先选中 mise shim");
+    const execStartMatch = /^ExecStart=(.*)$/mu.exec(sContent);
+    assert.ok(execStartMatch, "service 单元必须包含 ExecStart 行");
+    const execStartVal = execStartMatch[1].trim();
+    const execFirstArg = execStartVal.startsWith('"')
+      ? JSON.parse(execStartVal.match(/^"([^"\\]|\\.)*"/u)[0])
+      : execStartVal.split(/\s+/u)[0];
+    assert.equal(execFirstArg, expectedLinuxNode, "service 的 ExecStart 首段必须与 resolveNodeForHooks(linux) 一致（钉住 mise shim）");
+
+    // PK3-L7-fix2：断言 darwin 路径不受影响（不认 linux 的 mise shim，仍走 darwin 偏好/execPath）
+    const expectedDarwinNode = pickDrainNode("darwin", fx.home);
+    assert.notEqual(expectedDarwinNode, fx.shimNode, "darwin 平台绝不选用 linux 的 mise shim");
+    assert.ok(["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath].includes(expectedDarwinNode), "darwin 路径不受影响");
+    const dJob = expectedJob({ home: fx.home, platform: "darwin" });
+    assert.equal(dJob.node, expectedDarwinNode);
+    const dPlist = plistBody({ home: fx.home });
+    assert.doesNotMatch(dPlist, /mise\/shims\/node/u, "darwin plist 绝不包含 linux mise shim");
 
     const tContent = fs.readFileSync(paths.timer, "utf-8");
     assert.match(tContent, /Description=feishu-bridge 兜底发布定时器（Codex 链，每 30 分钟）/u);

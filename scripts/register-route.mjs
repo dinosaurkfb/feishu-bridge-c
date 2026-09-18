@@ -18,7 +18,7 @@
 
 import path from "node:path";
 import { isDirectRun } from "./direct-run.mjs";
-import { registerRouteBinding, initDefaultRoute, previewInitDefault, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
+import { registerRouteBinding, topicHandlerKind, initDefaultRoute, previewInitDefault, loadRoutes, restoreDefaultRoute, routesPath } from "./inbound-routes.mjs";
 import { gateBlocks, exitForGate } from "./maintenance-gate-core.mjs";
 
 const REASON_TEXT = {
@@ -156,6 +156,20 @@ function main() {
   console.log("\n已写入。路由 " + (r.routeChanged ? "新增" : "无变化") +
     (session ? "，话题 " + (r.sessionChanged ? "新增" : "无变化") : ""));
   console.log("默认路由未改动 —— 换默认路由是换权威路由，本命令不做。");
+  if (session && r.sessionChanged) {
+    // PK3-W232-fix2 P1-2 / fix3 P1-2：提示**消费共享三态**（登记到默认路由 ≠ 外部接管）。
+    // external 才说"本链不再回复"；local 说明仍由本链处理；unavailable 不猜。
+    // 已发出的绑定回执不会自动更新 —— 这里只能在终端说一声：不写飞书、不改已发消息（自动写飞书要 Frank 逐次授权）。
+    const after = topicHandlerKind({ sessionId: session, routesFile: file });
+    if (after.kind === "external") {
+      console.log("提示      这个话题的回复方式从现在起由外部处理器 " + after.routeId + " 决定：本链不再回复它。");
+      console.log("          已发出的绑定回执不会自动更新 —— 要不要另发一条接管状态消息：待定（需人工拍板）。");
+    } else if (after.kind === "local") {
+      console.log("提示      这个话题登记到的是默认路由（" + after.routeId + "）：仍由本链处理，回复方式不变。");
+    } else {
+      console.log("提示      登记已写入，但这个话题的路由现在判不了（" + (after.reason ?? "?") + "）：先跑 node scripts/doctor.mjs 看清楚。");
+    }
+  }
 }
 
 if (isDirectRun(import.meta.url)) main();

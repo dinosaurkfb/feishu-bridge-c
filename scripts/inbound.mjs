@@ -18,6 +18,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { topicHandlerKind, topicHandlerText } from "./inbound-routes.mjs";
+import { fileURLToPath } from "node:url";
 import { EXPIRY_SOURCE, normalizeBody } from "./selector.mjs";
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
@@ -112,6 +114,62 @@ export function selectClaudeLegacyUpdate(u, { now = Date.now() } = {}) {
   return promoteBinding({ root: u.projectRoot, generationId, operationId: idy.operationId, sessionId: u.eventSessionId, now });
 }
 
+/** 三种结局的回执文案。拒绝必须带原因 —— 静默丢弃是不可接受的失败模式。 */
+export function ackText(kind, detail) {
+  if (kind === "accepted") {
+    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。四种投递方式封闭渲染，说不清的不许冒充其中一种。
+    const where = {
+      // issue #140：转发是 fire-and-forget（spawn 即返回），结果要等 forward-runner 落盘才知道 ——
+      // 回执不许冒充送达（2026-09-08 三条消息拿到送达回执、转发进程秒退、消息从未到达会话）。
+      // 措辞里的旧字样已被 R54 测试用 git grep 级全仓扫描禁止 —— 注释里也不许再出现。
+      live_session: "正在转发到你正开着的会话（" + detail.targetName + "）（跨会话转发，附凭证）；转发结果落在运行目录，doctor 可查",
+      resume: "已续起本话题绑定的那条会话，后台执行",
+      continue: "已起一轮后台执行（沿用本项目最近的对话）",
+      reply_only: "已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）",
+    }[detail.mode] ?? ("已投递（方式：" + String(detail.mode) + "）");
+    return [
+      "已受理 · " + detail.taskName,
+      where + "。完成后结果会自动发布到本话题。",
+      "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
+    ].join("\n");
+  }
+  if (kind === "bound") {
+    // PK3-W232-fix2 P1-1：三态判定只有一份（inbound-routes.topicHandlerKind，内部复用 loadRoutes + selectRoute）。
+    // 能走到这里说明本链自己接管（已登记外部 route 时 dispatcher 根本不进本链），所以 local 就承诺本链；
+    // external 是防御性的；**unavailable 不许落回旧承诺** —— 说清判不了，让人去 doctor。
+    // fix3：带上本链默认路由 —— 与 aily-inbound 给 dispatcher 的那份同形（id self），表空时判 local 而不是 unavailable。
+    const handler = detail?.topicHandler ?? topicHandlerKind({
+      sessionId: detail?.sessionId, routesFile: detail?.routesFile,
+      defaultRoute: { id: "self", handler: fileURLToPath(import.meta.url) },
+    });
+    const instructionLine = topicHandlerText(handler)
+      ?? "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。";
+    const lines = [
+      "绑定完成 · " + detail.taskName,
+      "这个话题现在通向 " + detail.root + "。",
+      instructionLine,
+    ];
+    if (detail.bodySkipped) lines.splice(2, 0, "你这条消息里带的正文没有被执行（配对消息只做绑定）；要下指令请再发一条新消息。");
+    return lines.join("\n");
+  }
+  if (kind === "control") return detail.text;
+  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
+  if (kind === "rejected") {
+    const lines = ["已拒绝 · " + detail.reasonText];
+    // 说清楚这个话题通向谁。同一个群里有多个项目话题之后，最容易犯的错是
+    // 「@ 错了话题」—— 而单看「消息里没有指令正文」，人完全看不出自己站错了地方
+    //（2026-08-20 实测：一条本该给 cc2cd 的空 @ 落在了 feishu-bridge-cc 的话题里，
+    // 回执如实、正确、且毫无用处）。
+    if (detail.taskName) lines.push("本话题通向：" + detail.taskName + "。");
+    lines.push("本条指令没有被投递给任何任务。");
+    return lines.join("\n");
+  }
+  return [
+    "系统错误 · " + detail.detail,
+    "本条指令没有被投递。请勿视为已受理。",
+  ].join("\n");
+}
+
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {
 
 // 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放（stdout 就是给运输 agent 的回复）
@@ -160,51 +218,7 @@ function writeReceipt(name, payload) {
   return file;
 }
 
-/** 三种结局的回执文案。拒绝必须带原因 —— 静默丢弃是不可接受的失败模式。 */
-function ackText(kind, detail) {
-  if (kind === "accepted") {
-    // 说清楚落到哪条线上：他在终端里看不看得到这条指令，取决于这个。四种投递方式封闭渲染，说不清的不许冒充其中一种。
-    const where = {
-      // issue #140：转发是 fire-and-forget（spawn 即返回），结果要等 forward-runner 落盘才知道 ——
-      // 回执不许冒充送达（2026-09-08 三条消息拿到送达回执、转发进程秒退、消息从未到达会话）。
-      // 措辞里的旧字样已被 R54 测试用 git grep 级全仓扫描禁止 —— 注释里也不许再出现。
-      live_session: "正在转发到你正开着的会话（" + detail.targetName + "）（跨会话转发，附凭证）；转发结果落在运行目录，doctor 可查",
-      resume: "已续起本话题绑定的那条会话，后台执行",
-      continue: "已起一轮后台执行（沿用本项目最近的对话）",
-      reply_only: "已起一次性回复（零工具、不读任何会话历史，不进 owner 的会话）",
-    }[detail.mode] ?? ("已投递（方式：" + String(detail.mode) + "）");
-    return [
-      "已受理 · " + detail.taskName,
-      where + "。完成后结果会自动发布到本话题。",
-      "消息 " + detail.messageId.slice(-8) + " | claim " + detail.key.slice(0, 8),
-    ].join("\n");
-  }
-  if (kind === "bound") {
-    const lines = [
-      "绑定完成 · " + detail.taskName,
-      "这个话题现在通向 " + detail.root + "。",
-      "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
-    ];
-    if (detail.bodySkipped) lines.splice(2, 0, "你这条消息里带的正文没有被执行（配对消息只做绑定）；要下指令请再发一条新消息。");
-    return lines.join("\n");
-  }
-  if (kind === "control") return detail.text;
-  if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
-  if (kind === "rejected") {
-    const lines = ["已拒绝 · " + detail.reasonText];
-    // 说清楚这个话题通向谁。同一个群里有多个项目话题之后，最容易犯的错是
-    // 「@ 错了话题」—— 而单看「消息里没有指令正文」，人完全看不出自己站错了地方
-    //（2026-08-20 实测：一条本该给 cc2cd 的空 @ 落在了 feishu-bridge-cc 的话题里，
-    // 回执如实、正确、且毫无用处）。
-    if (detail.taskName) lines.push("本话题通向：" + detail.taskName + "。");
-    lines.push("本条指令没有被投递给任何任务。");
-    return lines.join("\n");
-  }
-  return [
-    "系统错误 · " + detail.detail,
-    "本条指令没有被投递。请勿视为已受理。",
-  ].join("\n");
-}
+
 
 // ---------- 频道定位采样旁路（不承重）----------
 // 取到事件之前 sampleCtx 为 null：那几条是系统错误 / 模板不可用 / 信封失败，不是入站消息，不入样本。
@@ -690,7 +704,7 @@ if (justBound) {
     pending_token_seen: typeof mapping.pending_token === "string" && mapping.pending_token.length > 0
       ? String(event.content ?? "").includes(mapping.pending_token) : null,
   });
-  finish("bound", { taskName: config.task_display_name, root: routed.root, bodySkipped },
+  finish("bound", { taskName: config.task_display_name, root: routed.root, bodySkipped, sessionId: event.session_id },
     { bound: true, root: routed.root, body_skipped: bodySkipped });
 }
 

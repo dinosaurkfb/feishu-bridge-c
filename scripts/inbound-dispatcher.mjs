@@ -12,7 +12,7 @@ import path from "node:path";
 
 import { CANONICAL_EVENT_ENV, buildCanonicalEvent } from "./canonical-event.mjs";
 import { ENVELOPE_ENV, fetchTriggerEvent } from "./envelope.mjs";
-import { routeRejectText, loadRoutes, selectRoute } from "./inbound-routes.mjs";
+import { effectiveRoutes, routeRejectText, loadRoutes, selectRoute } from "./inbound-routes.mjs";
 
 const appendLog = (file, line) => {
   if (typeof file !== "string" || !file) return;
@@ -97,11 +97,8 @@ export function runInboundDispatcher({
     log("routes table unusable: " + table.reason);
     return fail(routeRejectText(table.reason), table.reason);
   }
-  const fallback = defaultRoute && typeof defaultRoute.id === "string" &&
-    typeof defaultRoute.handler === "string"
-    ? [{ id: defaultRoute.id, handler: defaultRoute.handler, isDefault: true }]
-    : [];
-  const routes = table.routes.length > 0 ? table.routes : fallback;
+  // PK3-W232-fix3 P1-1：fallback 投影只此一份（inbound-routes.effectiveRoutes），三态判定 topicHandlerKind 用同一份。
+  const routes = effectiveRoutes({ routes: table.routes, defaultRoute });
   const picked = selectRoute({
     sessionId: canonical.event.source.session_id,
     routes,

@@ -1321,7 +1321,8 @@ export function runDoctor({
     if (buckets.inflight) parts.push("进行中 " + buckets.inflight);
     if (buckets.inflightUnverified) parts.push("进行中未验证 " + buckets.inflightUnverified);
     if (buckets.unclear) parts.push("查不清 " + buckets.unclear);
-    const body = scanned === 0 ? "近 24 小时没有转发结果（只盘 live_session 转发，没有转发就没有条目）"
+    const forwardScopeNote = "只统计本链 live_session 转发；外部处理器（routes.json 非默认路由）的转发结果不在此项";
+    const body = scanned === 0 ? "近 24 小时没有转发结果（" + forwardScopeNote + "）"
       : "近 24 小时共 " + scanned + " 条：" + parts.join("、") +
         (redNote.length ? "；最近的红：" + redNote.join("；") : "") +
         (noReceipt > 0 ? "；失败无回执 " + noReceipt + "：" + noReceiptKeys.join("、") : "") +
@@ -1329,7 +1330,8 @@ export function runDoctor({
         (noAnchor > 0 ? "；旧版 result 无落点记录，无法精确核回执 " + noAnchor + "：" + noAnchorKeys.join("、") : "") +
         (missingKeys.length ? "；缺结果的 key：" + missingKeys.join("、") : "") +
         (unclearNote.length ? "；查不清：" + unclearNote.join("；") : "") +
-        (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "");
+        (buckets.inflightUnverified > 0 ? "；有 " + buckets.inflightUnverified + " 条转发进行中，尚无结果" : "") +
+        "；" + forwardScopeNote;
     // R54 返修三 P1-3：有无法核验实例身份的进行中转发 → 本项 incomplete（ok:null），不判绿也不判红
     // R54 返修四 P1-2：无法核验实例身份 / 刚起还没结果 → 本项 incomplete（ok:null）
     const ok17 = scanned === 0 ? true

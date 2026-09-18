@@ -46,7 +46,8 @@ import { remindCodexPendingClaims } from "./claim-reminder.mjs";
 import { claimKey, recordClaimState, readClaimState, acquireClaim } from "../claim.mjs";
 import { codexControlRepairPrecondition } from "./repair-control-claim.mjs";
 import * as CODEX from "./inbound.mjs";
-import { selectLegacyUpdate } from "./inbound.mjs";
+import { topicHandlerKind } from "../inbound-routes.mjs";
+import { ackText, selectLegacyUpdate } from "./inbound.mjs";
 import { dispatchControlRepair } from "../repair-control-claim.mjs";
 import { codexControlPrecondition } from "./control-identity.mjs";
 import { isCanonicalIso } from "../canonical-time.mjs";
@@ -10925,6 +10926,101 @@ test("PK3-L2-fix2 P2-3：darwin absent 且有积压时保留「还有 N 条历�
   });
   assert.equal(withoutBacklog.ok, null);
   assert.doesNotMatch(withoutBacklog.detail, /历史积压未分类/u, "无积压时不带后缀：" + withoutBacklog.detail);
+});
+
+// ── PK3-W232-fix2（Codex 链）：根消息中性 + bound 回执的三态（共用判定只有一份）──────────
+
+test("PK3-W232-fix2（Codex 链）：bind-task 的 compose 路径根消息中性；bound 回执按三态说清谁接管", () => {
+  // 拿掉哪行会红：把 codex/bind-compose 的 rootText 改回传 sessionId/routesFile（并按外部处理器分支），
+  //   第一条会红（根消息又出现"取决于那一刻的选路"）；把 ackText 换回 fix1 的本地判定，坏表那条会红（落回旧承诺）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-w232-fix2-codex-"));
+  try {
+    const writeRoutes = (name, doc) => {
+      const f = path.join(dir, name);
+      fs.writeFileSync(f, typeof doc === "string" ? doc : JSON.stringify(doc, null, 2) + "\n");
+      return f;
+    };
+    const doc = (over = {}) => ({
+      schema_version: "1.0",
+      routes: [
+        { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
+        { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" },
+      ],
+      sessions: {},
+      ...over,
+    });
+    const okFile = writeRoutes("routes.json", doc({ sessions: { session_external_123: "c2c-inbound" } }));
+
+    // ① 真建话题入口的 compose 路径（bind-task → composeCodexBinding）：根消息不依赖未来选路
+    const binding = composeCodexBinding({
+      root: ROOT, threadId: "01911111-2222-7333-8444-555555555555",
+      template: TEMPLATE, globalStateFile: path.join(dir, "codex-global.json"),
+      threadDescriptions: path.join(dir, "threads"),
+    });
+    assert.match(binding.rootText, /回复方式取决于这个话题的路由/u, binding.rootText);
+    assert.doesNotMatch(binding.rootText, /本机输入与每轮回答会合成卡片回复到本话题/u, binding.rootText);
+    // 中性措辞里**提到**外部处理器是允许的（那是可能性）；不许的是按**此刻**的表给它下结论
+    assert.doesNotMatch(binding.rootText, /外部处理器 \S+ 接管/u, "建话题这一刻不该按未来选路给结论：" + binding.rootText);
+
+    // ② bound 回执：local → 本链承诺（能走到这里就是本链自己接管）
+    const localAck = ackText("bound", { taskName: "codex-task", sessionId: "session_unregistered", routesFile: okFile });
+    assert.match(localAck, /这个话题现在精确通向一个 Codex task/u, localAck);
+    assert.doesNotMatch(localAck, /外部处理器/u, localAck);
+
+    // ③ external → 外部处理器说明（防御性；实践中 dispatcher 不会把这种话题交给本链）
+    const extAck = ackText("bound", { taskName: "codex-task", sessionId: "session_external_123", routesFile: okFile });
+    assert.equal(extAck, ["绑定完成 · codex-task", "此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。"].join("\n"));
+
+    // ④ unavailable（停用 route / 坏表）→ 不许落旧承诺
+    const disabled = writeRoutes("routes-disabled.json", doc({
+      routes: [
+        { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
+        { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs", enabled: false },
+      ], sessions: { session_external_123: "c2c-inbound" },
+    }));
+    const broken = writeRoutes("routes-broken.json", "{ 这不是 JSON");
+    for (const [label, f] of [["停用 route", disabled], ["坏表", broken]]) {
+      const ack = ackText("bound", { taskName: "codex-task", sessionId: "session_external_123", routesFile: f });
+      assert.match(ack, /判不了/u, label + "：" + ack);
+      assert.doesNotMatch(ack, /精确通向一个 Codex task|外部处理器 \S+ 接管/u, label + "：不许落旧承诺：" + ack);
+      assert.doesNotMatch(ack, /以卡片发回/u, label + "：" + ack);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("PK3-W232-fix4（Codex 链）：真实 bound 回执不传 routesFile 时默认读 Codex 自己的表（bridgeHome()/routes.json），不受 Claude 表影响", () => {
+  // 拿掉哪行会红：codex/inbound.mjs 的 bound 分支把 routesFile 默认改回 undefined（走共享 routesPath），
+  //   本用例会红在"不含外部处理器 c2c-inbound 接管"（Claude 表说 external，Codex 表说 local）。
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-w232-two-tables-"));
+  const saved = { codexHome: process.env.FEISHU_CODEX_BRIDGE_HOME, claudeRoutes: process.env.FEISHU_BRIDGE_ROUTES };
+  try {
+    // Claude 链的表：话题登记给外部处理器
+    const claudeRoutes = path.join(tmp, "claude-routes.json");
+    fs.writeFileSync(claudeRoutes, JSON.stringify({ schema_version: "1.0",
+      routes: [{ id: "self", handler: "/opt/fake/inbound.mjs", default: true }, { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" }],
+      sessions: { "session_two_tables": "c2c-inbound" } }, null, 2) + "\n");
+    // Codex 链的表：同一话题未登记 → 默认路由 codex（本链）
+    const codexHome = path.join(tmp, "codex-bridge");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "routes.json"), JSON.stringify({ schema_version: "1.0",
+      routes: [{ id: "codex", handler: "/opt/fake/codex/inbound.mjs", default: true }], sessions: {} }, null, 2) + "\n");
+    process.env.FEISHU_CODEX_BRIDGE_HOME = codexHome;
+    process.env.FEISHU_BRIDGE_ROUTES = claudeRoutes;
+    // 两张表结论相反（前提）
+    assert.equal(topicHandlerKind({ sessionId: "session_two_tables", routesFile: claudeRoutes }).kind, "external");
+    assert.equal(topicHandlerKind({ sessionId: "session_two_tables", routesFile: path.join(codexHome, "routes.json") }).kind, "local");
+    // 真实入口形状：只有 taskName + sessionId，不传 routesFile
+    const ack = CODEX.ackText("bound", { taskName: "codex-task", sessionId: "session_two_tables" });
+    assert.doesNotMatch(ack, /外部处理器 c2c-inbound 接管/u, "Codex 回执不得受 Claude 表影响：" + ack);
+    assert.doesNotMatch(ack, /判不了/u, ack);
+    assert.match(ack, /这个话题现在精确通向一个 Codex task/u, ack);
+  } finally {
+    if (saved.codexHome === undefined) delete process.env.FEISHU_CODEX_BRIDGE_HOME; else process.env.FEISHU_CODEX_BRIDGE_HOME = saved.codexHome;
+    if (saved.claudeRoutes === undefined) delete process.env.FEISHU_BRIDGE_ROUTES; else process.env.FEISHU_BRIDGE_ROUTES = saved.claudeRoutes;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 sealSummary();

@@ -139,15 +139,23 @@ export function readProjectIdentity({ root, files = IDENTITY_FILES }) {
  * Aily 自动附带的根消息引用中读取这行短码，在同时存在多个 pending task 时确定性选中目标；
  * 绑定完成后仍回到 sessionID 路由。Claude 根消息也保留同一信号，不影响其既有行为。
  */
-export function composeRootMessage({ name, heading = name, purpose, root, token }) {
+export function composeRootMessage({
+  name, heading = name, purpose, root, token,
+}) {
   const lines = ["🌉 " + heading];
   if (purpose) lines.push("", purpose);
+  // **建话题这一刻平台侧的会话还不存在**，这个 session 以后落到哪条路由——本链自己处理，还是
+  // 被外部处理器接管——此刻无从判断（PK3-W232-fix2 P1-2）。所以根消息只说**不依赖未来选路**的事：
+  // 怎么说是指令，以及回复方式取决于路由。无条件的「每轮回答会合成卡片回复到本话题」是一个
+  // 本链单方面发下的承诺，登记了外部处理器的机器上它是假话（issue #232：Frank 据此以为坏了）。
+  const replyLine = "之后在这条消息下面 @ 一下就是给它下指令。回复方式取决于这个话题的路由：" +
+    "本链自己绑定会话时，进展与每一轮回答会以卡片发回这里；已经登记给外部处理器的话题，回复方式由那个处理器决定。";
   lines.push(
     "",
     "本机项目  " + root,
     "绑定码    " + token,
     "",
-    "本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。",
+    replyLine,
   );
   return lines.join("\n");
 }

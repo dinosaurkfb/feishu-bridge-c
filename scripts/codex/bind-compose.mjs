@@ -96,6 +96,8 @@ export function composeCodexBinding({
     idempotencyKey: idempotencyKeyFor(
       idempotencyScope ? bindingIdentity + "\n" + idempotencyScope : bindingIdentity,
     ),
+    // 根消息不接 sessionId / routes：建话题这一刻平台会话还不存在（PK3-W232-fix2 P1-2），
+    // 措辞必须不依赖未来选路 —— 详见 scripts/bind-compose.mjs 的 composeRootMessage。
     rootText: composeRootMessage({ name, heading, purpose: identity.purpose, root, token }),
     statusText: composeStatusMessage({ name })
       .replace("在这条消息下面 @ 一下运输 agent", "在这条消息下面真实 @" + agentName)

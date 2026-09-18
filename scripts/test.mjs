@@ -255,7 +255,8 @@ import {
 import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VERSION, SUBSCRIPTION_SCHEMA_VERSION_KEYED, buildLegacySubscriptionReadModel, compareFirstClaimShadow, legacyEndpointId, selectPendingSubscriptionClaim, stableControlId, subscriptionIdFor, validateSubscription, claimable } from "./subscription.mjs";
 import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, classifySubscriptionAuditPending, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, resolveSubscriptionAuditConflict, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
-import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, installFootprint, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
+import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
+import { installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -7872,19 +7873,26 @@ test("PK3-U1：uninstall.mjs dry-run 零写（整棵 HOME 前后一致）", () =
 test("PK3-U1：--purge 没带 --yes-delete-data 拒且零删；带了才删数据", () => {
   const routes = JSON.stringify({ routes: [], sessions: { keep: "self" } });
   const home = u1Home({ ".claude/feishu-bridge/routes.json": routes });
+  // purge 的清单从**产品派生函数**取（含 FEISHU_CODEX_BRIDGE_HOME 这类覆盖点），所以这里必须把它们
+  // 指到本用例自己的夹具里 —— 否则会去删套件绊线（那是别的用例的隔离根）。
+  const env = {
+    FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".codex", "feishu-bridge"),
+    CODEX_HOME: path.join(home, ".codex"),
+    FEISHU_BRIDGE_REGISTRY: path.join(home, ".claude", "feishu-bridge", "registry.json"),
+  };
   assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0);
   const before = u1Snapshot(home);
 
-  const refused = u1Run(home, "uninstall.mjs", ["--purge", "--apply"]);
+  const refused = u1Run(home, "uninstall.mjs", ["--purge", "--apply"], env);
   assert.equal(refused.status, 2, refused.stdout + refused.stderr);
   assert.match(refused.stderr, /--yes-delete-data/u);
   assert.equal(u1Snapshot(home), before, "被拒就零删（连 --apply 都不该做事）");
 
-  const purged = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"]);
+  const purged = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
   assert.equal(purged.status, 0, purged.stdout + purged.stderr);
-  assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "routes.json")), false, "purge 要删数据");
-  assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "runtime")), false, "purge 要删 runtime/（连 versions）");
-  assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "registry.json")), false);
+  // 两链的机器级桥根整棵删掉 —— 路由表 / 登记表 / 收据 / runtime 都在里面（P1-3：不许"退出 0 但制品还在"）
+  assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge")), false, "Claude 桥根整棵要没");
+  assert.equal(fs.existsSync(path.join(home, ".codex", "feishu-bridge")), false, "Codex 桥根整棵要没（含 tasks/*/inbound|outbound、receipts、installed-surface.json）");
 });
 
 test("PK3-U1：某条链没装 → 那一步报「未安装，跳过」且不算失败", () => {
@@ -7954,7 +7962,9 @@ test("PK3-U1：doctor 的 aily daemon 项（linux 有单元时核 enabled/active
   fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
   fs.mkdirSync(path.join(home, ".config", "systemd", "user"), { recursive: true });
-  fs.writeFileSync(path.join(home, ".config", "systemd", "user", "feishu-bridge-aily.service"), "[Service]\nExecStart=:/x/aily-cli daemon start --foreground\n");
+  // 健康态用**产品自己的投影**写（形状判据就是照它定的）：手写一份非规范形状会被判成内容漂移（那是判据该做的）
+  fs.writeFileSync(path.join(home, ".config", "systemd", "user", "feishu-bridge-aily.service"),
+    ailyDaemonUnit({ home, ailyCli: "/x/aily-cli", node: process.execPath }));
 
   const of = (args) => (args.includes("is-enabled") ? { ok: true, out: "enabled\n" } : { ok: true, out: "active\n" });
   const doc = runDoctor({ home, platform: "linux", systemctl: of });
@@ -7968,6 +7978,159 @@ test("PK3-U1：doctor 的 aily daemon 项（linux 有单元时核 enabled/active
   // darwin：不出现这一项（加一个恒 unknown 的项会把每台 mac 拖成 incomplete）
   const darwinDoc = runDoctor({ home, platform: "darwin" });
   assert.equal(darwinDoc.checks.some((x) => x.id === "aily_daemon"), false, "darwin 不该有 aily daemon 项");
+});
+
+// ── PK3-U1-fix1：Codex 一轮的四条 P1 + 两条 P2 的常驻反例 ────────────────────────────────
+
+test("PK3-U1-fix1 P1-1：足迹补全（Codex 技能 / drain plist / 断链 current）+ 钩子按严格归属认领", () => {
+  const home = u1Home({
+    // 外项目自己的同名钩子：没有本桥的 HOOK_TAG，**不许**被认成我们的（子串认领会误判成"半装"）
+    ".claude/settings.json": JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "/opt/orca/scripts/stop-hook.mjs --fast" }] }] } }),
+    // 断链的 runtime/current（指向一个不存在的版本）：existsSync 会漏，lstat 不会
+    ".codex/skills/m5codex-inbound-router/SKILL.md": "# skill\n",
+    ".codex/feishu-bridge/receipts/x.json": "{}\n",
+  });
+  fs.mkdirSync(path.join(home, ".claude", "feishu-bridge", "runtime"), { recursive: true });
+  fs.symlinkSync(path.join(home, ".claude", "feishu-bridge", "runtime", "versions", "gone"), path.join(home, ".claude", "feishu-bridge", "runtime", "current"));
+  const env = { CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".codex", "feishu-bridge") };
+  const foot = installFootprint({ home, env });
+
+  assert.deepEqual(foot.present.claudeHooks, [], "外项目的 /opt/orca/scripts/stop-hook.mjs 不是我们的钩子");
+  assert.equal(foot.partial, false, "也不该因为同名钩子被误判成半装：" + JSON.stringify(foot.orphans));
+  assert.deepEqual(foot.present.codexSkills.map((p) => path.basename(p)), ["m5codex-inbound-router"], "Codex 技能要纳入足迹");
+  assert.equal(foot.present.claudeCurrent, path.join(home, ".claude", "feishu-bridge", "runtime", "current"), "断链的 current 也算在（lstat）");
+  assert.deepEqual(foot.residue.map((r) => r.area).sort(), ["codex-skill", "runtime-current"], JSON.stringify(foot.residue));
+
+  // 一键卸载不许说"未安装，跳过"：只剩 Codex 技能也得真删掉
+  const dry = u1Run(home, "uninstall.mjs", [], env);
+  assert.match(dry.stdout, /3\. Codex 链：hooks \+ 技能 \+ 兜底排空服务  → 将停 \/ 将删/u, dry.stdout);
+  const applied = u1Run(home, "uninstall.mjs", ["--apply"], env);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.equal(fs.existsSync(path.join(home, ".codex", "skills", "m5codex-inbound-router")), false, "Codex 技能要真删掉");
+  assert.equal(lockPresent(path.join(home, ".claude", "feishu-bridge", "runtime", "current")), false, "断链的 current 也要摘掉");
+  assert.deepEqual(installFootprint({ home, env }).residue, [], "卸完不该还有足迹");
+});
+
+test("PK3-U1-fix1 P1-1：只剩 Codex 兜底 plist 时也要卸（drain plist 纳入足迹）", () => {
+  const home = u1Home();
+  const plist = path.join(home, "Library", "LaunchAgents", "com.frank.feishu-bridge-codex.drain.plist");
+  fs.mkdirSync(path.dirname(plist), { recursive: true });
+  fs.writeFileSync(plist, "<plist/>\n");
+  const foot = installFootprint({ home, platform: "darwin" });
+  assert.deepEqual(foot.present.codexDrain, [plist], "Codex drain plist 要纳入足迹");
+  assert.deepEqual(foot.residue.map((r) => r.area), ["codex-drain"], JSON.stringify(foot.residue));
+  const dry = u1Run(home, "uninstall.mjs", [], { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin" });
+  assert.equal(/3\. Codex 链.*→ 未安装，跳过/u.test(dry.stdout), false, "不许说未安装跳过：" + dry.stdout);
+});
+
+test("PK3-U1-fix1 P1-2：全程安装面锁 —— 预置锁时一键卸载拒绝且零写（不摘 current）", () => {
+  const home = u1Home();
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0);
+  const current = path.join(home, ".claude", "feishu-bridge", "runtime", "current");
+  assert.equal(lockPresent(current), true, "装完 current 在");
+  const before = u1Snapshot(home);
+  // 预置一把**活着**的安装面锁（owner pid 用本进程 —— 锁协议只按 pid 活性判陈旧）
+  const lock = path.join(home, ".claude", "feishu-bridge", "install-surface.lock");
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "t" }), lock);
+  const refused = u1Run(home, "uninstall.mjs", ["--apply"]);
+  assert.equal(refused.status, 2, refused.stdout + refused.stderr);
+  assert.match(refused.stderr, /安装面锁拿不到/u, refused.stderr);
+  assert.equal(lockPresent(current), true, "**current 不许被摘**（这就是 fix1 的硬缺口）");
+  fs.rmSync(lock, { force: true });
+  assert.equal(u1Snapshot(home), before, "被拒就零写：" + refused.stdout);
+});
+
+test("PK3-U1-fix1 P1-3：--purge 的清单来自产品派生函数（含自定义 CODEX 家目录与收据）", () => {
+  const home = u1Home();
+  const custom = path.join(home, "custom-codex-bridge");
+  // 套件全局设了 FEISHU_BRIDGE_REGISTRY（指到套件自己的登记表目录），子进程会继承 ——
+  // 这里必须把它也指回夹具，否则 purge 会去删套件的目录（产品行为本身是对的：覆盖点优先）。
+  const env = { CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: custom,
+    FEISHU_BRIDGE_REGISTRY: path.join(home, ".claude", "feishu-bridge", "registry.json") };
+  // 三样实测漏过的制品：Claude receipts/、两链 installed-surface.json、Codex tasks/<key>/inbound|outbound
+  for (const rel of ["tasks/t1/inbound/x.json", "tasks/t1/outbound/y.json", "receipts/z.json", "installed-surface.json", "registry.json"]) {
+    const p = path.join(custom, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, "{}\n");
+  }
+  fs.mkdirSync(path.join(home, ".claude", "feishu-bridge", "inbound", "receipts"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "feishu-bridge", "inbound", "receipts", "r.json"), "{}\n");
+  fs.writeFileSync(path.join(home, ".claude", "feishu-bridge", "installed-surface.json"), "{}\n");
+
+  const dry = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data"], env);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.ok(dry.stdout.includes(custom), "清单里要出现自定义 CODEX 家目录：" + dry.stdout);
+  assert.equal(/将保留：无/u.test(dry.stdout), false, "不许说「将保留：无」而实际留下东西");
+
+  const purged = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
+  assert.equal(purged.status, 0, purged.stdout + purged.stderr);
+  assert.equal(fs.existsSync(custom), false, "自定义 CODEX 家目录整棵要没（含 tasks/receipts/installed-surface.json）");
+  assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge")), false, "Claude 桥根整棵要没（含 receipts/ 与 installed-surface.json）");
+  assert.deepEqual(machinePurgeTargets({ home, env }).roots.filter((r) => fs.existsSync(r)), [], "两链桥根都不该还在");
+});
+
+test("PK3-U1-fix1 P1-4：aily 单元的 doctor 不再假绿 —— 内容漂移（ExecStart=/bin/false）要报", () => {
+  const home = u1Home();
+  const unit = path.join(home, ".config", "systemd", "user", "feishu-bridge-aily.service");
+  fs.mkdirSync(path.dirname(unit), { recursive: true });
+  // ① 内容漂移：形状不对（ExecStart 指向 /bin/false），但 enabled + active —— 旧判据会给 ok:true
+  fs.writeFileSync(unit, "[Service]\nExecStart=/bin/false\n");
+  const active = (args) => (args.includes("is-enabled") ? { ok: true, out: "enabled\n" } : { ok: true, out: "active\n" });
+  const c = runDoctor({ home, platform: "linux", systemctl: active }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([c.ok, /内容漂移|形状/u.test(c.detail), c.next !== null], [false, true, true], JSON.stringify(c));
+  // ② 规范形状 + enabled+active → ✓
+  fs.writeFileSync(unit, ailyDaemonUnit({ home, ailyCli: "/x/aily-cli", node: process.execPath }));
+  const okc = runDoctor({ home, platform: "linux", systemctl: active }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([okc.ok, /内容与投影\/收据一致/u.test(okc.detail)], [true, true], JSON.stringify(okc));
+  // ③ 收据漂移：形状规范、但安装收据里的摘要对不上 → ✗
+  const receiptFile = path.join(home, ".claude", "feishu-bridge", "installed-surface.json");
+  fs.mkdirSync(path.dirname(receiptFile), { recursive: true });
+  const rec = recordInstalledSurface({ chain: "claude", version: "0".repeat(16), file: receiptFile,
+    artifacts: [{ path: unit, kind: "file", sha256: "a".repeat(64) }], scripts: [] });
+  assert.equal(rec.ok, true, "夹具收据要合法：" + JSON.stringify(rec));
+  const drift = runDoctor({ home, platform: "linux", systemctl: active }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([drift.ok, /收据/u.test(drift.detail)], [false, true], JSON.stringify(drift));
+  // ④ 收据里记的**就是**磁盘那份 → 不误报（对账要能放过合法安装）
+  const right = recordInstalledSurface({ chain: "claude", version: "0".repeat(16), file: receiptFile,
+    artifacts: [{ path: unit, kind: "file", sha256: artifactSha({ kind: "file", text: fs.readFileSync(unit, "utf-8") }) }], scripts: [] });
+  assert.equal(right.ok, true, JSON.stringify(right));
+  const good = runDoctor({ home, platform: "linux", systemctl: active }).checks.find((x) => x.id === "aily_daemon");
+  assert.deepEqual([good.ok, /内容与投影\/收据一致/u.test(good.detail)], [true, true], JSON.stringify(good));
+});
+
+test("PK3-U1-fix1 P2-2：CLI 严格解析 —— 未知 / 重复参数 exit 2 且零写", () => {
+  const home = u1Home();
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0);
+  const before = u1Snapshot(home);
+  const unknown = u1Run(home, "uninstall.mjs", ["--apply", "--bogus"]);
+  assert.equal(unknown.status, 2, unknown.stdout + unknown.stderr);
+  assert.match(unknown.stderr, /不认识的参数/u, unknown.stderr);
+  const dup = u1Run(home, "uninstall.mjs", ["--apply", "--apply"]);
+  assert.equal(dup.status, 2, dup.stdout + dup.stderr);
+  assert.match(dup.stderr, /重复/u, dup.stderr);
+  const badValue = u1Run(home, "uninstall.mjs", ["--purge=yes"]);
+  assert.equal(badValue.status, 2, badValue.stdout + badValue.stderr);
+  assert.equal(u1Snapshot(home), before, "解析不过就零写");
+});
+
+test("PK3-U1-fix1 P2-1：settings 合同是「本桥条目消失 + 外部条目逐字段不变」（不宣称字节恢复）", () => {
+  // 外部工具（.orca）的钩子 + 一份非标准格式（紧凑、键序不同）的 settings
+  const external = { hooks: { Stop: [{ hooks: [{ type: "command", command: "/opt/orca/scripts/orca-stop.mjs" }] }], PostToolUse: [{ hooks: [{ type: "command", command: "/opt/orca/post.sh" }] }] }, permissions: { allow: ["Bash(ls:*)"], deny: ["Read(./.env)"] }, custom_top: { keep: [1, 2, 3] } };
+  const home = u1Home();
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), JSON.stringify(external));   // 非标准：紧凑单行
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0);
+  const applied = u1Run(home, "uninstall.mjs", ["--apply"]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  const after = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
+  // 本桥条目消失
+  assert.deepEqual((after.hooks?.Stop ?? []).filter((e) => JSON.stringify(e).includes("feishu-bridge")), [], "本桥的 Stop 条目要没了");
+  assert.equal((after.hooks?.UserPromptSubmit ?? []).length, 0, "本桥的两条 UserPromptSubmit 条目要没了");
+  assert.equal((after.permissions?.allow ?? []).length, 1, "本桥的预览放行规则要没了，别人的那条留着");
+  // 外部条目**逐字段**不变（这是合同，不是"字节相等"）
+  assert.deepEqual(after.hooks.Stop, external.hooks.Stop);
+  assert.deepEqual(after.hooks.PostToolUse, external.hooks.PostToolUse);
+  assert.deepEqual(after.permissions, external.permissions);
+  assert.deepEqual(after.custom_top, external.custom_top);
 });
 
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {

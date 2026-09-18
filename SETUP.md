@@ -405,6 +405,13 @@ node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数
 `subscriptions.json`、`chain-config.json`、`inbound/`（回执与账本）、`ledger/`。`versions/`（代码缓存）
 也留着 —— 重装更快。**项目里的 `.runtime-data/` 与话题历史，本命令一个字节都不碰**（那不属于机器级卸载）。
 
+**锁**：一键卸载在开工前取 `<home>/.claude/feishu-bridge/install-surface.lock`（与三个安装器、维护流程
+共用的一把），**持有到最后一个删除动作结束**；拿不到（别的安装 / 维护在跑）或维护门开着 → exit 2、零写。
+子安装器继承这次持有（`FEISHU_BRIDGE_INSTALL_SURFACE_HELD`），所以中间没有"无锁窗口"。
+
+**settings.json 的合同**：本桥的钩子条目与预览放行规则消失，**别人的条目逐字段不变**。
+不承诺"回到装前字节"——重新序列化会规范化格式（缩进 / 键序），只有原本是空 `{}` 的情形才恰好字节相等。
+
 **卸后怎么验**：
 
 ```bash

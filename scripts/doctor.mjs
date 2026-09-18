@@ -50,7 +50,9 @@ import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor, timerPlatform } from "./drain-schedule.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT, ailyDaemonUnitPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, foreignAilyDaemonUnits, installFootprint, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, ailyDaemonUnitPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, foreignAilyDaemonUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
+// 装机足迹住在维护层（它要同时知道两链装了什么，而顶层 scripts/*.mjs 不许 import codex/）
+import { describeFootprint, installFootprint } from "./maintenance/install-footprint.mjs";
 import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -77,7 +79,7 @@ const SYSTEMCTL_STATE_WORDS = new Set(["active", "reloading", "inactive", "faile
   "masked", "masked-runtime", "alias", "generated", "transient", "unknown"]);
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs";
-import { inspectInstalledSurface, installedSurfacePath, readInstalledSurface } from "./installed-surface.mjs";
+import { artifactSha, inspectInstalledSurface, installedSurfacePath, readInstalledSurface } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
@@ -344,11 +346,8 @@ export function runDoctor({
   const installedState = foot.clean ? "uninstalled" : (foot.partial ? "partial" : "installed");
   const footResidue = foot.residue.map((r) => r.area + "=" + String(r.what)).slice(0, 6).join("、");
   add("install_state", "装机状态", installedState !== "partial",
-    installedState === "uninstalled" ? "未安装 —— 三处 hooks / 技能 / 定时器 / runtime/current 都不在（" + foot.retainedNote + "）"
-      : installedState === "installed" ? "已安装：" + (foot.claudeComplete ? "Claude 链成套（钩子 + runtime/current）" : "") +
-        (foot.present.codexCurrent ? "；Codex 链 runtime/current 在" : "") +
-        "；另有 " + foot.residue.length + " 项足迹（钩子 " + foot.present.claudeHooks.length + " / 技能 " +
-        foot.present.claudeSkills.length + " / 定时器 " + foot.present.timer.length + "）"
+    installedState === "uninstalled" ? describeFootprint(foot) + " —— " + foot.retainedNote
+      : installedState === "installed" ? describeFootprint(foot)
       : "半装 / 残留（钩子或定时器还在、它们指的 runtime/current 已经不在了）：在的 —— " + footResidue + "；" +
         "这种情况下每次 Stop / 每 30 分钟都会去跑一个不存在的脚本。重装或卸干净：node scripts/uninstall.mjs",
     installedState === "partial" ? PREVIEW.uninstall : null);
@@ -704,7 +703,8 @@ export function runDoctor({
     (!registry.ok ? "登记表读不出来，查不清" : backlogText) + "；" + publisherText,
     backlogOk === false ? (backlogProblems > 0 ? PREVIEW.feishuOutbox : PREVIEW.installOutbound) : null);
 
-  // aily daemon 服务（PK3-U1，**仅在 linux 上**）：本桥自己写的那份 systemd --user 单元在不在、起没起来。
+  // aily daemon 服务（PK3-U1，**仅在 linux 上**）：本桥自己写的那份 systemd --user 单元在不在、起没起来、
+  // **而且内容是不是我们写的那份**（fix1 P1-4：只核 enabled+active 会假绿 —— ExecStart 被改成 /bin/false 也算"在跑"）。
   // darwin **不加这一项**（aily-cli 在 mac 上自带 daemon 管理）——加一个恒 unknown 的项只会把每台 mac 拖成 incomplete。
   if (timerKind === "systemd") {
     const ailyPath = ailyDaemonUnitPath(home);
@@ -712,21 +712,33 @@ export function runDoctor({
     const foreignText = foreign.length > 0
       ? "；已有不是本桥写的 aily daemon 单元：" + foreign.map((f) => f.path).join("、") + "（本桥不接管，也不覆盖）"
       : "";
+    const readUnitText = (f) => { try { return fs.readFileSync(f, "utf-8"); } catch { return null; }; };
     if (fs.existsSync(ailyPath)) {
       const enabled = systemctlFn(["is-enabled", "feishu-bridge-aily.service"]);
       const active = systemctlFn(["is-active", "feishu-bridge-aily.service"]);
       const enabledText = String(enabled.ok ? enabled.out : enabled.err ?? enabled.out ?? "").trim();
       const activeText = String(active.ok ? active.out : active.err ?? active.out ?? "").trim();
       const absent = systemdUnitAbsent(enabledText + activeText);
-      // 与⑥同一口径：「本来就没有」→ 不算故障；「查不清」（连不上 manager）→ unknown，不当 ready。
-      const ok = absent ? true : enabledText.startsWith("enabled") && activeText === "active" ? true
-        : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
+      // 内容判据两道：① 形状（本桥写的 ExecStart 形状：绝对路径 + daemon start --foreground）
+      //                ② 与安装收据的摘要对账（收据里有这个制品时）
+      const diskText = readUnitText(ailyPath);
+      const shapeOk = /^ExecStart=:"\/[^"]+" "daemon" "start" "--foreground"(?: "[^"]*")*$/mu.test(String(diskText ?? ""));
+      const artifact = (receiptDoc?.chains?.claude?.artifacts ?? []).find((a) => a.path === ailyPath) ?? null;
+      const shaOk = artifact === null ? null : artifact.sha256 === artifactSha({ kind: "file", text: diskText });
+      const contentProblem = !shapeOk
+        ? "磁盘上的 ExecStart 不是本桥写的形状（要「冒号 + 绝对路径 + daemon start --foreground」那几个引号参数）—— 同名但内容漂移"
+        : shaOk === false ? "磁盘单元与安装收据的摘要不一致（内容漂移：ExecStart / Environment 被改过，或 aily-cli 换了路径）"
+          : null;
+      const stateOk = enabledText.startsWith("enabled") && activeText === "active" ? true
+        : absent ? true : enabledText.startsWith("enabled") || activeText === "active" ? false : null;
+      const ok = contentProblem !== null ? false : stateOk;
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
-        ok === true ? "已启用且在跑（" + ailyPath + "）" + foreignText
-          : absent ? "单元在本机 manager 里查不到（本来就未加载）" + foreignText
-            : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
-              + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
-              : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
+        contentProblem !== null ? contentProblem + "（重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并 enable --now）" + foreignText
+          : ok === true ? "已启用且在跑，内容与投影/收据一致（" + ailyPath + "）" + foreignText
+            : absent ? "单元在本机 manager 里查不到（本来就未加载）" + foreignText
+              : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?")
+                + "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
+                : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + foreignText,
         ok === false ? PREVIEW.installOutbound : null);
     } else {
       add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", true,

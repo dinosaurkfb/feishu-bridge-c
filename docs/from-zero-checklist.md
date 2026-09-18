@@ -443,6 +443,12 @@ node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数
 底层仍然是三个安装器各自的 `--uninstall`，一键入口只是把它们按序串起来并逐个核退出码
 （失败即停、报在第几步）。想单独卸某一条链，仍可直接跑那条链的 `--uninstall --apply`。
 
+### 8.1.1 互斥与合同（PK3-U1-fix1）
+- 一键卸载**整段在安装面锁里**（`<home>/.claude/feishu-bridge/install-surface.lock`，与安装器/维护流程共用）：
+  拿不到锁或维护门开着 → exit 2、零写；子安装器继承父进程的持有（`FEISHU_BRIDGE_INSTALL_SURFACE_HELD`）。
+- `settings.json` 的合同是「本桥条目消失 + 别人条目逐字段不变」，**不是**"回到装前字节"（重新序列化会规范化格式）。
+- `--purge` 的清单来自产品派生函数（两链桥根 + 已知数据文件的覆盖点），不手写文件名清单。
+
 ### 8.2 卸载保留项（设计约束）
 卸载命令严格只移除非侵入性 hooks、技能目录与定时器，**绝不清理以下权威配置**：
 - `chain-config.json`（机器级链路模板）

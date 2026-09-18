@@ -24,6 +24,14 @@ import path from "node:path";
 import { acquireLockUngated, releasePublishLock } from "./registry.mjs";
 
 export const INSTALL_SURFACE_LOCK_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_LOCK";
+/**
+ * 「调用方已经在整段编排里持着这把锁」的继承点（PK3-U1-fix1 P1-2）。
+ * 一键卸载（scripts/uninstall.mjs）要把**整段编排**放在锁里：入站 → 出站 → Codex → 摘 current → purge。
+ * 子安装器是独立进程，它们自己再取一次同一把锁会自重入死锁 —— 所以父进程把自己的持有事实传给它们：
+ * 值必须是**本进程正在持有的那把锁的绝对路径**（与 installSurfaceLockPath 逐字相等才认），
+ * 子进程据此跳过取锁（独占权由父进程保证持有到编排结束）。位置不对 / 值不对一律当没设，照常取锁。
+ */
+export const INSTALL_SURFACE_HELD_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_HELD";
 
 export function installSurfaceLockPath({ home = os.homedir(), env = process.env } = {}) {
   const override = env[INSTALL_SURFACE_LOCK_ENV];
@@ -85,6 +93,12 @@ export function acquireInstallSurfaceLockOrRefuse({ home = os.homedir(), env = p
  * 拿不到锁 → 打印原因并 exit 2（busy）/ 3（残骸），什么都没写。
  */
 export function holdInstallSurfaceLockOrExit({ home = os.homedir(), env = process.env, err = (t) => process.stderr.write(t + "\n") } = {}) {
+  // 编排继承（PK3-U1-fix1）：调用方在整段编排里持着这把锁时不重复取、也不假装"取到了"。
+  const inherited = env[INSTALL_SURFACE_HELD_ENV];
+  if (typeof inherited === "string" && inherited.length > 0 && inherited === installSurfaceLockPath({ home, env })) {
+    return { ok: true, path: inherited, inherited: true, release: () => ({ ok: true }) };
+  }
+  // 普通路径走受控返回的那一份（PK3-L7-fix6 抽出的）：拒绝文案与退出码只写在那里，两个调用面不会漂。
   const refused = acquireInstallSurfaceLockOrRefuse({ home, env, err });
   if (!refused.ok) process.exit(refused.code);
   const got = refused.lock;

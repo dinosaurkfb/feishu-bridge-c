@@ -57,7 +57,7 @@ export function writeFailureMessage(err, { target = null, dir = os.tmpdir(), fre
     "（先清临时目录再重跑；见 node scripts/test-support/tmp-residue.mjs）";
 }
 
-/** 翻译后再抛（保留原错误的 code / errno / syscall / path，并挂 cause）。 */
+/** 翻译后再抛（保留原错误的 code / errno / syscall / path，并挂 cause）。`dir`/`free` 由调用方按**写入端**给。 */
 export function diagnoseWriteError(err, { target = null, dir = os.tmpdir(), free = undefined } = {}) {
   const message = writeFailureMessage(err, { target, dir, free });
   if (message === null) return err;
@@ -71,11 +71,37 @@ export function diagnoseWriteError(err, { target = null, dir = os.tmpdir(), free
  * 把 fs 上的几个写入口包一层翻译（**只影响本进程**：产品行为一个字没改，改的是错误信息）。
  * 幂等：同一个 fs 上重复调用只包一次。
  */
-export function installWriteDiagnosis({ fsLike = fs, dirOf = (file) => (typeof file === "string" ? path.dirname(file) : os.tmpdir()), env = process.env } = {}) {
+/**
+ * 被包的同步入口 → **哪一个参数是"写往哪里"**（余量要按写入端所在目录查，不是源）。
+ *   · 单向写入口（writeFile / appendFile / mkdir）：args[0]；
+ *   · 复制 / 改名（copyFile / rename / cp）：**args[1]** —— 源与目标可能在不同文件系统上，
+ *     问源那侧的余量会答非所问（评审实测：`copyFileSync(src, dst)` 用了 `args[0]`）。
+ */
+export const WRITE_ENTRY_POINTS = Object.freeze({
+  writeFileSync: 0,
+  appendFileSync: 0,
+  mkdirSync: 0,
+  copyFileSync: 1,
+  renameSync: 1,
+  cpSync: 1,
+});
+
+/** 写入口的落点目录（拿不到就用 TMPDIR）。 */
+const targetDirOf = (value) => (typeof value === "string" && value.length > 0 ? path.dirname(path.resolve(value)) : os.tmpdir());
+
+/**
+ * 把 fs 上的写入口包一层翻译（**只影响本进程**：产品行为一个字没改，改的是错误信息）。
+ * 幂等：同一个 fsLike 上重复调用只包一次。
+ * @param {{ fsLike?: object, freeOf?: (dir: string) => number|null }} opts
+ *   `freeOf` 可注入（用例要造"目标目录余量低、源余量高"这种反例，真盘不会配合）。
+ */
+export function installWriteDiagnosis({ fsLike = fs, freeOf = freeBytesOf, env = process.env } = {}) {
   if (fsLike.__writeDiagnosisInstalled === true) return { installed: false, reason: "already" };
   const originals = new Map();
-  // 只包**同步**入口：夹具与产品在这条线上都用 writeFileSync（omm 那次报的也是它）。
-  for (const name of ["writeFileSync", "appendFileSync", "copyFileSync", "renameSync", "mkdirSync"]) {
+  // 只包**同步**入口：夹具与产品在这条线上都用同步写（omm 那次的报错也是 writeFileSync）。
+  // **cpSync 必须单独包**：它是 Node 自己实现的目录复制，不走 fs.copyFileSync 那一跳
+  // （评审探针验证过）—— 而 gate-d-* 那 72MB 的大目录复制走的正是它。
+  for (const [name, targetArg] of Object.entries(WRITE_ENTRY_POINTS)) {
     const original = fsLike[name];
     if (typeof original !== "function") continue;
     originals.set(name, original);
@@ -83,7 +109,9 @@ export function installWriteDiagnosis({ fsLike = fs, dirOf = (file) => (typeof f
       try {
         return original.apply(fsLike, args);
       } catch (err) {
-        throw diagnoseWriteError(err, { target: typeof args[0] === "string" ? args[0] : null, dir: dirOf(args[0]) });
+        const target = typeof args[targetArg] === "string" ? args[targetArg] : null;
+        const dir = targetDirOf(args[targetArg]);
+        throw diagnoseWriteError(err, { target, dir, free: freeOf(dir) });
       }
     };
   }

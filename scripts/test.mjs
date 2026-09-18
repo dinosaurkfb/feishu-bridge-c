@@ -7992,6 +7992,39 @@ test("PK3-T1 后一条：上一条用例造的临时目录**已被逐用例回�
   assert.ok(fs.existsSync(SUITE_TMP.root), "本轮根本身还在（只在套件退出时清）");
 });
 
+test("PK3-T1-fix1：cpSync 必须被包，且 copy/rename/cp 的余量按**写入端**（args[1]）查", () => {
+  // 假 fs + 注入 freeOf：造"目标目录余量低、源目录余量高"的反例（真盘不会配合）。
+  const srcDir = path.join(os.tmpdir(), "t1fix1-src");
+  const dstDir = path.join(os.tmpdir(), "t1fix1-dst");
+  const freeOf = (dir) => (dir === dstDir ? 1024 : 8 * 1024 * 1024 * 1024);
+  const fakeFs = {
+    cpSync: () => { throw Object.assign(new Error("UNKNOWN: unknown error, cp"), { code: "UNKNOWN" }); },
+    copyFileSync: () => { throw Object.assign(new Error("UNKNOWN: unknown error, copyfile"), { code: "UNKNOWN" }); },
+    renameSync: () => { throw Object.assign(new Error("UNKNOWN: unknown error, rename"), { code: "UNKNOWN" }); },
+  };
+  const inst = installWriteDiagnosis({ fsLike: fakeFs, freeOf });
+  // ① cpSync 在名单里（它是 Node 自己实现的目录复制，不走 fs.copyFileSync 那一跳）
+  assert.ok(inst.wrapped.includes("cpSync"), "cpSync 必须被包：" + JSON.stringify(inst.wrapped));
+  // ② 复制类按 args[1]（写入端）查余量：源余量高、目标余量低 → 说"像是盘满"并点名目标目录
+  for (const name of ["cpSync", "copyFileSync", "renameSync"]) {
+    let err = null;
+    try { fakeFs[name](path.join(srcDir, "big"), path.join(dstDir, "big"), { recursive: true }); } catch (e) { err = e; }
+    assert.ok(err !== null, name + " 必须抛");
+    assert.equal(err.writeDiagnosis, true, name + " 的失败要经过翻译：" + String(err.message));
+    assert.match(String(err.message), /像是盘满/u, name + "：" + String(err.message));
+    assert.ok(String(err.message).includes("TMPDIR=" + dstDir), name + " 要点名**目标**目录：" + String(err.message));
+    assert.equal(String(err.message).includes("TMPDIR=" + srcDir), false, name + " 不许把源目录当写入端：" + String(err.message));
+    assert.equal(err.code, "UNKNOWN", name + " 的原 code 必须保留");
+  }
+  // ③ 余量都不低时不许猜"像是盘满"（UNKNOWN 只贴数字）
+  const richFs = { cpSync: () => { throw Object.assign(new Error("UNKNOWN: unknown error, cp"), { code: "UNKNOWN" }); } };
+  installWriteDiagnosis({ fsLike: richFs, freeOf: () => 8 * 1024 * 1024 * 1024 });
+  let rich = null;
+  try { richFs.cpSync(path.join(srcDir, "big"), path.join(dstDir, "big")); } catch (e) { rich = e; }
+  assert.equal(/像是盘满/u.test(String(rich?.message)), false, "余量正常时不许猜盘满：" + String(rich?.message));
+  assert.match(String(rich?.message), /UNKNOWN（余量不算低/u, "但要说清是 UNKNOWN：" + String(rich?.message));
+});
+
 test("PK3-T1：写盘失败翻译 —— ENOSPC/低余量 UNKNOWN 带 TMPDIR 与剩余空间；别的错误原样抛", () => {
   const here = os.tmpdir();
   assert.equal(freeBytesOf(here) !== null, true, "statfs 读得到剩余空间");

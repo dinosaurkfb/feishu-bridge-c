@@ -112,4 +112,3 @@ export function installSuiteTempRoot({ env = process.env, out = (s) => process.s
   suiteTempRoot = api;
   return api;
 }
-

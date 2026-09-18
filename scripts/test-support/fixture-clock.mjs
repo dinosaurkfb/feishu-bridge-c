@@ -19,35 +19,20 @@ export const isoAt = (ms) => new Date(ms).toISOString();
  * 基准钟名字表：这些名字一旦出现，右值就必须是相对量。
  * 为什么按名字：它们在 test.mjs 里就是"这一段的 now"，而每段都跟 `*_TTL_MS` 配对用。
  */
-export const FIXTURE_BASE_CLOCKS = Object.freeze(["T0", "T0B", "T0C", "T0D", "T052", "ISO0", "ISO0B"]);
-
 /**
- * 找出源码里的**时钟炸弹形状**（纯函数，注入源码文本，便于守卫用例逐字钉正反例）：
- *   ① 基准钟被赋成写死日期（`const T0B = Date.parse("2026-…")` / `= "2026-…"`）；
- *   ② 注入的钟指向写死日期（`clock: () => Date.parse("2026-…")`）—— 签发用固定日期、
- *      校验读真实时钟，且两者相差一个 TTL 时必炸。
- * 只认这两种形状：**不**扫普通的时间戳字面量（`created_at: "2026-…"` 之类的惰性夹具值不炸，
- * 收窄判据是为了不误报 —— 见 PI-REPORT 里"只列不改"那一节）。
+ * 运行时不变量（PK3-T4-fix1，替代原来的源码正则扫描——正则会误报注释/字符串、漏报等价写法）：
+ * 夹具的基准钟必须"就在当下"。写死一个日期再配相对 TTL，就是到期那天全红的时钟炸弹；
+ * 这里在夹具**取值那一刻**断言它离 Date.now() 不超过 maxSkewMs，字面量日期会在写下当天就红。
+ * 接受毫秒数或 ISO 字符串，返回毫秒数。
  */
-export function fixtureClockProblem(src) {
-  const problems = [];
-  const text = String(src ?? "");
-  for (const name of FIXTURE_BASE_CLOCKS) {
-    const re = new RegExp("(?:const|let|var)\\s+" + name + "\\s*=\\s*([^;\\n]+)", "gu");
-    for (const m of text.matchAll(re)) {
-      const rhs = m[1].trim();
-      const literal = /^["'`]?\d{4}-\d\d-\d\dT/u.test(rhs) || /^Date\.parse\(\s*["'`]\d{4}-/u.test(rhs);
-      if (literal) problems.push({ kind: "literal_base_clock", name, rhs });
-    }
+export const FIXTURE_CLOCK_MAX_SKEW_MS = 60 * 60 * 1000;
+export function assertFreshFixtureClock(value, { now = Date.now(), maxSkewMs = FIXTURE_CLOCK_MAX_SKEW_MS, label = "基准钟" } = {}) {
+  const t = typeof value === "string" ? Date.parse(value) : Number(value);
+  if (!Number.isFinite(t)) throw new Error(label + " 不是时间：" + String(value));
+  const skew = now - t;
+  if (skew > maxSkewMs || skew < -maxSkewMs) {
+    throw new Error(label + " 离现在 " + Math.round(skew / 60000) + " 分钟（上限 " + Math.round(maxSkewMs / 60000) + " 分钟）：" +
+      "夹具时钟必须是相对量（fixtureNow()）；写死日期配相对 TTL 就是时钟炸弹");
   }
-  for (const m of text.matchAll(/clock:\s*\(\)\s*=>\s*Date\.parse\(\s*["'`]\d{4}-\d\d-\d\dT[^"'`]*["'`]\s*\)/gu)) {
-    problems.push({ kind: "literal_injected_clock", snippet: m[0] });
-  }
-  return problems;
+  return t;
 }
-
-/** 守卫用例打印用的一行。 */
-export const formatFixtureClockProblem = (p) =>
-  p.kind === "literal_base_clock"
-    ? "基准钟 " + p.name + " 被赋成写死日期：" + p.rhs + "（改成 fixtureNow() / isoAt(T0 + TTL)）"
-    : "注入的钟指向写死日期：" + p.snippet + "（改成 clock: () => fixtureNow()，过期分支用相对量表达）";

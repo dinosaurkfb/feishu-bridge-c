@@ -64,7 +64,7 @@ import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authori
 // PK3-T1：本轮临时目录根 + 写盘失败翻译（都在 test-support/ 下：不动共用面 test-harness.mjs 的导出）
 import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
 // PK3-T4：夹具基准钟（相对当前时间）+「别把写死日期当 now」的守卫判据
-import { fixtureNow, isoAt, fixtureClockProblem, formatFixtureClockProblem } from "./test-support/fixture-clock.mjs";
+import { fixtureNow, isoAt, assertFreshFixtureClock, FIXTURE_CLOCK_MAX_SKEW_MS } from "./test-support/fixture-clock.mjs";
 import { freeBytesOf, installWriteDiagnosis, writeFailureMessage } from "./test-support/write-diagnosis.mjs";
 import { resumeHint, describeStatus as describeStatusCtl } from "./feishu-control.mjs"; // PK2-W3-fix8：恢复提示一处分流
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs"; // R56 返修一直调（注入 now）
@@ -8230,53 +8230,21 @@ test("PK3-T1 后一条：上一条用例造的临时目录**已被逐用例回�
 // 2026-09-18T09:00Z 起干净 main 全量恒红 10 条，reason 形如 reaffirm_intent_expired /
 // intent_cleanup_unclean / selection_plan_context_missing，且与任何代码改动无关。
 
-test("PK3-T4 守卫：基准钟/注入钟不许写死日期（判据逐字断言正反例）", () => {
-  const detector = fixtureClockProblem;
-  // 守卫自己也在被扫的同一个文件里 —— 所以**合成样例不许在源码里出现完整炸弹形状**（否则它抓自己）。
-  // 拆成"日期字面量"与"外壳"两段拼出来，源码里就不存在 `Date.parse("2026-…` 这个组合。
-  const D = "2026-09-11T09:00:00.000Z";
-  const D2 = "2026-09-20T00:00:00.000Z";
-  const parse = (d) => 'Date.parse("' + d + '")';
-  const quoted = (d) => '"' + d + '"';
-
-  // ① 触发条件（正例）：基准钟被赋成写死日期 —— Date.parse(字面量) / ISO 字面量 / 模板串三种写法都抓
-  assert.deepEqual(detector("const T0B = " + parse(D) + ";"),
-    [{ kind: "literal_base_clock", name: "T0B", rhs: parse(D) }]);
-  assert.deepEqual(detector("  const T0D = " + quoted(D) + ";"),
-    [{ kind: "literal_base_clock", name: "T0D", rhs: quoted(D) }]);
-  assert.deepEqual(detector("  const ISO0B = `" + D + "`;"),
-    [{ kind: "literal_base_clock", name: "ISO0B", rhs: "`" + D + "`" }]);
-  // ② 触发条件（正例）：注入的钟指向写死日期（签发用固定日期、校验读真实时钟 = 必炸形状）
-  assert.deepEqual(detector("const x = { clock: () => " + parse(D2) + " };"),
-    [{ kind: "literal_injected_clock", snippet: "clock: () => " + parse(D2) }]);
-  // ③ 反向（负例）：相对量一律放行（含派生的 ISO 与"相对 TTL 的过期分支"）
-  for (const ok of [
-    "const T0B = fixtureNow();",
-    "const T0 = fixtureNow() + 1000;",
-    "const ISO0B = isoAt(T0B);",
-    "const ISO_TTLB = isoAt(T0B + TAL.OWNER_SELECT_REAFFIRM_TTL_MS);",
-    "const before = T0B - 1; const after = T0B + TAL.OWNER_SELECT_REAFFIRM_TTL_MS + 1;",
-    "clock: () => T0B + 1000",
-    "clock: () => fixtureNow()",
-    // 惰性夹具时间戳（created_at / recorded_at 之类）**不**在判据内：它们不跟真实时钟的 TTL 配对
-    'const rec = { created_at: "2026-09-10T08:00:00.000Z", updated_at: "2026-09-10T08:00:00.000Z" };',
-    'const until = "2099-01-01T00:00:00.000Z";',
-  ]) {
-    assert.deepEqual(detector(ok), [], "不该判红：" + ok);
-  }
-  // ④ 相对量自洽：fixtureNow() 就是"现在"、isoAt(base + TTL) - base 就是 TTL —— 所以派生的
-  //    TTL 时刻永远在将来（不会像写死日期那样到期）
+test("PK3-T4 守卫（运行时不变量）：夹具基准钟必须就在当下——写死日期配相对 TTL 当天就红，不靠扫源码", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  // ① 相对量：fixtureNow() 通过并原样返回毫秒；ISO 字符串也接受
   const base = fixtureNow();
-  assert.ok(base <= Date.now() && Date.now() - base < 1000, "fixtureNow() 就在当下：" + base);
-  assert.equal(Date.parse(isoAt(base + TAL.OWNER_SELECT_REAFFIRM_TTL_MS)) - base, TAL.OWNER_SELECT_REAFFIRM_TTL_MS,
-    "派生的 TTL 时刻 = 基准 + TTL");
-  assert.ok(Date.parse(isoAt(base + TAL.OWNER_SELECT_REAFFIRM_TTL_MS)) > Date.now(), "所以它还在将来");
-
-  // ⑤ 真文件：scripts/test.mjs 本身必须干净（否则到期那天会再炸一次）
-  const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");
-  const found = detector(src);
-  assert.deepEqual(found.map(formatFixtureClockProblem), [],
-    "test.mjs 里还有写死的基准钟/注入钟：" + JSON.stringify(found));
+  assert.equal(assertFreshFixtureClock(base, { label: "T0B" }), base);
+  assert.equal(assertFreshFixtureClock(isoAt(base), { label: "ISO0B" }), base);
+  // ② 这次炸弹的原形：写死 2026-09-11T09:00Z，在 2026-09-18T09:00Z 那一刻（也在写下当天 +1h 之后）都红
+  const literal = Date.parse("2026-09-11T09:00:00.000Z");
+  assert.throws(() => assertFreshFixtureClock(literal, { now: literal + 7 * DAY, label: "T0B" }), /T0B 离现在 \d+ 分钟.*时钟炸弹/u);
+  assert.throws(() => assertFreshFixtureClock(literal, { now: literal + FIXTURE_CLOCK_MAX_SKEW_MS + 1, label: "T0B" }), /时钟炸弹/u);
+  // ③ 边界：恰好 maxSkewMs 通过；超 1ms 红；未来方向同样红
+  assert.equal(assertFreshFixtureClock(literal, { now: literal + FIXTURE_CLOCK_MAX_SKEW_MS }), literal);
+  assert.throws(() => assertFreshFixtureClock(literal, { now: literal - FIXTURE_CLOCK_MAX_SKEW_MS - 1 }), /时钟炸弹/u);
+  // ④ 不是时间 → 红且说明
+  assert.throws(() => assertFreshFixtureClock("not-a-date", { label: "T0" }), /T0 不是时间/u);
 });
 
 test("PK3-T1-fix1：cpSync 必须被包，且 copy/rename/cp 的余量按**写入端**（args[1]）查", () => {
@@ -38401,6 +38369,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   // R51 公共构造器：手工 1.1-transition 形状记录（17 键）与封闭 proof 形状，只给本段测试用。
   const EP51 = "endpoint_" + "1".repeat(24);
   const T0 = isoAt(fixtureNow());   // PK3-T4：相对当前时间（写死日期 + 相对 TTL = 时钟炸弹）
+  assertFreshFixtureClock(T0, { label: "T0" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const R51_OP = "01234567-89ab-4def-8012-3456789abcde";
   const R51_TGT = { runtime: "claude", project_root: "/p/r51", claude_session_id: "00000000-0000-4000-8000-0000000000aa" };
   const r51Live = (id, facts, extra = {}) => ({
@@ -39311,6 +39280,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
   const r52Uuid = (n) => (String(n).repeat(8) + "-2222-4222-8222-222222222222").slice(0, 36);
   const r52Sha = (c) => c.repeat(64);
   const T052 = isoAt(fixtureNow());   // PK3-T4：相对当前时间（同上）
+  assertFreshFixtureClock(T052, { label: "T052" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const r52ShaOf = (s) => crypto.createHash("sha256").update(s).digest("hex");
   // 1.0 shadow 账本（init + seed 各一笔，B1 13 键）——R52 各测试共用形状。
   const r52Doc10 = (endpointId, liveIds) => {
@@ -44140,6 +44110,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 {
   const EP57 = "endpoint_" + "7".repeat(24);
   const T0 = fixtureNow();   // PK3-T4：相对当前时间（原来写死 2026-09-10T08:00Z + 30 天 TTL）
+  assertFreshFixtureClock(T0, { label: "T0" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const T0_PLUS_TTL = isoAt(T0 + TAL.OWNER_SELECT_HANDLE_TTL_MS); // T0 + 30 天（相对量，不写死日期）
   const TGT57 = (n) => ({ runtime: "claude", project_root: "/p/r57", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
   const CLAIM57 = (c) => c.repeat(64);
@@ -44990,6 +44961,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 {
   const EP57B = legacyEndpointId({ runtime: "claude", agentUid: "agent_b" });
   const T0B = fixtureNow();   // PK3-T4：相对当前时间（原来写死日期 + 7 天 TTL → 到期那天全红）
+  assertFreshFixtureClock(T0B, { label: "T0B" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const ISO0B = isoAt(T0B);
   // 签发 + 7 天（reaffirm TTL）：**相对量**，不写死日期
   const ISO_TTLB = isoAt(T0B + TAL.OWNER_SELECT_REAFFIRM_TTL_MS);
@@ -46899,6 +46871,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 {
   const EP57C = "endpoint_" + "9".repeat(24);
   const T0C = fixtureNow();   // PK3-T4：相对当前时间（同上）
+  assertFreshFixtureClock(T0C, { label: "T0C" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const FUTC = "2099-01-01T00:00:00.000Z";
   const TGTC = (n) => ({ runtime: "claude", project_root: "/p/r57c", claude_session_id: "00000000-0000-4000-8000-" + String(n).padStart(12, "0") });
   const F4C = (om) => ({ matched_om: om, matched_fields: ["chat_id", "sender", "body", "thread_root"], pending_token_state: "present" });
@@ -47407,6 +47380,7 @@ test("R62 返修一 T8：收据 conflict 的 endpoint 计入未对账——「�
 {
   const EP57D = "endpoint_" + "d".repeat(24).replace(/d/g, "d");
   const T0D = fixtureNow();   // PK3-T4：相对当前时间（同上）
+  assertFreshFixtureClock(T0D, { label: "T0D" });   // PK3-T4-fix1：运行时不变量——写死日期当天就红
   const SESSION_D = "aily_r57d";
   const CHAT_D = "oc_r57d";
   const ROOT_D = "om_root57d";

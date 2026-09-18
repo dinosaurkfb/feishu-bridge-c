@@ -156,7 +156,8 @@ import { composeAsk, isInitPrompt } from "./init-hook.mjs";
 import {
   composeTransportRule, isAilyTransportTurn, isBridgeOwnedTurn,
 } from "./inbound-hook.mjs";
-import { ROUTE_REJECT, ROUTE_REJECT_TEXT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute, judgeInitDefault, previewInitDefault, routeRejectText } from "./inbound-routes.mjs";
+import { ROUTE_REJECT, ROUTE_REJECT_TEXT, loadRoutes, registerRoute, registerRouteBinding, registerSession, selectRoute, topicHandlerKind, topicHandlerText, validateRoutesDoc, defaultRouteHandler, restoreDefaultRoute, initDefaultRoute, judgeInitDefault, previewInitDefault, routeRejectText } from "./inbound-routes.mjs";
+import { composeSessionRootMessage } from "./bind-session.mjs";
 import {
   CANONICAL_EVENT_ENV, CANONICAL_EVENT_ENV as CANONICAL_PASS, buildCanonicalEvent, inheritedCanonicalEvent, legacyEventFromCanonical, validateCanonicalEvent,
 } from "./canonical-event.mjs";
@@ -5026,8 +5027,10 @@ test("绑定码进了根消息正文 —— 将来靠引用块做确定性匹配
   const msg = composeRootMessage({ name: "a", root: "/tmp/a", token });
   assert.ok(msg.includes(token));
   assert.ok(msg.includes("/tmp/a"));
-  assert.ok(msg.includes("本机输入与每轮回答会合成卡片"));
-  assert.ok(msg.includes("从本话题发出的输入不会重复显示"));
+  // PK3-W232-fix2：根消息不再无条件承诺"每轮回答会合成卡片"（那只在会话登记给本链时成立），
+  // 改成不依赖未来选路的说法 —— 具体措辞由 PK3-W232-fix2 的用例钉住，这里只钉"怎么下指令"这一句还在。
+  assert.ok(msg.includes("之后在这条消息下面 @ 一下就是给它下指令"));
+  assert.ok(msg.includes("回复方式取决于这个话题的路由"));
 });
 
 test("根消息里不含任何当前进度字样 —— 它发出去就改不了", () => {
@@ -56535,6 +56538,12 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       // PK3-A3：轮转提示从硬编码 @ M5Claude 改为读模板 transport_agent_name（夹具中为 @ T）—— 基线（b9ff7e8）
       //   与分支的措辞差异是本单有意的变更，归一成同一占位（行为由 PK3-A3 用例守）。
       s = s.replace(/去新话题真实 @ [^\s]+ 后/gu, "去新话题真实 @ <AGENT> 后");
+      // PK3-W232-fix2：根消息里"回复方式"那句从无条件承诺改成依赖路由的中性措辞 —— 同样是**有意**的措辞变更
+      //   （旧承诺在登记了外部处理器的机器上是假话），归一成同一占位；哪一句该出现由 PK3-W232-fix2 用例守。
+      //   注意**不要加行首锚**：这句话也会整段出现在 lark 调用记录（files.lark 的 JSON 串）里。
+      //   `[^"\\\n]*` 的尾巴不许吃换行：反过来会把紧跟其后的行一起吞掉（比对就会莫名其妙少一行）。
+      s = s.replace(/(?:本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。|之后在这条消息下面 @ 一下就是给它下指令。回复方式取决于这个话题的路由：[^"\\\n]*)/gu,
+        "<ROOT_REPLY_LINE>");
       return s;
     };
     return { normalize, valToPlaceholder, counts };
@@ -59152,84 +59161,218 @@ test("PK3-T3-fix3 单元（注入 files）：同毫秒不同纳秒重写 → big
   }
 });
 
-test("PK3-W232：临时 routes 文件登记外部路由 → 绑定完成文案含「外部处理器」且不含「每轮回答会合成卡片」；未登记 → 原文案一字不差", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-w232-routes-"));
-  try {
-    const routesFile = path.join(tmp, "routes.json");
-    const routesDoc = {
-      routes: [
-        { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
-        { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" },
-      ],
-      sessions: {
-        "session_external_123": "c2c-inbound",
-      },
-    };
-    fs.writeFileSync(routesFile, JSON.stringify(routesDoc, null, 2) + "\n");
+// ── PK3-W232-fix2：接入文案与"这个话题谁在处理"的三态判定的常驻反例 ───────────────────
 
-    // ① Claude 链绑定完成（inbound.mjs ackText bound）：
-    // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」
-    const extAck = inboundAckText("bound", {
-      taskName: "demo-task",
-      root: "/opt/demo-project",
-      sessionId: "session_external_123",
-      routesFile,
-    });
-    assert.match(extAck, /外部处理器 c2c-inbound 接管/u);
-    assert.doesNotMatch(extAck, /每轮回答会合成卡片/u);
-    assert.doesNotMatch(extAck, /以卡片发回/u);
-    assert.equal(
-      extAck,
-      [
-        "绑定完成 · demo-task",
-        "这个话题现在通向 /opt/demo-project。",
-        "此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。",
-      ].join("\n")
-    );
+const w232Doc = (over = {}) => ({
+  schema_version: "1.0",
+  routes: [
+    { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
+    { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" },
+  ],
+  sessions: {},
+  ...over,
+});
+const w232Write = (dir, doc, name = "routes.json") => {
+  const f = path.join(dir, name);
+  fs.writeFileSync(f, typeof doc === "string" ? doc : JSON.stringify(doc, null, 2) + "\n");
+  return f;
+};
 
-    // 未登记（走默认路由）→ 原文案一字不差
-    const unregAck = inboundAckText("bound", {
-      taskName: "demo-task",
-      root: "/opt/demo-project",
-      sessionId: "session_unregistered_456",
-      routesFile,
-    });
-    assert.equal(
-      unregAck,
-      [
-        "绑定完成 · demo-task",
-        "这个话题现在通向 /opt/demo-project。",
-        "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。",
-      ].join("\n"),
-      "未登记外部路由时，绑定完成文案必须一字不差"
-    );
+test("PK3-W232-fix2 P1-1：三态判定严格复用选路 —— 停用/不存在 route、坏表都是 unavailable，不落旧承诺", () => {
+  // 拿掉哪行会红：把 topicHandlerKind 换回 fix1 那种"自己比 sessions/default"的判定，
+  //   本用例会红在 kind（期望 unavailable、实得 external）与"不含外部处理器接管/不含旧承诺"上。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w232-tri-"));
+  const cases = [
+    // label, doc, sessionId, 期望 reason
+    ["停用的 route", w232Doc({ routes: [
+      { id: "self", handler: "/opt/fake/inbound.mjs", default: true },
+      { id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs", enabled: false },
+    ], sessions: { "s-ext": "c2c-inbound" } }), "s-ext", "session_maps_to_unknown_route"],
+    ["不存在的 route", w232Doc({ sessions: { "s-ext": "ghost-route" } }), "s-ext", "session_maps_to_unknown_route"],
+    ["坏 JSON", "{ 这不是 JSON", "s-ext", "routes_table_unreadable"],
+    ["表的位置是个目录（读不出来）", null, "s-ext", "routes_table_unreadable"],
+    ["没有默认路由且话题未登记", w232Doc({ routes: [{ id: "c2c-inbound", handler: "/opt/fake/c2c-inbound.mjs" }] }), "s-none", "no_default_route"],
+    ["一条启用路由都没有且话题未登记", w232Doc({ routes: [] }), "s-none", "no_route_handler"],
+  ];
+  for (const [label, doc, sessionId, wantReason] of cases) {
+    let f;
+    if (label.startsWith("表的位置是个目录")) {
+      f = path.join(dir, "routes-dir");
+      fs.mkdirSync(f, { recursive: true });
+    } else {
+      f = w232Write(dir, doc, "routes-" + wantReason + "-" + label.length + ".json");
+    }
+    const kind = topicHandlerKind({ sessionId, routesFile: f });
+    assert.deepEqual([kind.kind, kind.reason], ["unavailable", wantReason], label + "：" + JSON.stringify(kind));
+    const text = topicHandlerText(kind);
+    assert.doesNotMatch(text, /外部处理器 \S+ 接管/u, label + "：不许声称外部处理器接管：" + text);
+    assert.doesNotMatch(text, /以卡片发回|会合成卡片/u, label + "：不许落旧承诺：" + text);
+    assert.match(text, /doctor/u, label + "：要指路 doctor：" + text);
+    // 回执层面同一条口径（真实 bound 回执走的就是它）
+    const ack = inboundAckText("bound", { taskName: "t", root: "/p", sessionId, routesFile: f });
+    assert.doesNotMatch(ack, /每轮回答会合成卡片|以卡片发回|外部处理器 \S+ 接管/u, label + "：ack 不许落旧承诺：" + ack);
+    assert.match(ack, /判不了/u, label + "：" + ack);
+  }
 
-    // ②（Codex 链 ackText 的同形断言在 scripts/codex/test.mjs —— Claude 套件不 import codex/）
+  // 对照一：登记给**启用的**非默认 route → external（带 id）
+  const okFile = w232Write(dir, w232Doc({ sessions: { "s-ext": "c2c-inbound" } }), "routes-ok.json");
+  const ext = topicHandlerKind({ sessionId: "s-ext", routesFile: okFile });
+  assert.deepEqual([ext.kind, ext.routeId], ["external", "c2c-inbound"], JSON.stringify(ext));
+  assert.match(topicHandlerText(ext), /外部处理器 c2c-inbound 接管：回复方式由该处理器决定。/u);
+  // 对照二：未登记 → 默认路由 = 本链；显式登记到默认路由也是本链
+  assert.equal(topicHandlerKind({ sessionId: "s-none", routesFile: okFile }).kind, "local");
+  assert.equal(topicHandlerKind({ sessionId: "s-self", routesFile: w232Write(dir, w232Doc({ sessions: { "s-self": "self" } }), "routes-self.json") }).kind, "local");
+  // 对照三：local 时三态文案为 null（本链承诺由各链自己写），且 bound 回执说本链承诺
+  assert.equal(topicHandlerText(topicHandlerKind({ sessionId: "s-none", routesFile: okFile })), null);
+  assert.match(inboundAckText("bound", { taskName: "t", root: "/p", sessionId: "s-none", routesFile: okFile }),
+    /它的进展和每一轮回答也会以卡片发回这里/u);
+});
 
-    // ③ 根消息生成（composeRootMessage）：
-    // 已登记外部处理器 → 含「外部处理器」且不含「每轮回答会合成卡片」
-    const extRootMsg = composeRootMessage({
-      name: "demo",
-      root: "/opt/demo-project",
-      token: "tok123",
-      sessionId: "session_external_123",
-      routesFile,
-    });
-    assert.match(extRootMsg, /此话题由外部处理器 c2c-inbound 接管：回复方式由该处理器决定。/u);
-    assert.doesNotMatch(extRootMsg, /每轮回答会合成卡片/u);
+test("PK3-W232-fix2 P1-2：真建话题入口的根消息是中性的（bind-preview 真 CLI + 四条 compose 调用路径）", () => {
+  // 拿掉哪行会红：把 composeRootMessage 改回"按 sessionId 判外部处理器、未登记就承诺合成卡片"，
+  //   本用例会红在「根消息不含旧承诺 / 含路由依赖说明」与 bind-preview 的真实输出上。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w232-root-"));
+  const project = path.join(dir, "proj");
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(project, "README.md"), "# 演示项目\n\n一句话说明。\n");
+  const tplFile = path.join(dir, "chain-config.json");
+  fs.writeFileSync(tplFile, JSON.stringify({
+    chain: "claude", transport_agent_name: "T", transport_app_id: "cli_x", transport_open_id: "ou_t",
+    outbound_agent_name: "O", outbound_app_id: "cli_y", outbound_open_id: "ou_o",
+    lark_cli_profile: "claude", lark_cli_bin: "/bin/lark", lark_cli_home: "/home/lark",
+    frank_sender_id: "12345", chat_name: "群", chat_id: "oc_abc", default_freshness_ms: 900000,
+    agent_uid: "agent_x",
+  }, null, 2) + "\n");
 
-    // 未登记 → 原文案一字不差
-    const unregRootMsg = composeRootMessage({
-      name: "demo",
-      root: "/opt/demo-project",
-      token: "tok123",
-      sessionId: "session_unregistered_456",
-      routesFile,
-    });
-    assert.match(unregRootMsg, /本机输入与每轮回答会合成卡片回复到本话题；从本话题发出的输入不会重复显示。/u);
-    assert.doesNotMatch(unregRootMsg, /外部处理器/u);
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+  // ① 真 CLI：bind-preview 打印的根消息就是"发出去就改不了"的那一条
+  const preview = spawnSync(process.execPath, [path.resolve("scripts", "bind-preview.mjs"), "--project", project],
+    { encoding: "utf-8", env: { ...process.env, HOME: dir, FEISHU_BRIDGE_CHAIN_TEMPLATE: tplFile } });
+  assert.equal(preview.status, 0, preview.stdout + preview.stderr);
+  const rootSection = preview.stdout.split("--- 根消息（发出去就改不了）---")[1].split("--- 底下第一条")[0];
+  assert.doesNotMatch(rootSection, /本机输入与每轮回答会合成卡片回复到本话题/u, "根消息不许承诺合成卡片：" + rootSection);
+  assert.match(rootSection, /回复方式取决于这个话题的路由/u, rootSection);
+  assert.match(rootSection, /本链自己绑定会话时/u, rootSection);
+
+  // ② 四条 compose 调用路径（bind-project / 两条轮转直接调它；bind-session 包一层）都是同一句话
+  const direct = composeRootMessage({ name: "demo", purpose: "p", root: project, token: "tok123" });
+  assert.match(direct, /回复方式取决于这个话题的路由/u, direct);
+  assert.doesNotMatch(direct, /会合成卡片回复到本话题；/u, direct);
+  const sessionRoot = composeSessionRootMessage({ name: "demo", purpose: "p", root: project, token: "tok123", sessionName: "wl" });
+  assert.match(sessionRoot, /回复方式取决于这个话题的路由/u, sessionRoot);
+  assert.doesNotMatch(sessionRoot, /本机输入与每轮回答会合成卡片/u, sessionRoot);
+
+  // ③ 结构：根消息里那句承诺只有一处定义，且没有任何调用点再传 sessionId/routesFile（= 不依赖未来选路）
+  const src = fs.readFileSync(path.resolve("scripts", "bind-compose.mjs"), "utf-8");
+  assert.equal((src.match(/回复方式取决于这个话题的路由/g) ?? []).length, 1, "中性措辞只该写一处");
+  for (const rel of ["bind-project.mjs", "bind-preview.mjs", "bind-session.mjs", "feishu-rotate.mjs", "codex/bind-compose.mjs", "codex/feishu-rotate.mjs"]) {
+    const code = fs.readFileSync(path.resolve("scripts", rel), "utf-8");
+    const calls = [...code.matchAll(/composeRootMessage\(\{[\s\S]{0,200}?\}\)/g)].map((m) => m[0]);
+    for (const c of calls) {
+      assert.doesNotMatch(c, /sessionId|routesFile|externalProcessor/u, rel + " 的 composeRootMessage 调用还在依赖未来选路：" + c);
+    }
+  }
+});
+
+test("PK3-W232-fix2 P1-2：已登记外部 route → dispatcher 不进本链 inbound（真分发，看 spawn 的是谁）", () => {
+  // 拿掉哪行会红：把 dispatcher 的选路改回"默认路由优先"（或让它忽略 sessions），
+  //   本用例会红在 spawned 的那个 handler 上（期望外部处理器、实得本链 inbound）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w232-dispatch-"));
+  const selfHandler = path.join(dir, "self-inbound.mjs");
+  const extHandler = path.join(dir, "c2c-inbound.mjs");
+  fs.writeFileSync(selfHandler, "// 本链 inbound 夹具\n");
+  fs.writeFileSync(extHandler, "// 外部处理器夹具\n");
+  const routesFile = w232Write(dir, {
+    schema_version: "1.0",
+    routes: [
+      { id: "self", handler: selfHandler, default: true },
+      { id: "c2c-inbound", handler: extHandler },
+    ],
+    sessions: { "s-ext": "c2c-inbound" },
+  });
+  let spawned = null;
+  const out = [];
+  const result = runInboundDispatcher({
+    endpointId: "m5codex",
+    expectedCallerAgentUid: "agent_expected",
+    defaultRoute: { id: "self", handler: selfHandler },
+    routesFile,
+    env: { AILY_CLI_CALLER_AGENT_UID: "agent_expected", AILY_CLI_SESSION_ID: "s" },
+    stdout: { write: (s) => out.push(s) }, stderr: { write: () => {} },
+    fetcher: () => ({ ok: true, attempts: 1, raw_envelope: { type: "message.create" }, event: {
+      message_id: "m-ext", session_id: "s-ext", sender_id: "frank",
+      created_at_ms: Date.now(), content: "执行",
+    } }),
+    spawnHandler: (...args) => { spawned = args; return { status: 0 }; },
+  });
+  assert.equal(result.exitCode, 0, JSON.stringify(result));
+  assert.equal(spawned?.[1]?.[0], extHandler, "登记给外部 route 的话题必须交给外部处理器：" + JSON.stringify(spawned?.[1]));
+  assert.notEqual(spawned?.[1]?.[0], selfHandler, "不许进本链 inbound（它就不会跑，也就不会产生本链的绑定完成文案）");
+  assert.equal(out.join(""), "", "本链没被启动，就不该有本链的回执：" + out.join(""));
+  // 对照：同一个表里**没登记**的 session → 默认路由（本链）被启动
+  let spawnedDefault = null;
+  runInboundDispatcher({
+    endpointId: "m5codex", expectedCallerAgentUid: "agent_expected",
+    defaultRoute: { id: "self", handler: selfHandler }, routesFile,
+    env: { AILY_CLI_CALLER_AGENT_UID: "agent_expected", AILY_CLI_SESSION_ID: "s" },
+    stdout: { write: () => {} }, stderr: { write: () => {} },
+    fetcher: () => ({ ok: true, attempts: 1, raw_envelope: { type: "message.create" }, event: {
+      message_id: "m-self", session_id: "s-none", sender_id: "frank",
+      created_at_ms: Date.now(), content: "执行",
+    } }),
+    spawnHandler: (...args) => { spawnedDefault = args; return { status: 0 }; },
+  });
+  assert.equal(spawnedDefault?.[1]?.[0], selfHandler, "未登记的话题照旧走本链：" + JSON.stringify(spawnedDefault?.[1]));
+});
+
+test("PK3-W232-fix2 P1-2：register-route --session 成功后只在终端提示接管，不写飞书", () => {
+  // 拿掉哪行会红：删掉 register-route.mjs 里那两行"提示 …"，本用例会红在提示行断言上。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "w232-register-"));
+  const home = path.join(dir, "home");
+  fs.mkdirSync(path.join(home, ".claude", "feishu-bridge"), { recursive: true });
+  const routesFile = path.join(home, ".claude", "feishu-bridge", "routes.json");
+  fs.writeFileSync(routesFile, JSON.stringify({
+    schema_version: "1.0",
+    routes: [{ id: "self", handler: "/opt/fake/inbound.mjs", default: true }],
+    sessions: {},
+  }, null, 2) + "\n");
+  // 假 lark-cli：只要有人调它就会留下计数文件
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const counter = path.join(dir, "lark-calls.txt");
+  fs.writeFileSync(path.join(bin, "lark-cli"), "#!/bin/sh\necho x >> " + JSON.stringify(counter) + "\nexit 0\n", { mode: 0o755 });
+  // handler 必须是**真实存在**的脚本（登记入口会核 handler_missing）
+  const extHandler = path.join(dir, "c2c-inbound.mjs");
+  fs.writeFileSync(extHandler, "// 外部处理器夹具\n");
+  const r = spawnSync(process.execPath, [path.resolve("scripts", "register-route.mjs"),
+    "--id", "c2c-inbound", "--handler", extHandler, "--session", "s-ext", "--routes", routesFile, "--apply"],
+  { encoding: "utf-8", env: { ...process.env, HOME: home, PATH: bin + path.delimiter + process.env.PATH } });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /提示\s+这个话题的回复方式从现在起由外部处理器 c2c-inbound 决定/u, r.stdout);
+  assert.match(r.stdout, /已发出的绑定回执不会自动更新/u, r.stdout);
+  assert.equal(fs.existsSync(counter), false, "登记命令不许写飞书（没有新的自动写入）：" + r.stdout);
+  assert.equal(loadRoutes(routesFile).sessions["s-ext"], "c2c-inbound", "路由表要真的写进去：" + r.stdout);
+});
+
+test("PK3-W232-fix2 P2-1：三态判定只剩一份实现（三处复制收成一个共享函数）", () => {
+  // 拿掉哪行会红：把 fix1 的 externalProcessorForSession 复制回任一调用点，
+  //   本用例会红在"不该再有本地判定"或"实现只能有一份"上。
+  const callers = ["scripts/bind-compose.mjs", "scripts/inbound.mjs", "scripts/codex/inbound.mjs"];
+  for (const rel of callers) {
+    const src = fs.readFileSync(path.resolve(rel), "utf-8");
+    assert.equal(/externalProcessorForSession/u.test(src), false, rel + " 里不该再有本地判定实现");
+    assert.equal(/table\.sessions\?\.\[/u.test(src), false, rel + " 里不该再自己比 sessions 表");
+  }
+  const impls = [];
+  const defRe = new RegExp("export function topic" + "HandlerKind", "u");
+  for (const dir of ["scripts", "scripts/codex", "scripts/m1a", "scripts/maintenance", "scripts/test-support"]) {
+    for (const f of fs.readdirSync(path.resolve(dir)).filter((n) => n.endsWith(".mjs") && !/^test/u.test(n))) {
+      if (defRe.test(fs.readFileSync(path.resolve(dir, f), "utf-8"))) impls.push(path.join(dir, f));
+    }
+  }
+  assert.deepEqual(impls, ["scripts/inbound-routes.mjs"], "实现只能有一份：" + JSON.stringify(impls));
+  // 两个调用点都改调它（两链各自的 bound 回执）
+  for (const rel of ["scripts/inbound.mjs", "scripts/codex/inbound.mjs"]) {
+    assert.match(fs.readFileSync(path.resolve(rel), "utf-8"), /topicHandlerKind\(/u, rel + " 要改调共享判定");
   }
 });
 

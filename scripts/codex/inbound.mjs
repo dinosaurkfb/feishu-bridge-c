@@ -17,23 +17,8 @@ import {
 } from "../handoff.mjs";
 import { REJECT, normalizeBody } from "../selector.mjs";
 import { evaluateChatGates, CHAT_FALLBACK_REASONS, OFF_TEMPLATE_HINT, isPrivateChatTurn } from "../inbound-route.mjs";
-import { loadRoutes } from "../inbound-routes.mjs";
+import { topicHandlerKind, topicHandlerText } from "../inbound-routes.mjs";
 import { CHAT_POLICY_ID, CHAT_FOOTER, CHAT_BIND_GUIDE, chatReply, chatReplyTimeoutMs, chatFailText, chatReplyPathStatus } from "../chat-reply.mjs";
-
-function externalProcessorForSession(sessionId, routesFile) {
-  if (typeof sessionId !== "string" || !sessionId.trim()) return null;
-  try {
-    const table = loadRoutes(routesFile || undefined);
-    if (!table || !table.ok) return null;
-    const targetRouteId = table.sessions?.[sessionId];
-    if (typeof targetRouteId !== "string" || !targetRouteId.trim()) return null;
-    const defaultRoute = (table.routes ?? []).find((r) => r.isDefault);
-    if (defaultRoute && targetRouteId === defaultRoute.id) return null;
-    return targetRouteId;
-  } catch {
-    return null;
-  }
-}
 import { chatKey, senderRef, inspectChat, admitChat, recordChatOutcome, lockUnclearedText } from "../chat-ledger.mjs";
 import {
   MAPPING_DISPOSITION, buildLegacyMappingContext, evaluateMappingAdmission, handleMappingPolicy,
@@ -126,16 +111,14 @@ export function ackText(kind, detail, { transportAgentName } = {}) {
   ].join("\n");
   if (kind === "chat") return detail.text + "\n" + CHAT_FOOTER + (detail.replayed ? "（同一条消息的重放：按记录重出）" : "") + (detail.ledgerNote ?? "");
   if (kind === "bound") {
-    const ext = detail?.externalProcessor ?? externalProcessorForSession(detail?.sessionId, detail?.routesFile);
-    if (ext) {
-      return [
-        "绑定完成 · " + detail.taskName,
-        "此话题由外部处理器 " + ext + " 接管：回复方式由该处理器决定。",
-      ].join("\n");
-    }
+    // PK3-W232-fix2 P1-1：三态判定只有一份（inbound-routes.topicHandlerKind）。能走到这里说明本链自己接管；
+    // external 防御性、**unavailable 不落旧承诺**（说清判不了，去 doctor）。
+    const handler = detail?.topicHandler ?? topicHandlerKind({ sessionId: detail?.sessionId, routesFile: detail?.routesFile });
+    const tail = topicHandlerText(handler)
+      ?? "这个话题现在精确通向一个 Codex task。之后在这里 @ " + agent + " 即可续接。";
     return [
       "绑定完成 · " + detail.taskName,
-      "这个话题现在精确通向一个 Codex task。之后在这里 @ " + agent + " 即可续接。",
+      tail,
     ].join("\n");
   }
   if (kind === "control") return detail.text;

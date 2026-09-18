@@ -156,6 +156,13 @@ function main() {
   console.log("\n已写入。路由 " + (r.routeChanged ? "新增" : "无变化") +
     (session ? "，话题 " + (r.sessionChanged ? "新增" : "无变化") : ""));
   console.log("默认路由未改动 —— 换默认路由是换权威路由，本命令不做。");
+  if (session && r.sessionChanged) {
+    // PK3-W232-fix2 P1-2：话题从此不再由本链回复（它走外部处理器），而**已发出的绑定回执不会自动更新** ——
+    // 这里只能在终端说一声：不写飞书、不改已发消息（自动写飞书要 Frank 逐次授权，本单不新增）。
+    // 「要不要另发一条接管状态消息」写进 PI-REPORT 交 Frank 拍板。
+    console.log("提示      这个话题的回复方式从现在起由外部处理器 " + id + " 决定：本链不再回复它。");
+    console.log("          已发出的绑定回执不会自动更新 —— 要不要另发一条接管状态消息：待定（需人工拍板）。");
+  }
 }
 
 if (isDirectRun(import.meta.url)) main();

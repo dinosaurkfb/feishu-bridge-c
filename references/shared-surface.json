@@ -1,6 +1,6 @@
 {
   "_README": "共用模块的导出面快照。scripts/ 是底座，scripts/codex/ 是适配层；这里列的是适配层依赖的模块。改动共用代码会让 node scripts/shared-surface.mjs 失败——那不是错误，是要求你确认这次扩大/缩小是有意的，然后用 --update 认下来。",
-  "generated_at": "2026-09-18T10:11:18.283Z",
+  "generated_at": "2026-09-18T18:29:37.013Z",
   "modules": {
     "argv-options.mjs": [
       "parseArgvOptions"
@@ -349,6 +349,8 @@
       "routeRejectText",
       "routesPath",
       "selectRoute",
+      "topicHandlerKind",
+      "topicHandlerText",
       "validateRoutesDoc"
     ],
     "install-projection.mjs": [

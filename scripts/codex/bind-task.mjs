@@ -54,7 +54,6 @@ if (existing.ok) {
     const d = composeCodexBinding({
       root: existing.task.root, threadId: thread.threadId, nameOverride: arg("name"),
       template: tpl.ok ? tpl.template : undefined,
-      sessionId: existing.task.session_id ?? arg("session-id") ?? null,
     });
     if (awaitingFirstMention && !apply) {
       console.log("这个 Codex task 已建好原话题，但首次 mention 的握手窗口需要刷新。");
@@ -152,7 +151,6 @@ const d = composeCodexBinding({
   nameOverride: arg("name"),
   idempotencyScope: target.overridden ? target.chatId : undefined,
   template: tpl.template,
-  sessionId: arg("session-id") ?? null,
 });
 
 console.log("任务      " + d.name + "  " + d.logicalTaskKey);

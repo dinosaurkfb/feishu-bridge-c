@@ -199,6 +199,43 @@ export function selectRoute({ sessionId, routes, sessions }) {
   return { ok: true, route: fallback, matchedBy: "default" };
 }
 
+/**
+ * 「这个话题到底谁在处理」的**唯一**三态判定（PK3-W232-fix2 P1-1 / P2-1）。
+ *
+ *   local       —— 本链自己（默认路由：没登记过的话题、或显式登记到默认路由）
+ *   external    —— 登记给了非默认且**启用**的外部路由（routeId 是那个 id）
+ *   unavailable —— 判不了：表读不出来 / 坏 JSON / 登记的 route 不存在或已停用 / 没有默认路由
+ *
+ * 内部**严格复用 loadRoutes + selectRoute**（本模块的两个原语），不再自己比 `sessions` 与 `default` ——
+ * 自己比会对「停用 route」「不存在的 route」（真实 selectRoute 给 session_maps_to_unknown_route）
+ * 说出“外部处理器 X 接管”这种假话，也会把坏 JSON 回退成“本链自绑定”的承诺。
+ * 调用方必须做到：**unavailable 时不许落回旧承诺文案**（说清判不了，让人去 doctor）。
+ *
+ * 建话题那一刻平台侧会话还不存在，sessionId 拿不到 —— 那种场景**不要**用它去猜未来选路：
+ * 根消息用中性措辞（那里根本不承诺回复方式）。
+ */
+export function topicHandlerKind({ sessionId = null, routesFile = undefined } = {}) {
+  let table = null;
+  try { table = loadRoutes(routesFile || undefined); }
+  catch (err) { return { kind: "unavailable", routeId: null, reason: ROUTE_REJECT.TABLE_UNREADABLE, detail: String(err?.message ?? err) }; }
+  if (!table || table.ok !== true) return { kind: "unavailable", routeId: null, reason: table?.reason ?? ROUTE_REJECT.TABLE_UNREADABLE };
+  const sel = selectRoute({ sessionId, routes: table.routes, sessions: table.sessions });
+  if (!sel.ok) return { kind: "unavailable", routeId: null, reason: sel.reason, declared: sel.declared ?? null };
+  return sel.route.isDefault === true
+    ? { kind: "local", routeId: sel.route.id, reason: null, matchedBy: sel.matchedBy }
+    : { kind: "external", routeId: sel.route.id, reason: null, matchedBy: sel.matchedBy };
+}
+
+/** 三态给**人**看的一句话（两链回执共用一条口径）。 */
+export function topicHandlerText(handler) {
+  if (handler.kind === "external") return "此话题由外部处理器 " + handler.routeId + " 接管：回复方式由该处理器决定。";
+  if (handler.kind === "unavailable") {
+    return "这个话题的路由表判不了（" + (ROUTE_REJECT_TEXT[handler.reason] ?? handler.reason) + "）：" +
+      "回复方式暂无法判断，先在终端跑 node scripts/doctor.mjs 看清楚。";
+  }
+  return null;   // local：由调用方按本链的承诺写（两链承诺不同）
+}
+
 /** 路由表的写锁。登记 route 和登记 session 必须在同一把锁下，否则会丢更新。 */
 const routesLockDir = (file) => file + ".lock";
 

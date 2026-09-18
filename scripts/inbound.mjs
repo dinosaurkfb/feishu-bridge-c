@@ -18,23 +18,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { loadRoutes } from "./inbound-routes.mjs";
+import { topicHandlerKind, topicHandlerText } from "./inbound-routes.mjs";
 import { EXPIRY_SOURCE, normalizeBody } from "./selector.mjs";
-
-function externalProcessorForSession(sessionId, routesFile) {
-  if (typeof sessionId !== "string" || !sessionId.trim()) return null;
-  try {
-    const table = loadRoutes(routesFile || undefined);
-    if (!table || !table.ok) return null;
-    const targetRouteId = table.sessions?.[sessionId];
-    if (typeof targetRouteId !== "string" || !targetRouteId.trim()) return null;
-    const defaultRoute = (table.routes ?? []).find((r) => r.isDefault);
-    if (defaultRoute && targetRouteId === defaultRoute.id) return null;
-    return targetRouteId;
-  } catch {
-    return null;
-  }
-}
 import { fetchTriggerEvent } from "./envelope.mjs";
 import { acquireClaim, claimKey, readClaimState, recordClaimState, watcherExpectEnv } from "./claim.mjs";
 // 失败回执的 outbox 落点与 Stop 钡 / 兑底定时器同一份判据（outbox vs outbox-<sid>），不另写一份
@@ -148,10 +133,12 @@ export function ackText(kind, detail) {
     ].join("\n");
   }
   if (kind === "bound") {
-    const ext = detail?.externalProcessor ?? externalProcessorForSession(detail?.sessionId, detail?.routesFile);
-    const instructionLine = ext
-      ? "此话题由外部处理器 " + ext + " 接管：回复方式由该处理器决定。"
-      : "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。";
+    // PK3-W232-fix2 P1-1：三态判定只有一份（inbound-routes.topicHandlerKind，内部复用 loadRoutes + selectRoute）。
+    // 能走到这里说明本链自己接管（已登记外部 route 时 dispatcher 根本不进本链），所以 local 就承诺本链；
+    // external 是防御性的；**unavailable 不许落回旧承诺** —— 说清判不了，让人去 doctor。
+    const handler = detail?.topicHandler ?? topicHandlerKind({ sessionId: detail?.sessionId, routesFile: detail?.routesFile });
+    const instructionLine = topicHandlerText(handler)
+      ?? "之后在这条消息下面 @ 一下就是给它下指令；它的进展和每一轮回答也会以卡片发回这里。";
     const lines = [
       "绑定完成 · " + detail.taskName,
       "这个话题现在通向 " + detail.root + "。",

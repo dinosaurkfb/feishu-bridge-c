@@ -53182,7 +53182,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   // 链模板的 agent_uid 决定 endpoint（与入站 / 策略面同源）；lark_cli_bin 指向夹具里的假 binary。
   // PK2-W2-fix3（T7）：`init:false` = **never_initialized** 现场（无收据、无账本）；`cutover:false` = shadow。
   const w1Fixture = (tag, opts = {}) => {
-    const { cutover = true, init = true, ...fxOpts } = opts;   // 合并：I3-fix1 的 inHome 等选项透传 r69Fixture；W2/W3 的开关留在本层
+    const { cutover = true, init = true, template = {}, ...fxOpts } = opts;   // 合并：I3-fix1 的 inHome 等选项透传 r69Fixture；W2/W3 的开关留在本层
     const f = r69Fixture("w1" + tag, fxOpts);
     try {
     const uid = "agent_w1_" + tag;
@@ -53204,7 +53204,7 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       "process.stdout.write(JSON.stringify({ ok: true, data: { message_id: id } }));",
     ].join("\n") + "\n", { mode: 0o700 });
     const tplFile = path.join(f.bridge, "chain-config.json");
-    fs.writeFileSync(tplFile, JSON.stringify({ ...TPL, agent_uid: uid, lark_cli_bin: path.join(bin, "lark-cli"), lark_cli_profile: "claude", lark_cli_home: larkHome }, null, 2) + "\n", { mode: 0o600 });
+    fs.writeFileSync(tplFile, JSON.stringify({ ...TPL, ...template, agent_uid: uid, lark_cli_bin: path.join(bin, "lark-cli"), lark_cli_profile: "claude", lark_cli_home: larkHome }, null, 2) + "\n", { mode: 0o600 });
     const EP = legacyEndpointId({ runtime: "claude", agentUid: uid });
     const initRes = init ? LEDGER_OP.ledgerEnter(f.ctx, { kind: "init", endpointId: EP, chain: "claude", apply: true }) : { phase: "skipped" };
     if (initRes.phase !== "done" && init) throw new Error("W1 夹具 init：" + JSON.stringify(initRes));
@@ -54714,8 +54714,8 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
   //   账本 createB1 / voidPending、W1 的 wirePromoteAuthoritative（认领原样复用）、
   //   topic-generation-store 的 prepare/register/close（锁内 CAS，不用锁前快照）。
   /** W2 夹具：w1Fixture 上绑一条会话并**认领**（B1 → active/current），于是有了可轮转的 active 代际。 */
-  const w2Rotatable = (tag) => {
-    const x = w1Fixture(tag);
+  const w2Rotatable = (tag, opts = {}) => {
+    const x = w1Fixture(tag, opts);
     const env = w1SessionEnv(x, { sessionId: W1_UUID_A });
     const r0 = w1Bind(x, env);
     if (r0.status !== 0) { x.f.cleanup(); throw new Error("W2 夹具前置绑定失败：" + r0.stdout + r0.stderr); }
@@ -55052,6 +55052,35 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       const expiry = readSidecarStore({ endpointId: x.EP, name: "expiry" });
       assert.equal(expiry.entries[newRec.id], expiryOld, "expiry 继承 current 到期值（" + String(expiryOld) + "）：" + String(expiry.entries[newRec.id]));
     } finally { x.f.cleanup(); }
+  });
+
+  test("PK3-A3: feishu-rotate 在 transport_agent_name=mmcc 模板下提示 @ mmcc 且不含 M5Claude；Mac 模板（M5Claude）对照输出一字不差", () => {
+    // ① omm 模板：transport_agent_name = "mmcc"
+    const { x: xMmcc, env: envMmcc } = w2Rotatable("a3mmcc", { template: { transport_agent_name: "mmcc" } });
+    try {
+      const r = w2RotateCli(xMmcc, envMmcc, ["--apply"]);
+      assert.equal(r.status, 0, "轮转 --apply 成功：" + r.stdout + r.stderr);
+      assert.match(r.stdout, /新话题已进入 pending。去新话题真实 @ mmcc 后，将原子切换为 active；旧话题变为只读历史。/u);
+      assert.equal(r.stdout.includes("M5Claude"), false, "mmcc 模板输出不得出现 M5Claude：" + r.stdout);
+    } finally { xMmcc.f.cleanup(); }
+
+    // ② Mac 模板：transport_agent_name = "M5Claude"（对照输出一字不差）
+    const { x: xMac, env: envMac } = w2Rotatable("a3mac", { template: { transport_agent_name: "M5Claude" } });
+    try {
+      const rMac = w2RotateCli(xMac, envMac, ["--apply"]);
+      assert.equal(rMac.status, 0, "Mac 模板轮转 --apply 成功：" + rMac.stdout + rMac.stderr);
+      assert.match(rMac.stdout, /新话题已进入 pending。去新话题真实 @ M5Claude 后，将原子切换为 active；旧话题变为只读历史。/u);
+      assert.equal(rMac.stdout.includes("运输 agent"), false, "Mac 模板不得出现回退词：" + rMac.stdout);
+    } finally { xMac.f.cleanup(); }
+
+    // ③ 兜底测试：未提供有效 transport_agent_name（如空白符）时退回中性词「运输 agent」，不退回 M5Claude
+    const { x: xNone, env: envNone } = w2Rotatable("a3none", { template: { transport_agent_name: "   " } });
+    try {
+      const rNone = w2RotateCli(xNone, envNone, ["--apply"]);
+      assert.equal(rNone.status, 0, "兜底轮转 --apply 成功：" + rNone.stdout + rNone.stderr);
+      assert.match(rNone.stdout, /新话题已进入 pending。去新话题真实 @ 运输 agent 后，将原子切换为 active；旧话题变为只读历史。/u);
+      assert.equal(rNone.stdout.includes("M5Claude"), false, "缺省时不得退回 M5Claude：" + rNone.stdout);
+    } finally { xNone.f.cleanup(); }
   });
   /** 同步真跑 spawnImpl（自动轮转 launcher 的注入缝）：子进程真跑完再返回，断言才看得见结果。 */
   const w2SyncSpawn = (env) => (cmd, args, opts) => {
@@ -56119,6 +56148,9 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       // PK2-W3-fix8：恢复提示收成一处 helper 按 st.level 分流 —— 基线（b9ff7e8）与分支的措辞差异是
       //   本单**有意**的措辞变更，归一成同一占位（落盘文件照比不受影响；哪一级指哪个脚本由 fix8 用例守）。
       s = s.replace(/恢复：[^\n]*(?:bind-project|bind-session)[^\n]*/gu, "恢复：<RESUME_HINT>");
+      // PK3-A3：轮转提示从硬编码 @ M5Claude 改为读模板 transport_agent_name（夹具中为 @ T）—— 基线（b9ff7e8）
+      //   与分支的措辞差异是本单有意的变更，归一成同一占位（行为由 PK3-A3 用例守）。
+      s = s.replace(/去新话题真实 @ [^\s]+ 后/gu, "去新话题真实 @ <AGENT> 后");
       return s;
     };
     return { normalize, valToPlaceholder, counts };

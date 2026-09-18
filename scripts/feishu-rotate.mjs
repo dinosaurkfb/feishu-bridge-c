@@ -454,4 +454,5 @@ try {
 } catch (err) {
   console.error("pending generation 已登记，但状态回复发送失败：" + err.message);
 }
-console.log("新话题已进入 pending。去新话题真实 @ M5Claude 后，将原子切换为 active；旧话题变为只读历史。");
+const transportAgentName = current?.config?.transport_agent_name?.trim() || "运输 agent";
+console.log("新话题已进入 pending。去新话题真实 @ " + transportAgentName + " 后，将原子切换为 active；旧话题变为只读历史。");

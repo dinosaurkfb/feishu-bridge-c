@@ -55081,6 +55081,15 @@ test("PK2-I4 T7 参数缺省：不给 --endpoint 时从链模板派生端点（�
       assert.match(rNone.stdout, /新话题已进入 pending。去新话题真实 @ 运输 agent 后，将原子切换为 active；旧话题变为只读历史。/u);
       assert.equal(rNone.stdout.includes("M5Claude"), false, "缺省时不得退回 M5Claude：" + rNone.stdout);
     } finally { xNone.f.cleanup(); }
+
+    // ④ PK3-A3-fix1：模板里 transport_agent_name 为非字符串（如 42）→ 轮转正常退出 0，提示退回「@ 运输 agent」，且不含 M5Claude
+    const { x: xNum, env: envNum } = w2Rotatable("a3num", { template: { transport_agent_name: 42 } });
+    try {
+      const rNum = w2RotateCli(xNum, envNum, ["--apply"]);
+      assert.equal(rNum.status, 0, "非字符串模板轮转 --apply 成功（退出 0，不抛 TypeError）：" + rNum.stdout + rNum.stderr);
+      assert.match(rNum.stdout, /新话题已进入 pending。去新话题真实 @ 运输 agent 后，将原子切换为 active；旧话题变为只读历史。/u);
+      assert.equal(rNum.stdout.includes("M5Claude"), false, "非字符串时不得退回 M5Claude：" + rNum.stdout);
+    } finally { xNum.f.cleanup(); }
   });
   /** 同步真跑 spawnImpl（自动轮转 launcher 的注入缝）：子进程真跑完再返回，断言才看得见结果。 */
   const w2SyncSpawn = (env) => (cmd, args, opts) => {

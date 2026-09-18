@@ -68,11 +68,21 @@ export FEISHU_BRIDGE_NODE="$HOME/.local/share/mise/shims/node"
   systemctl --user enable --now aily-daemon.service
   systemctl --user is-active aily-daemon.service  # 验证：应输出 active
   ```
-- **开启 linger（脱机常驻）**：
+- **开启 linger（仅在需要脱机常驻时）**：
+  保证 SSH 断开注销后，用户级 systemd 守护进程与定时器持续运行。
+  在多数现代发行版（如 Debian/Ubuntu，包括 omm 实测）下，polkit 策略默认允许普通用户管理自己的 linger 状态，**不需要 sudo**（rc=0，Linger=yes）：
+  ```bash
+  loginctl enable-linger "$USER"
+  ```
+  若当前环境 polkit 策略被收紧而被拒（如报错 Authorization required 或 Permission denied），再追加 `sudo` 执行：
   ```bash
   sudo loginctl enable-linger "$USER"
   ```
-  保证 SSH 断开后，用户级 systemd 守护进程与定时器持续运行。
+  - **验证**：
+    ```bash
+    loginctl show-user "$USER" -p Linger
+    # 预期输出：Linger=yes
+    ```
 
 ### 0.4 lark-cli 安装与凭据机制
 - 验证安装：
@@ -115,11 +125,11 @@ git checkout <指定_main_commit_hash>
 ### 2.1 准备配置参数
 | 参数项 | 参数来源与说明 | 格式示例 |
 |---|---|---|
-| `--agent-uid` | Aily 平台对应智能体详情页的 agent id | `agent_4m2jju48z6y2t` |
-| `--transport-app-id` | 智能体背后的飞书应用 App ID | `cli_a71xxxxxxxxx` |
-| `--transport-open-id` | **该 App 自身视角下**智能体的 open_id（不能复用其他应用视角查得的 open_id） | `ou_xxxxxxxxxxxx` |
-| `--frank-sender-id` | **Aily 平台的授权用户 user id**（纯数字字符串，非飞书 `ou_`） | `7621987654321` |
-| `--chat-id` | 飞书话题群 ID（通过 `lark-cli im +chat-search` 检索） | `oc_xxxxxxxxxxxx` |
+| `--agent-uid` | Aily 平台对应智能体详情页的 agent id | `agent_xxx` |
+| `--transport-app-id` | 智能体背后的飞书应用 App ID | `cli_xxx` |
+| `--transport-open-id` | **该 App 自身视角下**智能体的 open_id（不能复用其他应用视角查得的 open_id） | `ou_xxx` |
+| `--frank-sender-id` | **Aily 平台的授权用户 user id**（纯数字字符串，非飞书 `ou_`） | `1234567890123` |
+| `--chat-id` | 飞书话题群 ID（通过 `lark-cli im +chat-search` 检索） | `oc_xxx` |
 | `--chat-name` | 目标群名称 | `"AI任务群"` |
 | `--transport-agent-name` | 智能体在群内展示名 | `M5Claude` / `M5Codex` |
 
@@ -139,7 +149,7 @@ node scripts/init-chain-template.mjs \
   --outbound-agent-name "M5Claude" \
   --outbound-app-id cli_xxx \
   --outbound-open-id ou_xxx \
-  --frank-sender-id 7621... \
+  --frank-sender-id 123456... \
   --chat-id oc_xxx \
   --chat-name "群名" \
   --transport-agent-name "M5Claude" \
@@ -153,7 +163,7 @@ node scripts/init-chain-template.mjs \
   --outbound-agent-name "M5Claude" \
   --outbound-app-id cli_xxx \
   --outbound-open-id ou_xxx \
-  --frank-sender-id 7621... \
+  --frank-sender-id 123456... \
   --chat-id oc_xxx \
   --chat-name "群名" \
   --transport-agent-name "M5Claude" \
@@ -171,7 +181,7 @@ node scripts/codex/init-chain-template.mjs \
   --transport-agent-name "M5Codex" \
   --transport-app-id cli_xxx \
   --transport-open-id ou_xxx \
-  --frank-sender-id 7621... \
+  --frank-sender-id 123456... \
   --chat-id oc_xxx \
   --chat-name "群名"
 
@@ -181,7 +191,7 @@ node scripts/codex/init-chain-template.mjs \
   --transport-agent-name "M5Codex" \
   --transport-app-id cli_xxx \
   --transport-open-id ou_xxx \
-  --frank-sender-id 7621... \
+  --frank-sender-id 123456... \
   --chat-id oc_xxx \
   --chat-name "群名" \
   --apply

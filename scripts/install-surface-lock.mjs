@@ -65,16 +65,29 @@ export function acquireInstallSurfaceLock({ home = os.homedir(), env = process.e
 }
 
 /**
+ * 取锁的**受控返回**形态（PK3-L7-fix6）：不 exit、不挂 exit 钩子 —— 给「锁内段抽成可导入函数」的写方用
+ * （释放由调用方在 finally 里做）。`holdInstallSurfaceLockOrExit` 就是它加一层 exit 包装 ——
+ * 拒绝文案与退出码只写在这一处，两个调用面不会漂。
+ * @returns {{ok:true, lock} | {ok:false, code:2|3, text}}
+ */
+export function acquireInstallSurfaceLockOrRefuse({ home = os.homedir(), env = process.env, err = null } = {}) {
+  const got = acquireInstallSurfaceLock({ home, env });
+  if (got.ok) return { ok: true, lock: got };
+  const text = "安装面锁拿不到（" + got.reason + "：" + String(got.why) + "，" + got.path + "）—— 什么都没写。" +
+    (got.reason === "surface_install_busy" ? "等它结束再装。" : "");
+  if (typeof err === "function") err(text);
+  return { ok: false, code: got.reason === "surface_install_busy" ? 2 : 3, text };
+}
+
+/**
  * 安装器脚本（顶层线性代码，多处 exit）用：取锁并挂 exit 钩子释放。释放失败**不许报成功**：
  * 点名残骸并把退出码改成 3（评审探针：.reap 删除 EIO 时进程曾照样退 0）。
  * 拿不到锁 → 打印原因并 exit 2（busy）/ 3（残骸），什么都没写。
  */
 export function holdInstallSurfaceLockOrExit({ home = os.homedir(), env = process.env, err = (t) => process.stderr.write(t + "\n") } = {}) {
-  const got = acquireInstallSurfaceLock({ home, env });
-  if (!got.ok) {
-    err("安装面锁拿不到（" + got.reason + "：" + String(got.why) + "，" + got.path + "）—— 什么都没写。" + (got.reason === "surface_install_busy" ? "等它结束再装。" : ""));
-    process.exit(got.reason === "surface_install_busy" ? 2 : 3);
-  }
+  const refused = acquireInstallSurfaceLockOrRefuse({ home, env, err });
+  if (!refused.ok) process.exit(refused.code);
+  const got = refused.lock;
   process.on("exit", () => {
     const rel = got.release();
     if (!rel.ok) { err("安装面锁交不还（" + String(rel.why) + "，" + String(rel.path) + "）。"); process.exitCode = 3; }

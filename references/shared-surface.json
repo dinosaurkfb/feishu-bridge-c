@@ -377,14 +377,19 @@
       "referencedRuntimeScripts",
       "renderClaudeSettings",
       "renderClaudeSkill",
+      "resolveNodeForHooks",
       "systemdExecStartValue",
       "systemdShowExecArgv",
-      "systemdUnitAbsent"
+      "systemdUnitAbsent",
+      "timerKindFor",
+      "timerPlatform",
+      "unitFirstArg"
     ],
     "install-surface-lock.mjs": [
       "INSTALL_SURFACE_LOCK_ENV",
       "INSTALL_SURFACE_LOCK_STALE_MS",
       "acquireInstallSurfaceLock",
+      "acquireInstallSurfaceLockOrRefuse",
       "holdInstallSurfaceLockOrExit",
       "inspectInstallSurfaceLock",
       "installSurfaceLockPath"
@@ -740,6 +745,11 @@
       "installUnhandledRejectionGuard",
       "setSuiteInvariants",
       "treeDriftProblem"
+    ],
+    "timer-exec.mjs": [
+      "launchctl",
+      "systemctl",
+      "timerCmd"
     ],
     "topic-agent-ledger.mjs": [
       "AILY_SESSION_SHAPE",

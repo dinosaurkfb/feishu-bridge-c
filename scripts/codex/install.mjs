@@ -15,10 +15,11 @@ import { moduleRoot } from "../direct-run.mjs";
 import { shellQuote } from "../shell-quote.mjs";
 import { describeTemplateWrite, withChainTemplateWrite } from "../chain-template.mjs";
 import { buildHookCommand, codexHooksOwnedEntries, renderCodexHooks, ownsHookCommand, pickNode } from "./hook-command.mjs";
-import { referencedRuntimeScripts } from "../install-projection.mjs";
+import { referencedRuntimeScripts, timerPlatform } from "../install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
+import { codexDrainRemovalPlan, linuxDrainScene, uninstallDrainUnitsInLock } from "./drain-service.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
 import {
@@ -33,6 +34,14 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
+
+// **只在 linux 构造现场**（PK3-L7-fix5 P1-1）：darwin 真机上根本没有 systemd，这里连一次 systemctl
+// 都不该调 —— 旧版 `uninstall ? linuxDrainScene() : null` 会在 Mac 上把探询打成"查不清"，
+// 于是 --uninstall --apply 在任何卸载动作之前就 exit 1（真回归，隔离探针已复现）。
+const PFORM = timerPlatform({ home: os.homedir() });
+/** 预览用（锁外只读、算一份给人看）；apply 会在**锁内重读现场**（fix5 P1-3，由 uninstallDrainUnitsInLock 做）。 */
+const PREVIEW_DRAIN = uninstall && PFORM === "linux" ? linuxDrainScene() : null;
+const PREVIEW_DRAIN_PLAN = PREVIEW_DRAIN === null ? null : codexDrainRemovalPlan(PREVIEW_DRAIN);
 
 
 // 原来这里自带一份同样逻辑的 shellQuote。同一条策略写两遍就会漂 ——
@@ -113,7 +122,12 @@ if (!uninstall) {
 }
 // **调度器不在这条命令里。**装了但没启用是默认态，不是某个检查碰巧生效的结果。
 // 评审的裁决：启用要是一条独立命令，否则仍可能误组合。
-console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
+if (uninstall) {
+  // fix4 P2-1：预览也查 manager（与 apply 同一份计划、同一句话）—— 但**只在 linux**（fix5 P1-1）。
+  console.log(PREVIEW_DRAIN_PLAN !== null ? PREVIEW_DRAIN_PLAN.text : "兜底排空    未启用（默认）");
+} else {
+  console.log("兜底排空    未启用（默认）—— 单独跑 scripts/codex/drain-service.mjs 启用");
+}
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
@@ -232,6 +246,16 @@ if (!uninstall) {
 if (!uninstall && !fs.existsSync(registryFile(home))) {
   writeAtomic(registryFile(home), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }, null, 2) + "\n");
 }
+if (uninstall) {
+  // linux 上收掉兜底定时器（单元已丢、manager 里还在的孤儿也要收）。
+  // **PK3-L7-fix6**：这段是**持锁段**（锁在上面就取了，覆盖到这里），抽成 drain-service 的可导入函数
+  //   `uninstallDrainUnitsInLock` —— 交错注入只能从函数参数来；旧版那个"设了环境变量就在**锁外**跑任意
+  //   .mjs"的注入点已删除（生产可达，与 U1 四轮 P1-1 同类）。现场在函数里**重读**（fix5 P1-3），
+  //   不拿模块顶部那份预览快照；非 linux 一次 systemctl 都不调（fix5 P1-1）。
+  const drain = uninstallDrainUnitsInLock({ home: os.homedir(), platform: PFORM });
+  if (!drain.ok) process.exit(drain.code);
+}
+
 if (!uninstall) {
   // task 尚未路由成功时的脱敏错误回执使用这个目录；提前创建，避免首个错误路径才 mkdir。
   fs.mkdirSync(path.join(home, "receipts"), { recursive: true, mode: 0o700 });
@@ -243,4 +267,8 @@ if (!uninstall) {
       "要迁移请显式运行 scripts/codex/migrate-auto-publish.mjs --apply");
   }
 }
-console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
+if (uninstall) {
+  console.log("\n已完成本地卸载。");
+} else {
+  console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
+}

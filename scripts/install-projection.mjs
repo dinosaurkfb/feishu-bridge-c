@@ -16,7 +16,8 @@ import path from "node:path";
 
 import { runtimeScript } from "./runtime-install.mjs";
 import { nodeCommandPrefix, shellQuote } from "./shell-quote.mjs";
-import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, pickClaudeNode, timerKindFor } from "./drain-schedule.mjs";
+import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, pickClaudeNode, timerKindFor, timerPlatform, resolveNodeForHooks, unitFirstArg } from "./drain-schedule.mjs";
+export { timerKindFor, timerPlatform, resolveNodeForHooks, unitFirstArg };
 
 /** 埋进命令里的显式归属标记：与脚本路径无关，换克隆、换 runtime 都认得出自己那条。 */
 export const HOOK_TAG = "FEISHU_BRIDGE_HOOK:";

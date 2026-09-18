@@ -101,8 +101,10 @@ function plistFirstArg(text) {
   return first === null ? null : first[1];
 }
 
-/** systemd 单元里 ExecStart 的首段：裸词，或我们写的引用形式（JSON 字符串）。引号没闭合 → null。 */
-function unitFirstArg(text) {
+/** systemd 单元里 ExecStart 的首段：裸词，或我们写的引用形式（JSON 字符串）。引号没闭合 → null。
+ * **导出给 Codex 侧用（PK3-L7-fix3）**：判「单元里那个 node 还在不在」要读的正是这一段；
+ * 解析只此一份（那边的 plist 首段同理走 plistFirstArg）。 */
+export function unitFirstArg(text) {
   const line = /^ExecStart=(.*)$/mu.exec(String(text ?? ""));
   if (line === null) return null;
   const value = line[1].trim();

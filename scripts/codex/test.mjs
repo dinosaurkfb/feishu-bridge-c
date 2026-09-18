@@ -21,8 +21,12 @@ import {
 import {
   absentJob, auditOutbox, classifyBacklog, drainScriptPath, enableBlockers, loadedPhase,
   plistBody, scanRunnable,
+  CODEX_DRAIN_SYSTEMD_UNIT, codexBridgeOf, codexDrainSystemdPaths, codexDrainSystemdUnits, serviceState, SYSTEMD_PHASE_TEXT,
+  pickNode as pickDrainNode, expectedJob, shellQuoteItems, systemdEnvValue,
 } from "./drain-service.mjs";
 import { drainTimerCheck, drainTimerText, runDrainService } from "./drain-service.mjs"; // PK3-L2：兜底排空文案按平台 / PK3-L2-fix3：模块函数入参测入口
+// PK3-L7-fix6：持锁段抽成可导入单出口 —— 交错的确定性注入走**函数参数**（不再是环境变量）
+import { disableDrainInLock, enableDrainInLock, uninstallDrainUnitsInLock } from "./drain-service.mjs";
 import {
   classifyOutboxRecord, codexReplyEventKey, explainabilityGaps, hasPublishAuthorization, outboxMutationBlocker,
 } from "../outbox.mjs";
@@ -127,7 +131,7 @@ import { CHAT_SCOPE_PROBE_ARTIFACT_TYPE } from "../dialogue-chat-scope-probe.mjs
 import { shellQuote } from "../shell-quote.mjs";
 import { createGate } from "../maintenance-gate-core.mjs";
 import { compareInstalledSurface, readInstalledSurface } from "../installed-surface.mjs";
-import { referencedRuntimeScripts } from "../install-projection.mjs";
+import { referencedRuntimeScripts, resolveNodeForHooks } from "../install-projection.mjs";
 import { maintenanceEntryManifest } from "../maintenance/maintenance-entries.mjs";
 import {
   DIALOGUE_SHADOW_READINESS_ARTIFACT_TYPE, DIALOGUE_SHADOW_READINESS_DECISION,
@@ -4024,7 +4028,7 @@ test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 li
   const agents = path.join(fakeHome, "Library", "LaunchAgents");
   fs.mkdirSync(agents, { recursive: true });
   const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
-  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome }));
+  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome, bridge }));   // fix4：显式桥根要传下去（env 是套件徒线）
   const before = fs.readFileSync(plist);
   fs.rmSync(marker, { force: true });
 
@@ -4079,7 +4083,7 @@ test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打�
   const agents = path.join(fakeHome, "Library", "LaunchAgents");
   fs.mkdirSync(agents, { recursive: true });
   const plist = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
-  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome, node }));
+  fs.writeFileSync(plist, plistBody({ home: fakeHome, codexHome, bridge, node }));
   const before = fs.readFileSync(plist);
   fs.rmSync(marker, { force: true });
 
@@ -10782,26 +10786,23 @@ test("R57d 返修四 P1-2：repair 对 select 支 fail-open——ownerContext �
   assert.equal(drift.reason, "select_endpoint_mismatch", "② " + drift.reason);
 });
 
-// ── PK3-L2：Codex 侧兜底定时器文案按平台（注入 platform 钉）──
-test("PK3-L2-fix1 兜底排空文案按平台：非 darwin 一律「尚未实现」（不说 systemd、无 launchd 状态词）；darwin 说 launchd", () => {
+// ── PK3-L2 / PK3-L7：Codex 侧兜底定时器文案按平台（注入 platform 钉）──
+test("PK3-L7 兜底排空文案按平台：linux 说 systemd --user，darwin 说 launchd，其它平台一律「尚未实现」", () => {
   const linux = drainTimerText({ platform: "linux" });
-  assert.match(linux, /尚未实现/u, linux);
-  assert.doesNotMatch(linux, /systemd/u, "不许声称 systemd（那是 Claude 侧能力）：" + linux);
-  assert.doesNotMatch(linux, /launchd 状态/u, "不用 launchd 状态词：" + linux);
+  assert.match(linux, /systemd --user/u, "linux 上必须说明 systemd --user：" + linux);
+  assert.doesNotMatch(linux, /launchd/u, "linux 上不用 launchd 状态词：" + linux);
   const darwin = drainTimerText({ platform: "darwin" });
   assert.match(darwin, /launchd/u, darwin);
   const other = drainTimerText({ platform: "win32" });
   assert.match(other, /尚未实现/u, other);
 });
 
-test("PK3-L2-fix1 P1：linux 不探 launchd、报尚未实现（launchctl 调用次数 0）；darwin 照旧探测", () => {
+test("PK3-L7：其它平台（如 win32）不探 launchd/systemd、报尚未实现；darwin 照旧探测", () => {
   let calls = 0;
   const countingServiceState = () => { calls += 1; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
-  const linux = drainTimerCheck({ platform: "linux", serviceStateFn: countingServiceState });
-  assert.equal(calls, 0, "linux 下 launchd 探测（注入的 serviceStateFn）从未被调用：" + JSON.stringify(linux));
-  assert.match(linux.detail, /尚未实现/u, linux.detail);
-  assert.doesNotMatch(linux.detail, /systemd/u, "不许声称 systemd：" + linux.detail);
-  assert.doesNotMatch(linux.detail, /launchd 状态/u, "不许用 launchd 状态词：" + linux.detail);
+  const win32 = drainTimerCheck({ platform: "win32", serviceStateFn: countingServiceState });
+  assert.equal(calls, 0, "win32 下探测从未被调用：" + JSON.stringify(win32));
+  assert.match(win32.detail, /尚未实现/u, win32.detail);
   // darwin 照旧：探测一次、四态映射不变
   calls = 0;
   const darwin = drainTimerCheck({ platform: "darwin", serviceStateFn: countingServiceState });
@@ -10810,15 +10811,15 @@ test("PK3-L2-fix1 P1：linux 不探 launchd、报尚未实现（launchctl 调用
   assert.match(darwin.detail, /launchd 状态查不出来/u, darwin.detail);
 });
 
-test("PK3-L2-fix2 P1-1 / fix3 P2-1：非 Darwin 下无参运行 drain-service 报「尚未实现」且 launchctl 调用 0 次，输出不含自相矛盾指引", () => {
-  let launchctlCalls = 0;
-  const countingLaunchctl = () => { launchctlCalls++; return { ok: false, detail: "fake launchctl" }; };
-  const countingServiceState = () => { launchctlCalls++; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
+test("PK3-L7：非 Darwin/Linux 下无参运行 drain-service 报「尚未实现」且 launchctl/systemctl 调用 0 次", () => {
+  let calls = 0;
+  const countingLaunchctl = () => { calls++; return { ok: false, detail: "fake" }; };
+  const countingServiceState = () => { calls++; return { phase: "unverifiable", backlog: { ok: true, total: 0 } }; };
 
   let stdout = "";
   let exitCode = null;
   runDrainService([], {
-    platform: "linux",
+    platform: "win32",
     serviceStateFn: countingServiceState,
     spawnLaunchctlFn: countingLaunchctl,
     log: (msg) => { stdout += msg + "\n"; },
@@ -10827,70 +10828,66 @@ test("PK3-L2-fix2 P1-1 / fix3 P2-1：非 Darwin 下无参运行 drain-service �
   });
 
   assert.equal(exitCode, 0, "无参运行正常退出 0");
-  assert.equal(launchctlCalls, 0, "Linux 下无参运行不得调用 launchctl 或 serviceState");
+  assert.equal(calls, 0, "win32 下无参运行不得调用 launchctl 或 serviceState");
   assert.match(stdout, /尚未实现/u, "无参运行输出必须含「尚未实现」：" + stdout);
-  assert.match(stdout, /本平台没有启停实现（只在 darwin 有 launchd 实现）。/u, "必须说明本平台没有启停实现：" + stdout);
-  assert.doesNotMatch(stdout, /--enable --apply/u, "非 darwin 无参输出不得包含自相矛盾的启用指引：" + stdout);
-  assert.doesNotMatch(stdout, /launchd 状态查不出来/u, "不许出现 launchd 状态查不出来：" + stdout);
+  assert.match(stdout, /本平台没有启停实现/u, "必须说明本平台没有启停实现：" + stdout);
+  assert.doesNotMatch(stdout, /--enable --apply/u, "非支持平台无参输出不得包含自相矛盾的启用指引：" + stdout);
 });
 
-test("PK3-L2-fix3 P1-1：真实 env 残留 FEISHU_BRIDGE_PLATFORM=darwin + 显式 platform linux → 不探 launchctl（计数 0）", () => {
+test("PK3-L7：真实 env 残留 FEISHU_BRIDGE_PLATFORM=darwin + 显式 platform win32 → 不探 launchctl/systemctl（计数 0）", () => {
   const saved = process.env.FEISHU_BRIDGE_PLATFORM;
   const savedTimer = process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
   process.env.FEISHU_BRIDGE_PLATFORM = "darwin";
   process.env.FEISHU_BRIDGE_TIMER_PLATFORM = "darwin";
   try {
-    let launchctlCalls = 0;
+    let calls = 0;
     const countingLaunchctl = () => {
-      launchctlCalls++;
+      calls++;
       return { ok: false, detail: "should not be called" };
     };
     const countingServiceState = () => {
-      launchctlCalls++;
+      calls++;
       return { phase: "loaded", backlog: { ok: true, total: 0 } };
     };
 
-    // 1. drainTimerCheck 显式 platform: "linux" 必须不探 launchd，不能被 env 残留 darwin 污染
-    const check = drainTimerCheck({ platform: "linux", serviceStateFn: countingServiceState });
-    assert.equal(launchctlCalls, 0, "drainTimerCheck 显式 platform linux 不得探测 launchd（哪怕 env 残留 darwin）");
+    // 1. drainTimerCheck 显式 platform: "win32" 必须不探 launchd
+    const check = drainTimerCheck({ platform: "win32", serviceStateFn: countingServiceState });
+    assert.equal(calls, 0, "drainTimerCheck 显式 platform win32 不得探测");
     assert.equal(check.ok, null);
     assert.match(check.detail, /尚未实现/u);
 
-    // 2. drainTimerText 显式 platform: "linux" 必须返回尚未实现
-    const text = drainTimerText({ platform: "linux" });
+    // 2. drainTimerText 显式 platform: "win32" 必须返回尚未实现
+    const text = drainTimerText({ platform: "win32" });
     assert.match(text, /尚未实现/u);
-    assert.doesNotMatch(text, /launchd 状态查不出来/u);
 
-    // 3. runDrainService 显式 platform: "linux" 无参入口：不探 launchctl，计数 0
+    // 3. runDrainService 显式 platform: "win32" 无参入口：计数 0
     let stdout = "";
     let exitCode = null;
     runDrainService([], {
-      platform: "linux",
+      platform: "win32",
       serviceStateFn: countingServiceState,
       spawnLaunchctlFn: countingLaunchctl,
       log: (msg) => { stdout += msg + "\n"; },
       error: (msg) => { stdout += msg + "\n"; },
       exit: (code) => { exitCode = code; },
     });
-    assert.equal(exitCode, 0, "无参入口退出 0");
-    assert.equal(launchctlCalls, 0, "无参入口在显式 platform linux 下不得调用 launchctl 或 serviceState");
+    assert.equal(exitCode, 0);
+    assert.equal(calls, 0);
     assert.match(stdout, /尚未实现/u);
-    assert.match(stdout, /本平台没有启停实现/u);
-    assert.doesNotMatch(stdout, /--enable --apply/u, "P2-1：无参输出不得包含 --enable --apply 指引");
 
-    // 4. runDrainService 显式 platform: "linux" 带 --enable 或 --disable：直接拒绝，不探 launchctl，计数 0
+    // 4. runDrainService 显式 platform: "win32" 带 --enable：直接拒绝，计数 0
     let stderr = "";
     exitCode = null;
     runDrainService(["--enable"], {
-      platform: "linux",
+      platform: "win32",
       serviceStateFn: countingServiceState,
       spawnLaunchctlFn: countingLaunchctl,
       log: (msg) => { stderr += msg + "\n"; },
       error: (msg) => { stderr += msg + "\n"; },
       exit: (code) => { exitCode = code; },
     });
-    assert.equal(exitCode, 1, "--enable 在非 darwin 退出 1");
-    assert.equal(launchctlCalls, 0, "--enable 不得调用 launchctl");
+    assert.equal(exitCode, 1);
+    assert.equal(calls, 0);
     assert.match(stderr, /尚未实现/u);
   } finally {
     if (saved === undefined) delete process.env.FEISHU_BRIDGE_PLATFORM;
@@ -10898,6 +10895,1087 @@ test("PK3-L2-fix3 P1-1：真实 env 残留 FEISHU_BRIDGE_PLATFORM=darwin + 显�
     if (savedTimer === undefined) delete process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
     else process.env.FEISHU_BRIDGE_TIMER_PLATFORM = savedTimer;
   }
+});
+
+// ── PK3-L7：Codex 侧兜底定时器 Linux systemd --user 深度用例 ──
+/** 路径是否存在（含断链的 symlink）—— 触发锁/单元文件的"在不在"。 */
+const lockPresent = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
+
+function linuxDrainFixture(prefix = "pk3l7-codex-", { codexHomeName = ".codex" } = {}) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const home = path.join(base, "home");
+  const codexHome = path.join(home, codexHomeName);
+  const bridge = path.join(codexHome, "feishu-bridge");
+  const runtimeRoot = path.join(bridge, "runtime");
+
+  const plan = planRuntimeSync({ sourceRoot: ROOT, chain: "codex", root: runtimeRoot });
+  assert.equal(plan.ok, true, plan.reason ?? "");
+  assert.equal(applyRuntimeSync(plan, { chain: "codex", root: runtimeRoot }).ok, true);
+
+  fs.mkdirSync(bridge, { recursive: true });
+  fs.writeFileSync(path.join(bridge, "registry.json"), JSON.stringify({ schema_version: "1.0", runtime: "codex", tasks: [] }));
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+
+  // PK3-L7-fix2：在沙箱 home 构造 ~/.local/share/mise/shims/node，
+  // 确保 resolveNodeForHooks 在 Linux 下优先命中 mise shim（钉住 ExecStart 的 node 路径）
+  const shimDir = path.join(home, ".local", "share", "mise", "shims");
+  fs.mkdirSync(shimDir, { recursive: true });
+  const shimNode = path.join(shimDir, "node");
+  fs.writeFileSync(shimNode, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+  const logFile = path.join(base, "systemctl.log");
+  const fakeBin = path.join(base, "fake-systemctl");
+  // 假 manager 的 show 默认值 = **真实投影**：fix3 P1-3 之后 enable 会拿 show 复核 ExecStart，
+  // 而这把默认“健康的”假 systemctl 靠它回答「manager 里已经是你这份」——不是这份就得红。
+  const drainScript = drainScriptPath(home, codexHome);
+  // systemctl show -p Environment 打印的是 C 风格转义后的值（值里空格 → \x20），夹具照这个形状给。
+  const bridgeEnvLine = "FEISHU_CODEX_BRIDGE_HOME=" + bridge.replaceAll(" ", "\\x20");
+  const healthyShow = "{ path=" + shimNode + " ; argv[]=" + shimNode + " " + drainScript + " ; ignore_errors=no }";
+  const script = `#!/bin/sh
+echo "$@" >> "${logFile}"
+if [ "$1" != "--user" ]; then
+  echo "Error: first argument must be --user" >&2
+  exit 2
+fi
+sub="$2"
+if [ "$sub" = "is-enabled" ]; then
+  echo "\${SYSTEMCTL_MOCK_IS_ENABLED:-enabled}"
+  exit 0
+fi
+if [ "$sub" = "is-active" ]; then
+  act="\${SYSTEMCTL_MOCK_IS_ACTIVE:-active}"
+  if [ "$act" = "inactive" ]; then
+    echo "inactive"
+    exit 3
+  fi
+  echo "$act"
+  exit 0
+fi
+if [ "$sub" = "show" ]; then
+  if [ "$5" = "LoadState" ]; then
+    echo "\${SYSTEMCTL_MOCK_LOAD_STATE:-loaded}"
+    exit 0
+  fi
+  if [ "$5" = "Environment" ]; then
+    # PK3-L7-fix4 P1-2：manager 实际加载的 Environment（默认就是**本夹具桥根**，即健康态）
+    if [ -n "\${SYSTEMCTL_MOCK_ENVIRONMENT}" ]; then
+      echo "\${SYSTEMCTL_MOCK_ENVIRONMENT}"
+    else
+      echo "${bridgeEnvLine}"
+    fi
+    exit 0
+  fi
+  if [ -n "\${SYSTEMCTL_MOCK_SHOW}" ]; then
+    echo "\${SYSTEMCTL_MOCK_SHOW}"
+  else
+    echo "${healthyShow}"
+  fi
+  exit 0
+fi
+if [ "$sub" = "daemon-reload" ]; then
+  if [ "\${SYSTEMCTL_MOCK_FAIL_RELOAD}" = "1" ]; then
+    echo "Failed to reload: Bus error" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [ "$sub" = "enable" ]; then
+  if [ "\${SYSTEMCTL_MOCK_FAIL_ENABLE}" = "1" ]; then
+    echo "Failed to enable: Unit masked" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [ "$sub" = "disable" ]; then
+  if [ "\${SYSTEMCTL_MOCK_FAIL_DISABLE}" = "1" ]; then
+    echo "Failed to disable: Access denied" >&2
+    exit 1
+  fi
+  exit 0
+fi
+exit 0
+`;
+  fs.writeFileSync(fakeBin, script, { mode: 0o755 });
+  const readLog = () => {
+    try {
+      return fs.readFileSync(logFile, "utf-8").trim().split("\n").filter(Boolean).map((line) => line.split(/\s+/));
+    } catch {
+      return [];
+    }
+  };
+  return { base, home, codexHome, bridge, runtimeRoot, logFile, fakeBin, readLog, shimNode, drainScript };
+}
+
+test("PK3-L7：enable 写两份 unit 且 argv 序列逐字（daemon-reload → enable --now …，首项 --user）", () => {
+  const fx = linuxDrainFixture();
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  try {
+    let stdout = "";
+    let exitCode = null;
+    runDrainService(["--enable", "--apply"], {
+      home: fx.home,
+      codexHome: fx.codexHome,
+      bridge: fx.bridge,
+      platform: "linux",
+      log: (msg) => { stdout += msg + "\n"; },
+      error: (msg) => { stdout += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 0, "enable 成功退出 0：" + stdout);
+    const paths = codexDrainSystemdPaths(fx.home);
+    assert.ok(fs.existsSync(paths.service), "service 单元必须写入");
+    assert.ok(fs.existsSync(paths.timer), "timer 单元必须写入");
+
+    const sContent = fs.readFileSync(paths.service, "utf-8");
+    assert.match(sContent, /Description=feishu-bridge 兜底发布（Codex 链，drain-all）/u);
+    assert.match(sContent, /Type=oneshot/u);
+    assert.match(sContent, /ExecStart=.*drain-all\.mjs/u);
+    assert.match(sContent, /StandardOutput=append:.*drain\.log/u);
+
+    // PK3-L7-fix2：断言 .service 的 ExecStart 首段等于 resolveNodeForHooks(linux) 的结果（钉住 mise shim）
+    const expectedLinuxNode = resolveNodeForHooks({ homedir: fx.home, platform: "linux" });
+    assert.equal(expectedLinuxNode, fx.shimNode, "linux 下必须优先选中 mise shim");
+    const execStartMatch = /^ExecStart=(.*)$/mu.exec(sContent);
+    assert.ok(execStartMatch, "service 单元必须包含 ExecStart 行");
+    const execStartVal = execStartMatch[1].trim();
+    const execFirstArg = execStartVal.startsWith('"')
+      ? JSON.parse(execStartVal.match(/^"([^"\\]|\\.)*"/u)[0])
+      : execStartVal.split(/\s+/u)[0];
+    assert.equal(execFirstArg, expectedLinuxNode, "service 的 ExecStart 首段必须与 resolveNodeForHooks(linux) 一致（钉住 mise shim）");
+
+    // PK3-L7-fix2：断言 darwin 路径不受影响（不认 linux 的 mise shim，仍走 darwin 偏好/execPath）
+    const expectedDarwinNode = pickDrainNode("darwin", fx.home);
+    assert.notEqual(expectedDarwinNode, fx.shimNode, "darwin 平台绝不选用 linux 的 mise shim");
+    assert.ok(["/opt/homebrew/bin/node", "/usr/local/bin/node", process.execPath].includes(expectedDarwinNode), "darwin 路径不受影响");
+    const dJob = expectedJob({ home: fx.home, platform: "darwin" });
+    assert.equal(dJob.node, expectedDarwinNode);
+    const dPlist = plistBody({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge });
+    assert.doesNotMatch(dPlist, /mise\/shims\/node/u, "darwin plist 绝不包含 linux mise shim");
+
+    const tContent = fs.readFileSync(paths.timer, "utf-8");
+    assert.match(tContent, /Description=feishu-bridge 兜底发布定时器（Codex 链，每 30 分钟）/u);
+    assert.match(tContent, /OnUnitActiveSec=30min/u);
+    assert.match(tContent, /Unit=feishu-bridge-codex-drain\.service/u);
+
+    const calls = fx.readLog();
+    assert.deepEqual(calls, [
+      ["--user", "daemon-reload"],
+      ["--user", "enable", "--now", "feishu-bridge-codex-drain.timer"],
+      // PK3-L7-fix3 P1-3：enable 成功后**再问三道**复核 manager 实态（is-enabled / is-active / show ExecStart）——
+      // 返回 0 不等于真的加载了这份定义。
+      ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
+      ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
+      ["--user", "show", "feishu-bridge-codex-drain.service", "-p", "ExecStart", "--value"],
+      // PK3-L7-fix4 P1-2：复核再加两道 —— manager 实际加载的 LoadState 与 Environment
+      ["--user", "show", "feishu-bridge-codex-drain.service", "-p", "LoadState", "--value"],
+      ["--user", "show", "feishu-bridge-codex-drain.service", "-p", "Environment", "--value"],
+    ], "argv 序列必须逐字一致且首项恒为 --user：" + JSON.stringify(calls));
+    assert.match(stdout, /已启用，定时器已加载（manager 实态已复核/u, stdout);
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+  }
+});
+
+test("PK3-L7：disable 三步顺序（disable --now → 删两份 unit → daemon-reload）", () => {
+  const fx = linuxDrainFixture();
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  try {
+    const paths = codexDrainSystemdPaths(fx.home);
+    fs.mkdirSync(paths.dir, { recursive: true });
+    fs.writeFileSync(paths.service, "service");
+    fs.writeFileSync(paths.timer, "timer");
+
+    let stdout = "";
+    let exitCode = null;
+    runDrainService(["--disable", "--apply"], {
+      home: fx.home,
+      codexHome: fx.codexHome,
+      bridge: fx.bridge,
+      platform: "linux",
+      log: (msg) => { stdout += msg + "\n"; },
+      error: (msg) => { stdout += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 0, "disable 成功退出 0：" + stdout);
+    assert.equal(fs.existsSync(paths.service), false, "service 单元已删");
+    assert.equal(fs.existsSync(paths.timer), false, "timer 单元已删");
+
+    const calls = fx.readLog();
+    assert.deepEqual(calls, [
+      ["--user", "disable", "--now", "feishu-bridge-codex-drain.timer"],
+      ["--user", "daemon-reload"],
+    ], "disable 调用序列必须符合规范：" + JSON.stringify(calls));
+    assert.match(stdout, /已停用/u);
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+  }
+});
+
+test("PK3-L7：disable 失败不删单元、不报已停、退出 1", () => {
+  const fx = linuxDrainFixture();
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  const savedFail = process.env.SYSTEMCTL_MOCK_FAIL_DISABLE;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  process.env.SYSTEMCTL_MOCK_FAIL_DISABLE = "1";
+  try {
+    const paths = codexDrainSystemdPaths(fx.home);
+    fs.mkdirSync(paths.dir, { recursive: true });
+    fs.writeFileSync(paths.service, "service");
+    fs.writeFileSync(paths.timer, "timer");
+
+    let stderr = "";
+    let stdout = "";
+    let exitCode = null;
+    runDrainService(["--disable", "--apply"], {
+      home: fx.home,
+      codexHome: fx.codexHome,
+      bridge: fx.bridge,
+      platform: "linux",
+      log: (msg) => { stdout += msg + "\n"; },
+      error: (msg) => { stderr += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 1, "disable 失败退出 1");
+    assert.ok(fs.existsSync(paths.service), "单元文件未删");
+    assert.ok(fs.existsSync(paths.timer), "单元文件未删");
+    assert.match(stderr, /卸载失败/u);
+    assert.match(stderr, /单元文件没有删/u);
+    assert.doesNotMatch(stdout, /已停用/u);
+    const calls = fx.readLog();
+    assert.equal(calls.some((c) => c.includes("daemon-reload")), false, "disable 失败后决不能调 daemon-reload");
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+    if (savedFail === undefined) delete process.env.SYSTEMCTL_MOCK_FAIL_DISABLE;
+    else process.env.SYSTEMCTL_MOCK_FAIL_DISABLE = savedFail;
+  }
+});
+
+test("PK3-L7：serviceState Linux 四态映射（loaded / installed_not_loaded / absent / unverifiable）及 stale / orphan", () => {
+  const fx = linuxDrainFixture();
+  const paths = codexDrainSystemdPaths(fx.home);
+  const units = codexDrainSystemdUnits({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge });
+  const script = drainScriptPath(fx.home, fx.codexHome);
+  const expectedArgs = [pickDrainNode("linux", fx.home), script];
+  const expectedShow = "{ path=" + expectedArgs[0] + " ; argv[]=" + expectedArgs.join(" ") + " ; ignore_errors=no ; start_time=[n/a] ; status=0/0 }";
+
+  // fix4 P1-2：manager 侧现在要核三道 show（ExecStart / LoadState / Environment），假 runner 按 -p 分流。
+  const mockRunner = ({ enabled = "enabled", active = "active", show = expectedShow, loadState = "loaded",
+    environment = "FEISHU_CODEX_BRIDGE_HOME=" + fx.bridge.replaceAll(" ", "\\x20"), broken = false } = {}) => {
+    return (args) => {
+      if (broken) return { ok: false, out: "", err: "Failed to connect to bus" };
+      const sub = args[1];
+      if (sub === "is-enabled") return { ok: true, out: enabled + "\n" };
+      if (sub === "is-active") return active === "inactive" ? { ok: false, out: "inactive\n", err: "" } : { ok: true, out: active + "\n" };
+      if (sub === "show") {
+        if (args.includes("LoadState")) return { ok: true, out: loadState + "\n" };
+        if (args.includes("Environment")) return { ok: true, out: environment + "\n" };
+        return { ok: true, out: show };
+      }
+      return { ok: true, out: "" };
+    };
+  };
+
+  // 1. absent: 无文件且 systemctl 未在跑
+  const sAbsent = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ enabled: "disabled", active: "inactive" }) });
+  assert.equal(sAbsent.phase, "absent");
+
+  // 2. loaded: 文件存在且投影一致，enabled + active，show 匹配
+  fs.mkdirSync(paths.dir, { recursive: true });
+  fs.writeFileSync(paths.service, units.service);
+  fs.writeFileSync(paths.timer, units.timer);
+  const sLoaded = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ enabled: "enabled", active: "active" }) });
+  assert.equal(sLoaded.phase, "loaded");
+
+  // 3. installed_not_loaded: 文件存在，但 inactive
+  const sNotLoaded = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ enabled: "enabled", active: "inactive" }) });
+  assert.equal(sNotLoaded.phase, "installed_not_loaded");
+
+  // 4. unverifiable: 连不上 bus
+  const sUnverifiable = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ broken: true }) });
+  assert.equal(sUnverifiable.phase, "unverifiable");
+
+  // 5. loaded_other: show 的 ExecStart 与当前预期不一致
+  const sLoadedOther = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ enabled: "enabled", active: "active", show: "{ path=/bin/echo ; argv[]=/bin/echo foo }" }) });
+  assert.equal(sLoadedOther.phase, "loaded_other");
+
+  // 6. stale: 文件存在但内容对不上
+  fs.writeFileSync(paths.service, "stale content");
+  const sStale = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ enabled: "enabled", active: "active" }) });
+  assert.equal(sStale.phase, "stale");
+
+  // 7. orphan: 无文件但 systemd 仍在跑
+  fs.rmSync(paths.service, { force: true });
+  fs.rmSync(paths.timer, { force: true });
+  const sOrphan = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mockRunner({ enabled: "enabled", active: "active" }) });
+  assert.equal(sOrphan.phase, "orphan");
+});
+
+test("PK3-L7：drainTimerCheck / doctor ⑥ Linux 四态映射（loaded / installed_not_loaded / absent / unverifiable）", () => {
+  // loaded -> ok: true
+  const loaded = drainTimerCheck({ platform: "linux", serviceStateFn: () => ({ phase: "loaded" }) });
+  assert.equal(loaded.ok, true);
+  assert.match(loaded.detail, /已加载，正在按计划跑/u);
+
+  // installed_not_loaded -> ok: false
+  const notLoaded = drainTimerCheck({ platform: "linux", serviceStateFn: () => ({ phase: "installed_not_loaded" }) });
+  assert.equal(notLoaded.ok, false);
+  assert.match(notLoaded.detail, /单元已写入但没被 systemd --user 加载/u);
+  assert.ok(notLoaded.next);
+
+  // absent -> ok: null（未启用是安装后默认态，不是故障）
+  const absent = drainTimerCheck({ platform: "linux", serviceStateFn: () => ({ phase: "absent", backlog: { ok: true, total: 0 } }) });
+  assert.equal(absent.ok, null);
+  assert.match(absent.detail, /未启用（安装后的默认态，不是故障）/u);
+  assert.equal(absent.next, null);
+
+  // absent 带积压
+  const absentBacklog = drainTimerCheck({ platform: "linux", serviceStateFn: () => ({ phase: "absent", backlog: { ok: true, total: 5 } }) });
+  assert.equal(absentBacklog.ok, null);
+  assert.match(absentBacklog.detail, /还有 5 条历史积压未分类/u);
+
+  // unverifiable -> ok: null
+  const unverifiable = drainTimerCheck({ platform: "linux", serviceStateFn: () => ({ phase: "unverifiable" }) });
+  assert.equal(unverifiable.ok, null);
+  assert.match(unverifiable.detail, /systemd --user 状态查不出来/u);
+});
+
+test("PK3-L7：沙箱 HOME 不碰真实 systemd（SANDBOXED 未注入返回 unverifiable）", () => {
+  const fx = linuxDrainFixture();
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  try {
+    const st = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux" });
+    assert.equal(st.phase, "unverifiable");
+    assert.match(st.why, /沙箱/u);
+
+    let stdout = "";
+    let exitCode = null;
+    runDrainService(["--enable", "--apply"], {
+      home: fx.home,
+      codexHome: fx.codexHome,
+      bridge: fx.bridge,
+      platform: "linux",
+      log: (msg) => { stdout += msg + "\n"; },
+      error: (msg) => { stdout += msg + "\n"; },
+      exit: (code) => { exitCode = code; },
+    });
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /跳过真实 systemd --user/u);
+  } finally {
+    if (savedSys !== undefined) process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+  }
+});
+
+test("PK3-L7：codex/install.mjs --uninstall 在 Linux 上单元存在时按纪律停并删", () => {
+  const fx = linuxDrainFixture();
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  const savedTimer = process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  process.env.FEISHU_BRIDGE_TIMER_PLATFORM = "linux";
+  try {
+    const paths = codexDrainSystemdPaths(fx.home);
+    fs.mkdirSync(paths.dir, { recursive: true });
+    fs.writeFileSync(paths.service, "service");
+    fs.writeFileSync(paths.timer, "timer");
+
+    const r = spawnSync(process.execPath, [
+      path.join(ROOT, "scripts", "codex", "install.mjs"),
+      "--uninstall", "--apply",
+    ], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        HOME: fx.home,
+        CODEX_HOME: fx.codexHome,
+        FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
+        FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin,
+        FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
+      },
+    });
+    assert.equal(r.status, 0, "uninstall 成功退出 0：" + r.stderr + "\n" + r.stdout);
+    assert.equal(fs.existsSync(paths.service), false, "service 必须被删除");
+    assert.equal(fs.existsSync(paths.timer), false, "timer 必须被删除");
+    const calls = fx.readLog();
+    assert.deepEqual(calls, [
+      // PK3-L7-fix3 P2：先问 manager（不拿「盘上有文件」当前提）
+      // PK3-L7-fix5 P1-3：问两遍 —— 一遍是锁外预览（fix4 P2-1 的诚实预览），一遍是**持锁后重读现场**
+      ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
+      ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
+      ["--user", "show", "feishu-bridge-codex-drain.timer", "-p", "LoadState", "--value"],
+      ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
+      ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
+      ["--user", "show", "feishu-bridge-codex-drain.timer", "-p", "LoadState", "--value"],
+      ["--user", "disable", "--now", "feishu-bridge-codex-drain.timer"],
+      ["--user", "daemon-reload"],
+    ]);
+    assert.match(r.stdout, /已停用并删除 systemd 单元/u);
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+    if (savedTimer === undefined) delete process.env.FEISHU_BRIDGE_TIMER_PLATFORM;
+    else process.env.FEISHU_BRIDGE_TIMER_PLATFORM = savedTimer;
+  }
+});
+
+// ── PK3-L7-fix3：Codex 四轮（配额中断前已形成）3 P1 + 1 P2 的常驻反例 ──
+
+// 反例转红：把 pickNode 的 linux 分支改回 `try { … } catch { return process.execPath }`，
+//   本用例会在「exitCode === 1」与「单元文件零创建 / manager 一次没碰」三处红 ——
+//   回退时它会拿当前进程的 node 把两份单元写出来、并去 daemon-reload。
+test("PK3-L7-fix3 P1-1：linux 解不出 node 就硬失败（exit 1、零写、不碰 manager），绝不退回 process.execPath", () => {
+  const fx = linuxDrainFixture();
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  const savedNode = process.env.FEISHU_BRIDGE_NODE;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  process.env.FEISHU_BRIDGE_NODE = path.join(fx.base, "nope", "node");   // 不存在 → 解析必失败
+  try {
+    // ① 函数本身抛（不再静默回退）
+    assert.throws(() => pickDrainNode("linux", fx.home), /FEISHU_BRIDGE_NODE 指的路径不可用/u);
+    // ② --enable --apply 当场拒绝：exit 1、原因原话 + 指路、零写、manager 一次没碰
+    let stdout = "";
+    let stderr = "";
+    let exitCode = null;
+    runDrainService(["--enable", "--apply"], {
+      home: fx.home, codexHome: fx.codexHome, platform: "linux",
+      log: (m) => { stdout += m + "\n"; }, error: (m) => { stderr += m + "\n"; },
+      exit: (c) => { exitCode = c; },
+    });
+    assert.equal(exitCode, 1, "解不出 node 必须硬失败：" + stdout + stderr);
+    assert.match(stderr, /FEISHU_BRIDGE_NODE 指的路径不可用/u, "要带出 resolveNodeForHooks 的原话：" + stderr);
+    assert.match(stderr, /mise shim/u, "要指路（装 mise shim 或设 FEISHU_BRIDGE_NODE）：" + stderr);
+    assert.match(stderr, /不会退回当前进程的 node/u, stderr);
+    const paths = codexDrainSystemdPaths(fx.home);
+    assert.equal(fs.existsSync(paths.service), false, "零写：service 不许创建");
+    assert.equal(fs.existsSync(paths.timer), false, "零写：timer 不许创建");
+    assert.deepEqual(fx.readLog(), [], "解不出 node 就一次 manager 都不许碰：" + JSON.stringify(fx.readLog()));
+    assert.doesNotMatch(stdout, /已启用/u);
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+    if (savedNode === undefined) delete process.env.FEISHU_BRIDGE_NODE;
+    else process.env.FEISHU_BRIDGE_NODE = savedNode;
+  }
+});
+
+// 反例转红：把 serviceState linux 分支里 diskNodeMissing 那一支删掉（或把 unitFirstArg 换成不读文件），
+//   本用例会在「phase === stale」与「why 含那个不存在的路径」两处红 —— 删掉后它是 loaded_other（或 loaded）。
+test("PK3-L7-fix3 P1-1：单元里的 node 已被升级清掉 → 状态 stale 并点名那个路径（doctor ⑥ 也看得到）", () => {
+  const fx = linuxDrainFixture();
+  const paths = codexDrainSystemdPaths(fx.home);
+  const units = codexDrainSystemdUnits({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge });
+  const deadNode = path.join(fx.base, "mise", "installs", "node", "26", "bin", "node");   // 升级清掉的那种形状
+  const expectedArgs = [fx.shimNode, fx.drainScript];
+  const mock = (args) => {
+    const sub = args[1];
+    if (sub === "is-enabled") return { ok: true, out: "enabled\n" };
+    if (sub === "is-active") return { ok: true, out: "active\n" };
+    if (sub === "show") {
+      if (args.includes("LoadState")) return { ok: true, out: "loaded\n" };
+      if (args.includes("Environment")) return { ok: true, out: "FEISHU_CODEX_BRIDGE_HOME=" + fx.bridge.replaceAll(" ", "\\x20") + "\n" };
+      return { ok: true, out: "{ path=" + expectedArgs[0] + " ; argv[]=" + expectedArgs.join(" ") + " ; ignore_errors=no }" };
+    }
+    return { ok: true, out: "" };
+  };
+  // 对照：磁盘就是投影本身 → loaded（证明下面那次 stale 是“改掉 ExecStart 才出的”）
+  fs.mkdirSync(paths.dir, { recursive: true });
+  fs.writeFileSync(paths.service, units.service);
+  fs.writeFileSync(paths.timer, units.timer);
+  assert.equal(serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mock }).phase, "loaded");
+  // 改掉单元里的 node（其余不动）→ manager 一切正常，但那个路径已经不存在
+  const broken = units.service.replace(/^ExecStart=.*$/mu, "ExecStart=" + deadNode + " " + units.service.match(/^ExecStart=(.*)$/mu)[1].split(" ").slice(1).join(" "));
+  assert.match(broken, new RegExp(deadNode.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  fs.writeFileSync(paths.service, broken);
+  const st = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mock });
+  assert.equal(st.phase, "stale", "单元里的 node 不存在必须报 stale（不是 loaded、也不是查不清）：" + JSON.stringify(st.phase) + " / " + st.why);
+  assert.ok(st.why.includes(deadNode), "why 要点名那个不存在的路径：" + st.why);
+  assert.equal(fs.existsSync(deadNode), false, "夹具保证它真的不存在（否则这条反例没验到东西）");
+  // doctor ⑥ 的 detail 也要带出这个路径（否则人只看到「对不上（要重装）」）
+  const check = drainTimerCheck({ platform: "linux", serviceStateFn: () => st });
+  assert.equal(check.ok, false);
+  assert.ok(String(check.detail).includes(deadNode), "doctor ⑥ 的面要把路径写出来：" + check.detail);
+});
+
+// 反例转红：删掉 codexDrainSystemdUnits 里那行 Environment=FEISHU_CODEX_BRIDGE_HOME=，
+//   本用例在第一处（该行必须存在）与第三处（同值）红；
+//   把这一行从投影比对里排除掉（只比 ExecStart），第四处「改掉磁盘那一行 → stale」会红。
+test("PK3-L7-fix3 P1-2：linux 单元固化 FEISHU_CODEX_BRIDGE_HOME（与 darwin plist 同值同源），改这一行判漂移", () => {
+  const fx = linuxDrainFixture("pk3l7-fix3-space-", { codexHomeName: "My Codex Home" });   // 含空格的路径
+  const units = codexDrainSystemdUnits({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge });
+  const line = /^Environment=FEISHU_CODEX_BRIDGE_HOME=(.*)$/mu.exec(units.service);
+  assert.ok(line, "[Service] 里必须有 Environment=FEISHU_CODEX_BRIDGE_HOME：\n" + units.service);
+  const bridgeRoot = fx.bridge;
+  assert.equal(line[1], JSON.stringify(bridgeRoot), "含空格的路径要按 systemd 的引用规则写：" + line[1]);
+  const plistBridge = /<key>FEISHU_CODEX_BRIDGE_HOME<\/key><string>([^<]*)<\/string>/u.exec(
+    plistBody({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, node: "/usr/bin/node" }));
+  assert.ok(plistBridge, "darwin plist 里也应该有这一条");
+  assert.equal(line[1], JSON.stringify(plistBridge[1]), "两条链（plist / systemd）必须是同一个值、同一来源");
+  // 状态比对：磁盘是投影 → loaded；把磁盘那一行改掉 → stale
+  const paths = codexDrainSystemdPaths(fx.home);
+  const expectedArgs = [fx.shimNode, fx.drainScript];
+  const mock = (args) => {
+    const sub = args[1];
+    if (sub === "is-enabled") return { ok: true, out: "enabled\n" };
+    if (sub === "is-active") return { ok: true, out: "active\n" };
+    if (sub === "show") {
+      if (args.includes("LoadState")) return { ok: true, out: "loaded\n" };
+      if (args.includes("Environment")) return { ok: true, out: "FEISHU_CODEX_BRIDGE_HOME=" + fx.bridge.replaceAll(" ", "\\x20") + "\n" };
+      return { ok: true, out: "{ path=" + expectedArgs[0] + " ; argv[]=" + expectedArgs.join(" ") + " ; ignore_errors=no }" };
+    }
+    return { ok: true, out: "" };
+  };
+  fs.mkdirSync(paths.dir, { recursive: true });
+  fs.writeFileSync(paths.service, units.service);
+  fs.writeFileSync(paths.timer, units.timer);
+  assert.equal(serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mock }).phase, "loaded");
+  const otherHome = JSON.stringify(path.join(fx.base, "别的家", "feishu-bridge"));
+  fs.writeFileSync(paths.service, units.service.replace(/^Environment=.*$/mu, "Environment=FEISHU_CODEX_BRIDGE_HOME=" + otherHome));
+  const st = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mock });
+  assert.equal(st.phase, "stale", "桥根变了一定要判漂移（否则 drain 会去默认 ~/.codex/feishu-bridge 找状态）：" + st.why);
+});
+
+// 反例转红：删掉 enable 成功后那次 serviceStateFn 复核（直接打印「已加载」），
+//   本用例第一半会在 exitCode（期望 1、实得 0）与 doesNotMatch(/已启用，定时器已加载/) 两处红。
+test("PK3-L7-fix3 P1-3：enable --now 返回 0 但 manager 实态不对 → 非 0、点名哪一道、不说「已加载」", () => {
+  const cases = [
+    { name: "is-active 说 inactive", env: { SYSTEMCTL_MOCK_IS_ACTIVE: "inactive" }, want: /未 active|没被 systemd --user 加载/u },
+    { name: "show 回的是旧定义", env: { SYSTEMCTL_MOCK_SHOW: "{ path=/bin/echo ; argv[]=/bin/echo foo }" }, want: /ExecStart 与当前配置不一致/u },
+  ];
+  for (const c of cases) {
+    const fx = linuxDrainFixture();
+    const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    const savedEnv = Object.fromEntries(Object.keys(c.env).map((k) => [k, process.env[k]]));
+    process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+    for (const [k, v] of Object.entries(c.env)) process.env[k] = v;
+    try {
+      let stdout = "";
+      let stderr = "";
+      let exitCode = null;
+      runDrainService(["--enable", "--apply"], {
+        home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux",
+        log: (m) => { stdout += m + "\n"; }, error: (m) => { stderr += m + "\n"; },
+        exit: (code) => { exitCode = code; },
+      });
+      const all = stdout + stderr;
+      assert.equal(exitCode, 1, c.name + " → 复核不过必须非 0：" + all);
+      assert.match(all, c.want, c.name + " → 要点名是哪一道不过：" + all);
+      assert.doesNotMatch(all, /已启用，定时器已加载/u, c.name + " → 不许说「已加载」：" + all);
+      // 复核是在写盘之后：单元确实写了（不是「没写成功」的错）
+      assert.equal(fs.existsSync(codexDrainSystemdPaths(fx.home).service), true, c.name);
+    } finally {
+      if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+      else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+});
+
+// 反例转红：把 install.mjs 卸载段的条件改回 `fs.existsSync(service) || fs.existsSync(timer)`，
+//   「收孤儿」那一半会在「disable --now 被调用」与「输出含 收了一个孤儿 timer」两处红。
+test("PK3-L7-fix3 P2：卸载收 manager 里的孤儿 timer（盘上没文件也 disable --now）", () => {
+  const uninstallWith = (fx, env) => spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply",
+  ], {
+    encoding: "utf-8",
+    env: {
+      ...process.env,
+      HOME: fx.home,
+      CODEX_HOME: fx.codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
+      FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin,
+      FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
+      ...env,
+    },
+  });
+  // ① 孤儿：盘上两份 unit 都不在，manager 里还记着它（enabled 已丢、但 LoadState=loaded）
+  const orphan = linuxDrainFixture();
+  const r1 = uninstallWith(orphan, {
+    SYSTEMCTL_MOCK_IS_ENABLED: "disabled", SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "loaded",
+  });
+  assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+  const probeCalls = [
+    ["--user", "is-enabled", "feishu-bridge-codex-drain.timer"],
+    ["--user", "is-active", "feishu-bridge-codex-drain.timer"],
+    ["--user", "show", "feishu-bridge-codex-drain.timer", "-p", "LoadState", "--value"],
+  ];
+  assert.deepEqual(orphan.readLog(), [
+    // fix5 P1-3：探询**两遍**（锁外预览 + 持锁后重读现场）
+    ...probeCalls, ...probeCalls,
+    ["--user", "disable", "--now", "feishu-bridge-codex-drain.timer"],
+    ["--user", "daemon-reload"],
+  ], "孤儿也要 disable --now 收干净：" + JSON.stringify(orphan.readLog()));
+  assert.match(r1.stdout, /收了一个孤儿 timer/u, r1.stdout);
+  assert.equal(fs.existsSync(codexDrainSystemdPaths(orphan.home).timer), false);
+
+  // ② 对照：manager 与磁盘都没有 → 只问不问，不 disable、不 daemon-reload
+  const clean = linuxDrainFixture();
+  const r2 = uninstallWith(clean, {
+    SYSTEMCTL_MOCK_IS_ENABLED: "disabled", SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "not-found",
+  });
+  assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+  const calls = clean.readLog();
+  assert.equal(calls.some((c) => c.includes("disable")), false, "本来就没有 → 不许 disable：" + JSON.stringify(calls));
+  assert.equal(calls.some((c) => c.includes("daemon-reload")), false, "本来就没有 → 不许 daemon-reload：" + JSON.stringify(calls));
+  assert.doesNotMatch(r2.stdout, /收了一个孤儿 timer/u, r2.stdout);
+});
+
+// ── PK3-L7-fix4：Codex 二轮 2 P1 + 2 P2 的常驻反例 ──────────────────────────────────
+
+// 拿掉哪行会红：把 plistBody / codexDrainSystemdUnits 里的 `bridge` 入参去掉（改回从 codexHome 推导），
+//   本用例的投影断言与 e2e 两半都会红 —— 写出来的是 <CODEX_HOME>/feishu-bridge，而显式变量指到别处。
+test("PK3-L7-fix4 P1-1：显式 FEISHU_CODEX_BRIDGE_HOME 真进两种投影（unit 的 Environment= / plist 的 EnvironmentVariables）", () => {
+  const fx = linuxDrainFixture();
+  const explicit = path.join(fx.base, "explicit-bridge");
+  const savedBridge = process.env.FEISHU_CODEX_BRIDGE_HOME;
+  const savedMockEnv = process.env.SYSTEMCTL_MOCK_ENVIRONMENT;
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  process.env.FEISHU_CODEX_BRIDGE_HOME = explicit;
+  process.env.SYSTEMCTL_MOCK_ENVIRONMENT = "FEISHU_CODEX_BRIDGE_HOME=" + explicit;   // manager 里加载的就是显式那份
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  try {
+    // ① 派生优先级：显式值 > codexHome/feishu-bridge（规则只有一份，codex/state.mjs 的 bridgeHome）
+    assert.equal(codexBridgeOf({ codexHome: fx.codexHome, env: { FEISHU_CODEX_BRIDGE_HOME: explicit } }), explicit);
+    assert.equal(codexBridgeOf({ codexHome: fx.codexHome, env: {} }), path.join(fx.codexHome, "feishu-bridge"), "对照：不设变量 → codexHome/feishu-bridge");
+
+    // ② 两种投影（不传 bridge，让它们自己从 env 派生 —— 这正是 omm 上真实发生的那条路）
+    const units = codexDrainSystemdUnits({ home: fx.home, codexHome: fx.codexHome });
+    const envLine = /^Environment=FEISHU_CODEX_BRIDGE_HOME=(.*)$/mu.exec(units.service);
+    assert.ok(envLine, units.service);
+    // unit 那侧按 systemd 的引用规则写（无空格就是裸词，含空格/引号才加引号）；plist 那侧是 XML 裸值
+    const unquote = (v) => (v.startsWith('"') ? JSON.parse(v) : v);
+    assert.equal(unquote(envLine[1]), explicit, "unit 的 Environment= 要写显式桥根：" + envLine[1]);
+    const plist = plistBody({ home: fx.home, codexHome: fx.codexHome });
+    const plistBridge = /<key>FEISHU_CODEX_BRIDGE_HOME<\/key><string>([^<]*)<\/string>/u.exec(plist)[1];
+    assert.equal(plistBridge, explicit, "plist 的 EnvironmentVariables 要写显式桥根：" + plistBridge);
+    assert.equal(unquote(envLine[1]), plistBridge, "两条链必须同一个值、同一来源");
+
+    // ③ e2e：enable 全程不传 bridge 参数（只能从 env 派生），写出的 unit 与 manager 实态都对得上 → 0 且「已加载」
+    //    状态根也得在显式目录里（否则 backlog / 链路预检读不到登记表 → enable 被拦，验证就变成另一件事了）。
+    fs.mkdirSync(explicit, { recursive: true });
+    for (const f of ["registry.json", "chain-config.json"]) {
+      fs.copyFileSync(path.join(fx.bridge, f), path.join(explicit, f));
+    }
+    let stdout = "";
+    let exitCode = null;
+    runDrainService(["--enable", "--apply"], {
+      home: fx.home, codexHome: fx.codexHome, platform: "linux",
+      log: (m) => { stdout += m + "\n"; }, error: (m) => { stdout += m + "\n"; },
+      exit: (c) => { exitCode = c; },
+    });
+    assert.equal(exitCode, 0, "显式桥根下 enable 要能装上并复核通过：" + stdout);
+    assert.match(stdout, /已启用，定时器已加载（manager 实态已复核/u, stdout);
+    const written = fs.readFileSync(codexDrainSystemdPaths(fx.home).service, "utf-8");
+    assert.equal(unquote(/^Environment=FEISHU_CODEX_BRIDGE_HOME=(.*)$/mu.exec(written)[1]), explicit, written);
+  } finally {
+    if (savedBridge === undefined) delete process.env.FEISHU_CODEX_BRIDGE_HOME;
+    else process.env.FEISHU_CODEX_BRIDGE_HOME = savedBridge;
+    if (savedMockEnv === undefined) delete process.env.SYSTEMCTL_MOCK_ENVIRONMENT;
+    else process.env.SYSTEMCTL_MOCK_ENVIRONMENT = savedMockEnv;
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+  }
+});
+
+// 拿掉哪行会红：删掉 serviceState linux 分支里的 loadProbe / envProbe 两道（只复核 ExecStart），
+//   前两半会红（enable 变成 exit 0 且打出「已启用，定时器已加载」）；doctor 那一半也会红。
+test("PK3-L7-fix4 P1-2：enable 复核补 LoadState 与 Environment 两道（doctor 也是同一份判据）", () => {
+  const cases = [
+    { name: "LoadState=bad-setting", env: { SYSTEMCTL_MOCK_LOAD_STATE: "bad-setting" }, want: /LoadState=bad-setting/u },
+    { name: "Environment 是旧桥根", env: { SYSTEMCTL_MOCK_ENVIRONMENT: "FEISHU_CODEX_BRIDGE_HOME=/old/bridge" }, want: /FEISHU_CODEX_BRIDGE_HOME=\/old\/bridge 与投影/u },
+  ];
+  for (const c of cases) {
+    const fx = linuxDrainFixture();
+    const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    const savedEnv = Object.fromEntries(Object.keys(c.env).map((k) => [k, process.env[k]]));
+    process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+    for (const [k, v] of Object.entries(c.env)) process.env[k] = v;
+    try {
+      let out = "";
+      let exitCode = null;
+      runDrainService(["--enable", "--apply"], {
+        home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux",
+        log: (m) => { out += m + "\n"; }, error: (m) => { out += m + "\n"; },
+        exit: (code) => { exitCode = code; },
+      });
+      assert.equal(exitCode, 1, c.name + " → 复核不过必须非 0：" + out);
+      assert.match(out, c.want, c.name + " → 要点名是哪一道不符：" + out);
+      assert.doesNotMatch(out, /已启用，定时器已加载/u, c.name + " → 不许说「已加载」：" + out);
+    } finally {
+      if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+      else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  // 对照：三道都对 → 0 且「已加载」（既有 enable 用例也钉着这条，这里保证“三道都过才绿”在同一条用例里可比）
+  {
+    const fx = linuxDrainFixture();
+    const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+    try {
+      let out = "";
+      let exitCode = null;
+      runDrainService(["--enable", "--apply"], {
+        home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux",
+        log: (m) => { out += m + "\n"; }, error: (m) => { out += m + "\n"; },
+        exit: (code) => { exitCode = code; },
+      });
+      assert.equal(exitCode, 0, out);
+      assert.match(out, /已启用，定时器已加载（manager 实态已复核/u, out);
+    } finally {
+      if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+      else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+    }
+  }
+
+  // doctor：同一个坏现场 → 同一份函数给出的结论（不另写一份判据）
+  {
+    const fx = linuxDrainFixture();
+    const paths = codexDrainSystemdPaths(fx.home);
+    const units = codexDrainSystemdUnits({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge });
+    const expectedArgs = [fx.shimNode, fx.drainScript];
+    const mock = (args) => {
+      const sub = args[1];
+      if (sub === "is-enabled") return { ok: true, out: "enabled\n" };
+      if (sub === "is-active") return { ok: true, out: "active\n" };
+      if (sub === "show") {
+        if (args.includes("LoadState")) return { ok: true, out: "bad-setting\n" };   // 单元起不来，却 enabled+active
+        if (args.includes("Environment")) return { ok: true, out: "FEISHU_CODEX_BRIDGE_HOME=" + fx.bridge + "\n" };
+        return { ok: true, out: "{ path=" + expectedArgs[0] + " ; argv[]=" + expectedArgs.join(" ") + " ; ignore_errors=no }" };
+      }
+      return { ok: true, out: "" };
+    };
+    fs.mkdirSync(paths.dir, { recursive: true });
+    fs.writeFileSync(paths.service, units.service);
+    fs.writeFileSync(paths.timer, units.timer);
+    const st = serviceState({ home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux", systemctlFn: mock });
+    assert.notEqual(st.phase, "loaded", JSON.stringify(st.phase) + " / " + st.why);
+    assert.match(String(st.why), /LoadState=bad-setting/u, st.why);
+    const check = drainTimerCheck({ platform: "linux", serviceStateFn: () => st });
+    assert.equal(check.ok, false, JSON.stringify(check));
+    assert.match(String(check.detail), /LoadState=bad-setting/u, check.detail);
+  }
+
+  // 解析器：manager 报 Environment 的三种形状都要认得（带空格 / 带引号 / C 风格转义）
+  assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a/b/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a/b/c");
+  assert.equal(systemdEnvValue('PATH=/usr/bin FEISHU_CODEX_BRIDGE_HOME="/a b/c"', "FEISHU_CODEX_BRIDGE_HOME"), "/a b/c");
+  assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a\\x20b/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a b/c");
+  assert.equal(systemdEnvValue("PATH=/usr/bin", "FEISHU_CODEX_BRIDGE_HOME"), null, "没有这个变量 → null（不是空串）");
+  // PK3-L7-fix7（Codex 四轮 P2）：字面反斜杠只解码一次 —— 拿掉"先拆 = 再各解码一次"改回整项先解码，下面两条会得到 /ab/c
+  assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a\\\\b/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a\\b/c", "systemd 把字面反斜杠写成 \\\\，解一次得 /a\\b/c");
+  assert.equal(systemdEnvValue("FEISHU_CODEX_BRIDGE_HOME=/a\\x5cb/c", "FEISHU_CODEX_BRIDGE_HOME"), "/a\\b/c", "\\x5c 形式也只解一次");
+  assert.equal(systemdEnvValue('"FEISHU_CODEX_BRIDGE_HOME=/a\\\\b c"', "FEISHU_CODEX_BRIDGE_HOME"), "/a\\b c", "整条加引号 + 反斜杠 + 空格");
+});
+
+// 拿掉哪行会红：把 systemdTimerLookup 换回 fix3 的 true/false（unverifiable 折成 false）→ 第二半红
+//   （dry-run 说「未启用」而 apply 静默跳过）；把预览改回只看盘上文件 → 第一半红。
+test("PK3-L7-fix4 P2-1：卸载的 manager 查询是三态 —— 预览孤儿、unverifiable 预览与 apply 同一句话", () => {
+  const uninstall = (fx, args, env = {}) => spawnSync(process.execPath, [
+    path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", ...args,
+  ], {
+    encoding: "utf-8",
+    env: {
+      ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
+      FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...env,
+    },
+  });
+
+  // ① manager 里有、盘上零文件 → 预览说**孤儿**且零写；apply 真的 disable --now + daemon-reload
+  const orphan = linuxDrainFixture();
+  fs.rmSync(codexDrainSystemdPaths(orphan.home).dir, { recursive: true, force: true });
+  const before = (() => { const out = []; const walk = (d) => { for (const n of fs.readdirSync(d).sort()) { const p = path.join(d, n); const st = fs.lstatSync(p); if (st.isDirectory()) walk(p); else out.push(path.relative(orphan.home, p)); } }; walk(orphan.home); return out.join("\n"); })();
+  const dry = uninstall(orphan, []);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.match(dry.stdout, /将停用 manager 中的\*\*孤儿 timer\*\*/u, dry.stdout);
+  const after = (() => { const out = []; const walk = (d) => { for (const n of fs.readdirSync(d).sort()) { const p = path.join(d, n); const st = fs.lstatSync(p); if (st.isDirectory()) walk(p); else out.push(path.relative(orphan.home, p)); } }; walk(orphan.home); return out.join("\n"); })();
+  assert.equal(after, before, "dry-run 必须零写");
+  // fix4 P2-1：dry-run **要**问 manager（这就是预览与执行一致的前提），但只能问、不能动
+  assert.deepEqual(orphan.readLog().map((c) => c[1]), ["is-enabled", "is-active", "show"],
+    "dry-run 只发只读探询（is-enabled / is-active / show LoadState）：" + JSON.stringify(orphan.readLog()));
+  const applied = uninstall(orphan, ["--apply"]);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  const calls = orphan.readLog();
+  assert.ok(calls.some((c) => c.includes("disable") && c.includes("--now")), "apply 要 disable --now：" + JSON.stringify(calls));
+  assert.ok(calls.some((c) => c.includes("daemon-reload")), "apply 要 daemon-reload：" + JSON.stringify(calls));
+  assert.match(applied.stdout, /收了一个孤儿 timer/u, applied.stdout);
+
+  // ② unverifiable（manager 查不了）→ 预览与 apply 说同一句话；apply 拒且零写
+  const unclear = linuxDrainFixture();
+  const busFail = path.join(unclear.base, "systemctl-bus-fail");
+  fs.writeFileSync(busFail, "#!/bin/sh\necho \"Failed to connect to bus: No such file or directory\" >&2\nexit 1\n", { mode: 0o755 });
+  const unclearPaths = codexDrainSystemdPaths(unclear.home);
+  fs.mkdirSync(unclearPaths.dir, { recursive: true });
+  fs.writeFileSync(unclearPaths.service, "service");
+  fs.writeFileSync(unclearPaths.timer, "timer");
+  const dry2 = uninstall(unclear, [], { FEISHU_BRIDGE_SYSTEMCTL: busFail });
+  assert.equal(dry2.status, 0, dry2.stdout + dry2.stderr);
+  assert.match(dry2.stdout, /manager 查不清/u, dry2.stdout);
+  const applied2 = uninstall(unclear, ["--apply"], { FEISHU_BRIDGE_SYSTEMCTL: busFail });
+  assert.notEqual(applied2.status, 0, "查不清就不许静默跳过：" + applied2.stdout + applied2.stderr);
+  assert.match(applied2.stderr, /manager 查不清/u, applied2.stderr);
+  assert.match(applied2.stderr, /什么都没动/u, applied2.stderr);
+  assert.equal(fs.existsSync(unclearPaths.service), true, "拒的时候盘上那两份 unit 也不许删（查不清就不动）");
+
+  // ③ 对照：manager 与盘上都没有 → 「未启用（默认）」且 apply 不 disable
+  const clean = linuxDrainFixture();
+  fs.rmSync(codexDrainSystemdPaths(clean.home).dir, { recursive: true, force: true });
+  const cleanEnv = { SYSTEMCTL_MOCK_IS_ENABLED: "disabled", SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "not-found" };
+  const dry3 = uninstall(clean, [], cleanEnv);
+  assert.match(dry3.stdout, /未启用（默认）/u, dry3.stdout);
+  const applied3 = uninstall(clean, ["--apply"], cleanEnv);
+  assert.equal(applied3.status, 0, applied3.stdout + applied3.stderr);
+  assert.equal(clean.readLog().some((c) => c.includes("disable")), false, "本来就没有 → 不 disable：" + JSON.stringify(clean.readLog()));
+});
+
+// 拿掉哪行会红：把 codexBridgeOf 的 codexHome 默认值改回自调用（或让它变可选）→ 第一条断言红
+//   （旧写法不传参是 RangeError 爆栈，现在必须是明确的错）。
+test("PK3-L7-fix4 P2-2：codexBridgeOf 不再有自调用的默认参数（不传 codexHome 明确报错，不爆栈）", () => {
+  let err = null;
+  try { codexBridgeOf(); } catch (e) { err = e; }
+  assert.ok(err instanceof Error, "不传 codexHome 必须明确抛错");
+  assert.equal(err instanceof RangeError, false, "不许是 RangeError（自调用爆栈的形状）：" + err.message);
+  assert.match(err.message, /需要显式的 codexHome/u, err.message);
+  // 正常路径照旧
+  assert.equal(codexBridgeOf({ codexHome: "/a/.codex", env: {} }), "/a/.codex/feishu-bridge");
+  assert.equal(codexBridgeOf({ codexHome: "/a/.codex", env: { FEISHU_CODEX_BRIDGE_HOME: "/explicit" } }), "/explicit");
+  assert.throws(() => codexBridgeOf({ codexHome: "/a/.codex", env: { FEISHU_CODEX_BRIDGE_HOME: "relative/path" } }),
+    /必须是绝对路径/u, "显式变量是相对路径 → 抛（与 bridgeHome 同一条纪律）");
+});
+
+// ── PK3-L7-fix5：Codex 三轮 3 P1 的常驻反例 ─────────────────────────────────────────
+
+// 拿掉哪行会红：把 `LINUX_DRAIN` 改回“uninstall 就构造”（模块级无条件），本用例会红在
+//   「darwin 预览/卸载退出 0」与「systemctl 调用次数 = 0」两处 —— 假 systemctl 一律失败，
+//   就像真 Mac 上没有 systemd 那样。
+test("PK3-L7-fix5 P1-1：darwin 卸载/预览一次 systemctl 都不调（Mac 真机回归）", () => {
+  const fx = linuxDrainFixture();
+  const counter = path.join(fx.base, "sys-count.txt");
+  const fake = path.join(fx.base, "sys-no-systemd");
+  fs.writeFileSync(fake,
+    "#!/bin/sh\necho x >> " + JSON.stringify(counter) + "\necho 'System has not been booted with systemd as init system' >&2\nexit 1\n",
+    { mode: 0o755 });
+  const baseEnv = { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
+    FEISHU_BRIDGE_SYSTEMCTL: fake };
+  const run = (args, extra) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), ...args],
+    { encoding: "utf-8", env: { ...baseEnv, ...extra } });
+
+  // ① darwin 预览：一次都不调 systemctl，退出 0
+  const dry = run(["--uninstall"], { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin" });
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.equal(fs.existsSync(counter), false, "darwin 预览不许调 systemctl：" + dry.stdout);
+  assert.match(dry.stdout, /兜底排空/u, dry.stdout);
+
+  // ② darwin 卸载：同样一次不调（旧版会因为 unverifiable 在任何动作前 exit 1）
+  const ap = run(["--uninstall", "--apply"], { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin" });
+  assert.equal(ap.status, 0, ap.stdout + ap.stderr);
+  assert.equal(fs.existsSync(counter), false, "darwin 卸载不许调 systemctl：" + ap.stdout + ap.stderr);
+  assert.match(ap.stdout, /已完成本地卸载/u, ap.stdout);
+
+  // ③ 对照：同一个夹具在 linux 下照旧问 manager（计数器证明这个假二进制确实会被调到）
+  const lx = run(["--uninstall"], { FEISHU_BRIDGE_TIMER_PLATFORM: "linux", SYSTEMCTL_MOCK_IS_ENABLED: "disabled",
+    SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "not-found" });
+  assert.equal(lx.status, 0, lx.stdout + lx.stderr);
+  assert.equal(fs.existsSync(counter), true, "linux 下应当真的去问 manager（对照）：" + lx.stdout);
+});
+
+// 拿掉哪行会红：把 systemdEnvValue 换回 fix4 的旧解析（只认 NAME=value / NAME="value" / \x20），
+//   「整条加引号」那条会返回 null（断言红），含空格合法桥根的 enable 也会红在 exit 1（误报 loaded_other）。
+test("PK3-L7-fix5 P1-2：Environment 按 systemd shell_maybe_quote 的真实形状解析（四种常驻 + 含空格桥根）", () => {
+  const NAME = "FEISHU_CODEX_BRIDGE_HOME";
+  const shapes = [
+    ["裸值", "PATH=/usr/bin " + NAME + "=/a/b/c", "/a/b/c"],
+    ["整条加引号（含空格）", '"' + NAME + '=/a b/c" PATH=/usr/bin', "/a b/c"],
+    ["NAME=\"value\"", NAME + '="/a b/c"', "/a b/c"],
+    ["\\x20 转义", NAME + "=/a\\x20b/c", "/a b/c"],
+    ["多变量并列 + 值里带 =", "PATH=/a=b " + NAME + "=/x", "/x"],
+    ["空值", NAME + "=", ""],
+    ["没有这个变量", "PATH=/usr/bin", null],
+  ];
+  for (const [label, text, want] of shapes) {
+    assert.equal(systemdEnvValue(text, NAME), want, label + "：" + JSON.stringify(text));
+  }
+  assert.deepEqual(shellQuoteItems('"A=1 2" B=3'), ["A=1 2", "B=3"], "拆项：整条加引号 + 裸值");
+
+  // 含空格的**合法桥根**：manager 报的是真实形状（整条加引号）→ 必须 loaded，不许 loaded_other
+  const fx = linuxDrainFixture("pk3l7-fix5-space-", { codexHomeName: "My Codex Home" });
+  const savedSys = process.env.FEISHU_BRIDGE_SYSTEMCTL;
+  const savedEnv = process.env.SYSTEMCTL_MOCK_ENVIRONMENT;
+  process.env.FEISHU_BRIDGE_SYSTEMCTL = fx.fakeBin;
+  process.env.SYSTEMCTL_MOCK_ENVIRONMENT = '"' + NAME + "=" + fx.bridge + '"';
+  try {
+    let out = "";
+    let exitCode = null;
+    runDrainService(["--enable", "--apply"], {
+      home: fx.home, codexHome: fx.codexHome, bridge: fx.bridge, platform: "linux",
+      log: (m) => { out += m + "\n"; }, error: (m) => { out += m + "\n"; }, exit: (c) => { exitCode = c; },
+    });
+    assert.equal(exitCode, 0, "含空格的合法桥根不许误报漂移：" + out);
+    assert.match(out, /已启用，定时器已加载/u, out);
+  } finally {
+    if (savedSys === undefined) delete process.env.FEISHU_BRIDGE_SYSTEMCTL;
+    else process.env.FEISHU_BRIDGE_SYSTEMCTL = savedSys;
+    if (savedEnv === undefined) delete process.env.SYSTEMCTL_MOCK_ENVIRONMENT;
+    else process.env.SYSTEMCTL_MOCK_ENVIRONMENT = savedEnv;
+  }
+});
+
+// 拿掉哪行会红（四条都**实测**过，各自红在点名的那条断言上）：
+//   · `acquireInstallSurfaceLockOrRefuse` 那次取锁 → ② 红在 `bRun.status`（期望 2、实得 0）；
+//   · 锁内那次维护门复核 → ① 红在 `aRun.code`（期望 2、实得 0 —— 它会写完单元再出口 0）；
+//   · finally 里的 `refused.lock.release()` → ① 红在「锁要交还（不许留 stale lock）」；
+//   · 把现场计算挪到 hooks.beforeScene 之前（拿旧快照执行）→ ③ 红在「动作要报准」（实得 action:"none"）。
+// **PK3-L7-fix6**：交错注入改走**函数参数**（`hooks.beforeLock` / `hooks.beforeScene`）—— 旧版那两个
+//   "设了环境变量就在锁外跑任意 .mjs"的注入点已删除（生产可达，与 U1 四轮 P1-1 同类）。
+test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门 + 锁内重读现场，函数参数注入）", () => {
+  const drain = (fx, extra) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "drain-service.mjs"), "--enable", "--apply"],
+    { encoding: "utf-8", env: { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...extra } });
+  const drainLockPath = (fx) => path.join(fx.home, ".claude", "feishu-bridge", "install-surface.lock");
+  /** 进程内跑持锁段的公共出口：日志合并成一份、退出码记下来（exit 注入，与套件里其它入口同一约定）。 */
+  const inProcess = (fn, args, env) => {
+    const saved = new Map();
+    for (const [k, v] of Object.entries(env)) { saved.set(k, process.env[k]); process.env[k] = v; }
+    let out = "";
+    let code = null;
+    let ret = null;
+    try {
+      ret = fn({ ...args, log: (m) => { out += m + "\n"; }, error: (m) => { out += m + "\n"; }, exit: (c) => { code = c; } });
+    } finally {
+      for (const [k, v] of saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+    return { out, code, ret };
+  };
+
+  // ① 「查门之后、取锁之前，维护流程建门」→ 锁内复核必须拦住（exit 2、零写、锁已交还）
+  const a = linuxDrainFixture();
+  const gateFile = path.join(a.base, "maint.gate");
+  const aRun = inProcess(enableDrainInLock, {
+    home: a.home, codexHome: a.codexHome, bridge: a.bridge, paths: codexDrainSystemdPaths(a.home),
+    hooks: { beforeLock: () => { createGate({ file: gateFile, reason: "交错反例：取锁前建门" }); } },
+  }, { FEISHU_BRIDGE_SYSTEMCTL: a.fakeBin, FEISHU_BRIDGE_MAINTENANCE_GATE: gateFile });
+  assert.equal(aRun.code, 2, aRun.out);
+  assert.match(aRun.out, /维护门/u, aRun.out);
+  assert.match(aRun.out, /锁内复核/u, "要说明是锁内复核发现的：" + aRun.out);
+  assert.equal(fs.existsSync(codexDrainSystemdPaths(a.home).service), false, "① 拒了就零写：" + aRun.out);
+  assert.equal(lockPresent(drainLockPath(a)), false, "① 锁要交还（不许留 stale lock）");
+
+  // ② 锁被别人持有 → surface_install_busy exit 2 零写（enable 与 install --uninstall 两条写路径都受管）
+  const b = linuxDrainFixture();
+  fs.mkdirSync(path.dirname(drainLockPath(b)), { recursive: true });
+  fs.symlinkSync(JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "t" }), drainLockPath(b));
+  try {
+    const bRun = drain(b, { FEISHU_BRIDGE_SYSTEMCTL: b.fakeBin });
+    assert.equal(bRun.status, 2, bRun.stdout + bRun.stderr);
+    assert.match(bRun.stderr, /安装面锁拿不到/u, bRun.stderr);
+    assert.equal(fs.existsSync(codexDrainSystemdPaths(b.home).service), false, "② busy 也零写");
+    const cRun = spawnSync(process.execPath,
+      [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
+      { encoding: "utf-8", env: { ...process.env, HOME: b.home, CODEX_HOME: b.codexHome,
+        FEISHU_CODEX_BRIDGE_HOME: b.bridge, FEISHU_BRIDGE_SYSTEMCTL: b.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" } });
+    assert.equal(cRun.status, 2, "install 的 linux 写路径也要在锁里：" + cRun.stdout + cRun.stderr);
+    assert.match(cRun.stderr, /安装面锁拿不到/u, cRun.stderr);
+  } finally {
+    fs.rmSync(drainLockPath(b), { force: true });
+  }
+
+  // ③ 重读现场：hook 在「读现场之前」把两份 unit 放上去 → 必须看见并收掉。
+  //    这里把假 manager 设成"三探针都说不在"——**重读前**的现场是 action:"none"（什么都不做），
+  //    重读后的现场才有文件可收。拿旧快照执行的实现会在这一条上红（它会直接返回 none）。
+  const d = linuxDrainFixture();
+  const dPaths = codexDrainSystemdPaths(d.home);
+  fs.rmSync(dPaths.dir, { recursive: true, force: true });
+  const dRun = inProcess(uninstallDrainUnitsInLock, {
+    home: d.home, platform: "linux",
+    hooks: { beforeScene: () => {
+      fs.mkdirSync(dPaths.dir, { recursive: true });
+      fs.writeFileSync(dPaths.service, "service\n");
+      fs.writeFileSync(dPaths.timer, "timer\n");
+    } },
+  }, { FEISHU_BRIDGE_SYSTEMCTL: d.fakeBin, SYSTEMCTL_MOCK_IS_ENABLED: "disabled",
+    SYSTEMCTL_MOCK_IS_ACTIVE: "inactive", SYSTEMCTL_MOCK_LOAD_STATE: "not-found" });
+  assert.equal(dRun.ret?.ok, true, "③ 收成功要如实返回（这个函数不调 exit：退出码由调用方按 {ok,code} 映射）：" + JSON.stringify(dRun.ret) + dRun.out);
+  assert.equal(dRun.ret?.action, "files", "③ 动作要报准（盘上有文件）：" + JSON.stringify(dRun.ret));
+  assert.equal(fs.existsSync(dPaths.service), false, "③ 重读前放上去的 unit 必须被收掉：" + dRun.out);
+  assert.equal(fs.existsSync(dPaths.timer), false, "③ 同上（timer）");
+  assert.match(dRun.out, /已停用并删除 systemd 单元/u, dRun.out);
+
+  // 对照：正常路径（不注入）→ 0
+  const e = linuxDrainFixture();
+  const eRun = drain(e, { FEISHU_BRIDGE_SYSTEMCTL: e.fakeBin });
+  assert.equal(eRun.status, 0, eRun.stdout + eRun.stderr);
+  assert.match(eRun.stdout, /已启用，定时器已加载/u, eRun.stdout);
+  assert.equal(lockPresent(drainLockPath(e)), false, "对照：正常收尾也要交还锁");
+});
+
+// 拿掉哪行会红（两条都**实测**过）：把 CLI 改回读环境变量注入点 —— 变量名**字面量**写出来 →
+//   结构断言红（点名 scripts/codex/drain-service.mjs）；变量名在源码里**拼出来**躲过结构扫描 →
+//   行为断言红（「drain 的旧环境变量是死字母：它指向的脚本一个字都不许跑」，探针脚本真的被执行了）。
+test("PK3-L7-fix6：两个测试注入点只剩函数参数 —— 旧环境变量是死字母（CLI 设了也不跑）", () => {
+  // 名字拼出来：否则本文件自己会被下面的结构扫描扫到。
+  const VAR_DRAIN = "FEISHU_BRIDGE_DRAIN_" + "BEFORE_LOCK";
+  const VAR_INSTALL = "FEISHU_BRIDGE_CODEX_INSTALL_" + "BEFORE_LOCK";
+
+  // ① 结构：scripts/**（除测试）里 grep 不到 BEFORE_LOCK —— 注入面不许以任何形式回潮。
+  const hits = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { walk(full); continue; }
+      if (!e.name.endsWith(".mjs")) continue;
+      if (/^test.*\.mjs$/u.test(e.name) || /\.test\.mjs$/u.test(e.name)) continue;   // 测试自己会提到它
+      if (fs.readFileSync(full, "utf-8").includes("BEFORE_LOCK")) hits.push(path.relative(ROOT, full));
+    }
+  };
+  walk(path.join(ROOT, "scripts"));
+  assert.deepEqual(hits, [], "卸载 / 启停的测试注入点不许回到环境变量上：" + JSON.stringify(hits));
+
+  // ② 行为：设了它 → 什么也不跑（标记文件不出现），退出码与不设时一致。
+  const fx = linuxDrainFixture();
+  const marker = path.join(fx.base, "before-lock-ran.marker");
+  const hookFile = path.join(fx.base, "before-lock-hook.mjs");
+  fs.writeFileSync(hookFile, "import fs from \"node:fs\";\nfs.writeFileSync(" + JSON.stringify(marker) + ", \"ran\");\n");
+  const baseEnv = { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" };
+  const runCli = (script, extra) => spawnSync(process.execPath, [path.join(ROOT, "scripts", script), "--enable", "--apply"],
+    { encoding: "utf-8", env: { ...baseEnv, ...extra } });
+
+  const withDrain = runCli(path.join("codex", "drain-service.mjs"), { [VAR_DRAIN]: hookFile });
+  assert.equal(fs.existsSync(marker), false, "drain 的旧环境变量是死字母：它指向的脚本一个字都不许跑");
+  const withoutDrain = runCli(path.join("codex", "drain-service.mjs"), {});
+  assert.equal(withDrain.status, withoutDrain.status, "设与不设退出码要一致：" + withDrain.stdout + withDrain.stderr);
+  assert.equal(withDrain.status, 0, withDrain.stdout + withDrain.stderr);
+  assert.match(withDrain.stdout, /已启用，定时器已加载/u, withDrain.stdout);
+  assert.equal(fs.existsSync(marker), false, "跑了 enable 之后标记文件依然不许出现");
+
+  // install --uninstall 那条写路径同理
+  const fx2 = linuxDrainFixture();
+  const paths2 = codexDrainSystemdPaths(fx2.home);
+  fs.mkdirSync(paths2.dir, { recursive: true });
+  fs.writeFileSync(paths2.service, "service\n");
+  fs.writeFileSync(paths2.timer, "timer\n");
+  const marker2 = path.join(fx2.base, "install-before-lock-ran.marker");
+  const hookFile2 = path.join(fx2.base, "install-before-lock-hook.mjs");
+  fs.writeFileSync(hookFile2, "import fs from \"node:fs\";\nfs.writeFileSync(" + JSON.stringify(marker2) + ", \"ran\");\n");
+  const uninstallCli = (extra) => spawnSync(process.execPath,
+    [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
+    { encoding: "utf-8", env: { ...baseEnv, HOME: fx2.home, CODEX_HOME: fx2.codexHome,
+      FEISHU_CODEX_BRIDGE_HOME: fx2.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx2.fakeBin, ...extra } });
+  const withInstall = uninstallCli({ [VAR_INSTALL]: hookFile2 });
+  assert.equal(withInstall.status, 0, withInstall.stdout + withInstall.stderr);
+  assert.equal(fs.existsSync(marker2), false, "install 的旧环境变量是死字母");
+  assert.equal(fs.existsSync(paths2.service), false, "卸载照常收掉单元：" + withInstall.stdout);
 });
 
 test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {

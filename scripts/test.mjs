@@ -7643,7 +7643,7 @@ test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
   const src = fs.readFileSync(path.resolve("scripts", "timer-exec.mjs"), "utf-8");
   assert.match(src, /os\.userInfo\(\)\.homedir/u,
     "判据要用密码库里的 home，它不受 HOME 环境变量影响");
-  assert.match(src, /if \(SANDBOXED\) return \{ ok: false, skipped: true \};/u,
+  assert.match(src, /if \(isSandboxed\(\)\) return \{ ok: false, skipped: true \};/u,
     "launchctl 必须在沙箱安装时直接短路");
   // 包装只有一份：安装器自己不许再执行控制面命令（两份会各自漂移）。
   const installerSrc = fs.readFileSync(path.resolve("scripts", "install-outbound.mjs"), "utf-8");
@@ -18477,7 +18477,10 @@ test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允�
     'const home = process.env.HOME; const file = m.plistPath(home); fs.mkdirSync(path.dirname(file), { recursive: true });' +
     'fs.writeFileSync(file, m.plistBody({ home })); process.stdout.write(JSON.stringify({ expect: m.expectedJob({ home }), label: m.LAUNCH_LABEL }));',
     pathToFileURL(path.resolve("scripts", "codex", "drain-service.mjs")).href],
-    { encoding: "utf-8", env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex") } });
+    // PK3-L7-fix4 P1-1：显式桥根现在是权威来源，写 plist 的这一侧必须与 doctor 那一侧**同一个桥根**
+    //   （fixture 的 doctor run env 里就是这个值）—— 否则 plist 与投影对不上，会被判 stale。
+    { encoding: "utf-8", env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
+      FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") } });
   assert.equal(gen.status, 0, gen.stderr);
   const { expect, label } = JSON.parse(gen.stdout);
   const claudeJob = claudeDrainExpectedJob({ home: m.home });

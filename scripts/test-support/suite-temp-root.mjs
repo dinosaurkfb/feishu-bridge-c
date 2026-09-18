@@ -92,20 +92,28 @@ export const formatSuiteTempReport = (r) =>
 //   · 装包装**之前**存下的函数引用（先 `const m = fs.mkdtempSync` 再在别处调）也不生效 ——
 //   那几种要靠子进程级隔离（另票），本门只管本进程这一条路。“硬编码子进程”的覆盖本单不做。
 
+/** mkdtemp 追加的随机后缀（6 位，**不含路径分隔符**）—— 判据要按"可能生成的那个名字"算。 */
+export const MKDTEMP_SENTINEL = "XXXXXX";
+
 /**
- * 路径在不在本轮私有根之内。三道都比：
- *   1. `path.resolve`：相对前缀按 cwd 解析，跟 fs 自己的语义一致；
- *   2. 边界按 `path.sep` 判 —— 否则 `/tmp/root-abc` 会冒充 `/tmp/root`；
- *   3. **符号链接按 realpath 算（PK3-T2-fix3）**：prefix 自己还不存在（mkdtemp 正要造它），
- *      所以逐级往上找**最近的现存祖先**做 realpath，再把剩下那几段拼回去。
- *      否则 `root/jump -> 根外` 时，`mkdtempSync(root/jump/leak-)` 会被放行、目录真建在根外。
+ * 「这次 mkdtemp 会造出来的那个名字」在不在本轮私有根之内。四道都比：
+ *   1. **按可能生成的名字算（PK3-T2-fix4）**：mkdtemp 造的是 `prefix + 6 位随机后缀`，不是 prefix 本身。
+ *      不先补后缀就会两头都错：`mkdtempSync(<root>)` 生成的是 `<root>XXXXXX`（根的**兄弟**，
+ *      在根外）却被放行；而 prefix 最后一段本身是 symlink 时（`mkdtempSync(<root>/jump)`）实际上
+ *      造的是 `<root>/jumpXXXXXX`（根内的新目录，不穿过那个链接）却会被误拒。
+ *      补一个不含分隔符的哨兵后缀就能同时定对这两头。
+ *   2. `path.resolve`：相对前缀按 cwd 解析，跟 fs 自己的语义一致；
+ *   3. **符号链接按 realpath 算（PK3-T2-fix3）**：要造的名字还不存在，所以逐级往上找
+ *      **最近的现存祖先**做 realpath，再把剩下那几段拼回去 —— 否则 `root/jump -> 根外` 时
+ *      `mkdtempSync(root/jump/leak-)` 会被放行、目录真建在根外。
+ *   4. 边界按 `path.sep` 判 —— 否则 `/tmp/root-abc` 会冒充 `/tmp/root`。
  *
  * 不管的是 TOCTOU（判完到建之间有人把目录换成链接）—— 这是测试面的守卫，不是安全边界。
  */
-export const insideRoot = (target, root) => {
-  const t = path.resolve(target);
+export const insideRoot = (prefix, root) => {
+  const created = path.resolve(String(prefix) + MKDTEMP_SENTINEL);   // ① 可能生成的名字
   const r = canonicalizeOr(path.resolve(root), path.resolve(root));
-  const c = canonicalizeOr(t, t);
+  const c = canonicalizeOr(created, created);
   return c === r || c.startsWith(r + path.sep);
 };
 
@@ -156,13 +164,14 @@ export function installMkdtempGuard({ root, violations }) {
   const inner = { mkdtempSync: originals.mkdtempSync, mkdtemp: originals.mkdtemp, promisesMkdtemp: originals.promisesMkdtemp };
   const guard = (prefix) => {
     if (insideRoot(prefix, root)) return;
-    const target = path.resolve(String(prefix));
+    // 记的与报的都是**可能生成的那个名字**（prefix + 哨兵后缀）：那才是这套判据的对象。
+    const target = path.resolve(String(prefix) + MKDTEMP_SENTINEL);
     const canonical = canonicalizeOr(target, target);
     const v = { prefix: String(prefix), target, canonical, root, frame: blamelessFrame() };
     violations.push(v);
     throw new Error("临时目录硬门：mkdtemp 的前缀不在本轮私有根内 —— 这个临时目录会落在宿主 tmp 上、本轮收不回来\n" +
-      "  前缀：" + v.prefix + "\n  解析后：" + v.target +
-      (canonical === target ? "" : "\n  解链接后：" + canonical + "（前缀里某一级是指向根外的符号链接）") +
+      "  前缀：" + v.prefix + "\n  会生成：" + v.target +
+      (canonical === target ? "" : "（解链接后：" + canonical + " —— 前缀里某一级是指向根外的符号链接）") +
       "\n  本轮私有根：" + root + "\n  调用处：" + v.frame);
   };
   const wrapped = {

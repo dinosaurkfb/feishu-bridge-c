@@ -63,7 +63,7 @@ import { displaySafe, redactLocators, sanitizeForDisplay } from "./display-safe.
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob } from "./drain-schedule.mjs";
 import { machineContext, runDoctor, renderDoctor, summarizeDoctorChecks, authorityRunContext, firstDanglingSymlinkInChain } from "./doctor.mjs";
 // PK3-T1：本轮临时目录根 + 写盘失败翻译（都在 test-support/ 下：不动共用面 test-harness.mjs 的导出）
-import { installSuiteTempRoot, insideRoot, installMkdtempGuard } from "./test-support/suite-temp-root.mjs";
+import { installSuiteTempRoot, insideRoot, installMkdtempGuard, MKDTEMP_SENTINEL } from "./test-support/suite-temp-root.mjs";
 // PK3-T3：套件级安装面卫兵（启动快照 + 逐用例边界比对）
 import {
   installSurfaceGuard, resolveAuthoritativePaths, snapshotFile,
@@ -8285,7 +8285,8 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
     assert.match(err.message, /调用处：.*test\.mjs/u, "消息里要指得出调用处：" + err.message);
     assert.deepEqual(noLeftover("t2-escape-" + uniq), [], "越界那次不许真的造出目录（硬门是拦住，不是事后记账）");
     assert.equal(violations.length, 1, "越界要记一条 violation 给退出汇总");
-    assert.deepEqual([violations[0].prefix, violations[0].target, violations[0].root], [escape, escape, fakeRoot]);
+    // 记的是**可能生成的名字**（prefix + 哨兵后缀）—— 判据与消息都以它为准（PK3-T2-fix4）
+    assert.deepEqual([violations[0].prefix, violations[0].target, violations[0].root], [escape, escape + MKDTEMP_SENTINEL, fakeRoot]);
     // ② callback / promises 两路同样**当场**抛（不是把失败塞进 callback / rejected promise）
     assert.throws(() => fs.mkdtemp(path.join(hostTmp, "t2-escape-cb-" + uniq + "-"), () => {}), /临时目录硬门/u);
     assert.throws(() => fs.promises.mkdtemp(path.join(hostTmp, "t2-escape-pr-" + uniq + "-")), /临时目录硬门/u);
@@ -8294,8 +8295,9 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
     // ③ 私有根之内照常透传（含夹具最常用的 os.tmpdir() 写法）
     const inside = fs.mkdtempSync(path.join(fakeRoot, "t2-inside-"));
     assert.ok(inside.startsWith(fakeRoot + path.sep), inside);
-    // ④ 边界：根自己算之内；根的兄弟（root-x）不算 —— 前缀匹配必须按路径分量判
-    assert.equal(insideRoot(fakeRoot, fakeRoot), true);
+    // ④ 边界：判的是**可能生成的那个名字**（prefix + 6 位后缀），不是 prefix 本身（PK3-T2-fix4）
+    assert.equal(insideRoot(fakeRoot, fakeRoot), false, "mkdtempSync(根) 造的是根的**兄弟**（根 + 6 位后缀），不在根内");
+    assert.equal(insideRoot(fakeRoot + path.sep, fakeRoot), true, "根 + 分隔符 → 造在根内");
     assert.equal(insideRoot(fakeRoot + "-x", fakeRoot), false, "root-x 不是 root 之内");
     assert.equal(insideRoot(path.join(fakeRoot, "a", "b"), fakeRoot), true);
     assert.equal(insideRoot(path.dirname(fakeRoot), fakeRoot), false);
@@ -8308,6 +8310,70 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
     assert.equal(insideRoot(path.join(outLink, "notyet", "x-"), fakeRoot), false, "深层还没建也一样");
     assert.equal(insideRoot(path.join(inLink, "x-"), fakeRoot), true, "根内 symlink 指回根内 → 仍是之内");
     assert.equal(violations.length, 3, "透传与边界判定不该新增 violation");
+  } finally {
+    guard.restore();
+  }
+});
+
+test("PK3-T2-fix4：判据按「可能生成的名字」——四类边界（三路覆盖）", () => {
+  // Codex 三轮实测：mkdtemp 造的是 prefix + 6 位随机后缀，判 prefix 本身两头都错：
+  //   · `mkdtempSync(<根>)` 生成的是根的**兄弟**（根外）却被放行 —— 绕过硬门还留宿主 tmp 残骸；
+  //   · prefix 最后一段本身是 symlink 时（`mkdtempSync(<根>/jump)`）实际造的是 `<根>/jumpXXXXXX`
+  //     （根内的新目录，不穿过那个链接）却被误拒。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-fix4-"));
+  const fakeRoot = fs.realpathSync(base);
+  const hostTmp = SUITE_TMP.hostTmp;
+  const violations = [];
+  const guard = installMkdtempGuard({ root: fakeRoot, violations });
+  const uniq = process.pid + "-" + Date.now().toString(36);
+  const siblingStem = "t2-fix4-sib-" + uniq + "-";
+  const leftover = (stem) => fs.readdirSync(hostTmp).filter((n) => n.startsWith(stem));
+  try {
+    // ① mkdtempSync(根) 必须拒，且根的**兄弟**零创建（三路都覆盖）
+    const siblingPrefix = path.join(hostTmp, siblingStem).slice(0, -1);   // 故意让"生成名"落在 hostTmp 顶层
+    assert.throws(() => fs.mkdtempSync(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "sync：mkdtempSync(根) 要拒");
+    assert.throws(() => fs.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot)), () => {}), /临时目录硬门/u, "callback：同样拒");
+    assert.throws(() => fs.promises.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "promises：同样拒");
+    assert.deepEqual(fs.readdirSync(path.dirname(fakeRoot)).filter((n) => n.startsWith(path.basename(fakeRoot) + "XXXXXX")), [],
+      "被拒时一个兄弟目录都不许建出来");
+    void siblingPrefix;
+
+    // ② 根 + 分隔符 → 允许，且真的建在根内
+    const ok = fs.mkdtempSync(fakeRoot + path.sep);
+    assert.equal(path.dirname(ok), fakeRoot, "建在根内：" + ok);
+    assert.match(path.basename(ok), /^[A-Za-z0-9]{6}$/u, "前缀到分隔符为止时，生成名就是 6 位随机位：" + path.basename(ok));
+
+    // ③ 根内祖先 symlink 指向根外 → 仍拒；而 prefix 末段本身是 symlink（造根内新目录）→ 允许
+    const outLink = path.join(fakeRoot, "jump");
+    fs.symlinkSync(hostTmp, outLink, "dir");
+    assert.throws(() => fs.mkdtempSync(path.join(outLink, "t2-fix4-leak-" + uniq + "-")), /临时目录硬门/u, "穿过指向根外的链接 → 拒");
+    assert.deepEqual(leftover("t2-fix4-leak-" + uniq), [], "拒的时候根外零创建");
+    const besideLink = fs.mkdtempSync(outLink);   // 造的是 <根>/jumpXXXXXX，不穿过链接
+    assert.equal(path.dirname(besideLink), fakeRoot, "末段是 symlink 时造的是根内的新目录：" + besideLink);
+
+    // ④ 父目录还不存在：最近存在祖先的拼接判定仍要对（根内允许、根外拒）
+    //    「允许」≠「能建」：父目录缺席时 mkdtemp 自己报 ENOENT —— 那不是硬门的事（硬门只为"会不会落到根外"负责）
+    assert.equal(insideRoot(path.join(fakeRoot, "notyet", "x-"), fakeRoot), true, "根内、父目录还没建 → 判据允许");
+    let noParent = null;
+    assert.throws(() => fs.mkdtempSync(path.join(fakeRoot, "notyet", "x-" + uniq + "-")), (e) => { noParent = e; return true; });
+    assert.equal(noParent.code, "ENOENT", "允许之后是 mkdtemp 自己的 ENOENT，不是硬门：" + noParent.message);
+    assert.equal(/临时目录硬门/u.test(noParent.message), false, "别把 ENOENT 说成越界");
+    fs.mkdirSync(path.join(fakeRoot, "notyet"), { recursive: true });
+    const deepIn = fs.mkdtempSync(path.join(fakeRoot, "notyet", "x-" + uniq + "-"));
+    assert.equal(deepIn.startsWith(fakeRoot + path.sep), true, "父目录建好之后当然能建在根内：" + deepIn);
+    fs.rmSync(path.join(fakeRoot, "notyet"), { recursive: true, force: true });
+    assert.throws(() => fs.mkdtempSync(path.join(hostTmp, "t2-fix4-out-" + uniq + "-")), /临时目录硬门/u, "根外（父目录在）→ 拒");
+    assert.throws(() => fs.mkdtempSync(path.join(hostTmp, "t2-fix4-none-", "deep-" + uniq + "-")), /临时目录硬门/u, "根外且父目录不存在 → 也拒");
+    assert.deepEqual([...leftover("t2-fix4-out-" + uniq), ...leftover("t2-fix4-none-")], [], "根外零创建");
+
+    // 判据本身（纯函数）逐条钉：这四条是这次返修的全部内容
+    assert.deepEqual([
+      insideRoot(fakeRoot, fakeRoot),                        // ① 根的兄弟 → 不在内
+      insideRoot(fakeRoot + path.sep, fakeRoot),             // ② 根内 → 在内
+      insideRoot(path.join(outLink, "x-"), fakeRoot),        // ③ 穿过根外链接 → 不在内
+      insideRoot(outLink, fakeRoot),                         // ③b 末段是链接本身 → 在内
+      insideRoot(path.join(fakeRoot, "notyet", "x-"), fakeRoot),  // ④ 根内、父目录不存在 → 在内
+    ], [false, true, false, true, true], "四条边界：" + JSON.stringify(violations.map((v) => v.target)));
   } finally {
     guard.restore();
   }

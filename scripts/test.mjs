@@ -7802,10 +7802,12 @@ const u1Home = (files = {}) => {
  * 参数同时含 `--purge` 与 `--apply` 时，再**先**用同一份 env 与 home 派生一次删除清单：
  * 任何一项越出本用例夹具（home ∪ 显式传的两个桥根）就**不启动子进程**，直接让用例失败并点名越界项。
  */
-const u1Run = (home, script, args = [], env = {}) => {
+const u1Run = (home, script, args = [], env = {}, opts = {}) => {
   const childEnv = purgeChildEnv({ env: process.env, home, extra: env });
   if (args.includes("--purge") && args.includes("--apply")) {
-    const outside = purgeTargetsOutsideFixture({ home, env: childEnv, extra: env });
+    // 预检只吃**最终子进程环境**（PK3-U1-fix8 P1-1）：HOME 与覆盖点与子进程逐字一致，
+    // 不存在"预检按一个 home 算、子进程按另一个删"。
+    const outside = purgeTargetsOutsideFixture({ env: childEnv, declaredPrivateRoots: opts.declaredPrivateRoots ?? [] });
     assert.deepEqual(outside, [],
       "真 purge 的删除目标越出本用例夹具 —— 拒绝启动子进程（夹具：" + home + "）：" + JSON.stringify(outside));
   }
@@ -8578,7 +8580,8 @@ test("PK3-U1-fix4 P1-2：显式桥根只删封闭的已知条目（目录与别�
   fs.writeFileSync(unrelated, "keep\n");
   const home = u1Home();
   const env = { CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge };
-  const run = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
+  // 桥根显然在**本用例自己的 base** 下（不在 home 下）→ 按声明放行（PK3-U1-fix8：显式桥根要能证明是本用例的私有夹具）
+  const run = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env, { declaredPrivateRoots: [base] });
   assert.equal(run.status, 0, run.stdout + run.stderr);
   for (const rel of known) {
     assert.equal(fs.existsSync(path.join(bridge, rel)), false, "已知条目要没：" + rel + "（" + run.stdout + "）");
@@ -8598,7 +8601,7 @@ test("PK3-U1-fix4 P1-2：显式桥根只删封闭的已知条目（目录与别�
   fs.writeFileSync(path.join(realBridge, "registry.json"), "{}\n");
   const homeC = u1Home();
   const runC = u1Run(homeC, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
-    { CODEX_HOME: path.join(homeC, ".codex"), FEISHU_CODEX_BRIDGE_HOME: realBridge });
+    { CODEX_HOME: path.join(homeC, ".codex"), FEISHU_CODEX_BRIDGE_HOME: realBridge }, { declaredPrivateRoots: [realBase] });
   assert.equal(runC.status, 0, "realpath 写法要照常：" + runC.stdout + runC.stderr);
   assert.equal(fs.existsSync(path.join(realBridge, "registry.json")), false, runC.stdout);
 
@@ -8741,7 +8744,7 @@ test("PK3-U1-fix5 P1-1 + fix6 P1-1：显式桥根边界 —— 指向 home / .co
   fs.writeFileSync(path.join(bridge, "registry.json"), "{}\n");
   const homeD = u1Home();
   const runD = u1Run(homeD, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
-    { CODEX_HOME: path.join(homeD, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge });
+    { CODEX_HOME: path.join(homeD, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge }, { declaredPrivateRoots: [base] });
   assert.equal(runD.status, 0, "临时目录下的子目录允许：" + runD.stdout + runD.stderr);
   assert.equal(fs.existsSync(path.join(bridge, "registry.json")), false, runD.stdout);
 
@@ -8848,6 +8851,63 @@ test("PK3-U1-fix7 ②：显式传一份会派生出夹具外文件的 env → �
   } finally {
     fs.rmSync(sentinelDir, { recursive: true, force: true });
   }
+});
+
+// ── PK3-U1-fix8：预检与子进程只有一份 env；显式桥根要能证明是本用例的私有夹具 ──────────────
+
+// 拿掉哪行会红：把 purgeChildEnv 里那条 `extra.HOME` 与 `home` 的比较删掉（回到"extra 覆盖 HOME"）→
+//   ① 红在「必须抛错」（探针会拿到一个"预检按 homeA、子进程按 homeB"的 env）。
+test("PK3-U1-fix8 ①：extra.HOME 与夹具 home 不一致 → purgeChildEnv 当场抛错（不许预检与子进程两个 HOME）", () => {
+  const homeA = u1Home();
+  const homeB = u1Home();
+  assert.throws(() => purgeChildEnv({ env: {}, home: homeA, extra: { HOME: homeB } }),
+    /extra\.HOME.*不一致|只有一份 HOME/u, "不一致的 extra.HOME 必须抛错（用例写错了，不许静默覆盖）");
+  // 对照：一致（或压根不给 HOME）照常
+  assert.equal(purgeChildEnv({ env: {}, home: homeA, extra: { HOME: homeA } }).HOME, homeA, "一致时照常");
+  assert.equal(purgeChildEnv({ env: {}, home: homeA }).HOME, homeA, "不给 extra.HOME 时按夹具 home");
+});
+
+// 拿掉哪行会红：把 fixtureRootsFor 里 `if (!insideAll(v, allowedForms)) continue;` 那行删掉
+//   （回到 fix7 的"显式桥根直接进白名单"）→ ② 的越界守卫会返回空数组（探针不再点名），红在「必须非空并点名」；
+//   把 insideAll 换成只比词法（pathForms 只留 resolve）→ 同一条也会红（夹具内路径的父层符号链接骗过词法）。
+test("PK3-U1-fix8 ②：显式 CODEX_HOME 的父层是指向夹具外的符号链接 → 越界守卫非空并点名（纯派生，不真删）", () => {
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "u1f8-outside-"));
+  const home = u1Home();
+  // 夹具内的路径：<home>/link/codex-home —— 但 link 是指向夹具外目录的符号链接（真实的家在夹具外）
+  const linkInsideHome = path.join(home, "link");
+  fs.symlinkSync(outsideDir, linkInsideHome);
+  const codexHome = path.join(linkInsideHome, "codex-home");
+  const env = purgeChildEnv({ env: {}, home, extra: {
+    CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: path.join(codexHome, "feishu-bridge"),
+  } });
+  // 词法在 home 里、canonical 在夹具外 → 显式桥根进不了白名单，它派生的目标全被点名
+  const outside = purgeTargetsOutsideFixture({ env });
+  assert.notEqual(outside.length, 0, "canonical 落在夹具外的显式桥根必须让守卫报越界：" + JSON.stringify(outside));
+  assert.match(outside.join("\n"), /codex-home/u, "要点名那条路径：" + JSON.stringify(outside));
+  assert.match(outside.join("\n"), /→/u, "两种写法都要报出来（词法 → canonical）：" + JSON.stringify(outside));
+
+  // 对照 ①：**合法**的私有桥根（真在 home 下）→ 空数组，照常放行
+  const okHome = u1Home();
+  const okBridge = path.join(okHome, ".codex", "feishu-bridge-x");
+  fs.mkdirSync(okBridge, { recursive: true });
+  const okEnv = purgeChildEnv({ env: {}, home: okHome, extra: {
+    CODEX_HOME: path.join(okHome, ".codex"), FEISHU_CODEX_BRIDGE_HOME: okBridge } });
+  assert.deepEqual(purgeTargetsOutsideFixture({ env: okEnv }), [], "home 下的私有桥根照常放行");
+
+  // 对照 ②：桥根在 home 之外，但**用例显式声明**那是它自己的私有目录 → 放行（fix7 那三条真 apply 用例的形状）
+  const declaredBase = fs.mkdtempSync(path.join(os.tmpdir(), "u1f8-declared-"));
+  const declaredBridge = path.join(declaredBase, "elsewhere", "feishu-bridge");
+  fs.mkdirSync(declaredBridge, { recursive: true });
+  const declaredHome = u1Home();
+  const declaredEnv = purgeChildEnv({ env: {}, home: declaredHome, extra: {
+    CODEX_HOME: path.join(declaredHome, ".codex"), FEISHU_CODEX_BRIDGE_HOME: declaredBridge } });
+  assert.deepEqual(purgeTargetsOutsideFixture({ env: declaredEnv, declaredPrivateRoots: [declaredBase] }), [],
+    "声明过的私有目录照常放行");
+  assert.notEqual(purgeTargetsOutsideFixture({ env: declaredEnv }).length, 0,
+    "**没声明**时同样要报越界（声明才是那句'这是本用例的夹具'）");
+  fs.rmSync(outsideDir, { recursive: true, force: true });
+  fs.rmSync(declaredBase, { recursive: true, force: true });
 });
 
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {

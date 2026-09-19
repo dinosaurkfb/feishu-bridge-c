@@ -12027,8 +12027,9 @@ test("PK3-U1-fix5 P1-2：显式桥根 purge 的封闭清单 —— 真跑一遍�
   //   它会把套件 HOME 下的文件算进删除清单），启动前再核一遍清单全在本用例夹具内。
   const purgeEnv = purgeChildEnv({ env, home, extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge,
     FEISHU_BRIDGE_REGISTRY: path.join(bridge, "registry.json") } });
-  const outside = purgeTargetsOutsideFixture({ home, env: purgeEnv,
-    extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge } });
+  // 桥根不在 home 之下（这条用例就是要把显式桥根放在夹具自己的另一个目录里）→ 按声明放行；
+  // 预检只吃最终子进程环境（PK3-U1-fix8 P1-1）。
+  const outside = purgeTargetsOutsideFixture({ env: purgeEnv, declaredPrivateRoots: [base] });
   assert.deepEqual(outside, [], "真 purge 的删除目标越出本用例夹具 —— 拒绝启动子进程：" + JSON.stringify(outside));
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "uninstall.mjs"), "--purge", "--yes-delete-data", "--apply"],
     { encoding: "utf-8", env: purgeEnv });

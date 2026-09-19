@@ -7903,6 +7903,30 @@ const u1Snapshot = (home) => {
   return out.join("\n");
 };
 
+// PK3-U3（omm 2026-09-19 真机）：Linux 上 uninstall.mjs 第 3 步在 codex/install --uninstall 之后还要起
+//   codex/drain-service.mjs --disable --apply；后者走 acquireInstallSurfaceLockOrRefuse，旧版不认编排的 HELD 继承，
+//   撞上父进程自己持着的锁报 busy（退 2），卸载停在半截、两个 runtime/current 没删。
+//   拿掉哪行会红：acquireInstallSurfaceLockOrRefuse 里去掉 inheritedSurfaceLock 那段 → 这里 status 2、current 还在。
+test("PK3-U3：Linux 平台下一键卸载整条跑完——drain-service 在编排锁里认 HELD 继承，不再撞父进程的锁（沙箱 + 注入 systemctl）", () => {
+  const home = u1Home();
+  const fakeSystemctl = path.join(home, "fake-systemctl.sh");
+  fs.writeFileSync(fakeSystemctl, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const env = { FEISHU_BRIDGE_TIMER_PLATFORM: "linux", FEISHU_BRIDGE_SYSTEMCTL: fakeSystemctl };
+  for (const script of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
+    const r = u1Run(home, script, ["--apply"], env);
+    assert.equal(r.status, 0, script + "：" + r.stdout + r.stderr);
+  }
+  const claudeCurrent = path.join(home, ".claude", "feishu-bridge", "runtime", "current");
+  assert.ok(fs.lstatSync(claudeCurrent, { throwIfNoEntry: false }), "装完 Claude 链 current 在");
+  const un = u1Run(home, "uninstall.mjs", ["--apply"], env);
+  assert.equal(un.status, 0, "Linux 下一键卸载必须整条跑完：" + un.stdout + un.stderr);
+  assert.doesNotMatch(un.stdout + un.stderr, /surface_install_busy|停在这里/u, un.stdout + un.stderr);
+  assert.equal(fs.lstatSync(claudeCurrent, { throwIfNoEntry: false }), undefined, "Claude 链 runtime/current 要删掉");
+  const codexCurrentGone = !fs.readdirSync(home, { recursive: true }).some((p) => String(p).endsWith(path.join("feishu-bridge", "runtime", "current")));
+  assert.ok(codexCurrentGone, "两条链的 runtime/current 都要删掉");
+  assert.equal(u1Footprint(home, "linux").clean, true, "卸完足迹干净：" + JSON.stringify(u1Footprint(home, "linux").residue));
+});
+
 test("PK3-U1：装 → 一键卸 → settings 回到装前字节、机制不在、数据仍在、doctor 报未安装", () => {
   const home = u1Home({
     ".claude/feishu-bridge/routes.json": JSON.stringify({ routes: [{ id: "self", handler: "/abs/inbound.mjs", default: true }], sessions: { s1: "self" } }),

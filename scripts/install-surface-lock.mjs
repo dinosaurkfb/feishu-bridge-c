@@ -88,7 +88,31 @@ export function acquireInstallSurfaceLock({ home = os.homedir(), env = process.e
  * 拒绝文案与退出码只写在这一处，两个调用面不会漂。
  * @returns {{ok:true, lock} | {ok:false, code:2|3, text}}
  */
+/**
+ * 编排继承（HELD）的**唯一一份**判定（PK3-U3：把 holdInstallSurfaceLockOrExit 里那段抽出来，两个取锁面共用）。
+ *   · null：没声明 HELD，或 HELD 路径不是这一处的锁 → 调用方照常取锁；
+ *   · { ok: true, lock }：声明成立且核到实际持有者（锁在 / owner.pid === 父进程 / token）→ 不重复取、release 是空操作；
+ *   · { ok: false, code: 2, text }：声明了在锁里却核不上持有者 → fail-closed 拒绝、零写。
+ * 为什么要共用：omm 2026-09-19 真机卸载，uninstall.mjs 持锁编排里起的 codex/drain-service.mjs --disable --apply
+ *   走的是 acquireInstallSurfaceLockOrRefuse（PK3-L7-fix6），它不认 HELD，于是撞上父进程自己的锁报 busy、卸载停在半截。
+ */
+export function inheritedSurfaceLock({ home = os.homedir(), env = process.env } = {}) {
+  const inherited = env[INSTALL_SURFACE_HELD_ENV];
+  if (!(typeof inherited === "string" && inherited.length > 0 && inherited === installSurfaceLockPath({ home, env }))) return null;
+  const why = inheritedHolderProblem({ path: inherited, token: env[INSTALL_SURFACE_HELD_TOKEN_ENV] });
+  if (why === null) return { ok: true, lock: { ok: true, path: inherited, inherited: true, release: () => ({ ok: true }) } };
+  return { ok: false, code: 2, text: "安装面锁的 HELD 继承声明不成立（" + why + "）—— 拒绝，什么都没写。" +
+    "（这个变量只给 scripts/uninstall.mjs 编排里的子安装器用；不在编排里跑就 unset " + INSTALL_SURFACE_HELD_ENV + "）" };
+}
+
 export function acquireInstallSurfaceLockOrRefuse({ home = os.homedir(), env = process.env, err = null } = {}) {
+  // PK3-U3：先认编排继承（与 holdInstallSurfaceLockOrExit 同一份判定），再走普通取锁。
+  const held = inheritedSurfaceLock({ home, env });
+  if (held !== null) {
+    if (held.ok) return { ok: true, lock: held.lock, inherited: true };
+    if (typeof err === "function") err(held.text);
+    return { ok: false, code: held.code, text: held.text };
+  }
   const got = acquireInstallSurfaceLock({ home, env });
   if (got.ok) return { ok: true, lock: got };
   const text = "安装面锁拿不到（" + got.reason + "：" + String(got.why) + "，" + got.path + "）—— 什么都没写。" +
@@ -103,23 +127,14 @@ export function acquireInstallSurfaceLockOrRefuse({ home = os.homedir(), env = p
  * 拿不到锁 → 打印原因并 exit 2（busy）/ 3（残骸），什么都没写。
  */
 export function holdInstallSurfaceLockOrExit({ home = os.homedir(), env = process.env, err = (t) => process.stderr.write(t + "\n") } = {}) {
-  // 编排继承（PK3-U1-fix1）：调用方在整段编排里持着这把锁时不重复取、也不假装"取到了"。
-  const inherited = env[INSTALL_SURFACE_HELD_ENV];
-  if (typeof inherited === "string" && inherited.length > 0 && inherited === installSurfaceLockPath({ home, env })) {
-    // fix2 P1-1：路径对只是第一关 —— 还要核到**实际持有者**。不成立就不认这次继承，
-    // 往下走普通取锁（父进程持着 → busy → exit 2 零写）；这样“设个环境变量就能无锁写”不成立。
-    const why = inheritedHolderProblem({ path: inherited, token: env[INSTALL_SURFACE_HELD_TOKEN_ENV] });
-    if (why === null) {
-      // 调用方在整段编排里持着这把锁（见 INSTALL_SURFACE_HELD_ENV 的说明）：不重复取、也不假装“取到了”。
-      return { ok: true, path: inherited, inherited: true, release: () => ({ ok: true }) };
-    }
-    // 声明了在锁里、却核不上持有者 → **拒绝**（fail-closed，不是“当没设、照常取锁”）。
-    // 为什么不往下走普通取锁：那把锁不在（被回收 / 压根没建）时普通取锁会**真的拿到锁并开写**，
-    // 而调用方的前提（“我在编排的锁里”）已经被证伪 —— 零写并说明比它现在安全。
-    // （路径本身就不对的 HELD 是另一回事：那把锁不是这一处的，当没设、照常取锁。）
-    err("安装面锁的 HELD 继承声明不成立（" + why + "）—— 拒绝，什么都没写。" +
-      "（这个变量只给 scripts/uninstall.mjs 编排里的子安装器用；不在编排里跑就 unset " + INSTALL_SURFACE_HELD_ENV + "）");
-    process.exit(2);
+  // 编排继承（PK3-U1-fix1 / fix2）：判定只有一份（inheritedSurfaceLock，PK3-U3 抽出），两个取锁面共用。
+  //   声明成立 → 不重复取、也不假装"取到了"；声明了却核不上持有者 → fail-closed 拒绝 exit 2（不是"当没设、照常取锁"：
+  //   那把锁不在时普通取锁会真的拿到锁开写，而调用方"我在编排的锁里"的前提已被证伪）。路径本身不对的 HELD 当没设。
+  const held = inheritedSurfaceLock({ home, env });
+  if (held !== null) {
+    if (held.ok) return { ok: true, path: held.lock.path, inherited: true, release: () => ({ ok: true }) };
+    err(held.text);
+    process.exit(held.code);
   }
   // 普通路径走受控返回的那一份（PK3-L7-fix6 抽出的）：拒绝文案与退出码只写在那里，两个调用面不会漂。
   const refused = acquireInstallSurfaceLockOrRefuse({ home, env, err });

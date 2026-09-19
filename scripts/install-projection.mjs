@@ -302,10 +302,21 @@ export function installedClaudeNode({ home = os.homedir(), platform = process.pl
  * **不把 `No such file` 当判据**：连不上 manager 那句正是 `Failed to connect to bus: No such file or directory` ——
  * 它会被缩成"没装"，而那正是"查不清"要拦的（is-enabled 对缺失单元说的是
  * `Failed to get unit file state …`，那条已在下面）。 */
-export const systemdUnitAbsent = (text) =>
-  // PK3-U2：systemctl 对从未存在的单元说的是「Unit x.service does not exist」（不带 file），也算"本来就没有"
-  //   —— omm 2026-09-19 真机卸载在这句上中止：本桥从没写过 aily 单元，disable 报它不存在，卸载却当失败停在半截。
-  /(unit file .* does not exist|unit \S+ does not exist|unit .* not loaded|could not be found|not-found|not found|failed to get unit file state)/iu.test(String(text ?? ""));
+/**
+ * systemctl 的输出是不是在说「本来就没有这个单元」。
+ * `unit` 给了（PK3-U2-fix1，Codex 一轮 P2）：「… does not exist / not loaded / could not be found」这几句必须**点名本次操作的
+ * 单元**才算 —— 复合错误里「另一个单元不存在」不许把本单元的真失败（Access denied 等）吞成"没有"。
+ * 不给 unit 时维持旧口径（doctor / 维护门那些调用点读的是 is-enabled / is-active 这种单单元输出）。
+ * PK3-U2：systemctl 对从未存在的单元说的是「Unit x.service does not exist」（不带 file），也算 —— omm 2026-09-19 真机卸载在这句上中止。
+ */
+export const systemdUnitAbsent = (text, unit = null) => {
+  const t = String(text ?? "");
+  if (typeof unit === "string" && unit.length > 0) {
+    const u = unit.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    return new RegExp("(unit (?:file )?" + u + " does not exist|unit " + u + " not loaded|" + u + " could not be found|^\\s*not-found\\s*$|failed to get unit file state for " + u + ")", "imu").test(t);
+  }
+  return /(unit file .* does not exist|unit \S+ does not exist|unit .* not loaded|could not be found|not-found|not found|failed to get unit file state)/iu.test(t);
+};
 
 /** 单元里 ExecStart 那一行的值：与 `claudeDrainSystemdUnits` 同源（引用规则只写一处）。 */
 export const systemdExecStartValue = (args) => args.map(systemdQuote).join(" ");
@@ -527,7 +538,10 @@ export function ailyDaemonPlan({ home = os.homedir(), platform = process.platfor
   if (uninstall) {
     // PK3-U2：磁盘上没有本桥写的单元 → 预览不说"将删除"一个不存在的文件（omm 上 aily 是 aily-cli 自己的单元，
     //   本桥从没写过）。停用命令照发一次：manager 里若还挂着同名孤儿也能收掉；它回「不存在」算正常（systemdUnitAbsent）。
-    const onDisk = read(file) !== null;
+    // PK3-U2-fix1（Codex 一轮 P1）：存在性用 lstat（断链符号链接也算在盘上），只有 ENOENT 算缺席；
+    //   别的错误（EACCES 等）按"在"处理 —— 走真删除路径，删不掉就会报出来，不许被当成"本来没有"而静默留下残骸。
+    let onDisk = true;
+    try { onDisk = fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined; } catch { onDisk = true; }
     return { applicable: true, kind, action: onDisk ? "will-remove" : "not-installed", file, files: [], remove: onDisk ? [file] : [],
       commands: [["systemctl", "--user", "disable", "--now", AILY_DAEMON_UNIT + ".service"]],
       commandsAfterRemove: [["systemctl", "--user", "daemon-reload"]],

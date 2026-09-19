@@ -64,12 +64,16 @@ const settingsHomeOf = (p) => path.dirname(path.dirname(p));
  */
 const requireFromHere = createRequire(import.meta.url);
 let ownedEntriesExtractor = null;
+let ownsHookPredicate = null;
 const ownedEntriesFn = () => {
   if (ownedEntriesExtractor === null) {
-    ownedEntriesExtractor = requireFromHere("../install-projection.mjs").claudeSettingsOwnedEntries;
+    const mod = requireFromHere("../install-projection.mjs");
+    ownedEntriesExtractor = mod.claudeSettingsOwnedEntries;
+    ownsHookPredicate = mod.ownsHook;
   }
   return ownedEntriesExtractor;
 };
+const ownsHookFn = () => { ownedEntriesFn(); return ownsHookPredicate; };
 
 /**
  * 一个 settings.json 快照的**本桥条目投影 sha**（PK3-I244）。提取器只有一份（安装收据 / 卸载足迹用的
@@ -87,6 +91,7 @@ const stableJson = (v) => Array.isArray(v) ? "[" + v.map(stableJson).join(",") +
   : isPlainObject(v) ? "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stableJson(v[k])).join(",") + "}"
     : JSON.stringify(v);
 const OWNED_HOOK_EVENTS = Object.freeze({ Stop: "Stop", inbound: "UserPromptSubmit", init: "UserPromptSubmit" });
+const OWNED_HOOK_BASENAMES = Object.freeze({ Stop: "stop-hook.mjs", inbound: "inbound-hook.mjs", init: "init-hook.mjs" });
 
 const ownedSettingsShaOf = (entry) => {
   if (entry === null || entry === undefined || entry.state !== "present" || typeof entry.rawText !== "string") return null;
@@ -96,8 +101,9 @@ const ownedSettingsShaOf = (entry) => {
   if (!isPlainObject(doc)) return null;
   if (doc.hooks !== undefined && !isPlainObject(doc.hooks)) return null;
   if (doc.permissions !== undefined && !isPlainObject(doc.permissions)) return null;
-  for (const ev of new Set(Object.values(OWNED_HOOK_EVENTS))) {
-    if (doc.hooks?.[ev] !== undefined && !Array.isArray(doc.hooks[ev])) return null;
+  // fix3：**所有**事件的值都必须是数组（本桥 hook 可能被登记到任何事件，形状不对就扫不清 → unverifiable）
+  for (const ev of Object.keys(doc.hooks ?? {})) {
+    if (!Array.isArray(doc.hooks[ev])) return null;
   }
   if (doc.permissions?.allow !== undefined && !Array.isArray(doc.permissions.allow)) return null;
   let owned = null;
@@ -117,6 +123,22 @@ const ownedSettingsShaOf = (entry) => {
   };
   const parts = ["Stop", "inbound", "init"].map((k) => k + "=" + stableJson(fullOf(k)));
   parts.push("allow=" + stableJson(owned.allow ?? null));
+  // ③ fix3（Codex 二轮 P1）：本桥 hook 被登记到**非预期事件**（如 PreToolUse）—— 只对本桥归属的 hook 跨事件扫，
+  //   别人的 hook 不纳入。出现在哪儿、长什么样都进投影，于是新增 / 删除 / 改动都会翻 sha。
+  const owns = ownsHookFn();
+  const stray = [];
+  for (const [ev, groups] of Object.entries(doc.hooks ?? {})) {
+    for (const group of groups) {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
+      const { hooks, ...groupRest } = group;
+      for (const h of hooks) {
+        for (const [key, basename] of Object.entries(OWNED_HOOK_BASENAMES)) {
+          if (ev !== OWNED_HOOK_EVENTS[key] && owns(h, basename)) stray.push({ event: ev, basename, group: groupRest, hook: h });
+        }
+      }
+    }
+  }
+  parts.push("stray=" + stableJson(stray));
   return crypto.createHash("sha256").update("claude-settings-owned:v2:" + parts.join("\n")).digest("hex");
 };
 

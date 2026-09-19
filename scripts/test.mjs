@@ -58984,6 +58984,37 @@ test("PK3-I244-fix2 ②：本桥 hook 加 async:true 等行为字段 → changed
   }
 });
 
+// PK3-I244-fix3（Codex 二轮 P1）：本桥 hook 被登记到**非预期事件**（PreToolUse 等）也要报；别人的 hook 登到哪儿都不算；
+//   任何事件的值不是数组 → unverifiable。
+//   拿掉哪行会红：去掉卫兵里 stray 那段跨事件扫描 → 「本桥 inbound 被加到 PreToolUse」判 changed:false。
+test("PK3-I244-fix3：本桥 hook 出现在非预期事件 → modified；别人的 hook 加到新事件不算；事件值不是数组 → unverifiable", () => {
+  const cases = [
+    ["本桥 inbound 命令加到 PreToolUse", (doc) => { doc.hooks.PreToolUse = [{ matcher: "Bash", hooks: [{ type: "command", command: "node y.mjs # FEISHU_BRIDGE_HOOK:inbound-hook.mjs" }] }]; }, "modified"],
+    ["本桥 Stop 命令复制到 SubagentStop", (doc) => { doc.hooks.SubagentStop = [{ hooks: [{ ...doc.hooks.Stop[1].hooks[0] }] }]; }, "modified"],
+    ["别人的 hook 加到 PreToolUse", (doc) => { doc.hooks.PreToolUse = [{ matcher: "Bash", hooks: [{ type: "command", command: "node /opt/orca/pre.mjs" }] }]; }, null],
+    ["PostToolUse 的值是对象", (doc) => { doc.hooks.PostToolUse = { hooks: [] }; }, "unverifiable"],
+  ];
+  for (const [label, mutate, want] of cases) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-stray-"));
+    try {
+      const { file } = i244SettingsFixture(tmp);
+      const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+      try {
+        const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+        mutate(doc);
+        fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+        const res = guard.check();
+        assert.equal(res.changed, want !== null, label + "：" + i244Show(res.diffs));
+        if (want !== null) assert.equal(res.diffs[0]?.kind, want, label + "：" + i244Show(res.diffs));
+      } finally {
+        guard.uninstall();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
 test("PK3-I244-fix1 ①结构：卫兵与 boot 的**静态** import 只许 node: 内置与彼此", () => {
   // 判据（逐行扫 `^import` 语句的 from 说明符）：只允许两件东西 ——
   //   · `node:` 内置（卫兵要用 crypto / fs / module / os / path）；

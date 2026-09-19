@@ -256,6 +256,7 @@ import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VE
 import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, classifySubscriptionAuditPending, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, resolveSubscriptionAuditConflict, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
+import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
 import { stageRuntimeVersion as stageRuntimeVersionB, activateRuntimeVersion as activateRuntimeVersionB, verifyRuntimeVersion as verifyRuntimeVersionB, planRuntimeSync as planRuntimeSyncB, verifyRuntime as verifyRuntimeB } from "./runtime-install.mjs";
@@ -7371,6 +7372,124 @@ test("入站技能安装幂等：连续两次 apply 之后自检一致、不再�
   const rendered = src.match(/const expectedContent = [\s\S]{0,400}?;\n/u);
   assert.ok(rendered, "expectedContent 必须是一个集中定义");
   assert.match(rendered[0], /renderSkill/u);
+});
+
+// ── PK3-I241：装完自检 —— daemon 与 scan-local 各有各的判据 ──────────────────────────
+
+// 拿掉哪行会红（三条都实测过）：
+//   · socket 那条 `fs.existsSync(socket)` 换成恒 true（或删掉它）→ ① 的「未运行（socket 不在）」红；
+//   · 把 catch 里的 `probeFailureReason(err)` 折回固定文案（旧的「查不了（aily-cli 没跑起来）」）→
+//     ② 红在「必须带出 ENOENT」与「不许出现 没跑起来」两条上；
+//   · 把 scan 的三态折成布尔（reported / not_reported）→ ③ 的 "unavailable" 红（探测失败会被说成"报不到"）。
+test("PK3-I241：装完自检两件事各有各的判据 —— daemon 看 socket，scan-local 探测分三态（函数参数注入）", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "i241-home-"));
+  const socketDir = path.join(home, ".aily-cli", "sockets");
+  fs.mkdirSync(socketDir, { recursive: true });
+  // 真 Unix socket inode（python 在目录内 bind 短相对名，绕开 sun_path 104 字节限制）；进程退出后 inode 留在盘上 ——
+  // 正是「存在不证明进程还活着」那种形状（PK3-I241-fix1，Codex 一轮 P1）。
+  const bindSock = (dir) => {
+    const r = spawnSync("python3", ["-c", "import os,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.bind('aily-cli.sock')", dir], { encoding: "utf-8" });
+    assert.equal(r.status, 0, "夹具建 socket 失败：" + r.stderr);
+  };
+  bindSock(socketDir);
+  assert.equal(fs.lstatSync(path.join(socketDir, "aily-cli.sock")).isSocket(), true, "夹具必须是真 socket");
+  const lines = [];
+  const log = (l) => lines.push(l);
+  const reported = () => JSON.stringify([{ name: "m5claude-inbound-router" }]);
+
+  // ① socket 那一行**只陈述事实**（不经 exec、不依赖 PATH）：是 socket 且在 → 「在」但明说不证明进程活着；不许说"在跑"
+  //   拿掉哪行会红：把 isSocket() 判据换回 existsSync / 文案换回"在跑" → 下面 not_socket 与 doesNotMatch 断言红
+  const r1 = inboundPostInstallProbe({ home, execFile: reported, log });
+  assert.deepEqual([r1.socketState, r1.socketPresent, r1.scan.state], ["socket", true, "reported"], JSON.stringify(r1));
+  const out1 = lines.join("\n");
+  assert.match(out1, /aily daemon socket：在（/u, out1);
+  assert.match(out1, /存在不证明进程还活着/u, out1);
+  assert.doesNotMatch(out1, /是否在跑：在跑|未运行/u, "socket 在 ≠ 在跑，不许断言：" + out1);
+  // ①b 同名普通文件（残留 / 假绿的老夹具）→ not_socket，不当作在跑
+  lines.length = 0;
+  const homePlain = path.join(home, "plain");
+  fs.mkdirSync(path.join(homePlain, ".aily-cli", "sockets"), { recursive: true });
+  fs.writeFileSync(path.join(homePlain, ".aily-cli", "sockets", "aily-cli.sock"), "");
+  const r1p = inboundPostInstallProbe({ home: homePlain, execFile: reported, log });
+  assert.deepEqual([r1p.socketState, r1p.socketPresent], ["not_socket", false], JSON.stringify(r1p));
+  assert.match(lines.join("\n"), /同名文件在但不是 socket/u, lines.join("\n"));
+  // ①b2（fix2，Codex 二轮 P1）：sockets 是个普通文件 → lstat 报 ENOTDIR → 「查不清」带原因，**不许**说"不在 / 启动 daemon"
+  //   拿掉哪行会红：把 catch 折回一律 absent → 这里 socketState 得到 absent、文案出现「启动：aily-cli daemon start」
+  lines.length = 0;
+  const homeNotDir = path.join(home, "notdir");
+  fs.mkdirSync(path.join(homeNotDir, ".aily-cli"), { recursive: true });
+  fs.writeFileSync(path.join(homeNotDir, ".aily-cli", "sockets"), "");
+  const r1n = inboundPostInstallProbe({ home: homeNotDir, execFile: reported, log });
+  const out1n = lines.join("\n");
+  assert.deepEqual([r1n.socketState, r1n.socketWhy, r1n.socketPresent], ["unverifiable", "ENOTDIR", false], JSON.stringify(r1n));
+  assert.match(out1n, /aily daemon socket：查不清（ENOTDIR/u, out1n);
+  assert.doesNotMatch(out1n, /不在（|aily-cli daemon start/u, "查不清 ≠ 不在，不许劝人去启动：" + out1n);
+  // ①c 不在 → 给启动命令
+  lines.length = 0;
+  const r1b = inboundPostInstallProbe({ home: path.join(home, "别处"), execFile: reported, log });
+  const out1b = lines.join("\n");
+  assert.deepEqual([r1b.socketState, r1b.socketPresent], ["absent", false], out1b);
+  assert.match(out1b, /aily daemon socket：不在（/u, out1b);
+  assert.match(out1b, /aily-cli daemon start/u, "不在要给启动命令：" + out1b);
+
+  // ② 探测本身失败（ENOENT）→ 「查不了」+ 原因原话；**不许**代言 daemon 的状态
+  lines.length = 0;
+  const enoent = () => { const e = new Error("spawnSync aily-cli ENOENT"); e.code = "ENOENT"; throw e; };
+  const r2 = inboundPostInstallProbe({ home, execFile: enoent, log });
+  const out2 = lines.join("\n");
+  assert.deepEqual([r2.scan.state, r2.socketPresent], ["unavailable", true],
+    "探测失败时 socket 那一行仍是它自己的判据（socket 在 → 在）：" + JSON.stringify(r2));
+  assert.match(out2, /查不了/u, out2);
+  assert.match(out2, /ENOENT|不在 PATH/u, "原因要点名（非交互 ssh 下 PATH 没有 mise shims）：" + out2);
+  assert.doesNotMatch(out2, /没跑起来/u, "探测失败不许说成 daemon 没跑起来：" + out2);
+
+  // ②′ 原因映射的另外两个分支也各自点名（非 0 退出 / 超时），认不出来的原样带出来
+  assert.match(probeFailureReason({ status: 3, stderr: "boom\n" }), /退出码 3/u);
+  assert.match(probeFailureReason({ code: "ETIMEDOUT", signal: "SIGTERM" }), /超时/u);
+  assert.match(probeFailureReason({ code: "EACCES" }), /EACCES/u, "认不出来的错误原样带出来");
+
+  // ③ scan-local 报到了 / 报不到
+  lines.length = 0;
+  const r3 = inboundPostInstallProbe({ home, execFile: reported, log });
+  assert.deepEqual([r3.scan.state, /报到了/u.test(lines.join("\n"))], ["reported", true], lines.join("\n"));
+  lines.length = 0;
+  const r4 = inboundPostInstallProbe({ home, execFile: () => JSON.stringify([{ name: "别的技能" }]), log });
+  assert.deepEqual([r4.scan.state, /报不到（已知如此/u.test(lines.join("\n"))], ["not_reported", true], lines.join("\n"));
+});
+
+// 拿掉哪行会红：把 CLI 里那句 `inboundPostInstallProbe({ home: os.homedir() })` 换回旧的内联探测
+//   （把任何异常都折成「查不了（aily-cli 没跑起来）」）→ 第一条的「ENOENT」与「不许说没跑起来」红。
+test("PK3-I241：真入口也这么说 —— 非交互 ssh（PATH 里没有 aily-cli）不再被报成 daemon 没跑", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "i241-cli-"));
+  const home = path.join(base, "home");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  const env = { ...process.env, HOME: home };
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+
+  // ① socket 在 + PATH 里没有 aily-cli（非交互 ssh 的真实形状）→ daemon 那行说"在跑"，
+  //    探测那行说"查不了 + ENOENT"，而且**两行都不许**出现「没跑起来」。
+  const socketDir = path.join(home, ".aily-cli", "sockets");
+  fs.mkdirSync(socketDir, { recursive: true });
+  const bound = spawnSync("python3", ["-c", "import os,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.bind('aily-cli.sock')", socketDir], { encoding: "utf-8" });
+  assert.equal(bound.status, 0, "夹具建 socket 失败：" + bound.stderr);
+  const out = execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...env, PATH: "/usr/bin:/bin" } });
+  assert.match(out, /aily daemon socket：在（/u, out);
+  assert.doesNotMatch(out, /是否在跑：在跑|未运行/u, "socket 在 ≠ 在跑（PK3-I241-fix1）：" + out);
+  assert.match(out, /aily 是否已发现本技能：查不了：/u, out);
+  assert.match(out, /ENOENT|不在 PATH/u, out);
+  assert.doesNotMatch(out, /没跑起来/u, "这句是 issue #241 的原始误报，不许回来：" + out);
+
+  // ② 对照：PATH 里有一个报得到的假 aily-cli → 「scan-local 报到了」
+  const binDir = path.join(base, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, "aily-cli"),
+    "#!/bin/sh\nprintf '%s' '[{\"name\":\"m5claude-inbound-router\"}]'\n", { mode: 0o755 });
+  const out2 = execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"],
+    { encoding: "utf-8", env: { ...env, PATH: binDir + ":/usr/bin:/bin" } });
+  assert.match(out2, /aily 是否已发现本技能：scan-local 报到了/u, out2);
+  assert.doesNotMatch(out2, /没跑起来/u, out2);
 });
 
 test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不到脚本的技能", () => {

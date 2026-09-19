@@ -123,6 +123,13 @@ node scripts/install-inbound.mjs --apply
 装到 `~/.claude/skills/`，那是 `aily-cli skill scan-local` 真正会扫的位置
 （装完应当被列为 `[claude-code-local]`）。
 
+装完自检的最后两行**各说一件事**，别把它们读混了（issue #241）：
+
+- `aily daemon socket`：看 `~/.aily-cli/sockets/aily-cli.sock` 在不在、是不是 socket（不看 `aily-cli` 命令能不能跑）——**存在不证明进程还活着**（崩溃会留下 socket inode），要确认在不在跑用 `node scripts/doctor.mjs` 或 `aily-cli daemon status`；
+- `aily 是否已发现本技能`：跑 `scan-local`，三态 —— 报到了 / 报不到（已知如此：它扫宿主 agent 目录）/
+  **查不了**（探测本身失败，原因会带出来）。**「查不了」不等于 daemon 没跑** —— 非交互 ssh 下 PATH 里
+  常常没有 `aily-cli`（mise shims 不在 PATH），那时前一行的 socket 判据仍然是可信的。
+
 ### 3. 🔧 写机器级链路模板
 
 **这是本机第一件要配的事**，后面所有东西都从它来。

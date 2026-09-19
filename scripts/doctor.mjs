@@ -47,12 +47,12 @@ import { loadRoutes, routesPath, defaultRouteHandler } from "./inbound-routes.mj
 import { collectConnectivity, loadStatusProviders, statusProvidersPath } from "./status-providers.mjs";
 import { resolveProject } from "./project-resolve.mjs";
 import { pendingGeneration } from "./topic-generation.mjs";
-import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
+import { verifyRuntime, runtimeRoot, runtimeScript } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor, timerPlatform } from "./drain-schedule.mjs";
 import { CLAUDE_DRAIN_SYSTEMD_UNIT, ailyDaemonUnitPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, foreignAilyDaemonUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
 // 装机足迹住在维护层（它要同时知道两链装了什么，而顶层 scripts/*.mjs 不许 import codex/）
-import { describeFootprint, installFootprint } from "./maintenance/install-footprint.mjs";
+import { describeFootprint, describePartial, installFootprint } from "./maintenance/install-footprint.mjs";
 import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -345,11 +345,14 @@ export function runDoctor({
   const foot = installFootprint({ home, platform });
   const installedState = foot.clean ? "uninstalled" : (foot.partial ? "partial" : "installed");
   const footResidue = foot.residue.map((r) => r.area + "=" + String(r.what)).slice(0, 6).join("、");
+  // PK3-I249：半装现在**两个方向都判**（钩子在而 current 没了；current 在而钩子没了）—— 后者的机器
+  //   看着"已安装"，其实那一链已经不工作了。恢复指引两条都给：重装（这一链的安装器）或卸干净。
   add("install_state", "装机状态", installedState !== "partial",
     installedState === "uninstalled" ? describeFootprint(foot) + " —— " + foot.retainedNote
       : installedState === "installed" ? describeFootprint(foot)
-      : "半装 / 残留（钩子或定时器还在、它们指的 runtime/current 已经不在了）：在的 —— " + footResidue + "；" +
-        "这种情况下每次 Stop / 每 30 分钟都会去跑一个不存在的脚本。重装或卸干净：node scripts/uninstall.mjs",
+      : "半装 / 残留（" + describePartial(foot) + "）：在的 —— " + footResidue + "；" +
+        "重装：`node scripts/install-outbound.mjs --apply`（入站/Codex 链再加 install-inbound.mjs / codex/install.mjs）" +
+        "，或卸干净：`node scripts/uninstall.mjs --apply`",
     installedState === "partial" ? PREVIEW.uninstall : null);
 
   // ── 运行时（未安装的机器上不适用：报 unknown，不报✗——没装不是故障）
@@ -368,7 +371,10 @@ export function runDoctor({
   // self 路由的判据派生（① 的特判、⑦ 与 routes 项的指路共用）：有效默认路由恰为 self 且
   // handler 实指本桥 runtime/current 的 inbound。
   const runtimeCurrent = path.join(runtimeRoot(home, "claude"), "current");
-  const expectedHandler = path.join(runtimeCurrent, "scripts", "inbound.mjs");
+  // 本链预期的那份入站处理器：用**产品自己的派生函数**取（runtimeScript = <runtimeRoot>/current/scripts/<name>），
+  //   不在这里手拼"scripts/inbound.mjs" —— fix2 P1-1 的豁免判据要核的就是这个路径，它必须与
+  //   `--init-default --id self --handler …` 写进路由表的那一个同源。
+  const expectedHandler = runtimeScript("inbound.mjs", home);
 
   const routes = loadRoutes(routesFile);
   // issue #222：表里有启用路由但一条都没标 default —— 这台机器现在没有默认路由，未登记话题一律拒收
@@ -397,20 +403,43 @@ export function runDoctor({
   const tablesUnclear = links.providersProblem !== null || links.routesProblem !== null;
   const unregisteredAll = links.sections.filter((s) => s.state === "unregistered");
   // self 是本桥自己的入站路由：它的状态由本桥自身（feishu-status / doctor）提供，要求它再登记
-  // 一个外部状态入口是让桥给自己当外人。判据**不许**是"routeId 叫 self 就放过"——用上面
-  // defaultRouteHandler 的现成结论（默认路由恰为 self 且 handler 实指 runtime/current 的
-  // inbound）才豁免；名叫 self 但 handler 指向别处的照旧 ✗。
-  const selfExempt = defaultSelf.status === "runtime" && unregisteredAll.some((s) => s.id === "self");
+  // 一个外部状态入口是让桥给自己当外人。判据**不许**是"routeId 叫 self 就放过"——要能核到"这条路由确实是本桥那条"：
+  //   · 装着的机器：用 defaultRouteHandler 的现成结论（默认路由恰为 self **且** handler 实指
+  //     runtime/current 的 inbound，realpath 判据）；
+  //   · **没装的机器**（fix2 P1-1）：runtime/current 跟着卸掉了，"handler 在它之下"那半条 realpath 判据
+  //     必然不成立（这时 defaultSelf 一定是 outside），只能按**产品派生出来的那个 handler 路径**核：
+  //     expectedHandler = `<runtime/current>/scripts/inbound.mjs`，正是 README 里
+  //     `register-route --init-default --id self --handler <runtime/current/scripts/inbound.mjs>` 写的那个。
+  //   两半都不认名字：名叫 self、handler 是别的东西 → **不豁免**、照旧 ✗。
+  const selfRouteRetained = routes.ok && routes.routes.some((r) => r.id === "self" && r.isDefault === true && r.handler === expectedHandler);
+  //   fix3（Codex 二轮 P1）：还必须**是默认路由**。self 不是默认、而另一条（有状态入口的）外部路由被标了默认时，
+  //   卸后 ① 会被判不适用、⑦ 的 wrong_default 也会被降级 —— 错误的默认去向就不留 ✗ 了。
+  const selfIsBridgeRoute = defaultSelf.status === "runtime" || (foot.clean && selfRouteRetained);
+  const selfExempt = selfIsBridgeRoute && unregisteredAll.some((s) => s.id === "self");
   const unregistered = unregisteredAll.filter((s) => !(selfExempt && s.id === "self"));
   const unavailable = links.sections.filter((s) => s.state === "unavailable" && s.reason !== "not_probed");
-  add("route_without_provider", "① route 有状态入口",
-    tablesUnclear ? null : unregistered.length === 0,
-    tablesUnclear ? "路由表或状态入口表读不出来，查不清（" + (links.routesProblem ?? links.providersProblem) + "）"
-      : unregistered.length === 0 ? "每条启用路由都有获准报告运输状态的状态入口" +
-        (selfExempt ? "（self 是本桥自身的入站路由，状态由本桥自身提供，不另要求登记外部状态入口）" : "")
-      : unregistered.length + " 条路由没有状态入口：" + list(unregistered, (s) => s.id) +
-        (selfExempt ? "；self 是本桥自身的入站路由（状态由本桥自身提供），不计入" : ""),
-    unregistered.length > 0 ? PREVIEW.registerProvider : null);
+  // PK3-I249：**未安装态的 ①**。卸完之后 routes.json 里的 self 路由还留着，而它的状态入口是**本桥自身**
+  //   —— 跟着 runtime/current 一起卸掉了，于是 ① 报「1 条路由没有状态入口：self」→ blocked，与卸载完成
+  //   提示「doctor 应报未安装（无 ✗）」自相矛盾（omm 真机实测）。
+  //   收窄成"**没装 + 唯一没入口的正好是本桥那条 self**"才判不适用：self 的状态本来由本桥自己提供，没装了自然就没有；
+  //   **别的路由没状态入口仍然是保留数据自己的问题**（与装不装无关），照旧 ✗ —— 不然一台没装本桥、
+  //   但表里躺着 lonely 路由的机器就会被这条降级掩掉。
+  // 判据按**未过滤的 unregisteredAll** 算：self 被 selfExempt 滤掉之后 `unregistered` 会是空的，
+  //   拿它当'只剩 self'的条件就永远不成立（豁免本身把证据删掉了）。
+  const selfOnlyWhenUninstalled = foot.clean && selfRouteRetained &&
+    unregisteredAll.length > 0 && unregisteredAll.every((s) => s.id === "self");
+  // **表读不出来先说查不清**（fix2 P1-1）：豁免不许抢在它前面把"读不出"说成"未安装 —— 不适用"
+  //   （状态入口表读不出时，路由那侧仍会把每条 route 列成 unregistered，豁免正好会被它"满足"）。
+  const routeVerdict = tablesUnclear
+    ? { ok: null, next: null, text: "路由表或状态入口表读不出来，查不清（" + (links.routesProblem ?? links.providersProblem) + "）" }
+    : selfOnlyWhenUninstalled
+      ? { ok: null, next: null, text: "未安装 —— 不适用（只剩 self 没有状态入口，而 self 的状态由本桥自身提供、随 runtime/current 一起卸掉了）" }
+      : unregistered.length === 0
+        ? { ok: true, next: null, text: "每条启用路由都有获准报告运输状态的状态入口" +
+            (selfExempt ? "（self 是本桥自身的入站路由，状态由本桥自身提供，不另要求登记外部状态入口）" : "") }
+        : { ok: false, next: PREVIEW.registerProvider, text: unregistered.length + " 条路由没有状态入口：" + list(unregistered, (s) => s.id) +
+            (selfExempt ? "；self 是本桥自身的入站路由（状态由本桥自身提供），不计入" : "") };
+  add("route_without_provider", "① route 有状态入口", routeVerdict.ok, routeVerdict.text, routeVerdict.next);
   add("provider_runs", "② 状态入口能跑",
     tablesUnclear ? null : !probeProviders ? null : unavailable.length === 0,
     tablesUnclear ? "查不清（表读不出来）"
@@ -1614,11 +1643,16 @@ export function runDoctor({
   //   runtime/current 本来就不在 —— 报 ✗ 会把"没装"说成"坏了"。卸后验证（uninstall --apply 之后跑
   //   doctor）要的正是"零 ✗"，所以在这一处统一降级成 unknown。
   //   **只降这两项**：保留的数据本身自不自洽（① 路由有没有状态入口、③ 话题登记指向的路由在不在）
-  //   与装不装无关，卸了也照样该报 —— 那是数据的问题，不是"没装"。
+  //   与装不装无关，卸了也照样该报 —— 那是数据的问题，不是"没装"。（① 有一个例外，见它自己那一段：
+  //   卸后"唯一没状态入口的就是本桥那条 self"时不适用，PK3-I249。）
+  //   **⑦ 的降级不是无条件的**（fix2 P1-1）：只有"保留的默认路由确实是本桥那条"（selfRouteRetained）
+  //   才降 —— 那是"运行时被卸了、所以处理器当然不在它之下"。保留的路由 handler 是**别的东西**时，
+  //   那不是没装造成的，照旧 ✗；否则一台没装本桥、表里躺着坏路由/别人的路由的机器会被整条掩掉。
   if (foot.clean) {
     const INSTALL_DEPENDENT = new Set(["runtime", "default_route_handler"]);
     for (const c of checks) {
       if (!INSTALL_DEPENDENT.has(c.id) || c.ok === null || c.ok === true) continue;
+      if (c.id === "default_route_handler" && !selfRouteRetained) continue;
       c.ok = null;
       c.detail = "未安装 —— 不适用（" + c.detail + "）";
       c.next = null;

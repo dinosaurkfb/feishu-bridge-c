@@ -123,17 +123,24 @@ function makeContext({ home, env, purge }) {
     // 装机足迹：判据只有一份（maintenance/install-footprint.installFootprint）—— doctor 的未安装态
     // 用的是同一份，所以"uninstall 说卸干净了、doctor 说还有残留"这种自相矛盾在结构上不可能出现。
     const foot = installFootprint({ home, env, platform: timerPlatform({ home, env }) });
+    // PK3-I249：`why` 是**默认保留时**说的话（"这是什么、为什么留着"），`purgeNote` 是 `--purge` 时的处置。
+    //   旧版把"—— 整棵删"写在 `why` 里，于是**不带 --purge 的预览**里每一项后面都挂着"整棵删"，
+    //   读者以为它要被删。两句话分开放，各出现在它该出现的那一栏。
     const data = [
       ...targets.roots.map((p) => ({ path: p, kind: "root",
-        why: "机器级桥根（产品派生：登记表 / 模板 / 路由 / 订阅 / 回执 / 账本 / 收据 / runtime）—— 整棵删" })),
+        why: "机器级桥根：登记表 / 模板 / 路由表 / 订阅 / 回执 / 账本 / 收据 / runtime（重装即可继续用）",
+        purgeNote: "机器级桥根 —— 整棵删" })),
       // 显式 FEISHU_CODEX_BRIDGE_HOME（fix4 P1-2）：人给的位置只删封闭的已知子项，目录本身保留。
       ...targets.entries.dirs.map((p) => ({ path: p, kind: "entry-dir",
-        why: "显式桥根下的已知子目录（整棵删；父目录保留）" })),
+        why: "显式桥根下的已知子目录（tasks / receipts / intents / threads / inbound）",
+        purgeNote: "显式桥根下的已知子目录 —— 整棵删（父目录保留）" })),
       ...targets.entries.files.map((p) => ({ path: p, kind: "file",
-        why: "显式桥根下的已知数据文件（只删这个文件）" })),
+        why: "显式桥根下的已知数据文件（登记表 / 模板 / 日志 / 收据 …）",
+        purgeNote: "显式桥根下的已知数据文件 —— 只删这个文件" })),
       // **覆盖点只删文件**（fix2 P1-2）：它的父目录是人给的，可能是共享目录 —— 递归删它会带走无关的兄弟文件。
       ...targets.files.map((p) => ({ path: p, kind: "file",
-        why: "已知数据文件的覆盖点（只删这个文件，不碰它的父目录）" })),
+        why: "已知数据文件的覆盖点（登记表 / 路由表 …）",
+        purgeNote: "已知数据文件的覆盖点 —— 只删这个文件，不碰它的父目录" })),
     ];
     return { purge: targets, foot, data, steps: buildSteps({ foot, data, purgedRoots }) };
   };
@@ -161,8 +168,16 @@ function makeContext({ home, env, purge }) {
   function buildSteps({ foot, data, purgedRoots }) {
     const hooksWhich = [...foot.present.claudeHooks];
     const codexHooksWhich = [...foot.present.codexHooks];
-    const timerPresent = [...foot.present.timer, ...foot.present.codexDrain];
-    const claudeSkillsPresent = [...foot.present.claudeSkills, ...foot.present.codexSkills];
+    // 定时器**按链拆**（fix2 P1-3）：第 2 步是 Claude 链，只看 `foot.present.timer`（Claude 的 plist /
+    //   systemd 两份 unit）；linux 的 aily daemon 服务是单独一项（foot.present.ailyUnit）。
+    //   Codex 的兜底排空（plist / systemd 两份 unit）**只由第 3 步处理**。
+    //   旧版把 `foot.present.codexDrain` 并进这一份 → 一台**只有 Codex 链**的机器第 2 步也判"有东西可卸"，
+    //   于是去 spawn install-outbound.mjs，而它会直接读 `~/.claude/settings.json` —— 那台机器上根本没有
+    //   （Claude 链从没装过），卸载因此在中途以非零码停下。
+    const claudeTimers = [...foot.present.timer];
+    // PK3-I249：**按足迹字段拆链**，不做字符串过滤 —— 第 2 步只列 Claude 链自己在 ~/.claude 下的条目，
+    //   Codex 的技能（~/.codex/skills/*）只在第 3 步出现（旧版把两链技能并在一起，第 2 步会重复列 8 项）。
+    const claudeSkillsPresent = [...foot.present.claudeSkills];
     const STEPS = [
       {
         id: "inbound",
@@ -176,12 +191,12 @@ function makeContext({ home, env, purge }) {
         id: "outbound",
         title: "出站（Claude 链）：hooks + 技能 + 兜底定时器 +（linux）aily daemon 服务",
         why: "入站停掉之后再拆出站；定时器与 daemon 服务先停再删 plist/unit（安装器自己按这个顺序做，停不下来就不删）",
-        present: () => hooksWhich.length > 0 || timerPresent.length > 0 || claudeSkillsPresent.length > 0
+        present: () => hooksWhich.length > 0 || claudeTimers.length > 0 || claudeSkillsPresent.length > 0
           || foot.present.ailyUnit !== null,
         detail: () => [
           ...hooksWhich.map((n) => path.join(home, ".claude", "settings.json") + " 里的 " + n),
           ...claudeSkillsPresent,
-          ...timerPresent,
+          ...claudeTimers,
           ...[foot.present.ailyUnit].filter(Boolean),
         ],
         run: () => runNode("install-outbound.mjs", ["--uninstall", "--apply"]),
@@ -246,7 +261,7 @@ function makeContext({ home, env, purge }) {
         title: "机器级数据根（两链的全部机器级状态：登记表 / 路由表 / 话题映射 / 回执 / 账本 / 收据 / 模板 / 订阅）",
         why: "--purge --yes-delete-data 才走：这些是历史与绑定，删了就没了。清单从产品派生函数取（machinePurgeTargets），不是手写文件名清单 —— 手写会漏",
         present: () => data.some((d) => exists(d.path)),
-        detail: () => data.filter((d) => exists(d.path)).map((d) => d.path + "（" + d.why + "）"),
+        detail: () => data.filter((d) => exists(d.path)).map((d) => d.path + "（" + d.purgeNote + "）"),
         run: () => {
           const gone = [];
           for (const d of data) {
@@ -443,10 +458,14 @@ if (!isDirectRun(import.meta.url)) {
   console.log("");
   if (!purge) {
     const kept = scene.data.filter((d) => exists(d.path));
+    // PK3-I249：每一项只说"这是什么、为什么默认留着"；"--purge 时会怎么删"另起一句（旧版把它挂在每一项后面，
+    //   看起来像"这些要被删"）。
     console.log("将保留（默认不删）：");
     for (const d of kept) console.log("  · " + d.path + "（" + d.why + "）");
     if (kept.length === 0) console.log("  · （没有机器级数据文件）");
     console.log("  · <项目>/.runtime-data/ 与话题历史：**本命令不碰**（项目里的东西不归机器级卸载管）");
+    console.log("加 --purge --yes-delete-data 时：上面这些会被删 —— 产品派生的两个桥根整棵删；");
+    console.log("  显式 FEISHU_CODEX_BRIDGE_HOME 下只删已知条目（目录本身保留）；覆盖点只删那个文件。");
   } else {
     console.log("将保留：**机器级的状态与代码全删**（产品派生的两个桥根整棵删；显式 FEISHU_CODEX_BRIDGE_HOME");
     console.log("         只删其下已知条目、目录本身保留；覆盖点只删那个文件）。");

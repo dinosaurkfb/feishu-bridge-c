@@ -256,7 +256,7 @@ import { SUBSCRIPTION_ARTIFACT_TYPE, SUBSCRIPTION_REJECT, SUBSCRIPTION_SCHEMA_VE
 import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscriptionAuditEvent, classifySubscriptionAuditPending, clearSubscriptionAuditPending, loadSubscriptionAudit, loadSubscriptionAuditPending, loadSubscriptionStore, mergedSubscriptionView, planSubscriptionChange, planSubscriptionEntry, resolveSubscriptionAuditConflict, subscriptionAuditPendingPath, subscriptionStorePath, SUBSCRIPTION_STORE_ARTIFACT_TYPE, SUBSCRIPTION_STORE_SCHEMA_VERSION, validateSubscriptionAuditEvent, validateSubscriptionAuditPending, writeSubscriptionAuditPending } from "./subscription-store.mjs";
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
-import { claudeBridgeRoot, codexBridgeRoot, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
+import { claudeBridgeRoot, codexBridgeRoot, codexDrainUnitPaths, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
 import { INSTALL_WRITE_TARGET_ENV_KEYS, purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7：真 purge 用例的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
@@ -7928,13 +7928,18 @@ test("PK3-U3：Linux 平台下一键卸载整条跑完——drain-service 在编
 });
 
 test("PK3-U1：装 → 一键卸 → settings 回到装前字节、机制不在、数据仍在、doctor 报未安装", () => {
-  const home = u1Home({
-    ".claude/feishu-bridge/routes.json": JSON.stringify({ routes: [{ id: "self", handler: "/abs/inbound.mjs", default: true }], sessions: { s1: "self" } }),
-    // 状态入口表也按其判据配对：真实机器的保留数据是自洽的，① 应当保持 ✓（PK3-U1：数据自洽与装不装无关）
-    ".claude/feishu-bridge/status-providers.json": JSON.stringify({
-      providers: [{ id: "self", protocol: "feishu-bridge-status/v1", executable: process.execPath, script: "/abs/status-provider.mjs", args: [], allowed_kinds: ["transport"], project_root: "/abs/project" }],
-    }),
-  });
+  const home = u1Home();
+  // 保留数据的**真机形状**（fix2 P1-1）：self 的 handler 就是本桥装到 runtime/current 的那份 inbound
+  //   —— 用产品自己的派生函数 runtimeScript 取，不手写路径。豁免判据核的就是"这条路由确实是本桥那条"，
+  //   拿个假 handler（旧版的 /abs/inbound.mjs）当正例的话，这条用例验的就不是真机形状。
+  const bridgeDir = path.join(home, ".claude", "feishu-bridge");
+  fs.mkdirSync(bridgeDir, { recursive: true });
+  fs.writeFileSync(path.join(bridgeDir, "routes.json"), JSON.stringify({
+    routes: [{ id: "self", handler: runtimeScript("inbound.mjs", home), default: true }], sessions: { s1: "self" } }));
+  // 状态入口表也按其判据配对：真实机器的保留数据是自洽的，① 应当保持 ✓（PK3-U1：数据自洽与装不装无关）
+  fs.writeFileSync(path.join(bridgeDir, "status-providers.json"), JSON.stringify({
+    providers: [{ id: "self", protocol: "feishu-bridge-status/v1", executable: process.execPath, script: "/abs/status-provider.mjs", args: [], allowed_kinds: ["transport"], project_root: "/abs/project" }],
+  }));
   const settingsBefore = fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8");
 
   assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
@@ -7958,7 +7963,6 @@ test("PK3-U1：装 → 一键卸 → settings 回到装前字节、机制不在�
   assert.equal(fs.existsSync(path.join(home, "Library", "LaunchAgents", "com.frank.feishu-bridge-cc.drain.plist")), false, "定时器 plist 要删掉");
   assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "runtime", "current")), false, "runtime/current 要摘掉");
   // ③ 数据仍在（默认不删）—— 而且 versions/（代码缓存）也留着
-  const bridgeDir = path.join(home, ".claude", "feishu-bridge");
   assert.ok(fs.existsSync(path.join(bridgeDir, "routes.json")),
     "路由表要留着（目录里现在是：" + fs.readdirSync(bridgeDir).join("、") + "）");
   assert.ok(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "status-providers.json")), "状态入口表要留着");
@@ -8115,7 +8119,10 @@ test("PK3-U1-fix1 P1-1：足迹补全（Codex 技能 / drain plist / 断链 curr
   const foot = installFootprint({ home, env });
 
   assert.deepEqual(foot.present.claudeHooks, [], "外项目的 /opt/orca/scripts/stop-hook.mjs 不是我们的钩子");
-  assert.equal(foot.partial, false, "也不该因为同名钩子被误判成半装：" + JSON.stringify(foot.orphans));
+  // PK3-I249：外项目钩子不算我们的（上面那条），于是这台机器是"current 在、本链钩子一条都不在" →
+  //   **半装**（出站已经不转发）。旧版这里断言 partial=false，那正是本轮要修的反方向漏判。
+  assert.deepEqual([foot.partial, foot.orphans.hooks, foot.orphans.claudeRuntime], [true, false, true],
+    "同名钩子不算我们的，但 current 在而本链钩子全没 = 半装：" + JSON.stringify(foot.orphans));
   assert.deepEqual(foot.present.codexSkills.map((p) => path.basename(p)), ["m5codex-inbound-router"], "Codex 技能要纳入足迹");
   assert.equal(foot.present.claudeCurrent, path.join(home, ".claude", "feishu-bridge", "runtime", "current"), "断链的 current 也算在（lstat）");
   assert.deepEqual(foot.residue.map((r) => r.area).sort(), ["codex-skill", "runtime-current"], JSON.stringify(foot.residue));
@@ -9009,6 +9016,314 @@ test("PK3-U1-fix8 ②：显式 CODEX_HOME 的父层是指向夹具外的符号�
   fs.rmSync(declaredBase, { recursive: true, force: true });
 });
 
+// ── PK3-I249：真机卸载跑出的三处（半装反方向 / 预览措辞 / 按链拆清单）────────────────────
+
+/** 两链都装好（Claude: install-outbound；Codex: codex/install），返回 { home, settings, codexHooks }。 */
+const i249BothChains = () => {
+  const home = u1Home();
+  const env = u1Env(home);
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"], env).status, 0, "装 Claude 链");
+  assert.equal(u1Run(home, "codex/install.mjs", ["--apply"], env).status, 0, "装 Codex 链");
+  return {
+    home, env,
+    settings: path.join(home, ".claude", "settings.json"),
+    codexHooks: path.join(home, ".codex", "hooks.json"),
+  };
+};
+
+// 拿掉哪行会红：把 orphans.claudeRuntime / codexRuntime 那两行删掉（回到只看"钩子在而 current 没了"）→
+//   ① 红在 `partial`（两个 current 都在、钩子全没了却报 false）与 doctor 的 ok（✓ 而不是 ✗）。
+test("PK3-I249 ①：两个 runtime/current 都在、两链钩子全删 → ✗ 半装，指引含重装与卸干净", () => {
+  const fx = i249BothChains();
+  // 把两链的钩子都摘掉（模拟卸载中途停下：钩子已删、current 还在）
+  fs.writeFileSync(fx.settings, "{}\n");
+  fs.writeFileSync(fx.codexHooks, "{}\n");
+  assert.equal(fs.existsSync(path.join(fx.home, ".claude", "feishu-bridge", "runtime", "current")), true, "夹具要留着 Claude current");
+  assert.equal(fs.existsSync(path.join(fx.home, ".codex", "feishu-bridge", "runtime", "current")), true, "夹具要留着 Codex current");
+
+  const foot = installFootprint({ home: fx.home, platform: "darwin", env: fx.env });
+  assert.deepEqual([foot.partial, foot.orphans.claudeRuntime, foot.orphans.codexRuntime], [true, true, true],
+    "两个方向都判：current 在而钩子没了 = 半装：" + JSON.stringify(foot.orphans));
+  assert.deepEqual(foot.partialChains, ["claude", "codex"], JSON.stringify(foot.partialChains));
+
+  const st = runDoctor({ home: fx.home, platform: "darwin" }).checks.find((c) => c.id === "install_state");
+  assert.match(st.detail, /半装/u, st.detail);
+  assert.match(st.detail, /Claude 链/u, "要点名 Claude 链：" + st.detail);
+  assert.match(st.detail, /Codex 链/u, "要点名 Codex 链：" + st.detail);
+  assert.deepEqual([st.ok, /install-outbound\.mjs --apply/u.test(st.detail), /uninstall\.mjs --apply/u.test(st.detail), st.next !== null],
+    [false, true, true, true], "指引要同时给「重装」与「卸干净」：" + st.detail);
+});
+
+// 拿掉哪行会红：把 partialChains 里 `orphans.claudeRuntime` 那一项删掉 → ② 红在 partialChains（少了 claude）
+//   与 doctor 文案里的「点名 Claude 链」。
+test("PK3-I249 ②：只删 Claude 链钩子、Codex 链完整 → ✗ 且点名 Claude 链（不冤枉 Codex）", () => {
+  const fx = i249BothChains();
+  fs.writeFileSync(fx.settings, "{}\n");            // 只摘 Claude 链的钩子
+  const foot = installFootprint({ home: fx.home, platform: "darwin", env: fx.env });
+  assert.deepEqual([foot.partial, foot.orphans.claudeRuntime, foot.orphans.codex, foot.orphans.codexRuntime],
+    [true, true, false, false], JSON.stringify(foot.orphans));
+  assert.deepEqual(foot.partialChains, ["claude"], "只点名 Claude 链：" + JSON.stringify(foot.partialChains));
+
+  const st = runDoctor({ home: fx.home, platform: "darwin" }).checks.find((c) => c.id === "install_state");
+  // 判据要精确到"哪条链出了什么问题"：指引里本来就会提 codex/install.mjs（重装提示），不能拿它当"点名 Codex"。
+  assert.deepEqual([st.ok, /Claude 链：runtime\/current 在、三条钩子一条都不在/u.test(st.detail),
+    /Codex 链：/u.test(st.detail)], [false, true, false], JSON.stringify(st));
+  // 同一份判据：uninstall 的预览也说这一链还在（"将停 / 将删"），不是"未安装，跳过"
+  const dry = u1Run(fx.home, "uninstall.mjs", [], fx.env);
+  assert.equal(/2\. 出站（Claude 链）.*未安装，跳过/u.test(dry.stdout), false, dry.stdout);
+});
+
+/** 未安装态用例的保留数据（**真机形状**）：self 的 handler 就是本桥装到 runtime/current 的那份 inbound。
+ *  路径用产品自己的派生函数 runtimeScript 取 —— 豁免判据核的就是“这条路由确实是本桥那条”，
+ *  夹具里写个假 handler（旧版的 /abs/inbound.mjs）会把正例验成非真机形状。handler 可换（反例用）。 */
+const i249RetainedData = (home, { handler = runtimeScript("inbound.mjs", home) } = {}) => {
+  const dir = path.join(home, ".claude", "feishu-bridge");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify({
+    routes: [{ id: "self", handler, default: true }], sessions: { s1: "self" } }));
+  fs.writeFileSync(path.join(dir, "status-providers.json"), JSON.stringify({ providers: [] }));
+  return dir;
+};
+
+/**
+ * `--purge` 预览四类条目各一项的夹具（fix2 P2-2）：
+ *   ① 派生桥根（产品定位置，整棵删）  ② 显式桥根下的已知子目录  ③ 显式桥根下的已知数据文件
+ *   ④ 已知数据文件的覆盖点（`FEISHU_BRIDGE_ROUTES` 指到桥根之外）。
+ * 四类的**路径**从产品派生函数取（machinePurgeTargets），用例只写“期望的措辞”。
+ */
+const i249PurgeFixture = () => {
+  const home = u1Home();
+  const explicit = path.join(home, "explicit-bridge");           // 显式桥根（在 home 下 → 过强边界）
+  const override = path.join(home, "override", "routes.json");   // 覆盖点（在桥根之外）
+  const env = u1Env(home, { FEISHU_CODEX_BRIDGE_HOME: explicit, FEISHU_BRIDGE_ROUTES: override });
+  const targets = machinePurgeTargets({ home, env });
+  const root = targets.roots[0], dir = targets.entries.dirs[0], file = targets.entries.files[0], ov = targets.files[0];
+  for (const p of [root, dir]) fs.mkdirSync(p, { recursive: true });
+  for (const p of [file, ov]) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, "{}\n"); }
+  return { home, env, items: [root, dir, file, ov] };
+};
+
+// 拿掉哪行会红：把 `why` 里那句"—— 整棵删"改回去（或把 --purge 那句单独提示删掉）→
+//   ③ 前半（将保留一栏不含"整棵删"）或后半（文末有 --purge 说明）红。
+// fix2 P2-2：四类条目各造一项，**逐行**断言各自括号里写的是什么（默认预览 → why；--purge → purgeNote）。
+//   拿掉哪行会红：默认预览的 `（" + d.why + "）` 改成 d.purgeNote → ③ 的 why 表那一半红；
+//   --purge 预览的 detail 改回 d.why → purgeNote 表那一半红；把任意一类的 purgeNote 写混（比如覆盖点
+//   写成"整棵删"）→ 只有那一行红（旧版的四选一正则同样过，因为四项都匹得上同一个备选）。
+test("PK3-I249 ③ + fix2 P2-2：默认预览逐行写 why、--purge 预览逐行写各自处置（四类各一项）", () => {
+  const fx = i249PurgeFixture();
+  const dry = u1Run(fx.home, "uninstall.mjs", [], fx.env);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  const lines = dry.stdout.split("\n");
+  const keepAt = lines.findIndex((l) => l.includes("将保留（默认不删）"));
+  assert.ok(keepAt >= 0, "要有「将保留」一栏：" + dry.stdout);
+  const keepLines = lines.slice(keepAt).filter((l) => l.trim().startsWith("·"));
+  const [root, dir, file, ov] = fx.items;
+  // 逐行断言：每一类的**路径 + 它自己那句 why**。
+  const WHY = [
+    [root, "机器级桥根：登记表 / 模板 / 路由表 / 订阅 / 回执 / 账本 / 收据 / runtime（重装即可继续用）"],
+    [dir, "显式桥根下的已知子目录（tasks / receipts / intents / threads / inbound）"],
+    [file, "显式桥根下的已知数据文件（登记表 / 模板 / 日志 / 收据 …）"],
+    [ov, "已知数据文件的覆盖点（登记表 / 路由表 …）"],
+  ];
+  for (const [p, why] of WHY) {
+    assert.ok(keepLines.includes("  · " + p + "（" + why + "）"),
+      "「将保留」那一行要写它自己那句 why（不是 --purge 的处置）：" + p + "\n" + keepLines.join("\n"));
+  }
+  for (const l of keepLines) {
+    assert.doesNotMatch(l, /整棵删/u, "「将保留」的条目里不许再写「整棵删」（那是 --purge 时的处置）：" + l);
+  }
+  // --purge 的处置写在单独一句里
+  const tail = lines.slice(keepAt).join("\n");
+  assert.match(tail, /加 --purge --yes-delete-data 时/u, "要有一句单独说明 --purge 会怎么删：" + tail);
+  assert.match(tail, /整棵删/u, tail);
+
+  // --purge 的预览：每一项的括号里写的是它自己的 purgeNote（逐行、逐类）。
+  const purgeDry = u1Run(fx.home, "uninstall.mjs", ["--purge", "--yes-delete-data"], fx.env);
+  assert.equal(purgeDry.status, 0, purgeDry.stdout + purgeDry.stderr);
+  const purgeLines = purgeDry.stdout.split("\n").filter((l) => l.trim().startsWith("·"));
+  const PURGE = [
+    [root, "机器级桥根 —— 整棵删"],
+    [dir, "显式桥根下的已知子目录 —— 整棵删（父目录保留）"],
+    [file, "显式桥根下的已知数据文件 —— 只删这个文件"],
+    [ov, "已知数据文件的覆盖点 —— 只删这个文件，不碰它的父目录"],
+  ];
+  for (const [p, note] of PURGE) {
+    assert.ok(purgeLines.some((l) => l.includes(p) && l.trim().endsWith("（" + note + "）")),
+      "--purge 预览的条目要写它自己的处置：" + p + "（" + note + "）\n" + purgeLines.join("\n"));
+  }
+});
+
+// 拿掉哪行会红：把第 2 步的 `claudeSkillsPresent` 改回 `[...claudeSkills, ...codexSkills]`（旧版并链）→
+//   ④ 红在"第 2 步不许出现 .codex/skills"。
+test("PK3-I249 ④：预览第 2 步只列 Claude 链条目，Codex 技能只在第 3 步", () => {
+  const fx = i249BothChains();
+  const dry = u1Run(fx.home, "uninstall.mjs", [], fx.env);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  const lines = dry.stdout.split("\n");
+  const stepAt = (n) => lines.findIndex((l) => new RegExp("^" + n + "\\. ").test(l));
+  const s2 = stepAt(2), s3 = stepAt(3);
+  assert.ok(s2 >= 0 && s3 > s2, "要能切出第 2 / 3 步：" + dry.stdout);
+  const step2 = lines.slice(s2, s3).join("\n");
+  const step3 = lines.slice(s3, stepAt(4) > s3 ? stepAt(4) : lines.length).join("\n");
+  assert.doesNotMatch(step2, /\.codex\/skills/u, "第 2 步（Claude 链）不许列 Codex 技能：" + step2);
+  assert.match(step2, /\.claude\/skills/u, "第 2 步要列 Claude 链自己的技能：" + step2);
+  assert.match(step3, /\.codex\/skills/u, "第 3 步要列 Codex 技能：" + step3);
+  assert.match(step3, /\.codex\/hooks\.json/u, "第 3 步要列 Codex 钩子：" + step3);
+});
+
+// 拿掉哪行会红：把 routeVerdict 里 `selfOnlyWhenUninstalled` 那一支删掉（回到"豁免滤掉 self 之后就算 ✓"）→
+//   本用例红在①的 ok（会变成 true/「每条启用路由都有…状态入口」而不是 null/未安装 —— 不适用）。
+//   注：把 selfOnlyWhenUninstalled 里的 `selfRouteRetained` 删掉**不会**让本用例红 —— 本用例的 handler
+//   就是本桥那份（真机形状），两个条件同时成立；那一条的刀在下面那条反例上。
+test("PK3-I249 ⑤：装 → 一键卸 → doctor 零 ✗ 且结论是未安装（① 不再因 self 没状态入口染红）", () => {
+  // 真机形状：routes.json 里有 self 默认路由（handler 就是本桥装到 runtime/current 那份），
+  //   **状态入口表里没有 self**（它的状态由本桥自身提供）—— 而 self 的状态入口随 runtime/current
+  //   一起卸掉了（于是 self 一定会被 collectConnectivity 判 unregistered）。
+  const home = u1Home();
+  i249RetainedData(home);
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+
+  const rep = runDoctor({ home });
+  const st = rep.checks.find((c) => c.id === "install_state");
+  assert.match(st.detail, /^未安装/u, JSON.stringify(st));
+  assert.deepEqual(rep.checks.filter((c) => c.ok === false).map((c) => c.id), [],
+    "卸完不许有 ✗（① 也要判「未安装 —— 不适用」）：" + JSON.stringify(rep.checks.filter((c) => c.ok === false)));
+  const route = rep.checks.find((c) => c.id === "route_without_provider");
+  assert.deepEqual([route.ok, /未安装 —— 不适用/u.test(route.detail)], [null, true], JSON.stringify(route));
+  assert.match(renderDoctor(rep), /结论：未安装/u, renderDoctor(rep).split("\n").slice(-3).join("\n"));
+});
+
+// 拿掉哪行会红：把 `selfRouteRetained` 删掉（豁免只看 selfExempt 里的名字/真实运行时）→
+//   selfOnlyWhenUninstalled 重新变成"名字叫 self 就放行"，① 从 ✗ 变「未安装 —— 不适用」→ 红。
+//   把 `c.id === "default_route_handler" && !selfRouteRetained` 那一行删掉 → ⑦ 又变无条件降级 → 红。
+test("PK3-I249-fix2 P1-1：豁免要核到本桥路由身份 —— 名字叫 self 但 handler 不是本桥那份，照旧 ✗", () => {
+  const home = u1Home();
+  // 反例：id 叫 self，handler 是**别人/别处**的东西（不是本桥装到 runtime/current 的那份）。
+  i249RetainedData(home, { handler: path.join(home, "someone-elses-handler.mjs") });
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+
+  const rep = runDoctor({ home });
+  const route = rep.checks.find((c) => c.id === "route_without_provider");
+  assert.deepEqual([route.ok, /self/u.test(route.detail), /未安装 —— 不适用/u.test(route.detail)], [false, true, false],
+    JSON.stringify(route));
+  // ⑦ 也不许被"没装"整条掩掉：保留的默认路由 handler 不是本桥那份时，那不是"运行时被卸了"造成的。
+  const seven = rep.checks.find((c) => c.id === "default_route_handler");
+  assert.deepEqual([seven.ok, /未安装 —— 不适用/u.test(seven.detail)], [false, false], JSON.stringify(seven));
+});
+
+// 拿掉哪行会红：selfRouteRetained 去掉 `r.isDefault === true` → ① 变「未安装 —— 不适用」、⑦ 被降级成 null。
+test("PK3-I249-fix3 P1：保留的 self 不是默认、外部路由才是默认（且有状态入口）→ 卸后 ① 与 ⑦ 仍 ✗", () => {
+  const home = u1Home();
+  const dir = i249RetainedData(home);
+  fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify({
+    routes: [
+      { id: "self", handler: runtimeScript("inbound.mjs", home) },
+      { id: "ext", handler: path.join(home, "ext-handler.mjs"), default: true },
+    ], sessions: { s1: "self" } }));
+  fs.writeFileSync(path.join(dir, "status-providers.json"), JSON.stringify({ providers: [{
+    id: "ext", protocol: "feishu-bridge-status/v1", executable: process.execPath, script: path.join(home, "ext-status.mjs"),
+    args: [], allowed_kinds: ["transport"], project_root: home }] }));
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+  const rep = runDoctor({ home });
+  const route = rep.checks.find((c) => c.id === "route_without_provider");
+  assert.deepEqual([route.ok, /未安装 —— 不适用/u.test(route.detail)], [false, false], JSON.stringify(route));
+  const seven = rep.checks.find((c) => c.id === "default_route_handler");
+  assert.deepEqual([seven.ok, /未安装 —— 不适用/u.test(seven.detail)], [false, false], JSON.stringify(seven));
+});
+
+// 拿掉哪行会红：selfIsBridgeRoute 的 `(foot.clean && selfRouteRetained)` 换成 false → ① 的红项清单里多出 self，
+//   会误指用户给本桥自己的 self 登记外部状态入口（Codex 二轮 P2：措辞回归钉）。
+test("PK3-I249-fix3 P2：卸后本桥 self 与另一条无状态入口路由并存 → ① ✗ 只点名另一条、不点名 self", () => {
+  const home = u1Home();
+  const dir = i249RetainedData(home);
+  fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify({
+    routes: [
+      { id: "self", handler: runtimeScript("inbound.mjs", home), default: true },
+      { id: "lonely", handler: path.join(home, "lonely-handler.mjs") },
+    ], sessions: { s1: "self" } }));
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+  const route = runDoctor({ home }).checks.find((c) => c.id === "route_without_provider");
+  const listed = (/没有状态入口：([^；]*)/u.exec(route.detail) ?? [])[1] ?? "";
+  assert.deepEqual([route.ok, listed.split(/[，,、\s]+/u).filter(Boolean)], [false, ["lonely"]], JSON.stringify(route));
+});
+
+// 拿掉哪行会红：把 routeVerdict 里的 `tablesUnclear ? …` 那一支删掉（tablesUnclear 排到豁免之后）→
+//   本用例红在①的 detail（会变成「未安装 —— 不适用」而不是「查不清」）。
+test("PK3-I249-fix2 P1-1：表读不出时先说查不清 —— 不许被未安装豁免抢先判「不适用」", () => {
+  const home = u1Home();
+  i249RetainedData(home);            // 正例形状：handler 就是 runtimeScript 那份
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+  // 状态入口表写坏：读不出来 → collectConnectivity 报 providersProblem（不是"没有入口"）
+  fs.writeFileSync(path.join(home, ".claude", "feishu-bridge", "status-providers.json"), "{ 这不是 JSON\n");
+
+  const rep = runDoctor({ home });
+  const route = rep.checks.find((c) => c.id === "route_without_provider");
+  assert.deepEqual([route.ok, /查不清/u.test(route.detail), /未安装 —— 不适用/u.test(route.detail)], [null, true, false],
+    JSON.stringify(route));
+});
+
+// 拿掉哪行会红：把 install-footprint 的 codexDrain 改回 `kind === "launchd" ? [plistPath] : []`（只收 plist）→
+//   本用例红在 foot.clean（只剩两份 unit 却判"未安装"）、orphans.codexDrain 与第 3 步的清单。
+test("PK3-I249-fix2 P1-2：linux 上 Codex 兜底排空的两份 systemd unit 也在足迹里", () => {
+  const home = u1Home();
+  const env = u1Env(home, { FEISHU_BRIDGE_TIMER_PLATFORM: "linux" });
+  // 夹具：**只剩这两份 unit**（L7 那条路径写的，从产品派生函数取，不手写文件名）
+  const units = codexDrainUnitPaths({ kind: "systemd", home });
+  assert.equal(units.length, 2, JSON.stringify(units));
+  for (const p of units) {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, "[Unit]\n");
+  }
+  const foot = installFootprint({ home, platform: "linux", env });
+  assert.deepEqual([foot.clean, foot.present.codexDrain.length, foot.orphans.codexDrain, foot.partial, foot.partialChains],
+    [false, 2, true, true, ["codex"]], JSON.stringify(foot.residue));
+  // doctor：不报"未安装"，按半装点名 Codex 链
+  const st = runDoctor({ home, platform: "linux" }).checks.find((c) => c.id === "install_state");
+  assert.deepEqual([st.ok, /^未安装/u.test(st.detail), /Codex 链：兜底排空服务还在/u.test(st.detail)], [false, false, true], JSON.stringify(st));
+  // 卸载第 3 步（Codex 链）要处理它们
+  const dry = u1Run(home, "uninstall.mjs", [], env);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  const lines = dry.stdout.split("\n");
+  const s3 = lines.findIndex((l) => /^3\. /u.test(l));
+  const s4 = lines.findIndex((l) => /^4\. /u.test(l));
+  const step3 = lines.slice(s3, s4 > s3 ? s4 : lines.length).join("\n");
+  assert.ok(s3 >= 0 && s4 > s3, "要能切出第 3 / 4 步：" + dry.stdout);
+  for (const p of units) assert.ok(step3.includes(p), "第 3 步要列出 " + p + "：\n" + step3);
+  assert.match(step3, /将停 \/ 将删/u, step3);
+});
+
+// 拿掉哪行会红：把第 2 步的 `claudeTimers` 改回并上 `foot.present.codexDrain` → 本用例红在两处：
+//   ① 预览里第 2 步从"未安装，跳过"变成"将停 / 将删"；② --apply 会去 spawn install-outbound.mjs，
+//   而夹具里连 `~/.claude/settings.json` 都没有（install-outbound 一读就抛）→ 卸载停在第 2 步、退出码非 0。
+test("PK3-I249-fix2 P1-3：只有 Codex 链的机器不跑 Claude 卸载器（第 2 步跳过、drain 归第 3 步）", () => {
+  const home = u1Home();
+  fs.rmSync(path.join(home, ".claude", "settings.json"), { force: true });   // Claude 链从没装过
+  const env = u1Env(home, { FEISHU_BRIDGE_TIMER_PLATFORM: "linux" });
+  const units = codexDrainUnitPaths({ kind: "systemd", home });
+  for (const p of units) {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, "[Unit]\n");
+  }
+  const dry = u1Run(home, "uninstall.mjs", [], env);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  const lines = dry.stdout.split("\n");
+  const s2 = lines.findIndex((l) => /^2\. /u.test(l));
+  const s3 = lines.findIndex((l) => /^3\. /u.test(l));
+  assert.ok(s2 >= 0 && s3 > s2, "要能切出第 2 / 3 步：" + dry.stdout);
+  assert.match(lines.slice(s2, s3).join("\n"), /未安装，跳过/u, "第 2 步（Claude 链）在这台机器上没东西可卸：" + dry.stdout);
+  assert.match(lines.slice(s3, s3 + 3).join("\n"), /将停 \/ 将删/u, dry.stdout);
+
+  const applied = u1Run(home, "uninstall.mjs", ["--apply"], env);
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /2\. 出站（Claude 链）[^\n]*未安装，跳过/u, applied.stdout);
+  assert.deepEqual(units.map((p) => fs.existsSync(p)), [false, false],
+    "第 3 步要把两份 unit 收掉（否则它们永远没人处理）");
+});
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {
   const home = u1Home();
   assert.equal(u1Footprint(home).clean, true);
@@ -19649,6 +19964,12 @@ function doctorMachine({ installRuntime = false } = {}) {
     assert.equal(plan.ok, true, plan.reason ?? "");
     const applied = applyRuntimeSync(plan, { home, chain: "claude" });
     assert.equal(applied.ok, true, applied.reason ?? "");
+    // PK3-I249：**好机器必须真有本桥的三条钩子**。只装 runtime/current 不装钩子 = 出站根本不工作
+    //   （Stop 钩子没了），加了"current 在而钩子没了 = 半装"的反方向判据之后这种机器会被判 ✗ ——
+    //   旧夹具正是这种"自相矛盾的机器"。用产品自己的渲染器写，别手抄命令。
+    const settingsFile = path.join(home, ".claude", "settings.json");
+    const base = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf-8") : "{}";
+    fs.writeFileSync(settingsFile, renderClaudeSettings({ baseText: base, home }).text);
   }
   const okProvider = path.join(home, "provider-ok.mjs");
   fs.writeFileSync(okProvider, 'process.stdout.write(JSON.stringify({ schema_version: "feishu-bridge-status/v1", provider_id: process.argv[2] ?? "x", connections: [] }));\n');
@@ -19855,13 +20176,17 @@ test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允�
     { encoding: "utf-8", env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
       FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") } });
   assert.equal(gen.status, 0, gen.stderr);
-  // PK3-U1-fix2 P2-2：drain plist 在、而它指向的 runtime/current 不在 = **半装**（fix2 之后医生会报 ✗）。
-  // “好机器”当然要真有那份 runtime —— 旧夹具只写 plist 不装 Codex 运行时，是个自相矛盾的机器。
+  // PK3-U1-fix2 P2-2 / PK3-I249：「好机器」的 Codex 链必须**真装过** —— drain plist 在、runtime/current 也要在，
+  //   而 PK3-I249 之后还要求 codex hooks 也在（current 在而钩子全没 = 那一链不工作 = 半装 ✗）。
+  //   旧夹具只写 plist + runtime，是个自相矛盾的机器。这里跑**真安装器**（它自己会写 runtime / hooks / 技能），
+  //   别手抄 hooks.json。
   {
-    const codexRoot = codexRuntimeRoot(path.join(m.home, ".codex"));
-    const codexPlan = planRuntimeSync({ sourceRoot: path.resolve("."), chain: "codex", root: codexRoot });
-    assert.equal(codexPlan.ok, true, codexPlan.reason ?? "");
-    assert.equal(applyRuntimeSync(codexPlan, { chain: "codex", root: codexRoot }).ok, true);
+    const codexInstall = spawnSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], {
+      encoding: "utf-8",
+      env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
+        FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") },
+    });
+    assert.equal(codexInstall.status, 0, "Codex 链要真装上：" + codexInstall.stdout + codexInstall.stderr);
   }
   const { expect, label } = JSON.parse(gen.stdout);
   const claudeJob = claudeDrainExpectedJob({ home: m.home });

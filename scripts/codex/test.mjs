@@ -14,8 +14,8 @@ import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsola
 // PK3-T1：本轮临时目录根 + 写盘失败翻译 —— 从 test-support/ 取（不动共用面 test-harness.mjs 的导出）
 import { installSuiteTempRoot } from "../test-support/suite-temp-root.mjs";
 import { installWriteDiagnosis } from "../test-support/write-diagnosis.mjs";
-// PK3-U1-fix7：真 purge 用例的夹具边界（剔继承的删除目标覆盖点 + 启动前核清单）
-import { purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "../test-support/purge-fixture-guard.mjs";
+// PK3-U1-fix7 / PK3-I247：夹具环境清洗与边界守卫（真 purge 的删除目标 + 安装器写目标）
+import { INSTALL_WRITE_TARGET_ENV_KEYS, installerChildEnv, purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "../test-support/purge-fixture-guard.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -179,6 +179,13 @@ const withIntent = (action, threadId, home, input = {}) => {
 const isolatedEnv = (extra = {}) => ({
   ...process.env, FEISHU_BRIDGE_LAUNCHCTL: FAKE_LAUNCHCTL, ...extra,
 });
+/**
+ * `isolatedEnv` 的**安装器 / 卸载入口**版本（PK3-I247）：字段一字不差，但先过 `installerChildEnv` ——
+ * 继承的写目标 / 删除目标覆盖点（收据 `FEISHU_BRIDGE_INSTALLED_SURFACE`、安装面锁、桥根、覆盖文件）
+ * 一律剔掉；用例显式给的字段照旧生效。codex/install --apply 与 --uninstall 的调用都用它。
+ */
+const installerEnv = (extra = {}) =>
+  installerChildEnv({ env: process.env, extra: { FEISHU_BRIDGE_LAUNCHCTL: FAKE_LAUNCHCTL, ...extra } });
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
 const THREAD_B = "01922222-3333-7444-8555-666666666666";
 const TEMPLATE = {
@@ -2766,7 +2773,7 @@ test("安装器在隔离 HOME 只追加 hooks、渲染技能路径且保留已�
   writeRegistryFixtureUnvalidated([legacyTask], path.join(home, "registry.json"));
   const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
     encoding: "utf-8",
-    env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+    env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }),
   });
   assert.equal(r.status, 0, r.stderr);
   const hooks = JSON.parse(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"));
@@ -3308,7 +3315,7 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
   const installed = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+      env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }),
     });
   assert.equal(installed.status, 0, "夹具依赖安装器成功：" + installed.stderr);
   // 唯一写事务：模板写锁被别的写方持有时，安装器不改 bridge_root、也不动 hooks（评审反例：安装器无锁重写会覆盖并发登记）
@@ -3318,13 +3325,13 @@ test("Codex doctor 只读汇总依赖、安装和登记状态", () => {
     const tplBefore = fs.readFileSync(path.join(home, "chain-config.json"), "utf-8");
     const hooksBefore = fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8");
     fs.writeFileSync(path.join(home, "chain-config.json"), tplBefore.replace(/"bridge_root": "[^"]*"/u, '"bridge_root": "/old/clone"'));
-    const blocked = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+    const blocked = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }) });
     assert.notEqual(blocked.status, 0, "持锁时安装器必须失败：" + blocked.stdout + blocked.stderr);
     assert.match(blocked.stderr, /template_busy/u, blocked.stderr);
     assert.match(JSON.parse(fs.readFileSync(path.join(home, "chain-config.json"), "utf-8")).bridge_root, /\/old\/clone$/u, "持锁期间模板没被改");
     assert.equal(fs.readFileSync(path.join(codexHome, "hooks.json"), "utf-8"), hooksBefore, "hooks 没动");
     assert.equal(releasePublishLock(lockPath).ok, true);
-    const again = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+    const again = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }) });
     assert.equal(again.status, 0, again.stdout + again.stderr);
     assert.match(again.stdout, /bridge_root .* → runtime\/current/u, again.stdout);
     assert.ok(fs.readdirSync(home).some((n) => n.startsWith("chain-config.json.bak.")), "安装器改模板也先备份");
@@ -3762,7 +3769,7 @@ test("安装器只许写进 CODEX_HOME —— 套件 HOME 派生的 ~/.codex 一
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+      env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }),
     });
   assert.equal(r.status, 0, r.stderr);
 
@@ -3824,7 +3831,7 @@ test("迁移必须收敛旧克隆的 hook，而不是在旁边再加一条", () 
   const r = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home },
+      env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }),
     });
   assert.equal(r.status, 0, r.stderr);
 
@@ -3872,8 +3879,8 @@ test("装好的 runtime 必须能自证 —— doctor 在自己的运行环境�
   writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
   fs.writeFileSync(path.join(bridge, "chain-config.json"),
     JSON.stringify({ ...TEMPLATE, lark_cli_bin: path.join(bin, "lark-cli") }));
-  const env = { ...isolatedEnv(), HOME: fakeHome, CODEX_HOME: codexHome,
-    FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH };
+  const env = installerEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: bridge, PATH: bin + path.delimiter + process.env.PATH });
 
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
@@ -4020,7 +4027,7 @@ test("启用必须 fail-closed：launchd 查不出来时，只许一次只读 li
   fs.writeFileSync(lc, '#!/bin/sh\necho "$@" >> ' + JSON.stringify(marker) +
     '\ncase "$1" in\n  list) echo "看不懂的输出"; exit 0;;\nesac\nexit 0\n', { mode: 0o755 });
 
-  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+  const env = installerEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
     FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
@@ -4077,7 +4084,7 @@ test("已经在健康运行时，重跑 --enable 是无操作 —— 不许打�
     JSON.stringify(node) + ' ' + JSON.stringify(node) + ' ' + JSON.stringify(expectScript) +
     '; exit 0;;\nesac\nexit 0\n', { mode: 0o755 });
 
-  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+  const env = installerEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
     FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
@@ -4131,7 +4138,7 @@ test("启用必须 fail-closed：plist 读不出来时，launchctl 一次都不�
   const plistPathAsDir = path.join(agents, "com.frank.feishu-bridge-codex.drain.plist");
   fs.mkdirSync(plistPathAsDir);
 
-  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
+  const env = installerEnv({ HOME: fakeHome, CODEX_HOME: codexHome,
     FEISHU_CODEX_BRIDGE_HOME: bridge, FEISHU_BRIDGE_LAUNCHCTL: lc });
   // 先把运行时装好，免得卡在运行时那道门槛上、测不到我们要测的东西。
   assert.equal(spawnSync(process.execPath,
@@ -4170,7 +4177,7 @@ test("plist 读不出来不许当成「未启用」", () => {
   // **把 plist 路径做成目录** → 读它会 EISDIR。
   fs.mkdirSync(path.join(agents, "com.frank.feishu-bridge-codex.drain.plist"));
 
-  const env = isolatedEnv({ HOME: fakeHome, CODEX_HOME: path.join(dir, "codex"),
+  const env = installerEnv({ HOME: fakeHome, CODEX_HOME: path.join(dir, "codex"),
     FEISHU_CODEX_BRIDGE_HOME: bridge });
   const status = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "drain-service.mjs")], { encoding: "utf-8", env });
@@ -4250,7 +4257,7 @@ test("有副作用的技能必须关掉隐式调用，且装出来要带上那�
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
-  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
     { encoding: "utf-8", env }).status, 0);
@@ -4285,7 +4292,7 @@ test("每个命令都要有对应的技能，装出来还要能被 doctor 核验
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
-  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
     { encoding: "utf-8", env }).status, 0);
@@ -4715,7 +4722,7 @@ test("意图凭证：复现那次事故 —— 没有凭证的 --apply 一律拒
   fs.mkdirSync(root, { recursive: true });
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
   // 事故的形状：agent 自己去跑 bind-task --apply，**没有凭证**。
   const noIntent = spawnSync(process.execPath,
@@ -4813,7 +4820,7 @@ test("接线：走真实决策路径签票 → 真实 CLI 过门禁；代际变�
   const at = launched.indexOf("--intent");
   assert.notEqual(at, -1, "launcher 必须把票传下去：" + JSON.stringify(launched));
   const ticket = launched[at + 1];
-  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
   const pass = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "feishu-rotate.mjs"),
       "--project", root, "--thread-id", THREAD_A, "--automatic", "--apply",
@@ -4919,7 +4926,7 @@ test("轮转脚本真实入口：人工票不能拿去跑 --automatic", () => {
   delete task.channel_generation_id;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
   // 拿一张**人工创建**的票，去跑自动轮转 —— 必须被拒。
   const manual = issueIntent({ action: "rotate", threadId: THREAD_A,
@@ -5076,7 +5083,7 @@ test("只读的 $feishu-mode 不许签出可当写票用的凭证", () => {
     rootMessageId: "om_root", token: "a1b2c3" });
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
   const hook = (prompt) => {
     const r = spawnSync(process.execPath,
@@ -5148,7 +5155,7 @@ test("意图凭证：钩子只给写动作签，只读的不签", () => {
     rootMessageId: "om_root", token: "a1b2c3" });
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
-  const env = isolatedEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ FEISHU_CODEX_BRIDGE_HOME: home });
 
   const hook = (prompt) => {
     const r = spawnSync(process.execPath,
@@ -5214,7 +5221,7 @@ test("钩子注入的命令必须跑 runtime/current —— 不许按模板的 b
   const installedHook = path.join(runtimeRoot, "current", "scripts", "codex", "prompt-hook.mjs");
   // Aily 真机形状（2026-08-28）：CODEX_HOME 指向一个**没装桥**的会话专属目录，而 hooks.json 仍从真机 runtime 加载钩子。
   const sessionHome = path.join(dir, "aily-session-codex-home"); fs.mkdirSync(sessionHome, { recursive: true });
-  const env = isolatedEnv({ CODEX_HOME: sessionHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ CODEX_HOME: sessionHome, FEISHU_CODEX_BRIDGE_HOME: home });
 
   const hook = () => spawnSync(process.execPath, [installedHook],
     { encoding: "utf-8", env, input: JSON.stringify({
@@ -5247,7 +5254,7 @@ test("安装器要把模板的 bridge_root 更新到 runtime/current", () => {
   fs.writeFileSync(tplFile, JSON.stringify({
     ...TEMPLATE, bridge_root: "/Users/someone/old-clone/feishu-bridge-c" }));
 
-  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
+  const env = installerEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
     { encoding: "utf-8", env }).status, 0);
@@ -5304,7 +5311,7 @@ test("PK3-C220: codex init-chain-template 拒绝未知 flag（含 --bridge-root�
     "--chat-name", "测试群",
     "--lark-cli-bin", "/bin/lark-cli",
   ];
-  const env = isolatedEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
+  const env = installerEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
 
   try {
     // ① --bridge-root x --apply → 退出 2、stderr 含「bridge_root 由安装器维护」、模板未生成
@@ -5390,7 +5397,7 @@ test("PK3-C220-fix2: codex init 空值与重复 flag → 退出 2、零写（可
     "--agent-uid", "agent_codex_test", "--transport-agent-name", "M5Codex", "--transport-app-id", "cli_test",
     "--transport-open-id", "ou_test", "--frank-sender-id", "1234567890", "--chat-id", "oc_test123", "--chat-name", "测试群", "--lark-cli-bin", "/bin/lark-cli",
   ];
-  const env = isolatedEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
+  const env = installerEnv({ HOME: dir, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridgeHomeDir });
   const run = (extra) => spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "init-chain-template.mjs"), ...initArgs, ...extra], { encoding: "utf-8", env });
   try {
     const rEmpty = run(["--lark-cli-config-base", "", "--apply"]);
@@ -5427,7 +5434,7 @@ test("doctor 的 bridge_root 判据不许写成「永远通过」", () => {
     fs.writeFileSync(path.join(bin, n), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
   }
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
-  const env = isolatedEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home,
+  const env = installerEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home,
     PATH: bin + path.delimiter + process.env.PATH });
   // 先正常装一遍（安装器会把 bridge_root 校正过来）。
   fs.writeFileSync(path.join(home, "chain-config.json"),
@@ -5862,7 +5869,7 @@ test("hook 往返：含单引号的路径，装两次仍然只有一条", () => 
   fs.mkdirSync(codexHome, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
   writeRegistryFixtureUnvalidated([], path.join(home, "registry.json"));
-  const env = { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home };
+  const env = installerEnv({ CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home });
   const install = () => spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
 
@@ -5912,8 +5919,7 @@ test("技能要逐字节比对 —— 「文件在」不等于「装对了」", 
   const runtimeCurrent = path.join(codexHome, "feishu-bridge", "runtime", "current");
   assert.equal(spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome,
-      FEISHU_CODEX_BRIDGE_HOME: home } }).status, 0);
+    { encoding: "utf-8", env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }) }).status, 0);
 
   const audit = () => auditSkills({ repoRoot: ROOT, codexHome, runtimeCurrent, bridgeHome: home });
   assert.equal(audit().ok, true, "刚装完必须逐字节一致：" + JSON.stringify(audit().problems));
@@ -6118,8 +6124,8 @@ test("launchd 加载失败必须非零退出 —— 不许报成「已启用」"
     '  bootstrap) echo "Load failed: 5: Input/output error" >&2; exit 5;;\nesac\nexit 0\n',
     { mode: 0o700 });
 
-  const env = { ...isolatedEnv(), HOME: fakeHome, PATH: bin + path.delimiter + process.env.PATH,
-    CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge };
+  const env = installerEnv({ HOME: fakeHome, PATH: bin + path.delimiter + process.env.PATH,
+    CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge });
   // 先把运行时装好，否则会卡在运行时那道门槛上，测不到我们要测的东西。
   const installed = spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
@@ -10222,7 +10228,7 @@ test("维护门 · PR B：hooks.json 合并是纯函数（只动自己的 child�
   assert.equal(renderCodexHooks({ baseText: r.text, promptScript, stopScript, node, home, log }).text, r.text, "幂等");
   assert.deepEqual([codexHooksOwnedEntries(r.text).Stop.length, codexHooksOwnedEntries(r.text).UserPromptSubmit.length, codexHooksOwnedEntries("{ 坏")], [1, 1, null]);
   assert.deepEqual(renderCodexHooks({ baseText: null, promptScript, stopScript, node, home, log, uninstall: true }).actions, { UserPromptSubmit: "already-absent", Stop: "already-absent" });
-  const inst = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: { ...isolatedEnv(), CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } });
+  const inst = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: installerChildEnv({ env: isolatedEnv(), extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: home } }) });
   assert.equal(inst.status, 0, inst.stderr + inst.stdout);
   assert.match(inst.stdout, /安装收据    已记（/u);
   const file = path.join(home, "installed-surface.json");
@@ -11290,14 +11296,7 @@ test("PK3-L7：codex/install.mjs --uninstall 在 Linux 上单元存在时按纪�
       "--uninstall", "--apply",
     ], {
       encoding: "utf-8",
-      env: {
-        ...process.env,
-        HOME: fx.home,
-        CODEX_HOME: fx.codexHome,
-        FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
-        FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin,
-        FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
-      },
+      env: installerChildEnv({ env: process.env, extra: { HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" } }),
     });
     assert.equal(r.status, 0, "uninstall 成功退出 0：" + r.stderr + "\n" + r.stdout);
     assert.equal(fs.existsSync(paths.service), false, "service 必须被删除");
@@ -11486,15 +11485,7 @@ test("PK3-L7-fix3 P2：卸载收 manager 里的孤儿 timer（盘上没文件也
     path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply",
   ], {
     encoding: "utf-8",
-    env: {
-      ...process.env,
-      HOME: fx.home,
-      CODEX_HOME: fx.codexHome,
-      FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
-      FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin,
-      FEISHU_BRIDGE_TIMER_PLATFORM: "linux",
-      ...env,
-    },
+    env: installerChildEnv({ env: process.env, extra: { HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...env } }),
   });
   // ① 孤儿：盘上两份 unit 都不在，manager 里还记着它（enabled 已丢、但 LoadState=loaded）
   const orphan = linuxDrainFixture();
@@ -11686,10 +11677,7 @@ test("PK3-L7-fix4 P2-1：卸载的 manager 查询是三态 —— 预览孤儿�
     path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", ...args,
   ], {
     encoding: "utf-8",
-    env: {
-      ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
-      FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...env,
-    },
+    env: installerChildEnv({ env: process.env, extra: { HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux", ...env } }),
   });
 
   // ① manager 里有、盘上零文件 → 预览说**孤儿**且零写；apply 真的 disable --now + daemon-reload
@@ -11884,8 +11872,7 @@ test("PK3-L7-fix5 P1-3：三条 linux 写路径都进安装面锁（锁内查门
     assert.equal(fs.existsSync(codexDrainSystemdPaths(b.home).service), false, "② busy 也零写");
     const cRun = spawnSync(process.execPath,
       [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
-      { encoding: "utf-8", env: { ...process.env, HOME: b.home, CODEX_HOME: b.codexHome,
-        FEISHU_CODEX_BRIDGE_HOME: b.bridge, FEISHU_BRIDGE_SYSTEMCTL: b.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" } });
+      { encoding: "utf-8", env: installerChildEnv({ env: process.env, extra: { HOME: b.home, CODEX_HOME: b.codexHome, FEISHU_CODEX_BRIDGE_HOME: b.bridge, FEISHU_BRIDGE_SYSTEMCTL: b.fakeBin, FEISHU_BRIDGE_TIMER_PLATFORM: "linux" } }) });
     assert.equal(cRun.status, 2, "install 的 linux 写路径也要在锁里：" + cRun.stdout + cRun.stderr);
     assert.match(cRun.stderr, /安装面锁拿不到/u, cRun.stderr);
   } finally {
@@ -11972,8 +11959,7 @@ test("PK3-L7-fix6：两个测试注入点只剩函数参数 —— 旧环境变�
   fs.writeFileSync(hookFile2, "import fs from \"node:fs\";\nfs.writeFileSync(" + JSON.stringify(marker2) + ", \"ran\");\n");
   const uninstallCli = (extra) => spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), "--uninstall", "--apply"],
-    { encoding: "utf-8", env: { ...baseEnv, HOME: fx2.home, CODEX_HOME: fx2.codexHome,
-      FEISHU_CODEX_BRIDGE_HOME: fx2.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx2.fakeBin, ...extra } });
+    { encoding: "utf-8", env: installerChildEnv({ env: baseEnv, extra: { HOME: fx2.home, CODEX_HOME: fx2.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx2.bridge, FEISHU_BRIDGE_SYSTEMCTL: fx2.fakeBin, ...extra } }) });
   const withInstall = uninstallCli({ [VAR_INSTALL]: hookFile2 });
   assert.equal(withInstall.status, 0, withInstall.stdout + withInstall.stderr);
   assert.equal(fs.existsSync(marker2), false, "install 的旧环境变量是死字母");
@@ -12040,6 +12026,36 @@ test("PK3-U1-fix5 P1-2：显式桥根 purge 的封闭清单 —— 真跑一遍�
   const left = fs.readdirSync(bridge).sort();
   assert.deepEqual(left, [], "桥根下除父目录外必须为空（purge 前有 " + JSON.stringify(before) + "），还剩下：" + JSON.stringify(left));
   assert.equal(fs.existsSync(bridge), true, "人给的那个目录本身保留");
+});
+
+// 拿掉哪行会红：把 codex 套件的 `installerEnv` 换回 `isolatedEnv`（不再调 installerChildEnv）→
+//   codex/install --apply 会读到父进程设的覆盖点 → 红在「哨兵必须没被写」。
+test("PK3-I247：父进程设的安装写目标覆盖点进不了 codex/install —— 夹具外哨兵不被写（Codex 链同形调用）", () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "i247-outside-"));
+  const sentinelReceipt = path.join(outside, "installed-surface.json");
+  const sentinelLock = path.join(outside, "install-surface.lock");
+  const saved = Object.fromEntries(INSTALL_WRITE_TARGET_ENV_KEYS.map((k) => [k, process.env[k]]));
+  try {
+    process.env.FEISHU_BRIDGE_INSTALLED_SURFACE = sentinelReceipt;
+    process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK = sentinelLock;
+    // 与主线那条"安装器在隔离 HOME 只追加 hooks…"用例同形的调用：真 codex/install --apply
+    const dir = temp();
+    const home = path.join(dir, "home");
+    const codexHome = path.join(dir, "codex");
+    const bridge = path.join(dir, "bridge");
+    for (const d of [home, codexHome, bridge]) fs.mkdirSync(d, { recursive: true });
+    writeRegistryFixtureUnvalidated([], path.join(bridge, "registry.json"));
+    const env = installerEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge });
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(fs.existsSync(sentinelReceipt), false, "继承的收据覆盖点不许进子进程（哨兵被写了）");
+    assert.equal(fs.existsSync(sentinelLock), false, "继承的安装面锁覆盖点不许进子进程（哨兵被写了）");
+    assert.equal(fs.existsSync(path.join(bridge, "installed-surface.json")), true,
+      "收据照常落在夹具桥根里：" + JSON.stringify(fs.readdirSync(bridge)));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {

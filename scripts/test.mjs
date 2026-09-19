@@ -20245,10 +20245,11 @@ test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允�
   //   旧夹具只写 plist + runtime，是个自相矛盾的机器。这里跑**真安装器**（它自己会写 runtime / hooks / 技能），
   //   别手抄 hooks.json。
   {
+    //   PK3-I247：写盘调用一律经夹具环境清洗（继承的收据 / 安装面锁 / 桥根覆盖点剔掉，显式字段照旧）。
     const codexInstall = spawnSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
-        FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") },
+      env: installerChildEnv({ env: process.env, home: m.home, extra: { HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
+        FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") } }),
     });
     assert.equal(codexInstall.status, 0, "Codex 链要真装上：" + codexInstall.stdout + codexInstall.stderr);
   }

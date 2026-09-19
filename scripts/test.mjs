@@ -8472,18 +8472,27 @@ test("PK3-U1-fix4 P1-1：测试注入点只剩函数参数 —— 旧环境变�
   assert.equal(withoutVar.status, withVar.status, withoutVar.stdout + withoutVar.stderr);
 });
 
-// 拿掉哪行会红：把 purgeTargetProblems 的校验去掉 → 前五条会红在 status（期望 2、实得 0）与“零写”上；
-//   让 codexBridgeRoot 重新“相对路径静默忽略” → 第二/三条会红（相对值被当成没设，转而去删默认根）。
-test("PK3-U1-fix3 P1-2：purge 删除目标 fail-closed（相对路径 / 文件系统根 / home 父层一律 exit 2 零写）", () => {
+// 拿掉哪行会红（两条都实测过）：
+//   · 把 forbiddenPurgePath 的 pathForms 折回"单写比较" → tmpdir 夹具下 canonical 是 /private/var/… 而
+//     homeNorm 写的是 /var/…，只比一种写法就把 `<home>/bridge-link -> <home>` 放过去了（fix6 P1-1 的真形状）；
+//   · 把父层/祖先禁区从 canonical 那半去掉 → fix6 的行为反例红在 exit 2 与 keep.txt 还在。
+// **系统目录（/、/etc、/usr/local）只出现在这一条里**：它只做纯判定与预览（不真删）。真 apply 的拒绝反例
+// 在 fix5/fix6 那条里，用的全是不指向系统目录的形状（断链 / 指向 home 或 .codex 的链接）。
+test("PK3-U1-fix3 P1-2：purge 删除目标 fail-closed —— 系统目录 / 父层 / 相对路径一律拒（纯判定 + 预览）", () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f3-purge-"));
   const outside = path.join(base, "outside-sentinel.txt");
   const cases = [
     { name: "FEISHU_CODEX_BRIDGE_HOME=/", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "/" }), want: /文件系统根/u },
-    { name: "CODEX_HOME=relative-codex", env: () => ({ CODEX_HOME: "relative-codex" }), want: /CODEX_HOME 必须是绝对路径/u },
-    { name: "FEISHU_CODEX_BRIDGE_HOME=relative/bridge", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "relative/bridge" }), want: /FEISHU_CODEX_BRIDGE_HOME 必须是绝对路径/u },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=/etc", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "/etc" }), want: /不在 home 也不在系统临时目录/u },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=/usr/local/share", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "/usr/local/share" }), want: /不在 home 也不在系统临时目录/u },
+    // tmp 根本身在套件里往往**同时**是某个桥根的祖先（夹具 home 就在它下面）—— 两条判据都算拒；
+    // 「根本身」那一条由下面 fix5/fix6 那条用不受此影响的 home 逐字钉住。
+    { name: "FEISHU_CODEX_BRIDGE_HOME=<tmp 根>", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: os.tmpdir() }), want: /临时目录根本身|是某个桥根的父目录/u },
     { name: "FEISHU_CODEX_BRIDGE_HOME=<home>", env: (home) => ({ FEISHU_CODEX_BRIDGE_HOME: home }), want: /home 或 home 下的父层/u },
     { name: "FEISHU_CODEX_BRIDGE_HOME=<home>/.claude", env: (home) => ({ FEISHU_CODEX_BRIDGE_HOME: path.join(home, ".claude") }), want: /home 或 home 下的父层/u },
     { name: "FEISHU_CODEX_BRIDGE_HOME=<base>（桥根的父层）", env: (home) => ({ FEISHU_CODEX_BRIDGE_HOME: path.dirname(home) }), want: /父目录/u },
+    { name: "CODEX_HOME=relative-codex", env: () => ({ CODEX_HOME: "relative-codex" }), want: /CODEX_HOME 必须是绝对路径/u, throws: true },
+    { name: "FEISHU_CODEX_BRIDGE_HOME=relative/bridge", env: () => ({ FEISHU_CODEX_BRIDGE_HOME: "relative/bridge" }), want: /FEISHU_CODEX_BRIDGE_HOME 必须是绝对路径/u, throws: true },
     { name: "FEISHU_BRIDGE_REGISTRY=relative/registry.json", env: () => ({ FEISHU_BRIDGE_REGISTRY: "relative/registry.json" }), want: /FEISHU_BRIDGE_REGISTRY.*不是绝对路径|不是绝对路径/u },
   ];
   for (const c of cases) {
@@ -8495,24 +8504,23 @@ test("PK3-U1-fix3 P1-2：purge 删除目标 fail-closed（相对路径 / 文件�
     fs.writeFileSync(outside, "keep");
     const env = u1Env(home, c.env(home));
     const before = u1Snapshot(home);
+    // ① **纯判定**（不跑入口、不碰任何文件）：清单里的目标不合格，且点名为什么
+    if (c.throws === true) {
+      assert.throws(() => machinePurgeTargets({ home, env }), c.want, c.name + "：受验派生要当场抛");
+    } else {
+      const targets = machinePurgeTargets({ home, env });
+      assert.ok(targets.problems.length > 0, c.name + "：清单必须报不合格：" + JSON.stringify(targets.problems));
+      assert.match(targets.problems.map((p) => p.why).join("；"), c.want, c.name + "：" + JSON.stringify(targets.problems));
+    }
+    // ② 预览（只读）也必须拒，并且零写
     const dry = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data"], env);
     assert.equal(dry.status, 2, c.name + "（预览也要拒）：" + dry.stdout + dry.stderr);
     assert.match(dry.stderr, c.want, c.name + "：" + dry.stderr);
-    const applied = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], env);
-    assert.equal(applied.status, 2, c.name + "（--apply 也要拒）：" + applied.stdout + applied.stderr);
-    assert.match(applied.stderr, c.want, c.name + "：" + applied.stderr);
     assert.equal(u1Snapshot(home), before, c.name + "：拒了就零写");
     assert.equal(fs.existsSync(sentinel), true, c.name + "：夹具数据不许被删");
     assert.equal(fs.existsSync(outside), true, c.name + "：base 下的无关文件不许被删");
     assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge")), true, c.name);
   }
-  // 对照：合法的绝对路径（包括 home 之外的显式桥根）照常
-  const okHome = u1Home();
-  const okEnv = u1Env(okHome, { FEISHU_CODEX_BRIDGE_HOME: path.join(base, "elsewhere", "feishu-bridge") });
-  const okRun = u1Run(okHome, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], okEnv);
-  assert.equal(okRun.status, 0, okRun.stdout + okRun.stderr);
-  assert.equal(fs.existsSync(path.join(okHome, ".claude", "feishu-bridge")), false, "合法目标照常删：" + okRun.stdout);
-  assert.equal(fs.existsSync(outside), true, "对照：无关文件仍然不动");
 });
 
 // 拿掉哪行会红：把 aily 的 stateOk 里 `absent ? false` 改回 `absent ? true`（fix2 的行为）→
@@ -8562,24 +8570,9 @@ test("PK3-U1-fix4 P1-2：显式桥根只删封闭的已知条目（目录与别�
   assert.equal(fs.existsSync(unrelated), true, "同一目录下别人的文件不许动");
   assert.equal(fs.existsSync(bridge), true, "人给的目录本身保留（我们不该替他删目录）");
 
-  // ② 反例：显式桥根指向系统目录 → 校验直接拒（exit 2 零写并点名哪个变量哪个值）
-  const homeB = u1Home();
-  const sentinel = path.join(homeB, ".claude", "feishu-bridge", "routes.json");
-  fs.mkdirSync(path.dirname(sentinel), { recursive: true });
-  fs.writeFileSync(sentinel, JSON.stringify({ routes: [], sessions: {} }));
-  const before = u1Snapshot(homeB);
-  for (const [value, want] of [["/etc", /不在 home 也不在系统临时目录/u],
-    ["/usr/local/share", /不在 home 也不在系统临时目录/u]]) {
-    const envB = { CODEX_HOME: path.join(homeB, ".codex"), FEISHU_CODEX_BRIDGE_HOME: value };
-    const dry = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data"], envB);
-    assert.equal(dry.status, 2, value + "（预览也要拒）：" + dry.stdout + dry.stderr);
-    assert.match(dry.stderr, /FEISHU_CODEX_BRIDGE_HOME/u, value + "：要点名是哪个变量：" + dry.stderr);
-    assert.match(dry.stderr, want, value + "：" + dry.stderr);
-    const applied = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], envB);
-    assert.equal(applied.status, 2, value + "（--apply 也要拒）：" + applied.stdout + applied.stderr);
-  }
-  assert.equal(u1Snapshot(homeB), before, "拒了就零写");
-  assert.equal(fs.existsSync(sentinel), true, "拒了就不许动夹具数据");
+  // ② 系统目录那几条（etc 那类只读位置、`/`、tmp 根）**搬到纯判定那条用例**去了（PK3-U1-fix6 P1-2）：
+  //    这里只留"不指向系统目录"的真 apply 形状 —— 判据一旦回归，最多毁掉本用例自己的临时夹具，
+  //    不会去动系统路径。
 
   // ③ 对照：临时目录的 **realpath 写法**也认（macOS 上 os.tmpdir() 给 /var/...、realpath 给 /private/var/...）——
   //   只认一种写法会把合法目标误拒，所以判据两边都取。
@@ -8625,61 +8618,101 @@ test("PK3-U1-fix4 P1-3：aily 磁盘态与 manager 态各自独立 —— 磁盘
   assert.deepEqual([c2.ok, c2.next, /没有本桥写的单元/u.test(c2.detail)], [true, null, true], JSON.stringify(c2));
 });
 
-// 拿掉哪行会红（三条都**实测**过）：
-//   · 把 canonical 那半去掉（回到 fix4 的"任一安全即通过"）→ ① 红在 status（期望 2、实得 0 ——
-//     它会接着去删 bridge-link/tasks，也就是 /etc/tasks）；
-//   · 把 tmp 根那一句去掉 → ② 红在「os.tmpdir() 根本身要拒」（/private/tmp 那条也不再退出 2）；
-test("PK3-U1-fix5 P1-1：显式桥根边界词法与 canonical 都要过 —— home 外的 symlink 与临时目录根一律拒", () => {
-  // ① 反例：<home>/bridge-link -> /etc（词法在 home 里、真实去向在 home 与临时目录之外）→ 拒。
-  //   探针里的伤害形状是「删 bridge-link/tasks」= 沿父链删到 /etc/tasks：所以除了 exit 2，
-  //   还要断言 /etc 下那两个名字**根本没被碰过**（fix4 的"任一安全即通过"会走到删那一步）。
-  const homeA = u1Home();
-  fs.symlinkSync("/etc", path.join(homeA, "bridge-link"));
-  const beforeA = u1Snapshot(homeA);
-  for (const args of [["--purge", "--yes-delete-data"], ["--purge", "--yes-delete-data", "--apply"]]) {
-    const r = u1Run(homeA, "uninstall.mjs", args, { CODEX_HOME: path.join(homeA, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(homeA, "bridge-link") });
-    assert.equal(r.status, 2, "指向 home 外的符号链接必须拒：" + r.stdout + r.stderr);
-    assert.match(r.stderr, /canonical|符号链接/u, "要点名是 canonical 那一半不过：" + r.stderr);
-    assert.match(r.stderr, /FEISHU_CODEX_BRIDGE_HOME/u, r.stderr);
+// 拿掉哪行会红（**实测**过，含"单独拿掉不红"的情形 —— 这里是纵深，不是谎报）：
+//   · `forbiddenPurgePath` 的**参照侧**丢掉 realpath（pathForms 只留一种写法）→ ③ 红：
+//     HOME 本身是符号链接时 canonical 落在 realpath 那一侧，参照侧不认就漏判；
+//   · 父层/祖先禁区**只查词法那一趟**（canonical 那趟拿掉）→ 同样的 ③ 红（fix6 P1-1 的原形状）；
+//   · `canonicalPath` 换成词法直取（不再解析符号链接）→ 断链那条红在 exit 2 与「解析不出真实去向」；
+//   · 去掉 tmp 根那一句 → 纯判定那条红在「os.tmpdir() 根本身要拒」。
+// **真 apply 的拒绝形状全部落在夹具自己家里**（指向 home / .codex 的链接、断链）—— 不指向 /etc 这类
+// 系统目录：一旦判据回归，这条用例最多毁掉它自己的临时夹具，不会去动系统路径（Codex 六轮 P1-2）。
+test("PK3-U1-fix5 P1-1 + fix6 P1-1：显式桥根边界 —— 指向 home / .codex / 断链一律拒（真 apply 零写）", () => {
+  // ① 反例：`<home>/bridge-link -> <home>`（词法在 home 里、canonical 就是 home 本身）与
+  //    `-> <home>/.codex` —— 两条都必须拒，而且**沿父链的无关数据一个字节都不许动**。
+  for (const [name, target, want] of [
+    ["-> home", (home) => home, /home 或 home 下的父层/u],
+    ["-> home/.codex", (home) => path.join(home, ".codex"), /home 或 home 下的父层/u],
+    ["断链", () => path.join(os.tmpdir(), "u1f6-nonexistent-target"), /解析不出真实去向/u],
+  ]) {
+    const home = u1Home();
+    fs.mkdirSync(path.join(home, "tasks"), { recursive: true });
+    fs.writeFileSync(path.join(home, "tasks", "keep.txt"), "keep\n");
+    fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".codex", "codex-keep.txt"), "keep\n");
+    fs.symlinkSync(target(home), path.join(home, "bridge-link"));
+    const before = u1Snapshot(home);
+    const env = { CODEX_HOME: path.join(home, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(home, "bridge-link") };
+    for (const args of [["--purge", "--yes-delete-data"], ["--purge", "--yes-delete-data", "--apply"]]) {
+      const r = u1Run(home, "uninstall.mjs", args, env);
+      assert.equal(r.status, 2, name + " 必须拒：" + r.stdout + r.stderr);
+      assert.match(r.stderr, want, name + "：" + r.stderr);
+      assert.match(r.stderr, /FEISHU_CODEX_BRIDGE_HOME/u, name + "：要点名是哪个变量：" + r.stderr);
+    }
+    assert.equal(u1Snapshot(home), before, name + "：拒了就零写");
+    assert.equal(fs.readFileSync(path.join(home, "tasks", "keep.txt"), "utf-8"), "keep\n",
+      name + "：home 下沿父链的无关数据必须还在（fix6 P1-1 的伤害形状就是它被删）");
+    assert.equal(fs.existsSync(path.join(home, ".codex", "codex-keep.txt")), true, name + "：.codex 下的数据也要在");
   }
-  assert.equal(u1Snapshot(homeA), beforeA, "拒了就零写");
-  assert.equal(fs.existsSync("/etc/tasks"), false, "不许沿父链在 /etc 下动 tasks/");
-  assert.equal(fs.existsSync("/etc/registry.json"), false, "也不许碰 /etc/registry.json");
-  assert.equal(fs.existsSync("/etc/installed-surface.json"), false, "/etc 下一个字节都不该多");
 
-  // ② 反例：系统临时目录的**根本身** → 拒（其下的子目录才允许）。
-  //    套件里夹具 HOME 就住在 tmp 根之下，所以"它是某个桥根的父目录"那条会先命中（同样拒绝，
-  //    但钉不住这条新规则）—— 先用受验函数把**这一条**逐字钉住，再跑一次真入口证明它真的退出 2。
-  const ruleHome = path.join(os.tmpdir(), "u1f5-norm-home");
+  // ② 反例：系统临时目录的**根本身** → 拒（其下的子目录才允许）。这里用**不受夹具 home 影响**的
+  //    纯判定把「根本身」那一条逐字钉住（套件里夹具 HOME 就住在 tmp 根之下，"它是桥根的父目录"
+  //    会先命中 —— 同样拒，但钉不住这条规则），再跑一次真入口证明它退出 2。
+  const ruleHome = path.join(os.tmpdir(), "u1f6-norm-home");
   assert.match(String(explicitBridgeRootProblem(os.tmpdir(), ruleHome)), /临时目录根本身/u, "os.tmpdir() 根本身要拒");
   assert.match(String(explicitBridgeRootProblem("/tmp", ruleHome)), /临时目录根本身/u, "/tmp 根本身要拒");
-  assert.equal(explicitBridgeRootProblem(path.join("/private", "tmp", "u1f5", "bridge"), ruleHome), null,
+  assert.equal(explicitBridgeRootProblem(path.join("/private", "tmp", "u1f6", "bridge"), ruleHome), null,
     "对照：tmp 下的子目录允许（夹具就住在那儿）");
   const homeB = u1Home();
   const rootRun = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
     { CODEX_HOME: path.join(homeB, ".codex"), FEISHU_CODEX_BRIDGE_HOME: "/private/tmp" });
-  assert.equal(rootRun.status, 2, "/private/tmp 是临时目录根本身，必须拒：" + rootRun.stdout + rootRun.stderr);
+  assert.equal(rootRun.status, 2, "/private/tmp 是临时目录根本身（或某桥根的父目录），必须拒：" + rootRun.stdout + rootRun.stderr);
 
-  // ③ 对照：临时目录**下面**的子目录照常（夹具就住在那儿）
+  // ③ 反例：**HOME 自己就是符号链接**（部署里很常见：/home/x -> /Users/x）——canonical 落在 realpath 那一侧，
+  //    参照侧（home / .codex / 桥根）必须**两种写法都认**，否则"canonical 就是 home"会漏判。
+  const realTip = fs.mkdtempSync(path.join(os.tmpdir(), "u1f6-realhome-"));
+  const linkTip = realTip + "-link";
+  fs.symlinkSync(realTip, linkTip);                    // HOME = <…>-link，真实位置是 <…>
+  fs.mkdirSync(path.join(realTip, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(realTip, ".claude", "settings.json"), "{}\n");
+  fs.mkdirSync(path.join(realTip, "tasks"), { recursive: true });
+  fs.writeFileSync(path.join(realTip, "tasks", "keep.txt"), "keep\n");
+  fs.symlinkSync(linkTip, path.join(linkTip, "bridge-link"));   // <HOME>/bridge-link -> <HOME>
+  const tipRun = u1Run(linkTip, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(linkTip, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(linkTip, "bridge-link") });
+  assert.equal(tipRun.status, 2, "HOME 本身是符号链接、链接又指回 HOME → 必须拒：" + tipRun.stdout + tipRun.stderr);
+  assert.match(tipRun.stderr, /home 或 home 下的父层/u, tipRun.stderr);
+  assert.equal(fs.readFileSync(path.join(realTip, "tasks", "keep.txt"), "utf-8"), "keep\n",
+    "HOME 真实位置下的 tasks/keep.txt 必须还在");
+
+  // ④ 对照：**合法桥根形状**（符号链接指向 <home>/.codex/feishu-bridge-x）→ 允许，真 apply 照常
+  const homeC = u1Home();
+  const realBridge = path.join(homeC, ".codex", "feishu-bridge-x");
+  fs.mkdirSync(realBridge, { recursive: true });
+  fs.writeFileSync(path.join(realBridge, "registry.json"), "{}\n");
+  fs.symlinkSync(realBridge, path.join(homeC, "bridge-ok"));
+  const runC = u1Run(homeC, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeC, ".codex"), FEISHU_CODEX_BRIDGE_HOME: path.join(homeC, "bridge-ok") });
+  assert.equal(runC.status, 0, "合法桥根形状照常：" + runC.stdout + runC.stderr);
+  assert.equal(fs.existsSync(path.join(realBridge, "registry.json")), false, "已知条目照常删：" + runC.stdout);
+
+  // ⑤ 对照：临时目录**下面**的子目录、home 下的普通目录都照常
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f5-inside-"));
   const bridge = path.join(base, "elsewhere", "feishu-bridge");
   fs.mkdirSync(bridge, { recursive: true });
   fs.writeFileSync(path.join(bridge, "registry.json"), "{}\n");
-  const homeC = u1Home();
-  const runC = u1Run(homeC, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
-    { CODEX_HOME: path.join(homeC, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge });
-  assert.equal(runC.status, 0, "临时目录下的子目录允许：" + runC.stdout + runC.stderr);
-  assert.equal(fs.existsSync(path.join(bridge, "registry.json")), false, runC.stdout);
-
-  // ④ 对照：home 下的普通目录（不是符号链接）照常
   const homeD = u1Home();
+  const runD = u1Run(homeD, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+    { CODEX_HOME: path.join(homeD, ".codex"), FEISHU_CODEX_BRIDGE_HOME: bridge });
+  assert.equal(runD.status, 0, "临时目录下的子目录允许：" + runD.stdout + runD.stderr);
+  assert.equal(fs.existsSync(path.join(bridge, "registry.json")), false, runD.stdout);
+
   const insideHome = path.join(homeD, "custom-codex-bridge");
   fs.mkdirSync(insideHome, { recursive: true });
   fs.writeFileSync(path.join(insideHome, "registry.json"), "{}\n");
-  const runD = u1Run(homeD, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+  const runE = u1Run(homeD, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
     { CODEX_HOME: path.join(homeD, ".codex"), FEISHU_CODEX_BRIDGE_HOME: insideHome });
-  assert.equal(runD.status, 0, runD.stdout + runD.stderr);
-  assert.equal(fs.existsSync(path.join(insideHome, "registry.json")), false, runD.stdout);
+  assert.equal(runE.status, 0, runE.stdout + runE.stderr);
+  assert.equal(fs.existsSync(path.join(insideHome, "registry.json")), false, runE.stdout);
 });
 
 // 拿掉哪行会红：把 manager 三态里的 `managerUnverifiable ? "unverifiable"` 折成 `"absent"`
@@ -8702,6 +8735,31 @@ test("PK3-U1-fix5 P1-3：aily 磁盘无 unit + manager 查不清（连不上 bus
   assert.match(c2.detail, /manager 报 absent \/ not-found/u, c2.detail);
 });
 
+// 拿掉哪行会红：把任何一条真 apply 的拒绝反例改回指向 `/etc`（或往纯判定那条里塞一次带 --apply 的 purge 运行）
+//   → 本用例红在「这些用例把系统目录与真 apply 放在一起了」那条断言上（它会点名是哪个用例）。
+test("PK3-U1-fix6 P1-2：只读系统路径只测纯判定 —— 真 apply 的拒绝反例不许把目标指到那儿", () => {
+  // 判据（按用例块扫描，块 = 从 `test("` 起到下一条 `test("` 之前）：
+  //   块里出现只读系统路径（etc 那类、usr/local 那类）→ 该块里**不许**出现会执行删除的 purge 运行
+  //   （`--purge` 与 `--apply` 同现，或那条字面量数组 [\"--purge\", \"--yes-delete-data\", \"--apply\"]）。
+  //   系统目录只能喂给纯判定（machinePurgeTargets / explicitBridgeRootProblem）与只读预览。
+  // 判据里的字样**拼出来**：否则本用例自己的正文会把两条判据都撞上（扫描器扫到自己）。
+  const SYS_DIR = "\/" + "etc\\b|\\/usr\\/local\\b";
+  const PURGE = "--pur" + "ge";
+  const APPLY = "--ap" + "ply";
+  const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");
+  const blocks = src.split(/\ntest\(/u).slice(1);
+  const risky = [];
+  for (const b of blocks) {
+    const name = (b.match(/^"([^"]+)"/u) ?? [null, "（取不到用例名）"])[1];
+    if (!new RegExp(SYS_DIR, "u").test(b)) continue;
+    const runsDeletingPurge = new RegExp(PURGE + "[^\\n]*" + APPLY + "|" + APPLY + "[^\\n]*" + PURGE, "u").test(b) ||
+      new RegExp('\\["' + PURGE + '",\\s*"--yes-delete-data",\\s*"' + APPLY + '"\\]', "u").test(b);
+    if (runsDeletingPurge) risky.push(name);
+  }
+  assert.deepEqual(risky, [],
+    "这些用例把系统目录与真 apply 放在一起了（判据一旦回归就会真去删系统路径）：" + JSON.stringify(risky));
+  assert.ok(blocks.length > 100, "块扫描要真的切开两套件用例（实际 " + blocks.length + " 块）");
+});
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {
   const home = u1Home();
   assert.equal(u1Footprint(home).clean, true);

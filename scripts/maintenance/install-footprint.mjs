@@ -107,6 +107,44 @@ export function canonicalPath(p) {
   }
 }
 
+/** 一个位置的**两种写法**（原样 + realpath）：`/var/…` 与 `/private/var/…` 这类差异不能漏判。 */
+const pathForms = (p) => {
+  const out = new Set([path.resolve(p)]);
+  try { out.add(fs.realpathSync(p)); } catch { /* 不存在就这一种写法 */ }
+  return out;
+};
+/** 待判路径只比**它自己写出来的那条**：它的真实去向由 canonical 那一趟负责（两趟各管一件事）。 */
+const candidateForms = (q) => new Set([path.resolve(q)]);
+
+/**
+ * **单条路径的禁区判据**（PK3-U1-fix3 的判据抽成一份；fix6 起 lexical 与 canonical 各调一次）：
+ * 这条路径本身是不是"不许删的位置"。返回 null = 可以，否则一句为什么。
+ * 覆盖：文件系统根 / home 与 home 下的父层（`.claude`、`.codex`）/ 任何桥根的严格祖先。
+ *
+ * **不许只查一条路径**：`<home>/bridge-link -> <home>` 的词法看着无害（它在 home 里、也不等于 home），
+ * canonical 却是 home 本身 —— 只查词法就会把 home 当桥根，随后删掉 `home/tasks/` 这类无关数据
+ * （Codex 六轮探针：真跑 --purge --yes-delete-data --apply 退出 0 并删了 `<home>/tasks/keep.txt`）。
+ */
+const forbiddenPurgePath = (q, { homeNorm, rootsNorm, fsRoot }) => {
+  // **两种写法都要认**：macOS 上 `os.tmpdir()` 给 `/var/…` 而 realpath 给 `/private/var/…`，
+  // 只比一种写法会让"canonical 就是 home 自己"这种情况漏判（Codex 六轮探针正是这么绕过去的）。
+  const qs = candidateForms(q);
+  const differs = (forms) => [...qs].some((x) => forms.has(x));
+  if (qs.has(fsRoot)) return "是文件系统根 —— 递归删它等于删整台机器";
+  if (differs(pathForms(homeNorm)) || differs(pathForms(path.join(homeNorm, ".claude"))) ||
+      differs(pathForms(path.join(homeNorm, ".codex")))) {
+    return "是 home 或 home 下的父层（桥根在它下面，删它会带走无关内容）";
+  }
+  for (const r of rootsNorm) {
+    for (const x of qs) {
+      for (const y of pathForms(r)) {
+        if (y !== x && y.startsWith(x + path.sep)) return "是某个桥根的父目录（只允许桥根本身及其下）";
+      }
+    }
+  }
+  return null;
+};
+
 /**
  * 显式桥根（`FEISHU_CODEX_BRIDGE_HOME`）的**强边界**（PK3-U1-fix5 P1-1）：词法路径**且** canonical 路径
  * 都必须落在允许的命名空间里，且都不是"根本身"。返回 null = 通过，否则返回一句为什么。
@@ -119,7 +157,7 @@ export function canonicalPath(p) {
  * 这是本桥专用的位置"：一个目录里的子目录可以只属于本桥，而临时目录根本身是所有进程共用的，删它就等于
  * 删别人还在用的东西（测试夹具正是"临时目录下的子目录"，所以不能把 tmp 整片禁掉）。
  */
-export function explicitBridgeRootProblem(candidate, homeNorm) {
+export function explicitBridgeRootProblem(candidate, homeNorm, { roots = [] } = {}) {
   const lexical = path.resolve(candidate);
   const canonical = canonicalPath(candidate);
   const bases = namespaceRoots(homeNorm);
@@ -132,6 +170,23 @@ export function explicitBridgeRootProblem(candidate, homeNorm) {
   }
   if (tmpRoots().some((t) => lexical === t || canonical === t)) {
     return "是系统临时目录根本身（其下的子目录可以，根部不行 —— 那是所有进程共用的位置）";
+  }
+  // **父层 / 祖先禁区对两条路径都要查**（PK3-U1-fix6 P1-1）：判据只有一份（forbiddenPurgePath），
+  // 各调一次 —— 不许"词法看着没问题就放行"。canonical 可能就是 home 自己（symlink 指回 home）。
+  const ctx = {
+    homeNorm: path.resolve(homeNorm),
+    rootsNorm: roots.map((r) => path.resolve(r)),
+    fsRoot: path.parse(path.resolve(homeNorm)).root,
+  };
+  for (const q of [lexical, canonical]) {
+    const why = forbiddenPurgePath(q, ctx);
+    if (why === null) continue;
+    // 报"哪一条路径"时把 canonical 一并说出来：`<home>/bridge-link -> <home>` 触发的是**canonical**那一半，
+    // 只说词法路径会让人以为判据看错了地方。
+    return (q === canonical
+      ? "canonical 路径 " + canonical
+      : "词法路径 " + lexical + (canonical !== lexical ? "（canonical 是 " + canonical + "）" : "")) +
+      " " + why + "（符号链接会把删除带到那里）";
   }
   return null;
 }
@@ -150,21 +205,16 @@ export function purgeTargetProblems({ candidates = [], roots = [], home = os.hom
   const homeNorm = path.resolve(home);
   const fsRoot = path.parse(homeNorm).root;
   const rootsNorm = roots.map((r) => path.resolve(r));
-  const parents = new Set([homeNorm, path.join(homeNorm, ".claude"), path.join(homeNorm, ".codex")].map((p) => path.resolve(p)));
   for (const c of candidates) {
     const v = c?.path;
     if (typeof v !== "string" || v.length === 0) continue;
     const push = (why) => problems.push({ varName: c.varName ?? "（派生）", value: v, why });
     if (!path.isAbsolute(v)) { push("不是绝对路径（相对路径会被静默当成别的东西）"); continue; }
     const n = path.resolve(v);
-    if (n === fsRoot) { push("是文件系统根 —— 递归删它等于删整台机器"); continue; }
-    if (parents.has(n)) { push("是 home 或 home 下的父层（桥根在它下面，删它会带走无关内容）"); continue; }
-    if (rootsNorm.some((r) => r !== n && r.startsWith(n + path.sep))) {
-      push("是某个桥根的父目录（只允许桥根本身及其下）");
-      continue;
-    }
+    const forbidden = forbiddenPurgePath(n, { homeNorm, rootsNorm, fsRoot });
+    if (forbidden !== null) { push(forbidden); continue; }
     if (c.boundary === "explicit-bridge-root") {
-      const boundary = explicitBridgeRootProblem(v, homeNorm);
+      const boundary = explicitBridgeRootProblem(v, homeNorm, { roots });
       if (boundary !== null) {
         push(boundary + " —— 显式桥根必须能证明是本桥专用的位置（双确认授权的是删桥数据，不是删环境变量指到的任何地方）；" +
           "要卸它请把它指回 home 下，或手工处置");

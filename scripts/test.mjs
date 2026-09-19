@@ -258,7 +258,7 @@ import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
-import { purgeChildEnv, purgeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7：真 purge 用例的夹具边界
+import { INSTALL_WRITE_TARGET_ENV_KEYS, purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7：真 purge 用例的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -7804,6 +7804,13 @@ const u1Home = (files = {}) => {
  */
 const u1Run = (home, script, args = [], env = {}, opts = {}) => {
   const childEnv = purgeChildEnv({ env: process.env, home, extra: env });
+  // PK3-U1-fix9（Codex 十轮 P1）：凡是会写盘的运行（--apply / --uninstall），安装写目标（收据 / 安装面锁）
+  //   若由用例显式给出，也必须落在本用例夹具内；继承值已在 purgeChildEnv 里剔掉。
+  if (args.includes("--apply") || args.includes("--uninstall")) {
+    const writeOutside = writeTargetsOutsideFixture({ env: childEnv, declaredPrivateRoots: opts.declaredPrivateRoots ?? [] });
+    assert.deepEqual(writeOutside, [],
+      "安装写目标越出本用例夹具 —— 拒绝启动子进程（夹具：" + home + "）：" + JSON.stringify(writeOutside));
+  }
   if (args.includes("--purge") && args.includes("--apply")) {
     // 预检只吃**最终子进程环境**（PK3-U1-fix8 P1-1）：HOME 与覆盖点与子进程逐字一致，
     // 不存在"预检按一个 home 算、子进程按另一个删"。
@@ -7816,6 +7823,39 @@ const u1Run = (home, script, args = [], env = {}, opts = {}) => {
     { encoding: "utf-8", env: childEnv, timeout: 300_000 });
 };
 const u1Footprint = (home, platform = process.platform) => installFootprint({ home, platform });
+// PK3-U1-fix9（Codex 十轮 P1）：u1Run 跑安装器 --apply 时，父环境里的安装写目标覆盖点进不去子进程；用例显式给到夹具外则拒绝启动。
+//   拿掉哪行会红：purgeChildEnv 不剔 INSTALL_WRITE_TARGET_ENV_KEYS → ① 哨兵被写；去掉 u1Run 的写目标守卫 → ② 子进程被启动、哨兵被写。
+test("PK3-U1-fix9：安装写目标（收据 / 安装面锁）覆盖点——继承值进不去子进程、显式给到夹具外就拒绝启动", () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "u1f9-outside-"));
+  const sentinelReceipt = path.join(outside, "installed-surface.json");
+  const sentinelLock = path.join(outside, "install-surface.lock");
+  const saved = Object.fromEntries(INSTALL_WRITE_TARGET_ENV_KEYS.map((k) => [k, process.env[k]]));
+  try {
+    assert.deepEqual([...INSTALL_WRITE_TARGET_ENV_KEYS].sort(), ["FEISHU_BRIDGE_INSTALLED_SURFACE", "FEISHU_BRIDGE_INSTALL_SURFACE_LOCK"].sort(),
+      "写目标变量名取产品常量（同源）");
+    // ① 父进程设了指向夹具外的写目标 → 子进程拿不到：安装照常成功，哨兵一个字节都没写
+    process.env.FEISHU_BRIDGE_INSTALLED_SURFACE = sentinelReceipt;
+    process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK = sentinelLock;
+    const home = u1Home();
+    const r = u1Run(home, "install-outbound.mjs", ["--apply"]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(fs.existsSync(sentinelReceipt), false, "继承的收据覆盖点不许进子进程（哨兵被写了）");
+    assert.equal(fs.existsSync(sentinelLock), false, "继承的安装面锁覆盖点不许进子进程（哨兵被写了）");
+    // ② 用例显式把写目标给到夹具外 → 守卫拒绝启动子进程并点名
+    for (const k of INSTALL_WRITE_TARGET_ENV_KEYS) delete process.env[k];
+    const home2 = u1Home();
+    assert.throws(() => u1Run(home2, "install-outbound.mjs", ["--apply"], { FEISHU_BRIDGE_INSTALLED_SURFACE: sentinelReceipt }),
+      /安装写目标越出本用例夹具[\s\S]*FEISHU_BRIDGE_INSTALLED_SURFACE/u);
+    assert.equal(fs.existsSync(sentinelReceipt), false, "拒绝启动 → 哨兵没被写");
+    // 对照：显式给到夹具内 → 放行
+    assert.equal(u1Run(home2, "install-outbound.mjs", ["--apply"], { FEISHU_BRIDGE_INSTALLED_SURFACE: path.join(home2, "receipt-here.json") }).status, 0);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+
 const u1Snapshot = (home) => {
   const out = [];
   const walk = (d) => {

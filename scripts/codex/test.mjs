@@ -14,6 +14,8 @@ import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsola
 // PK3-T1：本轮临时目录根 + 写盘失败翻译 —— 从 test-support/ 取（不动共用面 test-harness.mjs 的导出）
 import { installSuiteTempRoot } from "../test-support/suite-temp-root.mjs";
 import { installWriteDiagnosis } from "../test-support/write-diagnosis.mjs";
+// PK3-U1-fix7：真 purge 用例的夹具边界（剔继承的删除目标覆盖点 + 启动前核清单）
+import { purgeChildEnv, purgeTargetsOutsideFixture } from "../test-support/purge-fixture-guard.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -12021,8 +12023,15 @@ test("PK3-U1-fix5 P1-2：显式桥根 purge 的封闭清单 —— 真跑一遍�
   assert.ok(before.length >= 5, "夹具必须真的在桥根下写过东西：" + JSON.stringify(before));
 
   // ④ purge：显式桥根只删封闭的已知条目、保留目录本身
+  //   PK3-U1-fix7：**继承的删除目标覆盖点先剔掉**（套件绊线自己就设了 FEISHU_BRIDGE_CHAIN_TEMPLATE，
+  //   它会把套件 HOME 下的文件算进删除清单），启动前再核一遍清单全在本用例夹具内。
+  const purgeEnv = purgeChildEnv({ env, home, extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge,
+    FEISHU_BRIDGE_REGISTRY: path.join(bridge, "registry.json") } });
+  const outside = purgeTargetsOutsideFixture({ home, env: purgeEnv,
+    extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge } });
+  assert.deepEqual(outside, [], "真 purge 的删除目标越出本用例夹具 —— 拒绝启动子进程：" + JSON.stringify(outside));
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "uninstall.mjs"), "--purge", "--yes-delete-data", "--apply"],
-    { encoding: "utf-8", env });
+    { encoding: "utf-8", env: purgeEnv });
   assert.equal(run.status, 0, run.stdout + run.stderr);
   const left = fs.readdirSync(bridge).sort();
   assert.deepEqual(left, [], "桥根下除父目录外必须为空（purge 前有 " + JSON.stringify(before) + "），还剩下：" + JSON.stringify(left));

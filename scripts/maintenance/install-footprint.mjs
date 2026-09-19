@@ -267,6 +267,21 @@ export function codexBridgeKnownEntries({ codexBridgeHome } = {}) {
  *
  * **项目里的东西不在这里**：`<项目>/.runtime-data/` 与飞书话题历史不归机器级卸载管。
  */
+/**
+ * 会改变 `--purge` **删除文件**的覆盖点（覆盖文件只删文件本身）。
+ * **只有这一份**：`machinePurgeTargets` 的循环与测试侧的隔离清单都从它取（清单漂了就等于没隔离）。
+ */
+export const PURGE_FILE_OVERRIDE_KEYS = Object.freeze([
+  "FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_ROUTES", "FEISHU_BRIDGE_STATUS_PROVIDERS", "FEISHU_BRIDGE_CHAIN_TEMPLATE",
+]);
+
+/**
+ * 会改变 `--purge` **删除目标**的**全部**环境变量：两个换桥根的（`CODEX_HOME` / `FEISHU_CODEX_BRIDGE_HOME`）
+ * 加四个换覆盖文件的。测试辅助构造子进程环境时按这一份**先剔除**继承值（PK3-U1-fix7）——
+ * 开发机上这些变量常常指着线上数据，一条"真 --purge --apply"的用例就可能把夹具外的东西删掉。
+ */
+export const PURGE_TARGET_ENV_KEYS = Object.freeze(["CODEX_HOME", "FEISHU_CODEX_BRIDGE_HOME", ...PURGE_FILE_OVERRIDE_KEYS]);
+
 export function machinePurgeTargets({ home = os.homedir(), env = process.env } = {}) {
   const codexHome = codexHomeOf({ home, env });        // 受验：相对路径直接抛
   const claudeRoot = claudeBridgeRoot({ home });
@@ -285,7 +300,7 @@ export function machinePurgeTargets({ home = os.homedir(), env = process.env } =
       : { path: codexRoot, varName: "CODEX_HOME" },
   ];
   const files = [];
-  for (const key of ["FEISHU_BRIDGE_REGISTRY", "FEISHU_BRIDGE_ROUTES", "FEISHU_BRIDGE_STATUS_PROVIDERS", "FEISHU_BRIDGE_CHAIN_TEMPLATE"]) {
+  for (const key of PURGE_FILE_OVERRIDE_KEYS) {
     const v = env[key];
     if (typeof v !== "string" || v.length === 0) continue;
     // 覆盖点正好落在桥根里 → 已经被整棵删覆盖了，不重复列（但**形状校验仍然要过**）

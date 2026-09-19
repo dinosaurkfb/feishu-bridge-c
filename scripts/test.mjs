@@ -258,6 +258,7 @@ import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
+import { purgeChildEnv, purgeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7：真 purge 用例的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -7794,9 +7795,24 @@ const u1Home = (files = {}) => {
   }
   return home;
 };
-const u1Run = (home, script, args = [], env = {}) => spawnSync(process.execPath,
-  [path.resolve("scripts", script), ...args],
-  { encoding: "utf-8", env: { ...process.env, HOME: home, ...env }, timeout: 300_000 });
+/**
+ * 跑一条子进程入口。**继承的环境里那些"删除目标覆盖点"先剔掉**（PK3-U1-fix7，清单与产品同源），
+ * 再叠加用例显式给的 env —— 开发机上 `FEISHU_BRIDGE_REGISTRY` 之类常常指着线上数据，
+ * 不剔的话一条"真 --purge --apply"的用例会删到夹具外。
+ * 参数同时含 `--purge` 与 `--apply` 时，再**先**用同一份 env 与 home 派生一次删除清单：
+ * 任何一项越出本用例夹具（home ∪ 显式传的两个桥根）就**不启动子进程**，直接让用例失败并点名越界项。
+ */
+const u1Run = (home, script, args = [], env = {}) => {
+  const childEnv = purgeChildEnv({ env: process.env, home, extra: env });
+  if (args.includes("--purge") && args.includes("--apply")) {
+    const outside = purgeTargetsOutsideFixture({ home, env: childEnv, extra: env });
+    assert.deepEqual(outside, [],
+      "真 purge 的删除目标越出本用例夹具 —— 拒绝启动子进程（夹具：" + home + "）：" + JSON.stringify(outside));
+  }
+  return spawnSync(process.execPath,
+    [path.resolve("scripts", script), ...args],
+    { encoding: "utf-8", env: childEnv, timeout: 300_000 });
+};
 const u1Footprint = (home, platform = process.platform) => installFootprint({ home, platform });
 const u1Snapshot = (home) => {
   const out = [];
@@ -8784,6 +8800,56 @@ test("PK3-U1-fix6 P1-2：只读系统路径只测纯判定 —— 真 apply 的�
     "这些用例把系统目录与真 apply 放在一起了（判据一旦回归就会真去删系统路径）：" + JSON.stringify(risky));
   assert.ok(blocks.length > 100, "块扫描要真的切开两套件用例（实际 " + blocks.length + " 块）");
 });
+// ── PK3-U1-fix7：真 purge 用例的夹具边界（继承环境里的覆盖点 + 启动前核清单）──────────────
+
+// 拿掉哪行会红：把 u1Run 里那次 `purgeChildEnv(...)` 换回 `{ ...process.env, HOME: home, ...env }`
+//   （继承值不再剔除）→ 子进程会读到父进程设的 FEISHU_BRIDGE_REGISTRY，把哨兵当覆盖文件删掉 →
+//   红在「哨兵必须还在」。
+test("PK3-U1-fix7 ①：父进程设的覆盖点（FEISHU_BRIDGE_REGISTRY）进不了子进程 —— 夹具外哨兵还在", () => {
+  const sentinelDir = fs.mkdtempSync(path.join(os.tmpdir(), "u1f7-outer-"));
+  const sentinel = path.join(sentinelDir, "shared-registry.json");
+  fs.writeFileSync(sentinel, "{}\n");
+  const saved = process.env.FEISHU_BRIDGE_REGISTRY;
+  process.env.FEISHU_BRIDGE_REGISTRY = sentinel;          // 父进程"像开发机那样"设着它
+  try {
+    const home = u1Home();                                 // 用例自己的夹具（与哨兵无关）
+    const r = u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"], u1Env(home));
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(fs.existsSync(sentinel), true,
+      "父进程设的覆盖点不许进子进程（否则真 purge 会把它当覆盖文件删掉）：" + sentinel);
+    assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge")), false, "夹具照常删：" + r.stdout);
+  } finally {
+    if (saved === undefined) delete process.env.FEISHU_BRIDGE_REGISTRY;
+    else process.env.FEISHU_BRIDGE_REGISTRY = saved;
+    fs.rmSync(sentinelDir, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把 u1Run 里那段"启动前核清单"（purgeTargetsOutsideFixture + assert）删掉 →
+//   子进程会被真的启动，那条夹具外的覆盖文件被删 → 红在「守卫必须拒绝启动」与「哨兵还在」两条上。
+test("PK3-U1-fix7 ②：显式传一份会派生出夹具外文件的 env → 守卫拒绝启动并点名越界项", () => {
+  const sentinelDir = fs.mkdtempSync(path.join(os.tmpdir(), "u1f7-escaped-"));
+  const sentinel = path.join(sentinelDir, "outside-registry.json");
+  fs.writeFileSync(sentinel, "{}\n");
+  try {
+    const home = u1Home();
+    // 显式把覆盖点指到夹具外（**文件覆盖点不享受"显式传的夹具目录"待遇** —— 它必须落在夹具之内）
+    assert.throws(
+      () => u1Run(home, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
+        u1Env(home, { FEISHU_BRIDGE_REGISTRY: sentinel })),
+      (err) => {
+        const msg = String(err?.message ?? err);
+        assert.match(msg, /越出本用例夹具/u, msg);
+        assert.match(msg, /outside-registry\.json/u, "要点名那条越界路径：" + msg);
+        return true;
+      },
+      "越界的真 purge 必须在启动子进程之前被拦下");
+    assert.equal(fs.existsSync(sentinel), true, "被拦下时哨兵一个字节都不许动");
+  } finally {
+    fs.rmSync(sentinelDir, { recursive: true, force: true });
+  }
+});
+
 test("PK3-U1：装机足迹判据只有一份 —— uninstall 与 doctor 说同一件事", () => {
   const home = u1Home();
   assert.equal(u1Footprint(home).clean, true);

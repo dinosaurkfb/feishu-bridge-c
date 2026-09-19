@@ -247,7 +247,7 @@ node scripts/codex/install.mjs --apply
     - 自检最后两行**各说一件事**（issue #241），别读混：`aily daemon socket` 看的是（只说 socket 在不在、是不是 socket；**在不证明进程活着**，确认用 doctor）
       `~/.aily-cli/sockets/aily-cli.sock`；`aily 是否已发现本技能` 看的是 `scan-local` 探测（报到了 /
       报不到 / **查不了 + 原因**）。**非交互 ssh** 下 PATH 里常常没有 `aily-cli`（mise shims 不在 PATH）——
-      那时第二行会说「查不了：找不到 aily-cli（ENOENT）」，这**不等于 daemon 没跑**，daemon 状态看第一行。
+      那时第二行会说「查不了：找不到 aily-cli（ENOENT）」，这**不等于 daemon 没跑**；第一行只报告 socket 状态（在 / 不在 / 查不清），确认 daemon 在不在跑用 `node scripts/doctor.mjs`。
   - `codex/install.mjs`：
     - `hooks ... UserPromptSubmit → installed, Stop → installed`
 

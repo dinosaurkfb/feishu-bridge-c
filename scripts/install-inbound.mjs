@@ -92,19 +92,28 @@ export function probeFailureReason(err) {
  *
  * `execFile` 是**函数参数**（用例注入用）：CLI 调它不传，生产恒 `execFileSync` —— 不读任何
  * "只给测试"的环境变量（Codex 对 U1/L7 都判过：那种钩子生产可达）。
- * @returns {{ socket: string, socketState: "socket"|"not_socket"|"absent", socketPresent: boolean, scan: { state: "reported"|"not_reported"|"unavailable", why: string|null } }}
+ * @returns {{ socket: string, socketState: "socket"|"not_socket"|"absent"|"unverifiable", socketPresent: boolean, scan: { state: "reported"|"not_reported"|"unavailable", why: string|null } }}
  */
 export function inboundPostInstallProbe({ home = os.homedir(), execFile = execFileSync, log = console.log, skillName = SKILL_NAME } = {}) {
   const socket = path.join(home, ".aily-cli", "sockets", "aily-cli.sock");
   // PK3-I241-fix1（Codex 一轮 P1）：socket 文件在 ≠ daemon 在跑（可能是崩溃残留的 inode，也可能只是个同名普通文件）。
   // 这里**只陈述事实**：是不是 socket、在不在；"在不在跑"要么真连一次 socket、要么问受验的 manager —— 那是 doctor 的事。
-  let socketState = "absent";   // "socket" | "not_socket" | "absent"
-  try { socketState = fs.lstatSync(socket).isSocket() ? "socket" : "not_socket"; } catch { socketState = "absent"; }
+  // PK3-I241-fix2（Codex 二轮 P1）：**只有 ENOENT 才是"不在"**。ENOTDIR（sockets 是个普通文件）、EACCES 等是
+  // "查不清"—— 折成"不在"就会劝人去启动一个可能正在跑的 daemon。
+  let socketState = "absent";   // "socket" | "not_socket" | "absent" | "unverifiable"
+  let socketWhy = null;
+  try { socketState = fs.lstatSync(socket).isSocket() ? "socket" : "not_socket"; }
+  catch (err) {
+    if (err?.code === "ENOENT") socketState = "absent";
+    else { socketState = "unverifiable"; socketWhy = String(err?.code ?? err?.message ?? err); }
+  }
   log("  · aily daemon socket：" + (socketState === "socket"
     ? "在（" + socket + "）—— 存在不证明进程还活着；要确认在不在跑：node scripts/doctor.mjs（systemd 判据）或 aily-cli daemon status"
     : socketState === "not_socket"
       ? "同名文件在但不是 socket（" + socket + "）—— 多半是残留，不当作在跑"
-      : "不在（" + socket + "）—— 启动：aily-cli daemon start"));
+      : socketState === "unverifiable"
+        ? "查不清（" + socketWhy + "：" + socket + "）—— 不等于不在；确认用 node scripts/doctor.mjs 或 aily-cli daemon status"
+        : "不在（" + socket + "）—— 启动：aily-cli daemon start"));
 
   let scan;
   try {
@@ -122,8 +131,8 @@ export function inboundPostInstallProbe({ home = os.homedir(), execFile = execFi
   log("  · aily 是否已发现本技能：" + (
     scan.state === "reported" ? "scan-local 报到了"
       : scan.state === "not_reported" ? "scan-local 报不到（已知如此 —— 它扫的是宿主 agent 目录，不扫这里）"
-        : "查不了：" + scan.why + "（**这是探测本身的问题，不是 daemon 的状态** —— daemon 看上面那一行）"));
-  return { socket, socketState, socketPresent: socketState === "socket", scan };
+        : "查不了：" + scan.why + "（**这是探测本身的问题，不是 daemon 的状态** —— 上面那一行只报 socket 状态）"));
+  return { socket, socketState, socketWhy, socketPresent: socketState === "socket", scan };
 }
 
 if (!isDirectRun(import.meta.url)) {

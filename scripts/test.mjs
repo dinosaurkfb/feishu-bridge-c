@@ -7413,6 +7413,17 @@ test("PK3-I241：装完自检两件事各有各的判据 —— daemon 看 socke
   const r1p = inboundPostInstallProbe({ home: homePlain, execFile: reported, log });
   assert.deepEqual([r1p.socketState, r1p.socketPresent], ["not_socket", false], JSON.stringify(r1p));
   assert.match(lines.join("\n"), /同名文件在但不是 socket/u, lines.join("\n"));
+  // ①b2（fix2，Codex 二轮 P1）：sockets 是个普通文件 → lstat 报 ENOTDIR → 「查不清」带原因，**不许**说"不在 / 启动 daemon"
+  //   拿掉哪行会红：把 catch 折回一律 absent → 这里 socketState 得到 absent、文案出现「启动：aily-cli daemon start」
+  lines.length = 0;
+  const homeNotDir = path.join(home, "notdir");
+  fs.mkdirSync(path.join(homeNotDir, ".aily-cli"), { recursive: true });
+  fs.writeFileSync(path.join(homeNotDir, ".aily-cli", "sockets"), "");
+  const r1n = inboundPostInstallProbe({ home: homeNotDir, execFile: reported, log });
+  const out1n = lines.join("\n");
+  assert.deepEqual([r1n.socketState, r1n.socketWhy, r1n.socketPresent], ["unverifiable", "ENOTDIR", false], JSON.stringify(r1n));
+  assert.match(out1n, /aily daemon socket：查不清（ENOTDIR/u, out1n);
+  assert.doesNotMatch(out1n, /不在（|aily-cli daemon start/u, "查不清 ≠ 不在，不许劝人去启动：" + out1n);
   // ①c 不在 → 给启动命令
   lines.length = 0;
   const r1b = inboundPostInstallProbe({ home: path.join(home, "别处"), execFile: reported, log });

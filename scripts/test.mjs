@@ -58769,6 +58769,166 @@ test("PK3-T3 单元（注入 files 临时目录）：符号链接目标变化 �
   }
 });
 
+// ── PK3-I244：settings.json 只比**本桥拥有的条目**（运行时改写 model / effort 不再误报）──────
+
+/** diffs 里有 BigInt（mtimeNs）—— 拼进断言消息前先转成字符串，别让 JSON.stringify 抛。 */
+const i244Show = (x) => JSON.stringify(x, (k, v) => (typeof v === "bigint" ? v.toString() : v));
+
+/** settings.json 的夹具：key 就是"非本桥键"，hooks 里那条是我们的（tag 判定与 node 无关）。 */
+const i244SettingsFixture = (tmp) => {
+  const home = path.join(tmp, "home");
+  const file = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const base = {
+    model: "opus",
+    effortLevel: "medium",
+    hooks: {
+      Stop: [
+        { hooks: [{ type: "command", command: "node /opt/orca/stop-hook.mjs" }] },          // 别人的
+        { hooks: [{ type: "command", command: "node x.mjs # FEISHU_BRIDGE_HOOK:stop-hook.mjs", timeout: 20 }] },
+      ],
+    },
+    permissions: { allow: ["Bash(ls:*)"] },
+  };
+  fs.writeFileSync(file, JSON.stringify(base, null, 2) + "\n");
+  return { home, file, base };
+};
+
+// 拿掉哪行会红：把 snapshotFile 里 settings.json 那一支去掉（回到整文件 sha）→ ① 立刻红在 changed: false
+//   （改 model 会让整文件 sha 变），② 仍会红 —— 但红的是 ①，而那正是这次要修的那条误报。
+test("PK3-I244 ①：只改 settings.json 的 model / effortLevel / 别人的 hook → changed: false", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-ok-"));
+  try {
+    const { file, base } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+      doc.model = "sonnet";                       // Claude Code 运行时切模型
+      doc.effortLevel = "high";
+      doc.theme = "dark";
+      doc.permissions.allow.push("Bash(git status:*)");   // 人家自己的放行规则
+      doc.hooks.Stop[0].hooks[0].command = "node /opt/orca/stop-hook-v2.mjs";   // 别人的 hook 改了
+      fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+      // 连 mtime 也变（运行时写它就是会变）—— 本桥条目没变就不该报，连 touched 都不报
+      const future = new Date(Date.now() + 5000);
+      fs.utimesSync(file, future, future);
+
+      const res = guard.check();
+      assert.equal(res.changed, false, "非本桥键变化不许算写穿：" + i244Show(res.diffs));
+      assert.deepEqual(res.diffs, [], "一条 diff 都不该有（含 touched）");
+    } finally {
+      guard.uninstall();
+    }
+    assert.equal(typeof base.model, "string");   // 夹具键名别被顺手改掉（上面那几行依赖它们）
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把投影的 sha 换成"只算 hooks、不算 allow/命令文本"→ 去掉命令里的 tag 比对 →
+//   ② 红在 kind modified（改命令之后两侧投影仍相等）。
+test("PK3-I244 ②：改本桥的 Stop hook 命令 → changed: true、kind modified、点名 settings.json", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-mod-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+      const ours = doc.hooks.Stop[1].hooks[0];
+      ours.command = ours.command.replace("node x.mjs", "node /somewhere/else/stop-hook.mjs");
+      fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "本桥条目变了必须报");
+      assert.equal(res.diffs.length, 1, i244Show(res.diffs));
+      const d = res.diffs[0];
+      assert.equal(d.kind, "modified");
+      assert.equal(d.path, path.resolve(file), "要点名 settings.json");
+      assert.notEqual(d.beforeSha, d.afterSha);
+      assert.match(guard.formatErrorReport(res), /settings\.json/u, guard.formatErrorReport(res));
+      assert.match(guard.formatErrorReport(res), /本桥条目 sha/u, "报告要说清比的是本桥条目");
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把 ownedSettingsSha 的 `if (owned === null) return null;` 去掉（坏 JSON 折成空投影）→
+//   ③ 红在 kind unverifiable（会变成 modified/changed 但口径错，或直接绿）。
+test("PK3-I244 ③：settings.json 变成坏 JSON → unverifiable（changed: true，fail-closed）", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-badjson-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      fs.writeFileSync(file, "{ 这不是 JSON");     // 解析不了 = 验不了，不许绿
+      const res = guard.check();
+      assert.equal(res.changed, true, "读不出/解析不了必须 fail-closed");
+      assert.equal(res.diffs.length, 1, i244Show(res.diffs));
+      assert.equal(res.diffs[0].kind, "unverifiable");
+      assert.equal(res.diffs[0].path, path.resolve(file));
+      assert.match(guard.formatErrorReport(res), /读取出错无法验证/u, guard.formatErrorReport(res));
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把 `isClaudeSettingsPath` 放宽成"所有 json"（或把投影套到全部文件）→ ④ 红在
+//   routes.json 改一个字节却 changed: false。
+test("PK3-I244 ④：其余文件的整文件口径不变 —— 改 routes.json 一个字节仍报 modified", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-other-files-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const routes = path.join(tmp, "home", ".claude", "feishu-bridge", "routes.json");
+    fs.mkdirSync(path.dirname(routes), { recursive: true });
+    fs.writeFileSync(routes, JSON.stringify({ routes: [], sessions: {} }) + "\n");
+    const guard = installSurfaceGuard({ files: [file, routes], registerExitHook: false });
+    try {
+      // settings.json 换成一堆非本桥键（只有空白与键序变化）→ 不算；routes.json 改一个字节 → 算
+      const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+      doc.model = "haiku";
+      fs.writeFileSync(file, JSON.stringify(doc, null, 4) + "\n");
+      fs.writeFileSync(routes, JSON.stringify({ routes: [], sessions: { x: 1 } }) + "\n");
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "routes.json 改了必须报");
+      assert.deepEqual(res.diffs.map((d) => [path.basename(d.path), d.kind]), [["routes.json", "modified"]],
+        "只有 routes.json 那一条（settings.json 的非本桥键不算）：" + i244Show(res.diffs));
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把投影只用于"读得到"的路径、坏 JSON 走 unverifiable 那支去掉（即回到整文件口径）→
+//   上面 ③ 红；把 mtime 比较恢复（不跳过投影文件）→ ① 红在 touched（运行时改写会动 mtime）。
+test("PK3-I244 ⑤：纯 mtime 变化（本桥条目一字未动）不算写穿；本桥条目变了才算", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-mtime-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      // 只动 mtime（同字节重写 + utimes）：整文件口径下会判 touched，投影口径下不该报
+      const text = fs.readFileSync(file, "utf-8");
+      fs.writeFileSync(file, text);
+      const future = new Date(Date.now() + 60_000);
+      fs.utimesSync(file, future, future);
+      assert.deepEqual(guard.check().diffs, [], "本桥条目没变 —— 连 touched 都不许报");
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("PK3-T3 单元：逐用例边界 checkBoundary 核验并在命中时记录肇事用例名", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-unit-boundary-"));
   try {

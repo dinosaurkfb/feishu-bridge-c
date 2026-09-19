@@ -86,7 +86,8 @@ export function probeFailureReason(err) {
  * 于是那句话把「探测命令不可用」说成了「daemon 没跑」；同一时刻 daemon 其实是 active 的、桥 doctor 密钥 ✓。
  * **两件事各有各的判据，不能互相代言：**
  *
- *   · daemon 在不在跑：看 `~/.aily-cli/sockets/aily-cli.sock` 在不在（**不经 exec**、不依赖 PATH）；
+ *   · socket 状态：看 `~/.aily-cli/sockets/aily-cli.sock` 在不在、是不是 socket（**不经 exec**、不依赖 PATH）——
+ *     只陈述路径状态，**不证明 daemon 进程在跑**（崩溃会留下 socket inode）；在不在跑用 doctor 或 aily-cli daemon status；
  *   · 技能有没有被发现：跑 `scan-local`，分**三态** —— 报到了 / 报不到（已知如此）/ **查不了**
  *     （探测本身失败，原因原话带出来；这一态**不许**断言 daemon 的状态）。
  *
@@ -316,7 +317,7 @@ for (const f of files) {
 }
 console.log("  ✓ 目标是真实目录（不是软链）");
 
-// 最后两项**各有各的判据**（PK3-I241）：daemon 在不在跑看 socket（不经 exec），
+// 最后两项**各有各的判据**（PK3-I241）：socket 那一行只报 socket 状态（不经 exec，不证明进程在跑），
 // 「是否已发现本技能」三态分开 —— 探测本身失败只说自己失败，不代言 daemon 的状态。
 inboundPostInstallProbe({ home: os.homedir() });
 

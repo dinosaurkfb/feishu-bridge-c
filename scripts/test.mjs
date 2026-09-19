@@ -58933,6 +58933,57 @@ test("PK3-I244 ⑤：纯 mtime 变化（本桥条目一字未动）不算写穿�
 
 // 拿掉哪行会红：把 `import { claudeSettingsOwnedEntries } from "../install-projection.mjs"` 加回卫兵顶层
 //   （fix1 收掉的那一行）→ 本用例点名 install-surface-guard.mjs 里那条 import。
+// PK3-I244-fix2（Codex 一轮 P1 ①）：合法 JSON 但形状不对 → unverifiable（不许被投影成"四组空条目"当成没变）。
+//   拿掉哪行会红：去掉卫兵里 `if (!isPlainObject(doc)) return null;` 等形状校验 → null / [] / hooks:"x" 三种都判 changed:false。
+test("PK3-I244-fix2 ①：settings.json 变成合法但形状不对的 JSON（null / 数组 / hooks 不是对象）→ unverifiable", () => {
+  for (const [label, text] of [["null", "null\n"], ["数组", "[]\n"], ["hooks 是字符串", JSON.stringify({ hooks: "x" }) + "\n"], ["Stop 不是数组", JSON.stringify({ hooks: { Stop: {} } }) + "\n"]]) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-shape-"));
+    try {
+      const { file } = i244SettingsFixture(tmp);
+      const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+      try {
+        fs.writeFileSync(file, text);
+        const res = guard.check();
+        assert.equal(res.changed, true, label + "：形状不对必须报：" + i244Show(res.diffs));
+        assert.equal(res.diffs[0]?.kind, "unverifiable", label + "：" + i244Show(res.diffs));
+      } finally {
+        guard.uninstall();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+// PK3-I244-fix2（Codex 一轮 P1 ②）：本桥 hook 的**行为字段**变了（加 async:true / 改 timeout / 所在 matcher 条目加键）→ modified。
+//   拿掉哪行会红：投影退回共享提取器那三个字段（不取完整对象）→ async:true 与 matcher 键两条判 changed:false。
+test("PK3-I244-fix2 ②：本桥 hook 加 async:true 等行为字段 → changed:true、modified；别人的 hook 加同样字段不算", () => {
+  const cases = [
+    ["本桥 Stop hook 加 async:true", (doc) => { doc.hooks.Stop[1].hooks[0].async = true; }, true],
+    ["本桥 Stop 所在条目加 matcher", (doc) => { doc.hooks.Stop[1].matcher = "*"; }, true],
+    ["别人的 Stop hook 加 async:true", (doc) => { doc.hooks.Stop[0].hooks[0].async = true; }, false],
+  ];
+  for (const [label, mutate, want] of cases) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-behav-"));
+    try {
+      const { file } = i244SettingsFixture(tmp);
+      const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+      try {
+        const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+        mutate(doc);
+        fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+        const res = guard.check();
+        assert.equal(res.changed, want, label + "：" + i244Show(res.diffs));
+        if (want) assert.equal(res.diffs[0]?.kind, "modified", label + "：" + i244Show(res.diffs));
+      } finally {
+        guard.uninstall();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
 test("PK3-I244-fix1 ①结构：卫兵与 boot 的**静态** import 只许 node: 内置与彼此", () => {
   // 判据（逐行扫 `^import` 语句的 from 说明符）：只允许两件东西 ——
   //   · `node:` 内置（卫兵要用 crypto / fs / module / os / path）；

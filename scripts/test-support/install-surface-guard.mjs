@@ -76,14 +76,48 @@ const ownedEntriesFn = () => {
  * 同一份）；坏 JSON / 读不出 → 返回 null，调用方按 **unverifiable** 处置（fail-closed，不折成"没变"）。
  * 四个键固定、数组顺序有意义，原样序列化 —— 只求"两侧同法即可比"。
  */
+// PK3-I244-fix2（Codex 一轮 2 P1）——两处都**只在卫兵这一侧**收，不改共享提取器的输出（安装收据用它算 sha，
+// 改了会让已装机器的收据全部对不上）：
+//   ① 形状：提取器只对 JSON 解析失败返回 null；合法但形状不对的文档（顶层 null / 数组 / hooks 不是对象 …）会被
+//      投影成"四组空条目"，从而被当成"没变"。所以先查形状，查不过就是 unverifiable（fail-closed）。
+//   ② 行为字段：提取器只保留 command / type / timeout；本桥 hook 加上 async 之类会改变行为的字段它看不见。所以用
+//      提取器**认出**本桥的命令，再回原文把这些 hook 的**完整对象**（全部字段、键排序）纳入投影。
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const stableJson = (v) => Array.isArray(v) ? "[" + v.map(stableJson).join(",") + "]"
+  : isPlainObject(v) ? "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stableJson(v[k])).join(",") + "}"
+    : JSON.stringify(v);
+const OWNED_HOOK_EVENTS = Object.freeze({ Stop: "Stop", inbound: "UserPromptSubmit", init: "UserPromptSubmit" });
+
 const ownedSettingsShaOf = (entry) => {
   if (entry === null || entry === undefined || entry.state !== "present" || typeof entry.rawText !== "string") return null;
+  let doc;
+  try { doc = JSON.parse(entry.rawText); } catch { return null; }
+  // ① 形状：顶层必须是对象；hooks / permissions 若在就必须是对象；各事件若在就必须是数组、permissions.allow 若在就必须是数组
+  if (!isPlainObject(doc)) return null;
+  if (doc.hooks !== undefined && !isPlainObject(doc.hooks)) return null;
+  if (doc.permissions !== undefined && !isPlainObject(doc.permissions)) return null;
+  for (const ev of new Set(Object.values(OWNED_HOOK_EVENTS))) {
+    if (doc.hooks?.[ev] !== undefined && !Array.isArray(doc.hooks[ev])) return null;
+  }
+  if (doc.permissions?.allow !== undefined && !Array.isArray(doc.permissions.allow)) return null;
   let owned = null;
   try { owned = ownedEntriesFn()(entry.rawText, { home: settingsHomeOf(entry.path) }); }
   catch { return null; }          // 连提取都跑不动（极端环境）→ 同样是"验不了"
   if (owned === null) return null;
-  const parts = ["Stop", "inbound", "init", "allow"].map((k) => k + "=" + JSON.stringify(owned[k] ?? null));
-  return crypto.createHash("sha256").update("claude-settings-owned:" + parts.join("\n")).digest("hex");
+  // ② 完整对象：提取器认出的本桥命令 → 回原文取该事件下 command 相同的 hook 的全部字段（连同所在 matcher 条目的其余键）
+  const fullOf = (key) => {
+    const cmds = new Set((owned[key] ?? []).map((h) => h?.command).filter((c) => typeof c === "string"));
+    const out = [];
+    for (const group of doc.hooks?.[OWNED_HOOK_EVENTS[key]] ?? []) {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
+      const { hooks, ...groupRest } = group;
+      for (const h of hooks) if (isPlainObject(h) && cmds.has(h.command)) out.push({ group: groupRest, hook: h });
+    }
+    return out;
+  };
+  const parts = ["Stop", "inbound", "init"].map((k) => k + "=" + stableJson(fullOf(k)));
+  parts.push("allow=" + stableJson(owned.allow ?? null));
+  return crypto.createHash("sha256").update("claude-settings-owned:v2:" + parts.join("\n")).digest("hex");
 };
 
 // PK3-T3-fix1：registry.json **不在**清单里——它是活账本（出站发布器 / stop hook 每发一条就改 message_count），

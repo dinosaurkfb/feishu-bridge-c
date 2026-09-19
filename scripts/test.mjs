@@ -20074,6 +20074,26 @@ const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === i
 
 // 拿掉哪行会红：把 `installerFixtureEnv` 换回 `{ ...process.env, ... }`（不再调 installerChildEnv）→
 //   子进程会读到父进程设的收据 / 安装面锁覆盖点 → 红在「哨兵必须没被写」（收据或锁落在哨兵路径上）。
+// 拿掉哪行会红：installerChildEnv 里 `if (outside.length > 0) { throw … }` 那一支 → 越界的显式写目标被放行，本用例红在 assert.throws。
+test("PK3-I247-fix2：installerChildEnv 对越出夹具的显式写目标拒绝启动（夹具内、声明过的私有根放行）", () => {
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-guard-home-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-guard-outside-"));
+  try {
+    assert.ok(INSTALL_WRITE_TARGET_ENV_KEYS.length >= 2, "写目标清单不许为空：" + JSON.stringify(INSTALL_WRITE_TARGET_ENV_KEYS));
+    for (const k of INSTALL_WRITE_TARGET_ENV_KEYS) {
+      assert.throws(() => installerChildEnv({ env: {}, home, extra: { HOME: home, [k]: path.join(outside, "x") } }),
+        /越出本用例夹具/u, k + " 指到夹具外必须拒绝");
+      assert.equal(installerChildEnv({ env: {}, home, extra: { HOME: home, [k]: path.join(home, "x") } })[k],
+        path.join(home, "x"), k + " 在夹具内照旧生效");
+      assert.equal(installerChildEnv({ env: {}, home, extra: { HOME: home, [k]: path.join(outside, "x") },
+        declaredPrivateRoots: [outside] })[k], path.join(outside, "x"), k + " 在声明过的私有根内放行");
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("PK3-I247：父进程设的安装写目标覆盖点进不了安装器 —— 夹具外哨兵不被写（Claude 链同形调用）", () => {
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "i247-outside-"));
   const sentinelReceipt = path.join(outside, "installed-surface.json");

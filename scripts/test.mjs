@@ -9091,7 +9091,13 @@ test("PK3-I249 ③：预览（不带 --purge）的「将保留」栏不挂「整
   fs.mkdirSync(path.join(fx.home, ".claude", "feishu-bridge"), { recursive: true });
   fs.writeFileSync(path.join(fx.home, ".claude", "feishu-bridge", "routes.json"), JSON.stringify({ routes: [], sessions: {} }));
   const purgeDry = u1Run(fx.home, "uninstall.mjs", ["--purge", "--yes-delete-data"], fx.env);
-  assert.match(purgeDry.stdout, /只删这个文件，不碰它的父目录|整棵删/u, purgeDry.stdout);
+  //   逐条看条目行本身：每一项括号里写的是 purgeNote（处置），不是默认预览的 why（这是什么）。
+  //   拿掉哪行会红：--purge 预览的 detail 改回 d.why → 条目行括号里是「机器级桥根：…」而不是「… —— 整棵删 / 只删…」。
+  const purgeItems = purgeDry.stdout.split("\n").filter((l) => /（(机器级桥根|显式桥根下的已知|已知数据文件的覆盖点)/u.test(l));
+  assert.ok(purgeItems.length > 0, "--purge 预览要列出数据条目：" + purgeDry.stdout);
+  for (const l of purgeItems) {
+    assert.match(l, /（(机器级桥根 —— 整棵删|显式桥根下的已知子目录 —— 整棵删（父目录保留）|显式桥根下的已知数据文件 —— 只删这个文件|已知数据文件的覆盖点 —— 只删这个文件，不碰它的父目录)）/u, "--purge 预览的条目要写处置：" + l);
+  }
 });
 
 // 拿掉哪行会红：把第 2 步的 `claudeSkillsPresent` 改回 `[...claudeSkills, ...codexSkills]`（旧版并链）→

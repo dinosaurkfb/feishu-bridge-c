@@ -303,7 +303,9 @@ export function installedClaudeNode({ home = os.homedir(), platform = process.pl
  * 它会被缩成"没装"，而那正是"查不清"要拦的（is-enabled 对缺失单元说的是
  * `Failed to get unit file state …`，那条已在下面）。 */
 export const systemdUnitAbsent = (text) =>
-  /(unit file .* does not exist|unit .* not loaded|could not be found|not-found|not found|failed to get unit file state)/iu.test(String(text ?? ""));
+  // PK3-U2：systemctl 对从未存在的单元说的是「Unit x.service does not exist」（不带 file），也算"本来就没有"
+  //   —— omm 2026-09-19 真机卸载在这句上中止：本桥从没写过 aily 单元，disable 报它不存在，卸载却当失败停在半截。
+  /(unit file .* does not exist|unit \S+ does not exist|unit .* not loaded|could not be found|not-found|not found|failed to get unit file state)/iu.test(String(text ?? ""));
 
 /** 单元里 ExecStart 那一行的值：与 `claudeDrainSystemdUnits` 同源（引用规则只写一处）。 */
 export const systemdExecStartValue = (args) => args.map(systemdQuote).join(" ");
@@ -523,9 +525,14 @@ export function ailyDaemonPlan({ home = os.homedir(), platform = process.platfor
         "darwin 上 aily-cli 自带 daemon 管理，脚本里另有 scripts/aily-daemon-restart.sh）" };
   }
   if (uninstall) {
-    return { applicable: true, kind, action: "will-remove", file, files: [], remove: [file],
+    // PK3-U2：磁盘上没有本桥写的单元 → 预览不说"将删除"一个不存在的文件（omm 上 aily 是 aily-cli 自己的单元，
+    //   本桥从没写过）。停用命令照发一次：manager 里若还挂着同名孤儿也能收掉；它回「不存在」算正常（systemdUnitAbsent）。
+    const onDisk = read(file) !== null;
+    return { applicable: true, kind, action: onDisk ? "will-remove" : "not-installed", file, files: [], remove: onDisk ? [file] : [],
       commands: [["systemctl", "--user", "disable", "--now", AILY_DAEMON_UNIT + ".service"]],
-      commandsAfterRemove: [["systemctl", "--user", "daemon-reload"]], note: null, foreign: [] };
+      commandsAfterRemove: [["systemctl", "--user", "daemon-reload"]],
+      note: onDisk ? null : "本桥没写过 aily daemon 单元（磁盘上没有 " + file + "）；只发一次停用，收 manager 里可能残留的同名单元",
+      foreign: [] };
   }
   if (foreign.length > 0) {
     return { applicable: true, kind, action: "skipped_foreign", file, files: [], remove: [], commands: [], commandsAfterRemove: [],

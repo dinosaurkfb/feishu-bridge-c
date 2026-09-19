@@ -7825,6 +7825,39 @@ const u1Run = (home, script, args = [], env = {}, opts = {}) => {
 const u1Footprint = (home, platform = process.platform) => installFootprint({ home, platform });
 // PK3-U1-fix9（Codex 十轮 P1）：u1Run 跑安装器 --apply 时，父环境里的安装写目标覆盖点进不去子进程；用例显式给到夹具外则拒绝启动。
 //   拿掉哪行会红：purgeChildEnv 不剔 INSTALL_WRITE_TARGET_ENV_KEYS → ① 哨兵被写；去掉 u1Run 的写目标守卫 → ② 子进程被启动、哨兵被写。
+// PK3-U1-fix10（Codex 十一轮 P1）结构守卫：U1 新增的用例块（名字带 PK3-U1）里，**每一条**启动安装器 / 卸载入口的
+//   spawnSync / execFileSync 调用，传进去的 env 都必须来自 purgeChildEnv（内联调用，或一个由 purgeChildEnv 赋值的变量）；
+//   走 u1Run 的不在此列（u1Run 自己清洗）。按"每条调用"判，不按整块判——整块判会被同块里别处的 purgeChildEnv 盖过去。
+//   字样拼出来免得扫到自己。拿掉哪行会红：把 Codex 套件封闭性用例的 env 改回 { ...isolatedEnv(), … } → 本用例点名那条。
+test("PK3-U1-fix10：U1 新增用例里每一条启动安装器 / 卸载入口的调用，env 都经过夹具环境清洗", () => {
+  const ENTRY = new RegExp("(install-out" + "bound|install-in" + "bound|uninst" + "all)\\.mjs|\"install\\.mjs\"", "u");
+  const CALL = new RegExp("(?:spawn" + "Sync|execFile" + "Sync)\\(", "gu");
+  const PCE = "purgeChild" + "Env(";
+  const offenders = [];
+  let scanned = 0;
+  let calls = 0;
+  for (const file of [path.resolve("scripts", "test.mjs"), path.resolve("scripts", "codex", "test.mjs")]) {
+    const blocks = fs.readFileSync(file, "utf-8").split(/\ntest\(/u).slice(1);
+    for (const b of blocks) {
+      const name = (b.match(/^"([^"]+)"/u) ?? [null, ""])[1];
+      if (!name.includes("PK3-U1")) continue;
+      scanned += 1;
+      for (const m of b.matchAll(CALL)) {
+        const stmt = b.slice(m.index, b.indexOf(");", m.index) + 2);   // 这一条调用语句
+        if (!ENTRY.test(stmt)) continue;                                 // 不是启动安装器 / 卸载入口
+        calls += 1;
+        const envArg = stmt.match(/\benv:\s*([A-Za-z_$][\w$]*)\s*[,}]/u)?.[1] ?? (/\{[^{}]*\benv\s*[,}]/u.test(stmt) ? "env" : null);
+        const inline = stmt.includes(PCE);
+        const fromVar = envArg !== null && new RegExp("\\b(?:const|let)\\s+" + envArg + "\\s*=\\s*" + PCE.replace("(", "\\("), "u").test(b);
+        if (!inline && !fromVar) offenders.push(path.relative(process.cwd(), file) + "：" + name + " —— " + stmt.slice(0, 120).replace(/\s+/gu, " "));
+      }
+    }
+  }
+  assert.ok(scanned >= 20, "要真的扫到 U1 的用例块（实际 " + scanned + " 块）");
+  assert.ok(calls >= 2, "要真的找到启动安装器 / 卸载入口的调用（实际 " + calls + " 条）");
+  assert.deepEqual(offenders, [], "这些 U1 用例的调用没经过夹具环境清洗：" + JSON.stringify(offenders));
+});
+
 test("PK3-U1-fix9：安装写目标（收据 / 安装面锁）覆盖点——继承值进不去子进程、显式给到夹具外就拒绝启动", () => {
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "u1f9-outside-"));
   const sentinelReceipt = path.join(outside, "installed-surface.json");
@@ -8283,7 +8316,9 @@ const rel = held.release();
 process.stdout.write("RELEASE-OK：" + rel.ok + "\\n");
 `);
   const runDriver = (tokenOverride) => spawnSync(process.execPath, [driver, home, path.resolve("scripts", "install-outbound.mjs"), tokenOverride],
-    { encoding: "utf-8", env: { ...process.env, ...u1Env(home) }, timeout: 300_000 });
+    // PK3-U1-fix10（Codex 十一轮 P1）：driver 会把自己的 process.env 再传给 install-outbound --apply，
+    //   所以交给 driver 的环境先做夹具清洗（继承的删除目标 / 安装写目标覆盖点剔掉）。
+    { encoding: "utf-8", env: purgeChildEnv({ env: process.env, home, extra: u1Env(home) }), timeout: 300_000 });
   const okChild = runDriver("-");
   assert.match(okChild.stdout, /CHILD-STATUS：0/u, "真编排下子安装器要能继承（拿不到锁路径/token 或核不上都会变成 2）：" + okChild.stdout + okChild.stderr);
   fs.rmSync(path.join(home, ".claude", "skills"), { recursive: true, force: true });

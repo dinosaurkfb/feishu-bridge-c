@@ -15,7 +15,7 @@ import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsola
 import { installSuiteTempRoot } from "../test-support/suite-temp-root.mjs";
 import { installWriteDiagnosis } from "../test-support/write-diagnosis.mjs";
 // PK3-U1-fix7：真 purge 用例的夹具边界（剔继承的删除目标覆盖点 + 启动前核清单）
-import { purgeChildEnv, purgeTargetsOutsideFixture } from "../test-support/purge-fixture-guard.mjs";
+import { purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "../test-support/purge-fixture-guard.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -11989,8 +11989,11 @@ test("PK3-U1-fix5 P1-2：显式桥根 purge 的封闭清单 —— 真跑一遍�
   const bridge = path.join(base, "explicit-bridge");    // 显式桥根：人给的目录（产品只删已知子项、保留目录本身）
   fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...isolatedEnv(), HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge,
-    FEISHU_BRIDGE_REGISTRY: path.join(bridge, "registry.json") };
+  // PK3-U1-fix10（Codex 十一轮 P1）：安装这一步也走夹具环境清洗——继承的删除目标与安装写目标（收据 / 安装面锁）
+  //   覆盖点一律剔掉，再核写目标在夹具内；后面 purge 的清洗保护不了前面的安装。
+  const env = purgeChildEnv({ env: isolatedEnv(), home, extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge,
+    FEISHU_BRIDGE_REGISTRY: path.join(bridge, "registry.json") } });
+  assert.deepEqual(writeTargetsOutsideFixture({ env, declaredPrivateRoots: [base] }), [], "安装写目标越出本用例夹具 —— 拒绝启动");
 
   // ① 真入口写盘：codex/install.mjs --apply（登记表 / receipts / installed-surface.json / 技能 / runtime）
   const inst = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });

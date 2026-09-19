@@ -52,7 +52,7 @@ import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor, timerPlatform } from "./drain-schedule.mjs";
 import { CLAUDE_DRAIN_SYSTEMD_UNIT, ailyDaemonUnitPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, foreignAilyDaemonUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
 // 装机足迹住在维护层（它要同时知道两链装了什么，而顶层 scripts/*.mjs 不许 import codex/）
-import { describeFootprint, installFootprint } from "./maintenance/install-footprint.mjs";
+import { describeFootprint, describePartial, installFootprint } from "./maintenance/install-footprint.mjs";
 import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -345,11 +345,14 @@ export function runDoctor({
   const foot = installFootprint({ home, platform });
   const installedState = foot.clean ? "uninstalled" : (foot.partial ? "partial" : "installed");
   const footResidue = foot.residue.map((r) => r.area + "=" + String(r.what)).slice(0, 6).join("、");
+  // PK3-I249：半装现在**两个方向都判**（钩子在而 current 没了；current 在而钩子没了）—— 后者的机器
+  //   看着"已安装"，其实那一链已经不工作了。恢复指引两条都给：重装（这一链的安装器）或卸干净。
   add("install_state", "装机状态", installedState !== "partial",
     installedState === "uninstalled" ? describeFootprint(foot) + " —— " + foot.retainedNote
       : installedState === "installed" ? describeFootprint(foot)
-      : "半装 / 残留（钩子或定时器还在、它们指的 runtime/current 已经不在了）：在的 —— " + footResidue + "；" +
-        "这种情况下每次 Stop / 每 30 分钟都会去跑一个不存在的脚本。重装或卸干净：node scripts/uninstall.mjs",
+      : "半装 / 残留（" + describePartial(foot) + "）：在的 —— " + footResidue + "；" +
+        "重装：`node scripts/install-outbound.mjs --apply`（入站/Codex 链再加 install-inbound.mjs / codex/install.mjs）" +
+        "，或卸干净：`node scripts/uninstall.mjs --apply`",
     installedState === "partial" ? PREVIEW.uninstall : null);
 
   // ── 运行时（未安装的机器上不适用：报 unknown，不报✗——没装不是故障）
@@ -403,14 +406,23 @@ export function runDoctor({
   const selfExempt = defaultSelf.status === "runtime" && unregisteredAll.some((s) => s.id === "self");
   const unregistered = unregisteredAll.filter((s) => !(selfExempt && s.id === "self"));
   const unavailable = links.sections.filter((s) => s.state === "unavailable" && s.reason !== "not_probed");
+  // PK3-I249：**未安装态的 ①**。卸完之后 routes.json 里的 self 路由还留着，而它的状态入口是**本桥自身**
+  //   —— 跟着 runtime/current 一起卸掉了，于是 ① 报「1 条路由没有状态入口：self」→ blocked，与卸载完成
+  //   提示「doctor 应报未安装（无 ✗）」自相矛盾（omm 真机实测）。
+  //   收窄成"**没装 + 唯一没入口的就是 self**"才判不适用：self 的状态本来由本桥自己提供，没装了自然就没有；
+  //   **别的路由没状态入口仍然是保留数据自己的问题**（与装不装无关），照旧 ✗ —— 不然一台没装本桥、
+  //   但表里躺着 lonely 路由的机器就会被这条降级掩掉。
+  const selfOnlyWhenUninstalled = foot.clean && unregistered.length > 0 && unregistered.every((s) => s.id === "self");
   add("route_without_provider", "① route 有状态入口",
-    tablesUnclear ? null : unregistered.length === 0,
-    tablesUnclear ? "路由表或状态入口表读不出来，查不清（" + (links.routesProblem ?? links.providersProblem) + "）"
+    selfOnlyWhenUninstalled ? null : (tablesUnclear ? null : unregistered.length === 0),
+    selfOnlyWhenUninstalled
+      ? "未安装 —— 不适用（只剩 self 没有状态入口，而 self 的状态由本桥自身提供、随 runtime/current 一起卸掉了）"
+      : tablesUnclear ? "路由表或状态入口表读不出来，查不清（" + (links.routesProblem ?? links.providersProblem) + "）"
       : unregistered.length === 0 ? "每条启用路由都有获准报告运输状态的状态入口" +
         (selfExempt ? "（self 是本桥自身的入站路由，状态由本桥自身提供，不另要求登记外部状态入口）" : "")
       : unregistered.length + " 条路由没有状态入口：" + list(unregistered, (s) => s.id) +
         (selfExempt ? "；self 是本桥自身的入站路由（状态由本桥自身提供），不计入" : ""),
-    unregistered.length > 0 ? PREVIEW.registerProvider : null);
+    selfOnlyWhenUninstalled || unregistered.length === 0 ? null : PREVIEW.registerProvider);
   add("provider_runs", "② 状态入口能跑",
     tablesUnclear ? null : !probeProviders ? null : unavailable.length === 0,
     tablesUnclear ? "查不清（表读不出来）"
@@ -1614,7 +1626,8 @@ export function runDoctor({
   //   runtime/current 本来就不在 —— 报 ✗ 会把"没装"说成"坏了"。卸后验证（uninstall --apply 之后跑
   //   doctor）要的正是"零 ✗"，所以在这一处统一降级成 unknown。
   //   **只降这两项**：保留的数据本身自不自洽（① 路由有没有状态入口、③ 话题登记指向的路由在不在）
-  //   与装不装无关，卸了也照样该报 —— 那是数据的问题，不是"没装"。
+  //   与装不装无关，卸了也照样该报 —— 那是数据的问题，不是"没装"。（① 有一个例外，见它自己那一段：
+  //   卸后"唯一没状态入口的就是 self"时不适用，PK3-I249。）
   if (foot.clean) {
     const INSTALL_DEPENDENT = new Set(["runtime", "default_route_handler"]);
     for (const c of checks) {

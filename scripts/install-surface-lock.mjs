@@ -27,9 +27,14 @@ export const INSTALL_SURFACE_LOCK_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_LOCK";
 /**
  * 「调用方已经在整段编排里持着这把锁」的继承点（PK3-U1-fix1 P1-2）。
  * 一键卸载（scripts/uninstall.mjs）要把**整段编排**放在锁里：入站 → 出站 → Codex → 摘 current → purge。
- * 子安装器是独立进程，它们自己再取一次同一把锁会自重入死锁 —— 所以父进程把自己的持有事实传给它们：
- * 值必须是**本进程正在持有的那把锁的绝对路径**（与 installSurfaceLockPath 逐字相等才认），
- * 子进程据此跳过取锁（独占权由父进程保证持有到编排结束）。位置不对 / 值不对一律当没设，照常取锁。
+ * 子安装器是独立进程，它们自己再取一次同一把锁会自重入死锁 —— 所以父进程把自己的持有事实传给它们。
+ *
+ * **三态**（唯一判据 = `inheritedSurfaceLock`，两个取锁面共用；这里只说口径，别按"值不对就当没设"理解）：
+ *   · 值不是这一处的锁路径（或压根没设）→ **当没设**，调用方照常取锁；
+ *   · 值就是这一处的锁路径、且核到实际持有者（锁在 / owner.pid === 父进程 / token 逐字相等）→ 认继承：
+ *     不重复取锁，release 是空操作（独占权由父进程保证持有到编排结束）；
+ *   · **值对但核不上持有者 → fail-closed 拒绝（exit 2、零写）**，不是"当没设、照常取锁"
+ *     —— 那把锁不在时普通取锁会**真的拿到锁并开写**，而调用方"我在编排的锁里"的前提已经被证伪。
  */
 export const INSTALL_SURFACE_HELD_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_HELD";
 /**
@@ -37,7 +42,9 @@ export const INSTALL_SURFACE_HELD_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_HELD";
  * 「我持着锁」当成一句口头声明 —— 直接设上 HELD 就能无锁写安装面。改成两个变量：
  *   FEISHU_BRIDGE_INSTALL_SURFACE_HELD=<锁路径>  且  FEISHU_BRIDGE_INSTALL_SURFACE_HELD_TOKEN=<锁里的 token>
  * 子进程还要能核到**实际持有者**：锁文件在位、payload 形状受验、owner.pid === process.ppid（父进程就是持锁者）、
- * token 逐字相等。任一不符 → 不认继承，按普通取锁走（父进程持着 → surface_install_busy → exit 2 零写）。
+ * token 逐字相等。**任一不符 → 不认继承，但也不"当没设"**：直接 fail-closed 拒绝、exit 2 零写
+ * （见上面那段三态；判定只有 `inheritedSurfaceLock` 一份，`holdInstallSurfaceLockOrExit` 与
+ * `acquireInstallSurfaceLockOrRefuse` 共用）。
  */
 export const INSTALL_SURFACE_HELD_TOKEN_ENV = "FEISHU_BRIDGE_INSTALL_SURFACE_HELD_TOKEN";
 

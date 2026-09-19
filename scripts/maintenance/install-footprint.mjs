@@ -315,8 +315,8 @@ export function machinePurgeTargets({ home = os.homedir(), env = process.env } =
  * @returns {{
  *   kind: "launchd"|"systemd"|null,
  *   present: object, residue: Array<{area,what}>, orphans: object,
- *   clean: boolean, installed: boolean, partial: boolean, claudeComplete: boolean, codexComplete: boolean,
- *   retainedNote: string,
+ *   clean: boolean, installed: boolean, partial: boolean, partialChains: ("claude"|"codex")[],
+ *   claudeComplete: boolean, codexComplete: boolean, retainedNote: string,
  * }}
  */
 export function installFootprint({ home = os.homedir(), env = process.env, platform = process.platform,
@@ -376,27 +376,58 @@ export function installFootprint({ home = os.homedir(), env = process.env, platf
   // 成套 = 这一链的"已装"标记（钩子 + runtime/current）都在。平台没有定时器实现的机器不因此判残留。
   const claudeComplete = claudeHooks.length > 0 && present.claudeCurrent !== null;
   const codexComplete = codexHookNames.length > 0 && present.codexCurrent !== null;
-  // **"半装"只判会出事的地方**：这一链**装过**（钩子在），而它指向的 runtime/current 已经不在了 ——
-  // 那才是真残留（每个 Stop / 每 30 分钟都会去跑一个不存在的脚本，且不报错）。
-  // 「只有 runtime 没钩子」「只有一份别人的 / 遗留的 plist 而这一链从没装过」这类**不成套但不会出事**的
-  // 状态不算故障 —— 它们仍然会出现在 residue 清单里（人有得看），但不判 ✗。
+  // **"半装"判两个方向**（PK3-I249 补了反方向）：
+  //   · 钩子在、它指向的 runtime/current 不在 → 每个 Stop / 每 30 分钟都会去跑一个不存在的脚本，且不报错；
+  //   · **runtime/current 在、这一链的钩子一条都不在** → 那一链已经不工作了（Stop 钩子没了，出站不再转发），
+  //     却仍然会被认成"已安装"。omm 2026-09-19 真机卸载中途停下时就是这个样子（第一次停在 Claude 链钩子与
+  //     定时器已删、两个 current 还在 → doctor 报 ✓ 不成套；第二次停在 Codex 链还完整 → 报 ✓ 已安装）。
+  //     这两个都不是"能用的机器"，判 ✗。
+  // 剩下的「不成套」（两个方向都不成立，例如只有一份别人的 plist、或只有技能目录）仍然只进 residue 清单，
+  // 不判 ✗ —— 那种机器上出站仍然是好的，只是少了点东西。
   const orphans = {
     hooks: claudeHooks.length > 0 && present.claudeCurrent === null,
+    // 反方向：current 在、三条 Claude 钩子一条都不在（PK3-I249）
+    claudeRuntime: present.claudeCurrent !== null && claudeHooks.length === 0,
     // 定时器 / Codex drain plist **不看钩子在不在了**（fix2 P2-2）：它们指向的 runtime/current 不在时
     // 本身就是会出事的状态（每 30 分钟跑一次不存在的脚本），不该因为“钩子也被删了/从未装钩子”就说不是半装。
     timer: timerPaths.length > 0 && present.claudeCurrent === null,
     codex: codexHookNames.length > 0 && present.codexCurrent === null,
+    // 反方向：current 在、两条 Codex 钩子一条都不在（PK3-I249）
+    codexRuntime: present.codexCurrent !== null && codexHookNames.length === 0,
     codexDrain: codexDrain.length > 0 && present.codexCurrent === null,
   };
+  /** 判"半装"的链（doctor 与 uninstall 共用口径，别各推一遍）。 */
+  const partialChains = [
+    ...(orphans.hooks || orphans.claudeRuntime || orphans.timer ? ["claude"] : []),
+    ...(orphans.codex || orphans.codexRuntime || orphans.codexDrain ? ["codex"] : []),
+  ];
   return {
     kind, present, residue, orphans,
     clean: residue.length === 0,
     claudeComplete, codexComplete,
     installed: claudeComplete || codexComplete,
-    partial: orphans.hooks || orphans.timer || orphans.codex || orphans.codexDrain,
+    partial: Object.values(orphans).some(Boolean),
+    partialChains,
     retainedNote: "保留的数据（卸载默认不删）：registry.json / routes.json / status-providers.json / subscriptions.json / chain-config.json / inbound/ 回执与账本",
   };
 }
+
+/**
+ * 「半装」的**一句话**（doctor 与 uninstall 共用口径，PK3-I249）：点名哪条链、哪个方向。
+ * 两个方向分开说 —— 「钩子在、runtime 没了」与「runtime 在、钩子没了」的修法不一样：
+ * 前者重装即可，后者说明这一链已经停了、只是壳还在。
+ */
+export const describePartial = (foot) => {
+  const c = foot.orphans ?? {};
+  const bits = [];
+  if (c.hooks) bits.push("Claude 链：钩子在、它指的 runtime/current 不在 —— 每次 Stop 都会去跑一个不存在的脚本");
+  if (c.claudeRuntime) bits.push("Claude 链：runtime/current 在、三条钩子一条都不在 —— 出站已经不再转发");
+  if (c.timer) bits.push("Claude 链：兜底定时器还在、它指的 runtime/current 不在");
+  if (c.codex) bits.push("Codex 链：钩子在、它指的 runtime/current 不在");
+  if (c.codexRuntime) bits.push("Codex 链：runtime/current 在、两条钩子一条都不在 —— 出站已经不再转发");
+  if (c.codexDrain) bits.push("Codex 链：兜底排空服务还在、它指的 runtime/current 不在");
+  return bits.join("；");
+};
 
 /** 足迹的一句话（doctor 与 uninstall 输出共用口径）。 */
 export const describeFootprint = (foot) => {

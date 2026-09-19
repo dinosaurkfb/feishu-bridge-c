@@ -7505,7 +7505,8 @@ test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不
       return { code: 0, out: execFileSync(process.execPath,
         [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
         { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env, HOME: fakeHome } }) };
+          // PK3-I247-fix3：转手调用（参数由调用方给，含 --apply）也经夹具环境清洗。
+          env: installerChildEnv({ env: process.env, home: fakeHome, extra: { HOME: fakeHome } }) }) };
     } catch (err) {
       return { code: err.status ?? 1, out: String(err.stdout ?? "") + String(err.stderr ?? "") };
     }
@@ -7835,11 +7836,16 @@ const u1Footprint = (home, platform = process.platform) => installFootprint({ ho
 //   把 installerFixtureEnv / installerEnv 的包装拆掉（不再调 installerChildEnv）→ 第二段"薄包装"断言点名它。
 test("PK3-I247：三个测试文件里每一条启动安装器 / 卸载入口的调用，env 都经过夹具环境清洗（fix10 的守卫扩到全部用例块）", () => {
   // 字样拼出来免得扫到自己。
-  const ENTRY = new RegExp("(install-out" + "bound|install-in" + "bound|uninst" + "all)\.mjs|\"install\.mjs\"", "u");
-  const CALL = new RegExp("(?:spawn" + "Sync|execFile" + "Sync)\\(", "gu");
-  const INLINE = ["installerChild" + "Env(", "purgeChild" + "Env("];
-  const WRAPPERS = ["installerChild" + "Env", "purgeChild" + "Env", "installerFixture" + "Env", "installer" + "Env"];
-  const RUN = new RegExp("u1" + "Run\\(", "u");
+  // PK3-I247-fix3（Codex 一轮）：
+  //   P1 —— 扫**整份文件**（不只用例块）：转手函数（runInstaller 这类）定义在模块顶层、用常量指入口、参数动态展开，
+  //         旧判据只认用例块里字面入口名 + 字面 --apply，把它们整条漏掉。现在：指向入口的常量也算入口；
+  //         参数里有展开（...args）也算会写盘（由调用方决定参数）。env 的判定也收紧：只认 env 属性**本身**就是清洗调用，
+  //         或本调用之前、同一用例块内**最近一次**给该标识符赋值的语句来自清洗入口 / 薄包装（旧版全块搜索、stmt.includes 都会误认）。
+  //   P2 —— 入口名正则里的点号按字面转义（旧版在 JS 字符串里写 \.mjs，构造出的正则里 . 是通配符）。
+  const ENTRY_LIT = "(?:install-out" + "bound|install-in" + "bound|uninst" + "all)\\.mjs|\"install\\.mjs\"";
+  const CALL = new RegExp("(?:spawn" + "Sync|execFile" + "Sync|\\bspawn|\\bexecFile)\\(", "gu");
+  const CLEANSERS = ["installerChild" + "Env", "purgeChild" + "Env", "requireCleansedInstaller" + "Env"];
+  const WRAPPERS = [...CLEANSERS, "installerFixture" + "Env", "installer" + "Env"];
   const files = [
     path.resolve("scripts", "test.mjs"),
     path.resolve("scripts", "codex", "test.mjs"),
@@ -7848,29 +7854,48 @@ test("PK3-I247：三个测试文件里每一条启动安装器 / 卸载入口的
   const offenders = [];
   let scanned = 0;
   let calls = 0;
+  let viaConst = 0;
   for (const file of files) {
-    const blocks = fs.readFileSync(file, "utf-8").split(/\ntest\(/u).slice(1);
-    for (const b of blocks) {
-      scanned += 1;
-      const name = (b.match(/^"([^"]+)"/u) ?? [null, ""])[1];
-      for (const m of b.matchAll(CALL)) {
-        const stmt = b.slice(m.index, b.indexOf(");", m.index) + 2);   // 这一条调用语句
-        if (!ENTRY.test(stmt)) continue;                                 // 不是启动安装器 / 卸载入口
-        if (!/--apply|--uninstall/u.test(stmt)) continue;                // 只查会写盘的
-        calls += 1;
-        if (RUN.test(stmt)) continue;                                    // u1Run 自己清洗
-        if (INLINE.some((s) => stmt.includes(s))) continue;              // 内联清洗入口
-        // env 是标识符（`env: x` 或简写 `env`）：看它在本块里的定义是否来自清洗入口或其薄包装
-        const id = stmt.match(/\benv:\s*([A-Za-z_$][\w$]*)\s*[,}]/u)?.[1] ??
-          (/[,{]\s*env\s*[,}]/u.test(stmt) ? "env" : undefined);
-        const fromVar = id !== undefined && new RegExp(
-          "\\b(?:const|let)\\s+" + id + "\\s*=\\s*(?:" + WRAPPERS.join("|") + ")\\(", "u").test(b);
-        if (!fromVar) offenders.push(path.relative(process.cwd(), file) + "：" + name + " —— " + stmt.slice(0, 120).replace(/\s+/gu, " "));
+    const src = fs.readFileSync(file, "utf-8");
+    //   只认**值就是路径**的常量（path.resolve / path.join / 字符串字面量），不认 `const r = spawnSync(…入口…)` 这类结果变量。
+    const consts = [...src.matchAll(new RegExp("\\b(?:const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:path\\.(?:resolve|join)\\([^;\\n()]*(?:" + ENTRY_LIT + ")[^;\\n()]*\\)|\"[^\"\\n]*(?:" + ENTRY_LIT + ")\")", "gu"))]
+      .map((m) => m[1]);
+    const constRe = consts.length > 0 ? new RegExp("\\b(?:" + consts.join("|") + ")\\b", "u") : null;
+    const entryRe = new RegExp(ENTRY_LIT, "u");
+    const testStarts = [...src.matchAll(/\ntest\("([^"]+)"/gu)].map((m) => [m.index, m[1]]);
+    scanned += testStarts.length;
+    const blockOf = (i) => {
+      let at = 0, name = "（模块顶层）";
+      for (const [s, n] of testStarts) { if (s < i) { at = s; name = n; } else break; }
+      return { at, name };
+    };
+    for (const m of src.matchAll(CALL)) {
+      const stmt = src.slice(m.index, src.indexOf(");", m.index) + 2);
+      const literal = entryRe.test(stmt);
+      const byConst = !literal && constRe !== null && constRe.test(stmt);
+      if (!literal && !byConst) continue;                                           // 不是启动安装器 / 卸载入口
+      const argv = stmt.slice(0, stmt.indexOf("]") + 1);                            // 参数数组（第一个 ] 之前）
+      if (!/--apply|--uninstall/u.test(stmt) && !/\.\.\.\s*[A-Za-z_$]/u.test(argv)) continue;   // 只查会写盘的（含参数数组里的动态展开）
+      calls += 1;
+      if (byConst) viaConst += 1;
+      if (new RegExp("\\benv:\\s*(?:" + CLEANSERS.join("|") + ")\\(", "u").test(stmt)) continue;   // env 属性本身就是清洗调用
+      const id = stmt.match(/\benv:\s*([A-Za-z_$][\w$]*)\s*[,}\n]/u)?.[1] ??
+        (/[,{]\s*env\s*[,}]/u.test(stmt) ? "env" : undefined);
+      const block = blockOf(m.index);
+      let ok = false;
+      if (id !== undefined) {
+        const before = src.slice(block.at, m.index);
+        const defs = [...before.matchAll(new RegExp("(?:\\b(?:const|let|var)\\s+|[;{\\n]\\s*)" + id + "\\s*=(?![=>])\\s*([^;\\n]*)", "gu"))];
+        const last = defs.at(-1);
+        ok = last !== undefined &&
+          new RegExp("^(?:\\([^)]*\\)\\s*=>\\s*)?(?:" + WRAPPERS.join("|") + ")\\(", "u").test(last[1]);
       }
+      if (!ok) offenders.push(path.relative(process.cwd(), file) + "：" + block.name + " —— " + stmt.slice(0, 120).replace(/\s+/gu, " "));
     }
   }
   assert.ok(scanned >= 1000, "要真的扫到三个文件的全部用例块（实际 " + scanned + " 块）");
   assert.ok(calls >= 40, "要真的找到启动安装器 / 卸载入口并写盘的调用（实际 " + calls + " 条）");
+  assert.ok(viaConst >= 1, "要真的认出经常量指入口的转手调用（linux-install.test.mjs 的 runInstaller；实际 " + viaConst + " 条）");
   assert.deepEqual(offenders, [], "这些用例的调用没经过夹具环境清洗：" + JSON.stringify(offenders));
 
   // 接受的"薄包装"必须真的是包装（内部调 installerChildEnv）—— 否则上面那段判据就成了空文。
@@ -10754,7 +10779,8 @@ test("安装不登记项目，也不改动既有登记表", () => {
 
   const run = (extra) => execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), ...extra],
-    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    // PK3-I247-fix3：转手调用也经夹具环境清洗。
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, home, extra: { HOME: home } }) });
 
   run(["--apply"]);
   assert.equal(fs.readFileSync(registryFile, "utf-8"), original,

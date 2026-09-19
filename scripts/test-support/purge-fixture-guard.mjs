@@ -55,6 +55,20 @@ export function purgeChildEnv({ env = process.env, home, extra = {} } = {}) {
  * （`PURGE_TARGET_ENV_KEYS` + `INSTALL_WRITE_TARGET_ENV_KEYS`），安装器与卸载入口吃的是同一组覆盖点。
  * `home` 缺省从最终 env 的 `HOME` 取（多数用例的 env 自带 HOME）—— 预检与子进程只有一份 env。
  */
+/**
+ * PK3-I247-fix3（Codex 一轮 P1）：**执行边界核验**。installerChildEnv 产出的对象登记在这里；
+ * 转手入口（如 linux-install.test.mjs 的 runInstaller）启动安装器 / 卸载入口前用
+ * requireCleansedInstallerEnv 核验 —— 只认**同一个对象**，展开复制（{ ...env }）或原样继承（process.env）都不算。
+ * 这样即使源码扫描认不出某种写法，把薄包装改回原样继承也会在运行时当场炸，而不是静默写夹具外。
+ */
+const CLEANSED_INSTALLER_ENVS = new WeakSet();
+export function requireCleansedInstallerEnv(env) {
+  if (env === null || typeof env !== "object" || !CLEANSED_INSTALLER_ENVS.has(env)) {
+    throw new Error("安装器 / 卸载入口的子进程环境必须直接来自 installerChildEnv（执行边界核验：展开复制或原样继承都不算）");
+  }
+  return env;
+}
+
 export function installerChildEnv({ env = process.env, extra = {}, home = undefined, declaredPrivateRoots = [] } = {}) {
   const targetHome = typeof home === "string" && home.length > 0 ? home : (extra.HOME ?? env.HOME);
   const childEnv = purgeChildEnv({ env, home: targetHome, extra });
@@ -62,6 +76,7 @@ export function installerChildEnv({ env = process.env, extra = {}, home = undefi
   if (outside.length > 0) {
     throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(outside));
   }
+  CLEANSED_INSTALLER_ENVS.add(childEnv);
   return childEnv;
 }
 

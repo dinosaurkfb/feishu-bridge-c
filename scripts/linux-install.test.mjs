@@ -23,7 +23,7 @@ import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
 import { systemctl, timerCmd } from "./timer-exec.mjs";
 import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
-import { installerChildEnv } from "./test-support/purge-fixture-guard.mjs"; // PK3-I247：安装器写目标隔离
+import { installerChildEnv, requireCleansedInstallerEnv } from "./test-support/purge-fixture-guard.mjs"; // PK3-I247：安装器写目标隔离
 
 // PK3-T2-fix1：这个入口也是测试，也要有本轮私有临时根 —— **在任何 mkdtemp 之前**装，
 // 装上之后越出私有根的 mkdtemp 当场 throw（硬门在退出时把 violations 汇总成非 0）。
@@ -225,7 +225,9 @@ function installerEnv(home, extra = {}) {
     FEISHU_BRIDGE_LAUNCHCTL: "", FEISHU_BRIDGE_SYSTEMCTL: "", FEISHU_BRIDGE_TIMER_PLATFORM: "",
     ...extra } });
 }
-const runInstaller = (env, args) => spawnSync(process.execPath, [INSTALLER, ...args], { encoding: "utf-8", env });
+// PK3-I247-fix3：转手入口在执行边界核验 env 直接来自 installerChildEnv（经 installerEnv）。
+const runInstaller = (env, args) =>
+  spawnSync(process.execPath, [INSTALLER, ...args], { encoding: "utf-8", env: requireCleansedInstallerEnv(env) });
 
 test("fix2/P1-1 installedNodeFrom：收据守门，来源按 hooks → 定时器；只认绝对路径", () => {
   const installed = "/opt/installed/node";

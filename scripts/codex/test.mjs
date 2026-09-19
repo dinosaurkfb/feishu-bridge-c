@@ -11754,11 +11754,12 @@ test("PK3-L7-fix5 P1-1：darwin 卸载/预览一次 systemctl 都不调（Mac �
   fs.writeFileSync(fake,
     "#!/bin/sh\necho x >> " + JSON.stringify(counter) + "\necho 'System has not been booted with systemd as init system' >&2\nexit 1\n",
     { mode: 0o755 });
-  const baseEnv = { ...process.env, HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
+  // PK3-I247-fix3：转手调用（参数由调用方给，含 --uninstall --apply）也经夹具环境清洗；显式字段照旧。
+  const baseExtra = { HOME: fx.home, CODEX_HOME: fx.codexHome, FEISHU_CODEX_BRIDGE_HOME: fx.bridge,
     FEISHU_BRIDGE_SYSTEMCTL: fake };
   const run = (args, extra) => spawnSync(process.execPath,
     [path.join(ROOT, "scripts", "codex", "install.mjs"), ...args],
-    { encoding: "utf-8", env: { ...baseEnv, ...extra } });
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, home: fx.home, extra: { ...baseExtra, ...extra } }) });
 
   // ① darwin 预览：一次都不调 systemctl，退出 0
   const dry = run(["--uninstall"], { FEISHU_BRIDGE_TIMER_PLATFORM: "darwin" });

@@ -58929,6 +58929,81 @@ test("PK3-I244 ⑤：纯 mtime 变化（本桥条目一字未动）不算写穿�
   }
 });
 
+// ── PK3-I244-fix1：卫兵启动阶段不许碰产品模块（boot 的依赖只有卫兵与 node 内置）────────────
+
+// 拿掉哪行会红：把 `import { claudeSettingsOwnedEntries } from "../install-projection.mjs"` 加回卫兵顶层
+//   （fix1 收掉的那一行）→ 本用例点名 install-surface-guard.mjs 里那条 import。
+test("PK3-I244-fix1 ①结构：卫兵与 boot 的**静态** import 只许 node: 内置与彼此", () => {
+  // 判据（逐行扫 `^import` 语句的 from 说明符）：只允许两件东西 ——
+  //   · `node:` 内置（卫兵要用 crypto / fs / module / os / path）；
+  //   · 卫兵与 boot 彼此（boot 静态 import 卫兵，这是 T3-fix2 的设计）。
+  // 任何**产品模块**的静态 import 都不许有：那会让它的整棵依赖树在基线快照之前求值。
+  const targets = [
+    path.resolve("scripts", "test-support", "install-surface-guard.mjs"),
+    path.resolve("scripts", "test-support", "install-surface-boot.mjs"),
+  ];
+  const allowed = new Set(["./install-surface-guard.mjs", "./install-surface-boot.mjs"]);
+  let scanned = 0;
+  for (const file of targets) {
+    const imports = fs.readFileSync(file, "utf-8").split("\n").filter((l) => /^import\b/u.test(l));
+    assert.ok(imports.length > 0, path.basename(file) + "：一条静态 import 都没有？扫描判据写错了");
+    for (const line of imports) {
+      const spec = line.match(/from\s+"([^"]+)"/u)?.[1] ?? "";
+      scanned += 1;
+      assert.ok(spec.startsWith("node:") || allowed.has(spec),
+        path.basename(file) + " 的静态 import 只能是 node: 内置或卫兵彼此：" + line.trim());
+    }
+  }
+  assert.ok(scanned >= 5, "扫描必须真的覆盖到那几条 import（实际 " + scanned + " 条）");
+});
+
+// 拿掉哪行会红：把基线快照改成"第一次 check() 时才取"（或把产品模块的静态 import 加回去，
+//   让它在快照前求值）→ 假产品模块在 import 阶段改的那一笔会被算进基线，退出码变 0，本用例红在
+//   「必须非 0 退出」与「必须点名 settings.json」两条上。
+test("PK3-I244-fix1 ②行为：假产品模块在 import 阶段改本桥 hook 条目 → 非 0 退出并点名 settings.json", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-import-pollution-"));
+  try {
+    const tmpHome = path.join(tmp, "home");
+    const settings = path.join(tmpHome, ".claude", "settings.json");
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    // 夹具里有一条**本桥拥有**的 Stop hook（tag 认领，与 node 无关）+ 一次外来的键
+    fs.writeFileSync(settings, JSON.stringify({
+      model: "opus",
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "node x.mjs # FEISHU_BRIDGE_HOOK:stop-hook.mjs", timeout: 20 }] }] },
+    }, null, 2) + "\n");
+
+    const fakeProductModule = path.join(tmp, "fake-product-module.mjs");
+    fs.writeFileSync(fakeProductModule, `
+import fs from "node:fs";
+// 假产品模块在 import 顶层求值阶段改**本桥条目**（不是无关的 model —— 那种本来就不该报）
+const file = ${JSON.stringify(settings)};
+const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+doc.hooks.Stop[0].hooks[0].command = "node /somewhere/else/stop-hook.mjs # FEISHU_BRIDGE_HOOK:stop-hook.mjs";
+fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\\n");
+`);
+
+    const runnerScript = path.join(tmp, "test-runner.mjs");
+    const bootShim = writeSurfaceBootShim(tmp, tmpHome);
+    fs.writeFileSync(runnerScript, `
+// 第一项 import 必须是引导垫片（显式注入 home 的卫兵，等价于正式入口的 install-surface-boot.mjs）
+import ${JSON.stringify(bootShim)};
+// 后续 import 是"import 阶段就写产品数据"的假产品模块
+import ${JSON.stringify(fakeProductModule)};
+
+process.exit(0);
+`);
+
+    const sp = spawnSync(process.execPath, [runnerScript], { env: { ...process.env, HOME: tmpHome }, encoding: "utf-8" });
+    const all = String(sp.stdout ?? "") + "\n" + String(sp.stderr ?? "");
+    assert.notEqual(sp.status, 0, "本桥条目在 import 阶段被改写必须非 0 退出（证明基线早于产品模块求值）：" + all);
+    assert.match(all, /安装面硬门：套件改动了本机安装面/u, all);
+    assert.match(all, /settings\.json/u, "要点名 settings.json：" + all);
+    assert.match(all, /本桥条目 sha/u, "报告要说清比的是本桥条目：" + all);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("PK3-T3 单元：逐用例边界 checkBoundary 核验并在命中时记录肇事用例名", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-unit-boundary-"));
   try {

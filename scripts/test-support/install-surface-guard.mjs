@@ -29,6 +29,9 @@
  *   就把读不出折成"没变"。其余 6 个文件照旧整文件比对。
  *   也**不为此放宽 mtimeNs**：本桥条目没变就不报（连 touched 也不报 —— 运行时写一次 mtime 天天会变），
  *   条目变了就报 modified。
+ *   投影要碰产品提取器，**只能在比对时惰性加载**（PK3-I244-fix1）：卫兵是三条正式入口的第一条 import，
+ *   顶层静态 import 产品模块会让它的依赖树在基线快照之前求值 —— 那正好会放过"import 阶段写盘的产品模块"
+ *   （T3-fix2 那条反例要钉的形状）。
  *
  * 监控根只认 os.userInfo().homedir（PK3-T3-fix4：不读任何环境变量，残留变量不能改根；
  * 测试要换根只能显式传 home / files）。符号链接除目标外也比 lstat mtimeNs：同目标重建算 touched。
@@ -40,10 +43,9 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-
-import { claudeSettingsOwnedEntries } from "../install-projection.mjs";
 
 /** settings.json 的**判定身份**：投影按本桥条目算（PK3-I244）。路径形状 = `<home>/.claude/settings.json`。 */
 const SETTINGS_SUFFIX = path.join(".claude", "settings.json");
@@ -52,14 +54,32 @@ const isClaudeSettingsPath = (p) => p.endsWith(SETTINGS_SUFFIX);
 const settingsHomeOf = (p) => path.dirname(path.dirname(p));
 
 /**
- * 本桥条目的**规范化序列化 sha**（PK3-I244）。提取器只有一份（`claudeSettingsOwnedEntries`，
- * 安装收据 / 卸载足迹用的同一份）；坏 JSON → 它返回 null → 这里也返回 null，调用方按 unverifiable
- * 处置（fail-closed，不折成"没变"）。四个键固定、数组顺序有意义，原样序列化 —— 只求"两侧同法即可比"。
- * node 用提取器自己的解析（同一进程内 baseline 与 current 各调一次，两侧一致，不会自造差异）。
+ * 产品提取器**只能惰性加载**（PK3-I244-fix1）。
+ *
+ * 卫兵经 `install-surface-boot.mjs` 是三个正式入口的**第一条 import**；T3-fix2 的合同是
+ * 「boot 的依赖只有卫兵与 Node 内置模块，基线快照先于一切产品模块求值」。顶层静态 import 产品模块会让
+ * `install-projection.mjs` 及其整棵依赖树在快照**之前**求值 —— 那种 import 阶段写盘的产品模块就会被当成
+ * 初始基线（正是 fix2 那条"假产品模块在 import 阶段写权威文件"反例要钉的形状）。
+ * 所以这里第一次**比对**时才同步加载一次（`require(esm)`，Node 22+；本仓 Node 26）。
  */
-const ownedSettingsSha = (text, home) => {
+const requireFromHere = createRequire(import.meta.url);
+let ownedEntriesExtractor = null;
+const ownedEntriesFn = () => {
+  if (ownedEntriesExtractor === null) {
+    ownedEntriesExtractor = requireFromHere("../install-projection.mjs").claudeSettingsOwnedEntries;
+  }
+  return ownedEntriesExtractor;
+};
+
+/**
+ * 一个 settings.json 快照的**本桥条目投影 sha**（PK3-I244）。提取器只有一份（安装收据 / 卸载足迹用的
+ * 同一份）；坏 JSON / 读不出 → 返回 null，调用方按 **unverifiable** 处置（fail-closed，不折成"没变"）。
+ * 四个键固定、数组顺序有意义，原样序列化 —— 只求"两侧同法即可比"。
+ */
+const ownedSettingsShaOf = (entry) => {
+  if (entry === null || entry === undefined || entry.state !== "present" || typeof entry.rawText !== "string") return null;
   let owned = null;
-  try { owned = claudeSettingsOwnedEntries(text, { home }); }
+  try { owned = ownedEntriesFn()(entry.rawText, { home: settingsHomeOf(entry.path) }); }
   catch { return null; }          // 连提取都跑不动（极端环境）→ 同样是"验不了"
   if (owned === null) return null;
   const parts = ["Stop", "inbound", "init", "allow"].map((k) => k + "=" + JSON.stringify(owned[k] ?? null));
@@ -123,31 +143,17 @@ export function snapshotFile(filepath) {
       };
     }
     const buf = fs.readFileSync(p);
-    // PK3-I244：settings.json 只比**本桥拥有的条目**（运行时改写 model / effort / 别人的 hooks 不算）；
-    // 提取不出来（坏 JSON）→ 记成 error，diff 侧按 unverifiable 报（fail-closed）。
+    // PK3-I244：settings.json 的**判定身份**是本桥拥有的条目 —— 但快照这一步只存**原始字节与文本**：
+    // 投影（要碰产品提取器）留到**比对时**做，卫兵启动阶段不加载任何产品模块（见上面 ownedEntriesFn）。
     if (isClaudeSettingsPath(p)) {
-      const ownedSha = ownedSettingsSha(buf.toString("utf-8"), settingsHomeOf(p));
-      if (ownedSha === null) {
-        return {
-          path: p,
-          state: "error",
-          type: "error",
-          error: "settings_owned_unreadable（settings.json 解析不了，本桥条目取不出来）",
-          projection: "claude-settings-owned",
-          symlinkTarget: null,
-          sha: null,
-          mtime: st.mtime.toISOString(),
-          mtimeNs: st.mtimeNs,
-        };
-      }
       return {
         path: p,
         state: "present",
         type: "file",
         projection: "claude-settings-owned",
         symlinkTarget: null,
-        sha: ownedSha,
-        rawSha: crypto.createHash("sha256").update(buf).digest("hex"),
+        sha: crypto.createHash("sha256").update(buf).digest("hex"),   // 原始字节 sha（诊断/报告用）
+        rawText: buf.toString("utf-8"),
         mtime: st.mtime.toISOString(),
         mtimeNs: st.mtimeNs,
       };
@@ -282,11 +288,45 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
           culprit,
         });
       } else if (before.type === "file" && after.type === "file") {
-        if (before.sha !== after.sha) {
+        // PK3-I244：投影文件（settings.json）**在比对时**才算本桥条目 —— 基线文本与当前文本各投影一次。
+        // 这一支**不比 mtime**：运行时改写 model / effort 会天天动它的 mtime，而本桥条目没变。
+        if (before.projection === "claude-settings-owned" || after.projection === "claude-settings-owned") {
+          const beforeOwned = ownedSettingsShaOf(before);
+          const afterOwned = ownedSettingsShaOf(after);
+          if (beforeOwned === null || afterOwned === null) {
+            // 投影不出来（坏 JSON / 读不出）→ **unverifiable**（fail-closed），不折成"没变"
+            diffs.push({
+              path: p,
+              kind: "unverifiable",
+              projection: "claude-settings-owned",
+              error: "settings_owned_unreadable（settings.json 解析不了，本桥条目取不出来）",
+              beforeSha: beforeOwned,
+              afterSha: afterOwned,
+              beforeMtime: before.mtime,
+              mtime: after.mtime,
+              beforeMtimeNs: before.mtimeNs,
+              mtimeNs: after.mtimeNs,
+              culprit,
+            });
+          } else if (beforeOwned !== afterOwned) {
+            diffs.push({
+              path: p,
+              kind: "modified",
+              projection: "claude-settings-owned",
+              beforeSha: beforeOwned,
+              afterSha: afterOwned,
+              beforeMtime: before.mtime,
+              mtime: after.mtime,
+              beforeMtimeNs: before.mtimeNs,
+              mtimeNs: after.mtimeNs,
+              culprit,
+            });
+          }
+        } else if (before.sha !== after.sha) {
           diffs.push({
             path: p,
             kind: "modified",
-            projection: after.projection ?? before.projection ?? null,
+            projection: null,
             beforeSha: before.sha,
             afterSha: after.sha,
             beforeMtime: before.mtime,
@@ -295,12 +335,6 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
             mtimeNs: after.mtimeNs,
             culprit,
           });
-        } else if (
-          // PK3-I244：投影文件（settings.json 只比本桥条目）**不比 mtime** —— 运行时改写 model / effort
-          // 会天天动它的 mtime，而本桥条目没变。条目真的变了走上面那条 modified。
-          (before.projection === "claude-settings-owned" || after.projection === "claude-settings-owned")
-        ) {
-          // 本桥条目一字未变：不报 touched
         } else if (
           (before.mtimeNs !== undefined && after.mtimeNs !== undefined && before.mtimeNs !== null && after.mtimeNs !== null)
             ? before.mtimeNs !== after.mtimeNs

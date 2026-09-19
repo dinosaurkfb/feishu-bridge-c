@@ -50,7 +50,9 @@ import { pendingGeneration } from "./topic-generation.mjs";
 import { verifyRuntime, runtimeRoot } from "./runtime-install.mjs";
 import { shellQuote } from "./shell-quote.mjs";
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, pickClaudeNode, timerKindFor, timerPlatform } from "./drain-schedule.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT, claudeDrainSystemdPaths, claudeDrainSystemdUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, ailyDaemonUnitPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, foreignAilyDaemonUnits, installedClaudeNode, systemdExecStartValue, systemdShowExecArgv, systemdUnitAbsent } from "./install-projection.mjs";
+// 装机足迹住在维护层（它要同时知道两链装了什么，而顶层 scripts/*.mjs 不许 import codex/）
+import { describeFootprint, installFootprint } from "./maintenance/install-footprint.mjs";
 import { larkProvisionedSecretPath, loadChainTemplate, resolveLarkIdentity } from "./chain-template.mjs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -77,7 +79,7 @@ const SYSTEMCTL_STATE_WORDS = new Set(["active", "reloading", "inactive", "faile
   "masked", "masked-runtime", "alias", "generated", "transient", "unknown"]);
 import { readGate, maintenanceGatePath } from "./maintenance-gate-core.mjs";
 import { ownerSelectReconcile } from "./maintenance/owner-select-doctor.mjs";
-import { inspectInstalledSurface, installedSurfacePath, readInstalledSurface } from "./installed-surface.mjs";
+import { artifactSha, inspectInstalledSurface, installedSurfacePath, readInstalledSurface } from "./installed-surface.mjs";
 import { inspectMaintenanceDir, maintenanceDir, readJournal } from "./maintenance/journal.mjs";
 import { readVerifiedDoc } from "./maintenance/owner-select-state.mjs";
 import { readProcessStartTime } from "./process-start-time.mjs";
@@ -103,6 +105,7 @@ const PREVIEW = {
   rotate: "/feishu-rotate（在对应项目的会话里）",
   drainCodex: "node scripts/codex/drain-service.mjs --enable（预览；确认后自行加 --apply）",
   feishuOutbox: "$feishu-outbox（Codex 侧只读积压视图）/ node scripts/drain-outbox.mjs --dry-run",
+  uninstall: "node scripts/uninstall.mjs（预览；确认后自行加 --apply）—— 三链按序卸、默认保留数据",
 };
 
 const short = (v) => (typeof v === "string" && v.length > 8 ? v.slice(0, 8) + "…" : String(v ?? ""));
@@ -337,12 +340,25 @@ export function runDoctor({
   //     · ⑤ 绑定到期：legacy `expires_at` 确已冻结 → 改由**权威 expiry.json** 接替（见下面那一段）。
   //     · ⑥/⑯ 用登记表枚举项目根、结论是积压/转发事实；⑭ 自己带 cutover 分支 —— 都不降。
 
-  // ── 运行时
+  // ── 装机足迹（PK3-U1）：干净 / 成套 / 残留 三态。判据与 scripts/uninstall.mjs 共用一份
+  //   （install-projection.installFootprint），所以"卸干净了"与"doctor 说还有残留"在结构上不可能矛盾。
+  const foot = installFootprint({ home, platform });
+  const installedState = foot.clean ? "uninstalled" : (foot.partial ? "partial" : "installed");
+  const footResidue = foot.residue.map((r) => r.area + "=" + String(r.what)).slice(0, 6).join("、");
+  add("install_state", "装机状态", installedState !== "partial",
+    installedState === "uninstalled" ? describeFootprint(foot) + " —— " + foot.retainedNote
+      : installedState === "installed" ? describeFootprint(foot)
+      : "半装 / 残留（钩子或定时器还在、它们指的 runtime/current 已经不在了）：在的 —— " + footResidue + "；" +
+        "这种情况下每次 Stop / 每 30 分钟都会去跑一个不存在的脚本。重装或卸干净：node scripts/uninstall.mjs",
+    installedState === "partial" ? PREVIEW.uninstall : null);
+
+  // ── 运行时（未安装的机器上不适用：报 unknown，不报✗——没装不是故障）
   const runtime = verifyRuntime({ home, chain: "claude" });
-  add("runtime", "Claude 运行时", runtime.ok === true,
-    runtime.ok ? "current 指向 " + short(runtime.version) + "，清单与内容一致"
-      : "校验不过（" + (runtime.reason ?? "drift") + "）",
-    runtime.ok ? null : PREVIEW.installOutbound);
+  add("runtime", "Claude 运行时", foot.clean ? null : runtime.ok === true,
+    foot.clean ? "未安装（runtime/current 不在）—— 不适用"
+      : runtime.ok ? "current 指向 " + short(runtime.version) + "，清单与内容一致"
+        : "校验不过（" + (runtime.reason ?? "drift") + "）",
+    foot.clean || runtime.ok ? null : PREVIEW.installOutbound);
 
   // ── 三张表本身
   const registry = loadRegistryStrict(registryFile);
@@ -586,6 +602,17 @@ export function runDoctor({
     try { return { ok: true, out: execFileSync(bin, fullArgs, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }) }; }
     catch (err) { return { ok: false, out: String(err?.stdout ?? ""), err: String(err?.stderr ?? err?.message ?? err) }; }
   };
+  // systemctl 结果的**三态判据**（整份 doctor 只此一处，两个 systemd 项共用）：
+  //   readable = 「读到了」（命令成功 / stdout 是已知状态词 / 说的是"本来就没有这个单元"）
+  //   broken   = systemctl 自己不可用（命令不在、连不上 manager、权限不行）—— 与"没装"必须分开
+  const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
+  const stateWord = (r) => {
+    const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
+    return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
+  };
+  //「本来就没有这个单元」的判据与安装侧卸载**共用一份**（systemdUnitAbsent），不各写一遍。
+  const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
+  const broken = (r) => !readable(r);
   const timerKind = timerKindFor(platform);
   // 「现有安装里那个 node」（PK3-L1-fix2 P1-1）：与安装器同一份接线（收据 + 桥 hook + 现有 plist/unit）。
   // doctor 要核的是**线上那份配置的参数**，不是"当前偏好顺序会写成什么"—— 后者会把一个本来在跑的 job
@@ -610,16 +637,6 @@ export function runDoctor({
     const service = CLAUDE_DRAIN_SYSTEMD_UNIT + ".service";
     const enabled = systemctlFn(["is-enabled", unit]);
     const active = systemctlFn(["is-active", unit]);
-    const say = (r) => (String(r?.out ?? "") + " " + String(r?.err ?? "")).trim();
-    // P2（fix2）：已知状态词算"读到了"，不是"查不清"。只有命令不在 / 连不上 manager 才是查不清。
-    const stateWord = (r) => {
-      const word = String(r?.out ?? "").trim().split(/\s+/u)[0] ?? "";
-      return SYSTEMCTL_STATE_WORDS.has(word) ? word : null;
-    };
-    // systemctl 自己不可用（命令不在、实例连不上、权限不行）≠ 没装 —— 必须与 not_installed 分开。
-    //「本来就没有这个单元」的判据与安装侧卸载**共用一份**（systemdUnitAbsent），不各写一遍。
-    const readable = (r) => r?.ok === true || stateWord(r) !== null || systemdUnitAbsent(say(r));
-    const broken = (r) => !readable(r);
     if (broken(enabled) || broken(active)) {
       claudePhaseWhy = "systemctl --user 查不了（" + say(broken(enabled) ? enabled : active).slice(0, 120) + "）—— 查不清，不等于没在跑";
     } else {
@@ -686,6 +703,102 @@ export function runDoctor({
   add("backlog_vs_publisher", "⑥ 积压有人发（Claude 侧）", backlogOk,
     (!registry.ok ? "登记表读不出来，查不清" : backlogText) + "；" + publisherText,
     backlogOk === false ? (backlogProblems > 0 ? PREVIEW.feishuOutbox : PREVIEW.installOutbound) : null);
+
+  // aily daemon 服务（PK3-U1，**仅在 linux 上**）：本桥自己写的那份 systemd --user 单元在不在、起没起来、
+  // **而且内容是不是我们写的那份**（fix1 P1-4：只核 enabled+active 会假绿 —— ExecStart 被改成 /bin/false 也算"在跑"）。
+  // darwin **不加这一项**（aily-cli 在 mac 上自带 daemon 管理）——加一个恒 unknown 的项只会把每台 mac 拖成 incomplete。
+  if (timerKind === "systemd") {
+    const ailyPath = ailyDaemonUnitPath(home);
+    const foreign = foreignAilyDaemonUnits({ home });
+    const foreignText = foreign.length > 0
+      ? "；已有不是本桥写的 aily daemon 单元：" + foreign.map((f) => f.path).join("、") + "（本桥不接管，也不覆盖）"
+      : "";
+    const readUnitText = (f) => { try { return fs.readFileSync(f, "utf-8"); } catch { return null; }; };
+    // **磁盘态与 manager 态各自独立取得**（PK3-U1-fix4 P1-3）：旧版以「磁盘上有没有 unit」为前提才去问
+    // systemd —— 磁盘缺失那一条分支直接报 ok:true，于是「文件已不在、systemd 里还 loaded/active」这种
+    // 孤儿态完全看不见（探针：磁盘无 unit + manager enabled+active → ok === true、systemctl 调用 0 次）。
+    // 现在：只要这个平台有 systemd 就问一次 manager，四象限分开判。
+    // 唯一的例外是沙箱且没有注入点（体检的 home 不是真实家目录）—— 那时不去碰真实 systemd --user，
+    // 因为那台机器不是本次体检的对象（与上面的定时器分支同一套纪律）。
+    const canAskManager = !(sandboxed && !systemctlInjected);
+    const enabled = canAskManager ? systemctlFn(["is-enabled", "feishu-bridge-aily.service"]) : null;
+    const active = canAskManager ? systemctlFn(["is-active", "feishu-bridge-aily.service"]) : null;
+    const enabledWord = enabled === null ? null : stateWord(enabled);
+    const activeWord = active === null ? null : stateWord(active);
+    const enabledText = enabled === null ? "" : String(enabled.ok ? enabled.out : enabled.err ?? enabled.out ?? "").trim();
+    const activeText = active === null ? "" : String(active.ok ? active.out : active.err ?? active.out ?? "").trim();
+    const diskPresent = fs.existsSync(ailyPath);
+    // **manager 三态**（PK3-U1-fix5 P1-3，与上面 Claude timer 同一套 readable / 已知状态词判据）：
+    //   present      = manager 里认它（enabled 或 active）
+    //   absent       = 两个探针都"读到了"、且说的是"本来就没有 / 没启用没在跑"
+    //   unverifiable = systemctl 自己不可用（命令不在、`Failed to connect to bus: Permission denied`、
+    //                  非 0 且不是 not-found 类）—— **查不清就是查不清，不许折成 absent**
+    // 旧版只在磁盘有 unit 时才问 manager，磁盘没有就直接按"两边都不在"报 ok:true，正文还谎称
+    // 「manager 报 absent / not-found」；bus 连不上时那一句是假的（探针实测）。
+    const managerPresent = enabledWord === "enabled" || activeWord === "active";
+    const managerUnverifiable = canAskManager && !managerPresent && (broken(enabled) || broken(active));
+    const managerAbsent = canAskManager && !managerPresent && !managerUnverifiable &&
+      (systemdUnitAbsent(say(enabled) + " " + say(active)) ||
+        [enabledWord, activeWord].some((w) => w === "disabled" || w === "inactive" || w === "unknown"));
+    const managerState = !canAskManager ? "unasked" : managerPresent ? "present" : managerUnverifiable ? "unverifiable" : managerAbsent ? "absent" : "unverifiable";
+    const managerWhy = managerUnverifiable ? say(broken(enabled) ? enabled : active).slice(0, 120) : null;
+    if (!diskPresent && managerState === "present") {
+      // **磁盘缺失 + manager 还在**（fix4 P1-3 的第四象限）：单元文件被删了（一次失败的手工卸载、或只删了文件
+      // 没 disable），systemd --user 里却还留着它 —— 入站运输会由一个磁盘上已经没有的单元继续起。
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", false,
+        "**孤儿单元**：磁盘上的单元文件已经不在了（" + ailyPath + "），systemd --user 里却还是 " +
+        "enabled=" + (enabledText || "?") + " active=" + (activeText || "?") + " —— 它会在下次开机 / 重启时" +
+        "去起一个已经不存在的单元（或继续跑旧定义）。先把它拆干净：" +
+        "`systemctl --user disable --now feishu-bridge-aily.service`，再跑 doctor 复核" + foreignText,
+        PREVIEW.uninstall);
+    } else if (diskPresent) {
+      // 内容判据两道：① 形状（本桥写的 ExecStart 形状：绝对路径 + daemon start --foreground）
+      //                ② 与安装收据的摘要对账（收据里有这个制品时）
+      const diskText = readUnitText(ailyPath);
+      const shapeOk = /^ExecStart=:"\/[^"]+" "daemon" "start" "--foreground"(?: "[^"]*")*$/mu.test(String(diskText ?? ""));
+      const artifact = (receiptDoc?.chains?.claude?.artifacts ?? []).find((a) => a.path === ailyPath) ?? null;
+      const shaOk = artifact === null ? null : artifact.sha256 === artifactSha({ kind: "file", text: diskText });
+      // PK3-U1-fix2 P1-5：**收据缺席不能当“无问题”**。旧版把 shaOk=null 与“对上了”混为一谈，
+      // 只要 ExecStart 像个形状就报「内容与投影/收据一致」—— 那允许错误的 aily-cli 绝对路径绿灯。
+      // 三态收窄：形状不对 → ✗；收据里没这条制品（或收据读不出来）→ **?**（只核了形状，没对过账）；
+      // 收据有且 sha 相等 → 才允许绿。
+      const contentProblem = !shapeOk
+        ? "磁盘上的 ExecStart 不是本桥写的形状（要「冒号 + 绝对路径 + daemon start --foreground」那几个引号参数）—— 同名但内容漂移"
+        : shaOk === false ? "磁盘单元与安装收据的摘要不一致（内容漂移：ExecStart / Environment 被改过，或 aily-cli 换了路径）"
+          : null;
+      const unaudited = artifact === null;
+      // PK3-U1-fix3 P1-3：**磁盘有、manager 不认 = 没加载**（installed_not_loaded），不是 ✓。
+      const stateOk = managerState === "present" && enabledWord === "enabled" && activeWord === "active" ? true
+        : managerState === "present" ? false      // 认它但不健康（enabled 没 active / 只 active 没 enabled）
+          : managerState === "absent" ? false     // 磁盘有、manager 说没有 = 没加载（fix3 P1-3）
+            : null;                                // unverifiable / unasked = 查不清
+      // false 优先（真有故障就报），其次才是“收据里没有”→ unknown；只有对过账的才可能绿。
+      const ok = contentProblem !== null ? false : stateOk === false ? false : unaudited ? null : stateOk;
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", ok,
+        contentProblem !== null ? contentProblem + "（重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并 enable --now）" + foreignText
+          : ok === true ? "已启用且在跑，内容与投影/收据一致（" + ailyPath + "）" + foreignText
+            : unaudited && ok === null ? "单元在、ExecStart 形状对，但**安装收据里没有这条制品（或收据读不出来）** —— 只核了形状，无法与收据对账（判 ?）。重跑 `node scripts/install-outbound.mjs --apply` 会按投影重写并记收据" + foreignText
+              : managerState === "absent" ? "单元已写入但**没被 systemd --user 加载**（manager 报 absent / not-found）："
+                + "enable --now 没生效或没跑过（重跑 `node scripts/install-outbound.mjs --apply`）" + foreignText
+                : ok === false ? "单元在但没跑起来：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") +
+                  "（重跑 `node scripts/install-outbound.mjs --apply` 会 enable --now）" + foreignText
+                  : "查不清：enabled=" + (enabledText || "?") + " active=" + (activeText || "?") +
+                    (managerWhy ? "（systemctl --user 说：" + managerWhy + "）—— 查不清，不等于没装、也不等于没在跑" : "") + foreignText,
+        ok === false ? PREVIEW.installOutbound : null);
+    } else {
+      // 磁盘不在。三种 manager 态分开说：absent → **中性**（没装不是故障）；unasked → 中性但标 ?
+      // （沙箱里没问）；**unverifiable → ok:null**（fix5 P1-3：查不清就说查不清，
+      // 不许把 `Failed to connect to bus: Permission denied` 说成「manager 报 absent / not-found」）。
+      add("aily_daemon", "aily daemon 服务（systemd --user，入站运输）", managerState === "absent" || managerState === "unasked" ? true : null,
+        "磁盘上没有本桥写的单元" + (managerState === "absent"
+          ? "，systemd --user 里也没有（manager 报 absent / not-found）"
+          : managerState === "unasked"
+            ? "；沙箱里不碰真实 systemd --user，manager 里有没有查不清（判 ?）"
+            : "；**manager 查不清**（" + (managerWhy ?? "说不清") + "）—— systemctl 不可用 / 连不上 systemd --user / 权限不行时" +
+              "不许当成「本来就没有」，请人工核一下 manager 里到底有没有这个单元（判 ?）") +
+        " —— 入站运输靠 aily-cli 自己起的 daemon（本桥不接管）" + foreignText, null);
+    }
+  }
 
   // ⑧′ 机器人发送凭据的密钥在哪（PK3-L1，仅在 linux 上核）：
   // aily（provision）把每个 agent 的密钥写在 <configDir>/data/lark-cli/；linux 上 lark-cli 不用钥匙串、
@@ -1496,6 +1609,22 @@ export function runDoctor({
       (MODE_TEXT[authority.mode] ?? String(authority.mode)) + "；依据：" + authority.why + where + view, null);
   }
 
+  // ── 未安装态（PK3-U1）：**"装好的运行时对不对"这类项不适用**，不是故障。
+  //   runtime 与 ⑦（默认处理器在不在 runtime/current 之下）问的都是这件事，而一台没装本桥的机器上
+  //   runtime/current 本来就不在 —— 报 ✗ 会把"没装"说成"坏了"。卸后验证（uninstall --apply 之后跑
+  //   doctor）要的正是"零 ✗"，所以在这一处统一降级成 unknown。
+  //   **只降这两项**：保留的数据本身自不自洽（① 路由有没有状态入口、③ 话题登记指向的路由在不在）
+  //   与装不装无关，卸了也照样该报 —— 那是数据的问题，不是"没装"。
+  if (foot.clean) {
+    const INSTALL_DEPENDENT = new Set(["runtime", "default_route_handler"]);
+    for (const c of checks) {
+      if (!INSTALL_DEPENDENT.has(c.id) || c.ok === null || c.ok === true) continue;
+      c.ok = null;
+      c.detail = "未安装 —— 不适用（" + c.detail + "）";
+      c.next = null;
+    }
+  }
+
   // ── 汇总：三态唯一判据（`summarizeDoctorChecks`；非布尔 ok 一律视为 unknown，不得当 ready）
   const summary = summarizeDoctorChecks(checks);
   return { overall: summary.overall, checks, next: summary.next };
@@ -1508,9 +1637,16 @@ export function renderDoctor(report) {
     lines.push(mark + c.name + "：" + c.detail);
   }
   lines.push("");
-  lines.push(report.overall === "ready" ? "结论：ready —— 没有发现跨项目说不通的地方。"
-    : report.overall === "blocked" ? "结论：blocked —— 上面标 ✗ 的是真故障，需要人处理。"
-    : "结论：incomplete —— 没有发现故障，但标 ? 的本地查不出来。");
+  // PK3-U1：未安装态有它自己的结论句 —— 一台没装本桥的机器上，"incomplete" 会把读的人带向"查不清"，
+  // 而真实情况是"没装"。卸后验证要的正是这句话。
+  // 只在**没有 ✗** 时用它：机器没装归没装，保留的数据真有问题（① ③ ④ ⑤ 那些）还是要报 blocked。
+  const uninstalled = report.overall !== "blocked"
+    && report.checks.some((c) => c.id === "install_state" && c.detail.startsWith("未安装"));
+  lines.push(uninstalled
+    ? "结论：未安装 —— 本机没装本桥（三处 hooks / 技能 / 定时器 / runtime 都不在）。这不是故障；装上就是 `node scripts/install-outbound.mjs --apply`（再跟一次 install-inbound.mjs --apply）。"
+    : report.overall === "ready" ? "结论：ready —— 没有发现跨项目说不通的地方。"
+      : report.overall === "blocked" ? "结论：blocked —— 上面标 ✗ 的是真故障，需要人处理。"
+        : "结论：incomplete —— 没有发现故障，但标 ? 的本地查不出来。");
   if (report.next.length > 0) {
     lines.push("", "下一步（都是预览形式，改动要你自己确认）：");
     report.next.forEach((n, i) => lines.push((i + 1) + ". " + n));

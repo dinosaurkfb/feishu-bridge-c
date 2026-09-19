@@ -27,10 +27,11 @@ import { moduleRoot } from "./direct-run.mjs";
 import {
   applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
 } from "./runtime-install.mjs";
-import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill } from "./install-projection.mjs";
+import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, AILY_DAEMON_UNIT, ailyDaemonPlan, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, foreignAilyDaemonUnits, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill, resolveAilyCli } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, readInstalledSurface, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
+import { loadChainTemplate } from "./chain-template.mjs";
 // launchctl / systemctl 包装（PK3-L6-fix2 抽出的叶子模块）：带上"沙箱 HOME 不碰真实控制面"
 // 与 systemctl 首项必须 --user 两条纪律，以及计划里那条给人看的命令行的执行方式。
 import { timerCmd } from "./timer-exec.mjs";
@@ -94,9 +95,11 @@ const installedReceipt = (() => {
 const NODE_BIN = pickClaudeNode({ installed: installedClaudeNode({ home: os.homedir(), platform: TIMER_PLATFORM, receipt: installedReceipt }) });
 const rendered = renderClaudeSettings({ baseText: settingsBefore, home: os.homedir(), node: NODE_BIN, uninstall });
 const settings = rendered.settings;
-const stop = settings.hooks.Stop;
-const prompts = settings.hooks.UserPromptSubmit;
-const allow = settings.permissions.allow;
+// 卸载路径上 renderClaudeSettings 会把**空掉的** hooks / permissions 容器一并清掉（PK3-U1：让 settings 回到
+// 装前的样子），所以这里按"可能已经不在"读 —— 安装路径上它们一定在（投影刚建好）。
+const stop = settings.hooks?.Stop ?? [];
+const prompts = settings.hooks?.UserPromptSubmit ?? [];
+const allow = settings.permissions?.allow ?? [];
 const action = rendered.actions.stop;
 const inboundHookAction = rendered.actions.inbound;
 const initAction = rendered.actions.init;
@@ -195,6 +198,21 @@ const TIMER_PLAN = drainTimerPlan({ home: os.homedir(), node: NODE_BIN, platform
 const TIMER_FILES = TIMER_PLAN.files;
 const TIMER_REMOVE = TIMER_PLAN.remove ?? [];
 
+/**
+ * aily daemon 的 systemd --user 服务（PK3-U1，linux）—— 与兜底定时器同一套纪律：
+ * 计划驱动、沙箱 HOME 不碰真 systemd、停不下来就不删、已有外部单元不覆盖。
+ * aily-cli 的绝对路径：显式 env → 链路模板 aily_cli_bin → PATH（模板读不出来就算了，不当故障）。
+ */
+const AILY_TEMPLATE = (() => { try { return loadChainTemplate(); } catch { return null; } })();
+const AILY_PLAN = ailyDaemonPlan({
+  home: os.homedir(), platform: TIMER_PLATFORM, node: NODE_BIN, uninstall,
+  ailyCli: resolveAilyCli({ home: os.homedir(), template: AILY_TEMPLATE }),
+  // `--as <agent id>` / `--env online` 这类真实参数因环境而异（omm 的单元里就带），
+  // 不猜：要带就把它们写进这个环境变量，dry-run 会把最终 ExecStart 打出来让人核。
+  extraArgs: String(process.env.FEISHU_BRIDGE_AILY_DAEMON_ARGS ?? "").split(/\s+/u).filter(Boolean),
+  foreign: uninstall ? [] : foreignAilyDaemonUnits({ home: os.homedir() }),
+});
+
 /** 预览要按**实际执行顺序**列出步骤：`commands` → 删掉的文件 → `commandsAfterRemove`。 */
 function timerStepLines(plan, remove) {
   return [
@@ -239,6 +257,10 @@ console.log("兜底定时 : " + (TIMER_PLAN.kind === null ? "（无可写）" : 
   "  → " + TIMER_PLAN.action + (TIMER_PLAN.kind === null ? "（" + TIMER_PLAN.note + "）" : "（每 30 分钟排空全部登记项目）"));
 // 按**实际执行顺序**打印（P1-2：卸载是 enable 反向的三步，顺序就是行为）：命令 → 删文件 → 命令。
 for (const step of timerStepLines(TIMER_PLAN, TIMER_REMOVE)) console.log("            " + step);
+// aily daemon 服务（linux）：同样按实际执行顺序打印；不适用 / 跳过 / 找不到 aily-cli 都把话说出来。
+console.log("aily daemon：" + (AILY_PLAN.applicable ? AILY_PLAN.action + "  →  " + AILY_PLAN.file : AILY_PLAN.action));
+if (AILY_PLAN.note) console.log("            " + AILY_PLAN.note);
+for (const step of timerStepLines(AILY_PLAN, AILY_PLAN.remove)) console.log("            " + step);
 
 if (skillAction === "source-missing") {
   for (const sk of skillPlan.filter((x) => x.action === "source-missing")) {
@@ -428,6 +450,57 @@ if (uninstall) {
   }
 }
 
+// aily daemon 服务（linux）：与兜底定时器**同一条纪律** —— 计划驱动、沙箱 HOME 不碰真 systemd、
+// 停不下来就不删、已有外部单元不覆盖。不适用（darwin）/ 跳过 / 找不到 aily-cli 三种情况都把话说出来。
+let ailyNote;
+if (!AILY_PLAN.applicable || AILY_PLAN.action === "skipped_foreign" || AILY_PLAN.action === "aily_cli_missing") {
+  ailyNote = AILY_PLAN.note;
+} else if (uninstall) {
+  const ran = AILY_PLAN.commands.map(timerCmd);
+  const failedAt = ran.findIndex((r) => !r.ok && !r.skipped && !r.absent);
+  if (failedAt >= 0) {
+    console.error("卸载中止：" + AILY_PLAN.commands[failedAt].join(" ") + " 失败（" +
+      String(ran[failedAt].text ?? "说不清") + "）。\n" +
+      "  systemd 那边没停掉，所以**单元文件没删**（删了就等于把一个还在跑的 daemon 变成孤儿）—— 请先看它的状态再重试。");
+    process.exit(1);
+  }
+  for (const p of AILY_PLAN.remove) fs.rmSync(p, { force: true });
+  const ranAfter = AILY_PLAN.commandsAfterRemove.map(timerCmd);
+  const failedAfter = ranAfter.findIndex((r) => !r.ok && !r.skipped);
+  if (failedAfter >= 0) {
+    console.error("已停掉、单元文件已删，但 systemd --user daemon-reload 失败：" +
+      String(ranAfter[failedAfter].text ?? "说不清") + "；请手工执行 systemctl --user daemon-reload");
+    process.exit(1);
+  }
+  ailyNote = ran.some((r) => r.skipped)
+    ? "单元已删，但真实 systemd --user 未动（HOME 被重定向到 " + os.homedir() + "）"
+    : "已卸载";
+} else {
+  for (const f of AILY_PLAN.files) {
+    fs.mkdirSync(path.dirname(f.path), { recursive: true });
+    fs.writeFileSync(f.path, f.text);
+  }
+  const reloaded = timerCmd(AILY_PLAN.commands[0]);
+  if (reloaded.skipped) {
+    ailyNote = "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）";
+  } else if (!reloaded.ok) {
+    console.error("  systemctl --user daemon-reload 失败：" + String(reloaded.text ?? "说不清"));
+    ailyNote = "**单元已写入但 systemctl daemon-reload 失败 —— aily daemon 未加载**";
+    process.exitCode = 1;
+  } else {
+    const enabled = timerCmd(AILY_PLAN.commands[1]);
+    if (enabled.skipped) {
+      ailyNote = "已跳过（HOME 被重定向到 " + os.homedir() + "，不碰真实 systemd --user）";
+    } else if (enabled.ok) {
+      ailyNote = "已加载（systemd user service）";
+    } else {
+      console.error("  systemctl --user enable --now " + AILY_DAEMON_UNIT + ".service 失败：" + String(enabled.text ?? "说不清"));
+      ailyNote = "**单元已写入但 enable --now 失败 —— 入站收不到平台事件**";
+      process.exitCode = 1;
+    }
+  }
+}
+
 // 机器级安装收据（维护门 PR B）—— **放在全部制品（settings / 技能 / plist）都写完之后**：记的是已经落盘的东西，不是打算写的。记下这次往线上写了什么（settings 只记桥拥有的封闭条目、plist 与技能整文件）与引用的脚本。
 // 收据读不出（畸形）就不覆盖、只报出来 —— 它是下一次维护预检的"当前投影"，不能被安装器顺手改坏。
 if (!uninstall) {
@@ -438,10 +511,13 @@ if (!uninstall) {
     //   而收据记的是「这次往线上写了哪些文件 + 它们的内容摘要」，用 file 如实表达）。
     ...TIMER_FILES.map((f) => ({ path: f.path, kind: TIMER_PLAN.kind === "launchd" ? "plist" : "file",
       sha256: artifactSha({ kind: TIMER_PLAN.kind === "launchd" ? "plist" : "file", text: f.text }) })),
+    // aily daemon 的 systemd 单元（linux）：与定时器单元同类 —— 都是本桥写进用户级 systemd 的机器级制品。
+    ...AILY_PLAN.files.map((f) => ({ path: f.path, kind: "file", sha256: artifactSha({ kind: "file", text: f.text }) })),
     ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
   ];
   const timerText = TIMER_FILES.map((f) => f.text).join("\n");
-  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerText, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
+  const timerTextAll = timerText + AILY_PLAN.files.map((f) => f.text).join("\n");
+  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerTextAll, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
   const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
   console.log("安装收据 : " + report.text);
@@ -452,4 +528,5 @@ console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 
 // 说出来：登记表牵着绑定和话题历史，"这次安装到底动没动它"不该靠人去猜。
 console.log("登记表    ：" + registryAction);
 console.log("兜底定时器：" + launchNote);
+console.log("aily daemon：" + ailyNote);
 console.log("钩子和技能都立即生效，不需要重启会话。");

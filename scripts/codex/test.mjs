@@ -14,6 +14,8 @@ import { createTestHarness, installUnhandledRejectionGuard, installTestHomeIsola
 // PK3-T1：本轮临时目录根 + 写盘失败翻译 —— 从 test-support/ 取（不动共用面 test-harness.mjs 的导出）
 import { installSuiteTempRoot } from "../test-support/suite-temp-root.mjs";
 import { installWriteDiagnosis } from "../test-support/write-diagnosis.mjs";
+// PK3-U1-fix7：真 purge 用例的夹具边界（剔继承的删除目标覆盖点 + 启动前核清单）
+import { purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "../test-support/purge-fixture-guard.mjs";
 import { applySuppressionCore, suppressionDigest } from "../suppress-outbox-core.mjs";
 import {
   checkArgShape, locateTask, parseArgs as parseCodexSuppressArgs,
@@ -11976,6 +11978,68 @@ test("PK3-L7-fix6：两个测试注入点只剩函数参数 —— 旧环境变�
   assert.equal(withInstall.status, 0, withInstall.stdout + withInstall.stderr);
   assert.equal(fs.existsSync(marker2), false, "install 的旧环境变量是死字母");
   assert.equal(fs.existsSync(paths2.service), false, "卸载照常收掉单元：" + withInstall.stdout);
+});
+// 拿掉哪行会红：把 `inboundDir(root)` 从 codexBridgeKnownEntries 的 dirs 里删掉 →
+//   本用例红在「桥根下除父目录外必须为空」（剩 inbound/…）；把任何一条派生从清单里删掉同理，
+//   报错会把**剩下什么**逐条列出来。
+test("PK3-U1-fix5 P1-2：显式桥根 purge 的封闭清单 —— 真跑一遍会写盘的 Codex 夹具后，桥根下只剩父目录", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "u1f5-closure-"));
+  const home = path.join(base, "home");                 // 给 uninstall 用的隔离 HOME（Claude 根在它下面）
+  const codexHome = path.join(base, "codex-home");
+  const bridge = path.join(base, "explicit-bridge");    // 显式桥根：人给的目录（产品只删已知子项、保留目录本身）
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+  // PK3-U1-fix10（Codex 十一轮 P1）：安装这一步也走夹具环境清洗——继承的删除目标与安装写目标（收据 / 安装面锁）
+  //   覆盖点一律剔掉，再核写目标在夹具内；后面 purge 的清洗保护不了前面的安装。
+  const env = purgeChildEnv({ env: isolatedEnv(), home, extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge,
+    FEISHU_BRIDGE_REGISTRY: path.join(bridge, "registry.json") } });
+  assert.deepEqual(writeTargetsOutsideFixture({ env, declaredPrivateRoots: [base] }), [], "安装写目标越出本用例夹具 —— 拒绝启动");
+
+  // ① 真入口写盘：codex/install.mjs --apply（登记表 / receipts / installed-surface.json / 技能 / runtime）
+  const inst = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+  assert.equal(inst.status, 0, inst.stdout + inst.stderr);
+
+  // ② 真入口写盘：跑一次 codex/inbound.mjs（写 inbound/channel-samples.jsonl；认领路径还会写 chat-claims）
+  fs.writeFileSync(path.join(bridge, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const event = { message_id: "om_u1f5_closure", session_id: "sess_u1f5", sender_id: TEMPLATE.frank_sender_id,
+    created_at_ms: Date.now(), content: "hello 没有 @ 运输 agent" };
+  const inb = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "inbound.mjs")], {
+    encoding: "utf-8",
+    env: { ...env, AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, FEISHU_BRIDGE_ENVELOPE: JSON.stringify(event) },
+  });
+  assert.equal(inb.status, 0, inb.stdout + inb.stderr);
+  assert.equal(fs.existsSync(path.join(bridge, "inbound", "channel-samples.jsonl")), true,
+    "入站夹具必须真的写过 inbound/（否则这条用例是空转）：" + JSON.stringify(fs.readdirSync(bridge)));
+
+  // ③ 其余派生各自写一份（tasks / threads / intents / 迁移账本 / hook.log / 登记表 .prev）
+  const task = makeTaskEntry({ root: path.join(base, "proj"), threadId: THREAD_A, name: "closure", rootMessageId: "om_c", token: "cl111111" });
+  const added = addTask(task, { home: bridge });
+  assert.equal(added.ok, true, JSON.stringify(added));
+  recordThreadActivity({ threadId: THREAD_A, turnId: "t1", cwd: base, active: true, eventName: "Stop", home: bridge });
+  const intent = issueIntent({ action: "unbind", threadId: THREAD_A, params: buildIntentParams("unbind", { threadId: THREAD_A }), home: bridge });
+  assert.equal(intent.ok, true, JSON.stringify(intent));
+  assert.equal(enableAutoPublishForAllTasks({ home: bridge, apply: true }).ok, true, "迁移账本要写出来");
+  fs.writeFileSync(path.join(bridge, "hook.log"), "x\n");
+
+  const before = fs.readdirSync(bridge).sort();
+  // 夹具必须真的在桥根下铺开（不足 4 样说明这条用例没在测东西）
+  assert.ok(before.length >= 5, "夹具必须真的在桥根下写过东西：" + JSON.stringify(before));
+
+  // ④ purge：显式桥根只删封闭的已知条目、保留目录本身
+  //   PK3-U1-fix7：**继承的删除目标覆盖点先剔掉**（套件绊线自己就设了 FEISHU_BRIDGE_CHAIN_TEMPLATE，
+  //   它会把套件 HOME 下的文件算进删除清单），启动前再核一遍清单全在本用例夹具内。
+  const purgeEnv = purgeChildEnv({ env, home, extra: { CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: bridge,
+    FEISHU_BRIDGE_REGISTRY: path.join(bridge, "registry.json") } });
+  // 桥根不在 home 之下（这条用例就是要把显式桥根放在夹具自己的另一个目录里）→ 按声明放行；
+  // 预检只吃最终子进程环境（PK3-U1-fix8 P1-1）。
+  const outside = purgeTargetsOutsideFixture({ env: purgeEnv, declaredPrivateRoots: [base] });
+  assert.deepEqual(outside, [], "真 purge 的删除目标越出本用例夹具 —— 拒绝启动子进程：" + JSON.stringify(outside));
+  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "uninstall.mjs"), "--purge", "--yes-delete-data", "--apply"],
+    { encoding: "utf-8", env: purgeEnv });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  const left = fs.readdirSync(bridge).sort();
+  assert.deepEqual(left, [], "桥根下除父目录外必须为空（purge 前有 " + JSON.stringify(before) + "），还剩下：" + JSON.stringify(left));
+  assert.equal(fs.existsSync(bridge), true, "人给的那个目录本身保留");
 });
 
 test("PK3-L2-fix2 P1-2：serviceStateFn 抛错（如 EIO）收口为 ok:null、phase:unverifiable，doctor 不崩溃", () => {

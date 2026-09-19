@@ -205,6 +205,9 @@ export const codexHomeOf = (home = os.homedir()) =>
 const xml = (text) => String(text)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
+/** 兜底 drain 的日志（桥根下的 drain.log）—— **名字只有这一处**，plist 与卸载的 purge 清单都从这里取。 */
+export const drainLogPath = (bridgeHome) => path.join(bridgeHome, "drain.log");
+
 /** launchd 里**应该**跑的东西。跟 plist 同源 —— 各写一份就会漂。 */
 export function expectedJob({ home = os.homedir(), codexHome = codexHomeOf(home),
   platform = process.platform, node = pickNode(platform, home) } = {}) {
@@ -215,7 +218,7 @@ export function plistBody({ home = os.homedir(), node = pickNode(),
   codexHome = codexHomeOf(home), bridge = codexBridgeOf({ codexHome }) } = {}) {
   const script = drainScriptPath(home, codexHome);
   const workdir = path.join(codexRuntimeRoot(codexHome), "current");
-  const log = path.join(codexHome, "feishu-bridge", "drain.log");
+  const log = drainLogPath(path.join(codexHome, "feishu-bridge"));
   const [xNode, xScript, xWork, xLog, xHome, xBridge] =
     [node, script, workdir, log, home, bridge].map(xml);
   return `<?xml version="1.0" encoding="UTF-8"?>

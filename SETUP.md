@@ -272,6 +272,15 @@ tail ~/.claude/feishu-bridge/stop-hook.log         # 出站钩子每次干了什
 若以上均未找到则直接报错退出，坚决不回退版本升级易失效的 `process.execPath`。
 
 #### 3. aily daemon 建议托管为 systemd --user 服务
+
+> **2026-09-18 起（PK3-U1）：Linux 上这件事由本桥安装器做。**`node scripts/install-outbound.mjs --apply`
+> 会写 `~/.config/systemd/user/feishu-bridge-aily.service`（ExecStart 用**绝对路径**的 aily-cli，
+> `daemon start --foreground`；`Restart=on-failure`；代理等环境由 systemd --user 从
+> `~/.config/environment.d/*.conf` 继承）并 `enable --now`。要找 aily-cli 在不在 PATH 里，
+> 也可以在链路模板里给 `aily_cli_bin`；找不到就**不写**这个单元并把话说出来。
+> 要带 `--as <agent id>` / `--env online` 这类参数就用 `FEISHU_BRIDGE_AILY_DAEMON_ARGS`（dry-run 会把
+> 最终 ExecStart 打出来）。**机器上已经有 aily-cli 自己生成的单元（`aily-cli-daemon-*.service`）时，
+> 安装器不覆盖、报出来让你定夺。** 下面这段手工做法仍然有效（老机器 / 想自己管的时候用）。
 切勿在非交互 ssh 下随手执行 `nohup aily-cli daemon &`，不仅脱机后上下文脆弱，也无法稳定继承代理。推荐将其配置为 `systemd --user` 服务（拉起时自动继承 `environment.d` 中的代理环境变量）：
 
 新建单元文件 `~/.config/systemd/user/aily-daemon.service`（最小 unit 示例，不含敏感凭据）：
@@ -371,6 +380,59 @@ node scripts/binding.mjs                             # 看本仓库这条
 node scripts/binding.mjs --project ~/x               # 看别的项目
 node scripts/binding.mjs --project ~/x --renew 1y --apply
 ```
+
+---
+
+## 五点五、卸载（一键按序）
+
+```bash
+node scripts/uninstall.mjs                     # 预览：将停 / 将删 / 将保留（默认不动任何东西）
+node scripts/uninstall.mjs --apply             # 真的卸
+node scripts/uninstall.mjs --purge --yes-delete-data --apply   # 连机器级数据一起删
+```
+
+**顺序是写死的，别改成别的顺序**（顺序错了不报错，只留下半截状态）：
+
+| # | 卸什么 | 为什么在这个位置 |
+|---|---|---|
+| 1 | 入站技能（Claude 链） | 先停入站 = 止血：Aily 回合不再进运输层。反过来的话，平台事件会落在已经卸掉处理线程的本机上，静默丢 |
+| 2 | 出站（Claude 链）：hooks + 技能 + 兜底定时器 +（linux）aily daemon 服务 | 入站停掉之后再拆出站；定时器/服务**先停再删** plist/unit（停不下来就不删 —— 删了就是把还在跑的定时器变孤儿） |
+| 3 | Codex 链：hooks + 技能 + 兜底排空服务 | 同源机制，放在 Claude 链之后 |
+| 4 | `runtime/current`（两条链的「已安装」标记） | 最后才动：上面每一步都要靠 current 里的脚本干活，提前摘掉会让卸载自己跑不起来 |
+| 5 | `--purge` 才走：`versions/` 与机器级数据 | 破坏性动作，要 `--purge --yes-delete-data` 两个一起给（只写 `--purge` 会被拒） |
+
+**默认保留数据**（卸载的是机制，不是历史）：`registry.json`、`routes.json`、`status-providers.json`、
+`subscriptions.json`、`chain-config.json`、`inbound/`（回执与账本）、`ledger/`。`versions/`（代码缓存）
+也留着 —— 重装更快。**项目里的 `.runtime-data/` 与话题历史，本命令一个字节都不碰**（那不属于机器级卸载）。
+
+**锁**：一键卸载在开工前取 `<home>/.claude/feishu-bridge/install-surface.lock`（与三个安装器、维护流程
+共用的一把），**持有到最后一个删除动作结束**；拿不到（别的安装 / 维护在跑）或维护门开着 → exit 2、零写。
+子安装器继承这次持有（`FEISHU_BRIDGE_INSTALL_SURFACE_HELD`），所以中间没有"无锁窗口"。
+
+**settings.json 的合同**：本桥的钩子条目与预览放行规则消失，**别人的条目逐字段不变**。
+不承诺"回到装前字节"——重新序列化会规范化格式（缩进 / 键序），只有原本是空 `{}` 的情形才恰好字节相等。
+
+**`--purge` 的删除边界**（2026-09-19，PK3-U1-fix4）：
+- **产品自己派生的两处桥根整棵删**：`<home>/.claude/feishu-bridge`、`<codexHome>/feishu-bridge`。
+- **显式 `FEISHU_CODEX_BRIDGE_HOME`（人给的位置）只删它下面的封闭已知条目**（登记表 / 模板 / 路由表 /
+  回执 / 账本 / 收据 / tasks / intents / threads / 日志 / 锁），**目录本身保留** —— 那可能是共享目录，
+  里面还可能有别人的文件。
+- 显式桥根必须落在 home 或系统临时目录下；指到 `/etc` 这类系统目录会被拒绝（exit 2、零写，并点名变量与值）。
+- 覆盖点环境变量（`FEISHU_BRIDGE_REGISTRY` 等）只删那个文件，**绝不删它的父目录**。
+
+**卸后怎么验**：
+
+```bash
+node scripts/doctor.mjs
+```
+
+应看到「装机状态：未安装」与「结论：未安装 —— 本机没装本桥（…）。这不是故障。」，
+**一条 ✗ 都没有**（未安装的机器上，运行时/默认处理器那些项是"不适用"，不是故障）。
+若还有残留，doctor 会把在的项逐条列出来（那就是没卸干净）。
+
+**再装注意**：数据都在，重装就是 `node scripts/install-outbound.mjs --apply` +
+`node scripts/install-inbound.mjs --apply`（Codex 链再跑 `node scripts/codex/install.mjs --apply`）；
+如果之前用过 `--purge`，链路模板与绑定没了，要按第三节重新配、重新接项目。
 
 ---
 

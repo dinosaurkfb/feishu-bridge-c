@@ -14,7 +14,7 @@ import { SKILL_NAMES, auditSkills } from "./skill-content.mjs";
 import { drainTimerCheck } from "./drain-service.mjs"; // PK3-L2-fix1：兜底排空检查（平台化，非 darwin 不探测）
 
 import {
-  bridgeHome, loadCodexTemplate, loadRegistry, registryFile,
+  bridgeHome, hookLogFile, loadCodexTemplate, loadRegistry, registryFile, routesFile,
 } from "./state.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
@@ -102,7 +102,7 @@ try { hooks = JSON.parse(fs.readFileSync(hooksFile, "utf-8")); } catch { /* 下�
 const RUNTIME_CURRENT = path.join(RUNTIME_ROOT, "current");
 // 入站默认处理器必须就是装好的运行时（issue #88：装了 ≠ 在跑）—— 与 Claude 侧同一份判据 defaultRouteHandler。
 {
-  const codexRoutes = path.join(home, "routes.json");
+  const codexRoutes = routesFile(home);
   const expectedHandler = path.join(RUNTIME_CURRENT, "scripts", "codex", "inbound.mjs");
   const d = defaultRouteHandler({ file: codexRoutes, runtimeCurrent: RUNTIME_CURRENT, expectedHandler, expectedRouteId: "codex" });
   add("入站默认处理器",
@@ -146,7 +146,7 @@ const expectOf = (name) => ({
   node: pickNode(),
   script: path.join(RUNTIME_CURRENT, "scripts", "codex", name),
   home,
-  log: path.join(home, "hook.log"),
+  log: hookLogFile(home),
 });
 const expectPrompt = expectOf("prompt-hook.mjs");
 const expectStop = expectOf("stop-hook.mjs");

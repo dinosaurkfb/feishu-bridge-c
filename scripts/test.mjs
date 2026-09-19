@@ -58769,6 +58769,347 @@ test("PK3-T3 单元（注入 files 临时目录）：符号链接目标变化 �
   }
 });
 
+// ── PK3-I244：settings.json 只比**本桥拥有的条目**（运行时改写 model / effort 不再误报）──────
+
+/** diffs 里有 BigInt（mtimeNs）—— 拼进断言消息前先转成字符串，别让 JSON.stringify 抛。 */
+const i244Show = (x) => JSON.stringify(x, (k, v) => (typeof v === "bigint" ? v.toString() : v));
+
+/** settings.json 的夹具：key 就是"非本桥键"，hooks 里那条是我们的（tag 判定与 node 无关）。 */
+const i244SettingsFixture = (tmp) => {
+  const home = path.join(tmp, "home");
+  const file = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const base = {
+    model: "opus",
+    effortLevel: "medium",
+    hooks: {
+      Stop: [
+        { hooks: [{ type: "command", command: "node /opt/orca/stop-hook.mjs" }] },          // 别人的
+        { hooks: [{ type: "command", command: "node x.mjs # FEISHU_BRIDGE_HOOK:stop-hook.mjs", timeout: 20 }] },
+      ],
+    },
+    permissions: { allow: ["Bash(ls:*)"] },
+  };
+  fs.writeFileSync(file, JSON.stringify(base, null, 2) + "\n");
+  return { home, file, base };
+};
+
+// 拿掉哪行会红：把 snapshotFile 里 settings.json 那一支去掉（回到整文件 sha）→ ① 立刻红在 changed: false
+//   （改 model 会让整文件 sha 变），② 仍会红 —— 但红的是 ①，而那正是这次要修的那条误报。
+test("PK3-I244 ①：只改 settings.json 的 model / effortLevel / 别人的 hook → changed: false", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-ok-"));
+  try {
+    const { file, base } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+      doc.model = "sonnet";                       // Claude Code 运行时切模型
+      doc.effortLevel = "high";
+      doc.theme = "dark";
+      doc.permissions.allow.push("Bash(git status:*)");   // 人家自己的放行规则
+      doc.hooks.Stop[0].hooks[0].command = "node /opt/orca/stop-hook-v2.mjs";   // 别人的 hook 改了
+      fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+      // 连 mtime 也变（运行时写它就是会变）—— 本桥条目没变就不该报，连 touched 都不报
+      const future = new Date(Date.now() + 5000);
+      fs.utimesSync(file, future, future);
+
+      const res = guard.check();
+      assert.equal(res.changed, false, "非本桥键变化不许算写穿：" + i244Show(res.diffs));
+      assert.deepEqual(res.diffs, [], "一条 diff 都不该有（含 touched）");
+    } finally {
+      guard.uninstall();
+    }
+    assert.equal(typeof base.model, "string");   // 夹具键名别被顺手改掉（上面那几行依赖它们）
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把投影的 sha 换成"只算 hooks、不算 allow/命令文本"→ 去掉命令里的 tag 比对 →
+//   ② 红在 kind modified（改命令之后两侧投影仍相等）。
+test("PK3-I244 ②：改本桥的 Stop hook 命令 → changed: true、kind modified、点名 settings.json", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-mod-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+      const ours = doc.hooks.Stop[1].hooks[0];
+      ours.command = ours.command.replace("node x.mjs", "node /somewhere/else/stop-hook.mjs");
+      fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "本桥条目变了必须报");
+      assert.equal(res.diffs.length, 1, i244Show(res.diffs));
+      const d = res.diffs[0];
+      assert.equal(d.kind, "modified");
+      assert.equal(d.path, path.resolve(file), "要点名 settings.json");
+      assert.notEqual(d.beforeSha, d.afterSha);
+      assert.match(guard.formatErrorReport(res), /settings\.json/u, guard.formatErrorReport(res));
+      assert.match(guard.formatErrorReport(res), /本桥条目 sha/u, "报告要说清比的是本桥条目");
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把 ownedSettingsSha 的 `if (owned === null) return null;` 去掉（坏 JSON 折成空投影）→
+//   ③ 红在 kind unverifiable（会变成 modified/changed 但口径错，或直接绿）。
+test("PK3-I244 ③：settings.json 变成坏 JSON → unverifiable（changed: true，fail-closed）", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-badjson-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      fs.writeFileSync(file, "{ 这不是 JSON");     // 解析不了 = 验不了，不许绿
+      const res = guard.check();
+      assert.equal(res.changed, true, "读不出/解析不了必须 fail-closed");
+      assert.equal(res.diffs.length, 1, i244Show(res.diffs));
+      assert.equal(res.diffs[0].kind, "unverifiable");
+      assert.equal(res.diffs[0].path, path.resolve(file));
+      assert.match(guard.formatErrorReport(res), /读取出错无法验证/u, guard.formatErrorReport(res));
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把 `isClaudeSettingsPath` 放宽成"所有 json"（或把投影套到全部文件）→ ④ 红在
+//   routes.json 改一个字节却 changed: false。
+test("PK3-I244 ④：其余文件的整文件口径不变 —— 改 routes.json 一个字节仍报 modified", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-other-files-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const routes = path.join(tmp, "home", ".claude", "feishu-bridge", "routes.json");
+    fs.mkdirSync(path.dirname(routes), { recursive: true });
+    fs.writeFileSync(routes, JSON.stringify({ routes: [], sessions: {} }) + "\n");
+    const guard = installSurfaceGuard({ files: [file, routes], registerExitHook: false });
+    try {
+      // settings.json 换成一堆非本桥键（只有空白与键序变化）→ 不算；routes.json 改一个字节 → 算
+      const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+      doc.model = "haiku";
+      fs.writeFileSync(file, JSON.stringify(doc, null, 4) + "\n");
+      fs.writeFileSync(routes, JSON.stringify({ routes: [], sessions: { x: 1 } }) + "\n");
+
+      const res = guard.check();
+      assert.equal(res.changed, true, "routes.json 改了必须报");
+      assert.deepEqual(res.diffs.map((d) => [path.basename(d.path), d.kind]), [["routes.json", "modified"]],
+        "只有 routes.json 那一条（settings.json 的非本桥键不算）：" + i244Show(res.diffs));
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：把投影只用于"读得到"的路径、坏 JSON 走 unverifiable 那支去掉（即回到整文件口径）→
+//   上面 ③ 红；把 mtime 比较恢复（不跳过投影文件）→ ① 红在 touched（运行时改写会动 mtime）。
+test("PK3-I244 ⑤：纯 mtime 变化（本桥条目一字未动）不算写穿；本桥条目变了才算", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-owned-mtime-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      // 只动 mtime（同字节重写 + utimes）：整文件口径下会判 touched，投影口径下不该报
+      const text = fs.readFileSync(file, "utf-8");
+      fs.writeFileSync(file, text);
+      const future = new Date(Date.now() + 60_000);
+      fs.utimesSync(file, future, future);
+      assert.deepEqual(guard.check().diffs, [], "本桥条目没变 —— 连 touched 都不许报");
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ── PK3-I244-fix1：卫兵启动阶段不许碰产品模块（boot 的依赖只有卫兵与 node 内置）────────────
+
+// 拿掉哪行会红：把 `import { claudeSettingsOwnedEntries } from "../install-projection.mjs"` 加回卫兵顶层
+//   （fix1 收掉的那一行）→ 本用例点名 install-surface-guard.mjs 里那条 import。
+// PK3-I244-fix2（Codex 一轮 P1 ①）：合法 JSON 但形状不对 → unverifiable（不许被投影成"四组空条目"当成没变）。
+//   拿掉哪行会红：去掉卫兵里 `if (!isPlainObject(doc)) return null;` 等形状校验 → null / [] / hooks:"x" 三种都判 changed:false。
+test("PK3-I244-fix2 ①：settings.json 变成合法但形状不对的 JSON（null / 数组 / hooks 不是对象）→ unverifiable", () => {
+  for (const [label, text] of [["null", "null\n"], ["数组", "[]\n"], ["hooks 是字符串", JSON.stringify({ hooks: "x" }) + "\n"], ["Stop 不是数组", JSON.stringify({ hooks: { Stop: {} } }) + "\n"]]) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-shape-"));
+    try {
+      const { file } = i244SettingsFixture(tmp);
+      const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+      try {
+        fs.writeFileSync(file, text);
+        const res = guard.check();
+        assert.equal(res.changed, true, label + "：形状不对必须报：" + i244Show(res.diffs));
+        assert.equal(res.diffs[0]?.kind, "unverifiable", label + "：" + i244Show(res.diffs));
+      } finally {
+        guard.uninstall();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+// PK3-I244-fix2（Codex 一轮 P1 ②）：本桥 hook 的**行为字段**变了（加 async:true / 改 timeout / 所在 matcher 条目加键）→ modified。
+//   拿掉哪行会红：投影退回共享提取器那三个字段（不取完整对象）→ async:true 与 matcher 键两条判 changed:false。
+test("PK3-I244-fix2 ②：本桥 hook 加 async:true 等行为字段 → changed:true、modified；别人的 hook 加同样字段不算", () => {
+  const cases = [
+    ["本桥 Stop hook 加 async:true", (doc) => { doc.hooks.Stop[1].hooks[0].async = true; }, true],
+    ["本桥 Stop 所在条目加 matcher", (doc) => { doc.hooks.Stop[1].matcher = "*"; }, true],
+    ["别人的 Stop hook 加 async:true", (doc) => { doc.hooks.Stop[0].hooks[0].async = true; }, false],
+  ];
+  for (const [label, mutate, want] of cases) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-behav-"));
+    try {
+      const { file } = i244SettingsFixture(tmp);
+      const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+      try {
+        const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+        mutate(doc);
+        fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+        const res = guard.check();
+        assert.equal(res.changed, want, label + "：" + i244Show(res.diffs));
+        if (want) assert.equal(res.diffs[0]?.kind, "modified", label + "：" + i244Show(res.diffs));
+      } finally {
+        guard.uninstall();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+// PK3-I244-fix3（Codex 二轮 P1）：本桥 hook 被登记到**非预期事件**（PreToolUse 等）也要报；别人的 hook 登到哪儿都不算；
+//   任何事件的值不是数组 → unverifiable。
+//   拿掉哪行会红：去掉卫兵里 stray 那段跨事件扫描 → 「本桥 inbound 被加到 PreToolUse」判 changed:false。
+test("PK3-I244-fix3：本桥 hook 出现在非预期事件 → modified；别人的 hook 加到新事件不算；事件值不是数组 → unverifiable", () => {
+  const cases = [
+    ["本桥 inbound 命令加到 PreToolUse", (doc) => { doc.hooks.PreToolUse = [{ matcher: "Bash", hooks: [{ type: "command", command: "node y.mjs # FEISHU_BRIDGE_HOOK:inbound-hook.mjs" }] }]; }, "modified"],
+    ["本桥 Stop 命令复制到 SubagentStop", (doc) => { doc.hooks.SubagentStop = [{ hooks: [{ ...doc.hooks.Stop[1].hooks[0] }] }]; }, "modified"],
+    ["别人的 hook 加到 PreToolUse", (doc) => { doc.hooks.PreToolUse = [{ matcher: "Bash", hooks: [{ type: "command", command: "node /opt/orca/pre.mjs" }] }]; }, null],
+    ["PostToolUse 的值是对象", (doc) => { doc.hooks.PostToolUse = { hooks: [] }; }, "unverifiable"],
+  ];
+  for (const [label, mutate, want] of cases) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-stray-"));
+    try {
+      const { file } = i244SettingsFixture(tmp);
+      const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+      try {
+        const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+        mutate(doc);
+        fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+        const res = guard.check();
+        assert.equal(res.changed, want !== null, label + "：" + i244Show(res.diffs));
+        if (want !== null) assert.equal(res.diffs[0]?.kind, want, label + "：" + i244Show(res.diffs));
+      } finally {
+        guard.uninstall();
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+// PK3-I244-fix4（Codex 三轮 P2）：本桥 hook 同时出现在两个非预期事件时，只交换这两个事件键在 JSON 里的顺序 → 不算变化。
+//   拿掉哪行会红：去掉 stray 遍历前的按事件名排序 → changed:true。
+test("PK3-I244-fix4：只交换两个非预期事件在 JSON 里的键顺序、内容不变 → changed:false", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-evorder-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const stray = (name) => [{ hooks: [{ type: "command", command: "node z.mjs # FEISHU_BRIDGE_HOOK:" + name }] }];
+    const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+    doc.hooks = { ...doc.hooks, PreToolUse: stray("inbound-hook.mjs"), SubagentStop: stray("stop-hook.mjs") };
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      const { PreToolUse, SubagentStop, ...rest } = doc.hooks;
+      fs.writeFileSync(file, JSON.stringify({ ...doc, hooks: { ...rest, SubagentStop, PreToolUse } }, null, 2) + "\n");
+      const res = guard.check();
+      assert.equal(res.changed, false, "只换事件键顺序不该报：" + i244Show(res.diffs));
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("PK3-I244-fix1 ①结构：卫兵与 boot 的**静态** import 只许 node: 内置与彼此", () => {
+  // 判据（逐行扫 `^import` 语句的 from 说明符）：只允许两件东西 ——
+  //   · `node:` 内置（卫兵要用 crypto / fs / module / os / path）；
+  //   · 卫兵与 boot 彼此（boot 静态 import 卫兵，这是 T3-fix2 的设计）。
+  // 任何**产品模块**的静态 import 都不许有：那会让它的整棵依赖树在基线快照之前求值。
+  const targets = [
+    path.resolve("scripts", "test-support", "install-surface-guard.mjs"),
+    path.resolve("scripts", "test-support", "install-surface-boot.mjs"),
+  ];
+  const allowed = new Set(["./install-surface-guard.mjs", "./install-surface-boot.mjs"]);
+  let scanned = 0;
+  for (const file of targets) {
+    const imports = fs.readFileSync(file, "utf-8").split("\n").filter((l) => /^import\b/u.test(l));
+    assert.ok(imports.length > 0, path.basename(file) + "：一条静态 import 都没有？扫描判据写错了");
+    for (const line of imports) {
+      const spec = line.match(/from\s+"([^"]+)"/u)?.[1] ?? "";
+      scanned += 1;
+      assert.ok(spec.startsWith("node:") || allowed.has(spec),
+        path.basename(file) + " 的静态 import 只能是 node: 内置或卫兵彼此：" + line.trim());
+    }
+  }
+  assert.ok(scanned >= 5, "扫描必须真的覆盖到那几条 import（实际 " + scanned + " 条）");
+});
+
+// 拿掉哪行会红：把基线快照改成"第一次 check() 时才取"（或把产品模块的静态 import 加回去，
+//   让它在快照前求值）→ 假产品模块在 import 阶段改的那一笔会被算进基线，退出码变 0，本用例红在
+//   「必须非 0 退出」与「必须点名 settings.json」两条上。
+test("PK3-I244-fix1 ②行为：假产品模块在 import 阶段改本桥 hook 条目 → 非 0 退出并点名 settings.json", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-import-pollution-"));
+  try {
+    const tmpHome = path.join(tmp, "home");
+    const settings = path.join(tmpHome, ".claude", "settings.json");
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    // 夹具里有一条**本桥拥有**的 Stop hook（tag 认领，与 node 无关）+ 一次外来的键
+    fs.writeFileSync(settings, JSON.stringify({
+      model: "opus",
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "node x.mjs # FEISHU_BRIDGE_HOOK:stop-hook.mjs", timeout: 20 }] }] },
+    }, null, 2) + "\n");
+
+    const fakeProductModule = path.join(tmp, "fake-product-module.mjs");
+    fs.writeFileSync(fakeProductModule, `
+import fs from "node:fs";
+// 假产品模块在 import 顶层求值阶段改**本桥条目**（不是无关的 model —— 那种本来就不该报）
+const file = ${JSON.stringify(settings)};
+const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+doc.hooks.Stop[0].hooks[0].command = "node /somewhere/else/stop-hook.mjs # FEISHU_BRIDGE_HOOK:stop-hook.mjs";
+fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\\n");
+`);
+
+    const runnerScript = path.join(tmp, "test-runner.mjs");
+    const bootShim = writeSurfaceBootShim(tmp, tmpHome);
+    fs.writeFileSync(runnerScript, `
+// 第一项 import 必须是引导垫片（显式注入 home 的卫兵，等价于正式入口的 install-surface-boot.mjs）
+import ${JSON.stringify(bootShim)};
+// 后续 import 是"import 阶段就写产品数据"的假产品模块
+import ${JSON.stringify(fakeProductModule)};
+
+process.exit(0);
+`);
+
+    const sp = spawnSync(process.execPath, [runnerScript], { env: { ...process.env, HOME: tmpHome }, encoding: "utf-8" });
+    const all = String(sp.stdout ?? "") + "\n" + String(sp.stderr ?? "");
+    assert.notEqual(sp.status, 0, "本桥条目在 import 阶段被改写必须非 0 退出（证明基线早于产品模块求值）：" + all);
+    assert.match(all, /安装面硬门：套件改动了本机安装面/u, all);
+    assert.match(all, /settings\.json/u, "要点名 settings.json：" + all);
+    assert.match(all, /本桥条目 sha/u, "报告要说清比的是本桥条目：" + all);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("PK3-T3 单元：逐用例边界 checkBoundary 核验并在命中时记录肇事用例名", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-t3-unit-boundary-"));
   try {

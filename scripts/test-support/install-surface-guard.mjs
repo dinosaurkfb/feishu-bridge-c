@@ -18,6 +18,21 @@
  *   回复触发账本更新，导致无辜用例被误报拦截）。安装面卫兵只守护**装机才写**
  *   的静态权威配置与钩子；活账本的自洽性由 doctor 的账本自洽项管。
  *
+ * 为什么不整文件比对 settings.json（PK3-I244）：
+ *   `~/.claude/settings.json` 也**不是"只有装机才写"**的文件 —— Claude Code 运行时会自己改写它
+ *   （切模型 / effortLevel、以及"总是允许"这一类权限确认都会写）。2026-09-19 06:42:43Z 一次验收，
+ *   真 settings.json 被运行时改写，卫兵把这算到了当时正在跑的用例头上（`settings.json modified`），
+ *   全量红 1 条、单跑 3 次全绿 —— 与 T3-fix1 把 registry.json 移出清单是同一类问题（那次我没找同类）。
+ *   所以这一个文件按**本桥拥有的条目**判：`claudeSettingsOwnedEntries`（安装收据 / 卸载足迹用的同一份
+ *   提取器）的结果做规范化序列化后取 sha；model / effortLevel / permissions / theme / 别人的 hooks
+ *   怎么变都不算。**读不出 / 解析不了（坏 JSON）仍是 fail-closed 的 unverifiable**，不因为"只看条目"
+ *   就把读不出折成"没变"。其余 6 个文件照旧整文件比对。
+ *   也**不为此放宽 mtimeNs**：本桥条目没变就不报（连 touched 也不报 —— 运行时写一次 mtime 天天会变），
+ *   条目变了就报 modified。
+ *   投影要碰产品提取器，**只能在比对时惰性加载**（PK3-I244-fix1）：卫兵是三条正式入口的第一条 import，
+ *   顶层静态 import 产品模块会让它的依赖树在基线快照之前求值 —— 那正好会放过"import 阶段写盘的产品模块"
+ *   （T3-fix2 那条反例要钉的形状）。
+ *
  * 监控根只认 os.userInfo().homedir（PK3-T3-fix4：不读任何环境变量，残留变量不能改根；
  * 测试要换根只能显式传 home / files）。符号链接除目标外也比 lstat mtimeNs：同目标重建算 touched。
  *
@@ -28,8 +43,105 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+
+/** settings.json 的**判定身份**：投影按本桥条目算（PK3-I244）。路径形状 = `<home>/.claude/settings.json`。 */
+const SETTINGS_SUFFIX = path.join(".claude", "settings.json");
+const isClaudeSettingsPath = (p) => p.endsWith(SETTINGS_SUFFIX);
+/** 从路径反推 home：`<home>/.claude/settings.json` —— 注入 files 的场景也成立。 */
+const settingsHomeOf = (p) => path.dirname(path.dirname(p));
+
+/**
+ * 产品提取器**只能惰性加载**（PK3-I244-fix1）。
+ *
+ * 卫兵经 `install-surface-boot.mjs` 是三个正式入口的**第一条 import**；T3-fix2 的合同是
+ * 「boot 的依赖只有卫兵与 Node 内置模块，基线快照先于一切产品模块求值」。顶层静态 import 产品模块会让
+ * `install-projection.mjs` 及其整棵依赖树在快照**之前**求值 —— 那种 import 阶段写盘的产品模块就会被当成
+ * 初始基线（正是 fix2 那条"假产品模块在 import 阶段写权威文件"反例要钉的形状）。
+ * 所以这里第一次**比对**时才同步加载一次（`require(esm)`，Node 22+；本仓 Node 26）。
+ */
+const requireFromHere = createRequire(import.meta.url);
+let ownedEntriesExtractor = null;
+let ownsHookPredicate = null;
+const ownedEntriesFn = () => {
+  if (ownedEntriesExtractor === null) {
+    const mod = requireFromHere("../install-projection.mjs");
+    ownedEntriesExtractor = mod.claudeSettingsOwnedEntries;
+    ownsHookPredicate = mod.ownsHook;
+  }
+  return ownedEntriesExtractor;
+};
+const ownsHookFn = () => { ownedEntriesFn(); return ownsHookPredicate; };
+
+/**
+ * 一个 settings.json 快照的**本桥条目投影 sha**（PK3-I244）。提取器只有一份（安装收据 / 卸载足迹用的
+ * 同一份）；坏 JSON / 读不出 → 返回 null，调用方按 **unverifiable** 处置（fail-closed，不折成"没变"）。
+ * 四个键固定、数组顺序有意义，原样序列化 —— 只求"两侧同法即可比"。
+ */
+// PK3-I244-fix2（Codex 一轮 2 P1）——两处都**只在卫兵这一侧**收，不改共享提取器的输出（安装收据用它算 sha，
+// 改了会让已装机器的收据全部对不上）：
+//   ① 形状：提取器只对 JSON 解析失败返回 null；合法但形状不对的文档（顶层 null / 数组 / hooks 不是对象 …）会被
+//      投影成"四组空条目"，从而被当成"没变"。所以先查形状，查不过就是 unverifiable（fail-closed）。
+//   ② 行为字段：提取器只保留 command / type / timeout；本桥 hook 加上 async 之类会改变行为的字段它看不见。所以用
+//      提取器**认出**本桥的命令，再回原文把这些 hook 的**完整对象**（全部字段、键排序）纳入投影。
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const stableJson = (v) => Array.isArray(v) ? "[" + v.map(stableJson).join(",") + "]"
+  : isPlainObject(v) ? "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stableJson(v[k])).join(",") + "}"
+    : JSON.stringify(v);
+const OWNED_HOOK_EVENTS = Object.freeze({ Stop: "Stop", inbound: "UserPromptSubmit", init: "UserPromptSubmit" });
+const OWNED_HOOK_BASENAMES = Object.freeze({ Stop: "stop-hook.mjs", inbound: "inbound-hook.mjs", init: "init-hook.mjs" });
+
+const ownedSettingsShaOf = (entry) => {
+  if (entry === null || entry === undefined || entry.state !== "present" || typeof entry.rawText !== "string") return null;
+  let doc;
+  try { doc = JSON.parse(entry.rawText); } catch { return null; }
+  // ① 形状：顶层必须是对象；hooks / permissions 若在就必须是对象；各事件若在就必须是数组、permissions.allow 若在就必须是数组
+  if (!isPlainObject(doc)) return null;
+  if (doc.hooks !== undefined && !isPlainObject(doc.hooks)) return null;
+  if (doc.permissions !== undefined && !isPlainObject(doc.permissions)) return null;
+  // fix3：**所有**事件的值都必须是数组（本桥 hook 可能被登记到任何事件，形状不对就扫不清 → unverifiable）
+  for (const ev of Object.keys(doc.hooks ?? {})) {
+    if (!Array.isArray(doc.hooks[ev])) return null;
+  }
+  if (doc.permissions?.allow !== undefined && !Array.isArray(doc.permissions.allow)) return null;
+  let owned = null;
+  try { owned = ownedEntriesFn()(entry.rawText, { home: settingsHomeOf(entry.path) }); }
+  catch { return null; }          // 连提取都跑不动（极端环境）→ 同样是"验不了"
+  if (owned === null) return null;
+  // ② 完整对象：提取器认出的本桥命令 → 回原文取该事件下 command 相同的 hook 的全部字段（连同所在 matcher 条目的其余键）
+  const fullOf = (key) => {
+    const cmds = new Set((owned[key] ?? []).map((h) => h?.command).filter((c) => typeof c === "string"));
+    const out = [];
+    for (const group of doc.hooks?.[OWNED_HOOK_EVENTS[key]] ?? []) {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
+      const { hooks, ...groupRest } = group;
+      for (const h of hooks) if (isPlainObject(h) && cmds.has(h.command)) out.push({ group: groupRest, hook: h });
+    }
+    return out;
+  };
+  const parts = ["Stop", "inbound", "init"].map((k) => k + "=" + stableJson(fullOf(k)));
+  parts.push("allow=" + stableJson(owned.allow ?? null));
+  // ③ fix3（Codex 二轮 P1）：本桥 hook 被登记到**非预期事件**（如 PreToolUse）—— 只对本桥归属的 hook 跨事件扫，
+  //   别人的 hook 不纳入。出现在哪儿、长什么样都进投影，于是新增 / 删除 / 改动都会翻 sha。
+  const owns = ownsHookFn();
+  const stray = [];
+  // PK3-I244-fix4（Codex 三轮 P2）：按事件名排序遍历——只交换 JSON 里事件键的顺序不该翻投影 sha。
+  for (const [ev, groups] of Object.entries(doc.hooks ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    for (const group of groups) {
+      if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
+      const { hooks, ...groupRest } = group;
+      for (const h of hooks) {
+        for (const [key, basename] of Object.entries(OWNED_HOOK_BASENAMES)) {
+          if (ev !== OWNED_HOOK_EVENTS[key] && owns(h, basename)) stray.push({ event: ev, basename, group: groupRest, hook: h });
+        }
+      }
+    }
+  }
+  parts.push("stray=" + stableJson(stray));
+  return crypto.createHash("sha256").update("claude-settings-owned:v2:" + parts.join("\n")).digest("hex");
+};
 
 // PK3-T3-fix1：registry.json **不在**清单里——它是活账本（出站发布器 / stop hook 每发一条就改 message_count），
 // 开发机上套件跑着的同时线上桥也在跑，2026-09-18 11:41Z 一次验收就把我自己回复被发布时的账本更新算到了
@@ -88,6 +200,21 @@ export function snapshotFile(filepath) {
       };
     }
     const buf = fs.readFileSync(p);
+    // PK3-I244：settings.json 的**判定身份**是本桥拥有的条目 —— 但快照这一步只存**原始字节与文本**：
+    // 投影（要碰产品提取器）留到**比对时**做，卫兵启动阶段不加载任何产品模块（见上面 ownedEntriesFn）。
+    if (isClaudeSettingsPath(p)) {
+      return {
+        path: p,
+        state: "present",
+        type: "file",
+        projection: "claude-settings-owned",
+        symlinkTarget: null,
+        sha: crypto.createHash("sha256").update(buf).digest("hex"),   // 原始字节 sha（诊断/报告用）
+        rawText: buf.toString("utf-8"),
+        mtime: st.mtime.toISOString(),
+        mtimeNs: st.mtimeNs,
+      };
+    }
     const sha = crypto.createHash("sha256").update(buf).digest("hex");
     return {
       path: p,
@@ -140,6 +267,7 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
       diffs.push({
         path: p,
         kind: "unverifiable",
+        projection: after.projection ?? before.projection ?? null,
         error: after.error || before.error || "unreadable",
         beforeSha: before?.sha ?? null,
         afterSha: after?.sha ?? null,
@@ -217,10 +345,45 @@ export function diffSurfaceSnapshots(baseline, current, { culprits = new Map() }
           culprit,
         });
       } else if (before.type === "file" && after.type === "file") {
-        if (before.sha !== after.sha) {
+        // PK3-I244：投影文件（settings.json）**在比对时**才算本桥条目 —— 基线文本与当前文本各投影一次。
+        // 这一支**不比 mtime**：运行时改写 model / effort 会天天动它的 mtime，而本桥条目没变。
+        if (before.projection === "claude-settings-owned" || after.projection === "claude-settings-owned") {
+          const beforeOwned = ownedSettingsShaOf(before);
+          const afterOwned = ownedSettingsShaOf(after);
+          if (beforeOwned === null || afterOwned === null) {
+            // 投影不出来（坏 JSON / 读不出）→ **unverifiable**（fail-closed），不折成"没变"
+            diffs.push({
+              path: p,
+              kind: "unverifiable",
+              projection: "claude-settings-owned",
+              error: "settings_owned_unreadable（settings.json 解析不了，本桥条目取不出来）",
+              beforeSha: beforeOwned,
+              afterSha: afterOwned,
+              beforeMtime: before.mtime,
+              mtime: after.mtime,
+              beforeMtimeNs: before.mtimeNs,
+              mtimeNs: after.mtimeNs,
+              culprit,
+            });
+          } else if (beforeOwned !== afterOwned) {
+            diffs.push({
+              path: p,
+              kind: "modified",
+              projection: "claude-settings-owned",
+              beforeSha: beforeOwned,
+              afterSha: afterOwned,
+              beforeMtime: before.mtime,
+              mtime: after.mtime,
+              beforeMtimeNs: before.mtimeNs,
+              mtimeNs: after.mtimeNs,
+              culprit,
+            });
+          }
+        } else if (before.sha !== after.sha) {
           diffs.push({
             path: p,
             kind: "modified",
+            projection: null,
             beforeSha: before.sha,
             afterSha: after.sha,
             beforeMtime: before.mtime,
@@ -294,7 +457,8 @@ export function formatErrorReport({ diffs = [] } = {}) {
     if (d.kind === "modified") {
       const bSha = d.beforeSha ? d.beforeSha.slice(0, 12) : "n/a";
       const aSha = d.afterSha ? d.afterSha.slice(0, 12) : "n/a";
-      lines.push("  - " + d.path + "（sha: " + bSha + " → " + aSha + "，mtime: " + (d.mtime ?? "n/a") + culpritPart + "）");
+      const proj = d.projection === "claude-settings-owned" ? "本桥条目 sha: " : "sha: ";
+      lines.push("  - " + d.path + "（" + proj + bSha + " → " + aSha + "，mtime: " + (d.mtime ?? "n/a") + culpritPart + "）");
     } else if (d.kind === "touched") {
       const sha = d.afterSha ? d.afterSha.slice(0, 12) : (d.beforeSha ? d.beforeSha.slice(0, 12) : "n/a");
       const nsPart = d.beforeMtimeNs !== undefined && d.mtimeNs !== undefined && d.beforeMtimeNs !== d.mtimeNs

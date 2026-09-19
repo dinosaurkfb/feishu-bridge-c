@@ -8641,6 +8641,26 @@ test("PK3-U1-fix6b：显式桥根词法在 home 下、canonical 指到 home 与 
     }
 });
 
+test("PK3-U1-fix6c：显式桥根是系统临时目录根本身 → 拒（纯判定 + 只读预览，真 apply 不碰共享 tmp 根）", () => {
+  // ② 反例：系统临时目录的**根本身** → 拒（其下的子目录才允许）。这里用**不受夹具 home 影响**的
+  //    纯判定把「根本身」那一条逐字钉住（套件里夹具 HOME 就住在 tmp 根之下，"它是桥根的父目录"
+  //    会先命中 —— 同样拒，但钉不住这条规则），再跑一次真入口证明它退出 2。
+  const ruleHome = path.join(os.tmpdir(), "u1f6-norm-home");
+  assert.match(String(explicitBridgeRootProblem(os.tmpdir(), ruleHome)), /临时目录根本身/u, "os.tmpdir() 根本身要拒");
+  assert.match(String(explicitBridgeRootProblem("/tmp", ruleHome)), /临时目录根本身/u, "/tmp 根本身要拒");
+  assert.equal(explicitBridgeRootProblem(path.join("/private", "tmp", "u1f6", "bridge"), ruleHome), null,
+    "对照：tmp 下的子目录允许（夹具就住在那儿）");
+  const homeB = u1Home();
+  // PK3-U1-fix6c（Codex 七轮 P1）：tmp 根是**共享目录**——判据一旦回归，真 apply 会去删 /private/tmp 下与封闭清单
+  //   同名的条目。所以这里只跑**只读预览**（不带 --apply）：拒绝照样退出 2、零写，伤害面为零。
+  //   拿掉哪行会红：去掉 explicitBridgeRootProblem 里 tmp 根那一支 → 预览不再拒（status 0），这里红。
+  const beforeB = u1Snapshot(homeB);
+  const rootRun = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data"],
+    { CODEX_HOME: path.join(homeB, ".codex"), FEISHU_CODEX_BRIDGE_HOME: "/private/tmp" });
+  assert.equal(rootRun.status, 2, "/private/tmp 是临时目录根本身（或某桥根的父目录），预览就必须拒：" + rootRun.stdout + rootRun.stderr);
+  assert.equal(u1Snapshot(homeB), beforeB, "预览拒绝零写");
+});
+
 test("PK3-U1-fix5 P1-1 + fix6 P1-1：显式桥根边界 —— 指向 home / .codex / 断链一律拒（真 apply 零写）", () => {
   // ① 反例：`<home>/bridge-link -> <home>`（词法在 home 里、canonical 就是 home 本身）与
   //    `-> <home>/.codex` —— 两条都必须拒，而且**沿父链的无关数据一个字节都不许动**。
@@ -8669,18 +8689,6 @@ test("PK3-U1-fix5 P1-1 + fix6 P1-1：显式桥根边界 —— 指向 home / .co
     assert.equal(fs.existsSync(path.join(home, ".codex", "codex-keep.txt")), true, name + "：.codex 下的数据也要在");
   }
 
-  // ② 反例：系统临时目录的**根本身** → 拒（其下的子目录才允许）。这里用**不受夹具 home 影响**的
-  //    纯判定把「根本身」那一条逐字钉住（套件里夹具 HOME 就住在 tmp 根之下，"它是桥根的父目录"
-  //    会先命中 —— 同样拒，但钉不住这条规则），再跑一次真入口证明它退出 2。
-  const ruleHome = path.join(os.tmpdir(), "u1f6-norm-home");
-  assert.match(String(explicitBridgeRootProblem(os.tmpdir(), ruleHome)), /临时目录根本身/u, "os.tmpdir() 根本身要拒");
-  assert.match(String(explicitBridgeRootProblem("/tmp", ruleHome)), /临时目录根本身/u, "/tmp 根本身要拒");
-  assert.equal(explicitBridgeRootProblem(path.join("/private", "tmp", "u1f6", "bridge"), ruleHome), null,
-    "对照：tmp 下的子目录允许（夹具就住在那儿）");
-  const homeB = u1Home();
-  const rootRun = u1Run(homeB, "uninstall.mjs", ["--purge", "--yes-delete-data", "--apply"],
-    { CODEX_HOME: path.join(homeB, ".codex"), FEISHU_CODEX_BRIDGE_HOME: "/private/tmp" });
-  assert.equal(rootRun.status, 2, "/private/tmp 是临时目录根本身（或某桥根的父目录），必须拒：" + rootRun.stdout + rootRun.stderr);
 
   // ③ 反例：**HOME 自己就是符号链接**（部署里很常见：/home/x -> /Users/x）——canonical 落在 realpath 那一侧，
   //    参照侧（home / .codex / 桥根）必须**两种写法都认**，否则"canonical 就是 home"会漏判。
@@ -8754,11 +8762,12 @@ test("PK3-U1-fix5 P1-3：aily 磁盘无 unit + manager 查不清（连不上 bus
 //   → 本用例红在「这些用例把系统目录与真 apply 放在一起了」那条断言上（它会点名是哪个用例）。
 test("PK3-U1-fix6 P1-2：只读系统路径只测纯判定 —— 真 apply 的拒绝反例不许把目标指到那儿", () => {
   // 判据（按用例块扫描，块 = 从 `test("` 起到下一条 `test("` 之前）：
-  //   块里出现只读系统路径（etc 那类、usr/local 那类）→ 该块里**不许**出现会执行删除的 purge 运行
+  //   块里出现只读系统路径（etc 那类、usr/local 那类、共享 tmp 根）→ 该块里**不许**出现会执行删除的 purge 运行
   //   （`--purge` 与 `--apply` 同现，或那条字面量数组 [\"--purge\", \"--yes-delete-data\", \"--apply\"]）。
   //   系统目录只能喂给纯判定（machinePurgeTargets / explicitBridgeRootProblem）与只读预览。
   // 判据里的字样**拼出来**：否则本用例自己的正文会把两条判据都撞上（扫描器扫到自己）。
-  const SYS_DIR = "\/" + "etc\\b|\\/usr\\/local\\b";
+  // fix6c（Codex 七轮 P1）：共享的 tmp 根也算——真 apply 把目标指到 /tmp、/private/tmp 或 os.tmpdir() 本身同样危险。
+  const SYS_DIR = "\/" + "etc\\b|\\/usr\\/local\\b|\"\\/" + "(?:private\\/)?tmp\"|BRIDGE_HOME: os\\." + "tmpdir\\(\\)";
   const PURGE = "--pur" + "ge";
   const APPLY = "--ap" + "ply";
   const src = fs.readFileSync(path.resolve("scripts", "test.mjs"), "utf-8");

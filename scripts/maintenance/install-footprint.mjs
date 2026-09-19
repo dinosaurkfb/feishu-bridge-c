@@ -32,7 +32,7 @@ import {
 } from "../codex/state.mjs";
 import { intentDir } from "../codex/intent.mjs";
 import { installedSurfacePath } from "../installed-surface.mjs";
-import { drainLogPath, plistPath as codexDrainPlistPath } from "../codex/drain-service.mjs";
+import { codexDrainSystemdPaths, drainLogPath, plistPath as codexDrainPlistPath } from "../codex/drain-service.mjs";
 
 /** 存在性判据一律用 lstat：**断链的符号链接（dangling symlink）也算在**（fix1 P1-1：existsSync 会漏）。 */
 const defaultExists = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) !== undefined;
@@ -311,6 +311,16 @@ export function machinePurgeTargets({ home = os.homedir(), env = process.env } =
 }
 
 /**
+ * Codex 兜底排空的系统单元位置（darwin 一份 plist / linux 两份 unit）—— **写它们的是
+ * `codex/drain-service`**，这里只把"足迹要查哪几处"暴露出来。为什么要导出：顶层 `scripts/*.mjs`
+ * （以及它的套件）一律不许 import `codex/`（方向守卫盯着），而维护层本来就是跨两链的那一层。
+ */
+export const codexDrainUnitPaths = ({ kind, home = os.homedir() } = {}) =>
+  kind === "launchd" ? [codexDrainPlistPath(home)]
+    : kind === "systemd" ? [codexDrainSystemdPaths(home).service, codexDrainSystemdPaths(home).timer]
+      : [];
+
+/**
  * 装机足迹盘点（纯读）。
  * @returns {{
  *   kind: "launchd"|"systemd"|null,
@@ -351,7 +361,11 @@ export function installFootprint({ home = os.homedir(), env = process.env, platf
     if ((codexOwned.Stop ?? []).length > 0) codexHookNames.push("stop-hook.mjs");
   }
   const codexSkillPaths = CODEX_SKILLS.map((sk) => path.join(codexHome, "skills", sk.name)).filter(exists);
-  const codexDrain = kind === "launchd" ? [codexDrainPlistPath(home)].filter(exists) : [];
+  // Codex 兜底排空的**两份系统单元**也在足迹里（fix2 P1-2）：旧版只收 darwin 的 launchd plist，
+  //   于是 linux 上一台只剩下 `<CODEX_DRAIN_SYSTEMD_UNIT>.service/.timer` 的机器 foot.clean=true ——
+  //   doctor 报「未安装」、uninstall 第 3 步跳过，那两份单元永远没人处理。
+  //   路径取**写它们的那一处**（codex/drain-service 的 plistPath / codexDrainSystemdPaths），不在这里拼。
+  const codexDrain = codexDrainUnitPaths({ kind, home }).filter(exists);
   // **runtime 不看状态根**（fix2 P1-3）：它由 codexRuntimeRoot(codexHome) 派生，与 FEISHU_CODEX_BRIDGE_HOME 无关。
   const codexCurrent = path.join(codexRuntimeRoot(codexHome), "current");
 
@@ -384,29 +398,32 @@ export function installFootprint({ home = os.homedir(), env = process.env, platf
   //     这两个都不是"能用的机器"，判 ✗。
   // 剩下的「不成套」（两个方向都不成立，例如只有一份别人的 plist、或只有技能目录）仍然只进 residue 清单，
   // 不判 ✗ —— 那种机器上出站仍然是好的，只是少了点东西。
-  const orphans = {
-    hooks: claudeHooks.length > 0 && present.claudeCurrent === null,
+  // 定时器 / Codex drain 的判据**不看钩子在不在了**（fix2 P2-2）：它们指向的 runtime/current 不在时
+  // 本身就是会出事的状态（每 30 分钟跑一次不存在的脚本），不该因为“钩子也被删了/从未装钩子”就说不是半装。
+  //
+  // 这一份是**封闭判据表**（fix2 P2-1）：每一项 = 一个 orphan 事实 → 它属于哪条链。
+  // `orphans` / `partialChains` / `partial` 三样**都从它派生** —— 旧版 partial 走
+  // `Object.values(orphans).some(Boolean)`、partialChains 另写一遍「哪条链」，两条推导各写一次，
+  // 加一项忘了加另一边就会得到“partial=true 而 partialChains 空”这种自相矛盾（doctor 说半装却点不出链）。
+  const ORPHAN_FACTS = [
+    ["hooks", "claude", claudeHooks.length > 0 && present.claudeCurrent === null],
     // 反方向：current 在、三条 Claude 钩子一条都不在（PK3-I249）
-    claudeRuntime: present.claudeCurrent !== null && claudeHooks.length === 0,
-    // 定时器 / Codex drain plist **不看钩子在不在了**（fix2 P2-2）：它们指向的 runtime/current 不在时
-    // 本身就是会出事的状态（每 30 分钟跑一次不存在的脚本），不该因为“钩子也被删了/从未装钩子”就说不是半装。
-    timer: timerPaths.length > 0 && present.claudeCurrent === null,
-    codex: codexHookNames.length > 0 && present.codexCurrent === null,
+    ["claudeRuntime", "claude", present.claudeCurrent !== null && claudeHooks.length === 0],
+    ["timer", "claude", timerPaths.length > 0 && present.claudeCurrent === null],
+    ["codex", "codex", codexHookNames.length > 0 && present.codexCurrent === null],
     // 反方向：current 在、两条 Codex 钩子一条都不在（PK3-I249）
-    codexRuntime: present.codexCurrent !== null && codexHookNames.length === 0,
-    codexDrain: codexDrain.length > 0 && present.codexCurrent === null,
-  };
-  /** 判"半装"的链（doctor 与 uninstall 共用口径，别各推一遍）。 */
-  const partialChains = [
-    ...(orphans.hooks || orphans.claudeRuntime || orphans.timer ? ["claude"] : []),
-    ...(orphans.codex || orphans.codexRuntime || orphans.codexDrain ? ["codex"] : []),
+    ["codexRuntime", "codex", present.codexCurrent !== null && codexHookNames.length === 0],
+    ["codexDrain", "codex", codexDrain.length > 0 && present.codexCurrent === null],
   ];
+  const orphans = Object.fromEntries(ORPHAN_FACTS.map(([key, , hit]) => [key, hit]));
+  /** 判"半装"的链（doctor 与 uninstall 共用口径，别各推一遍）—— 与 orphans 同源。 */
+  const partialChains = [...new Set(ORPHAN_FACTS.filter(([, , hit]) => hit).map(([, chain]) => chain))];
   return {
     kind, present, residue, orphans,
     clean: residue.length === 0,
     claudeComplete, codexComplete,
     installed: claudeComplete || codexComplete,
-    partial: Object.values(orphans).some(Boolean),
+    partial: partialChains.length > 0,
     partialChains,
     retainedNote: "保留的数据（卸载默认不删）：registry.json / routes.json / status-providers.json / subscriptions.json / chain-config.json / inbound/ 回执与账本",
   };

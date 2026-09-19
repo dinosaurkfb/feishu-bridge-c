@@ -168,7 +168,13 @@ function makeContext({ home, env, purge }) {
   function buildSteps({ foot, data, purgedRoots }) {
     const hooksWhich = [...foot.present.claudeHooks];
     const codexHooksWhich = [...foot.present.codexHooks];
-    const timerPresent = [...foot.present.timer, ...foot.present.codexDrain];
+    // 定时器**按链拆**（fix2 P1-3）：第 2 步是 Claude 链，只看 `foot.present.timer`（Claude 的 plist /
+    //   systemd 两份 unit）；linux 的 aily daemon 服务是单独一项（foot.present.ailyUnit）。
+    //   Codex 的兜底排空（plist / systemd 两份 unit）**只由第 3 步处理**。
+    //   旧版把 `foot.present.codexDrain` 并进这一份 → 一台**只有 Codex 链**的机器第 2 步也判"有东西可卸"，
+    //   于是去 spawn install-outbound.mjs，而它会直接读 `~/.claude/settings.json` —— 那台机器上根本没有
+    //   （Claude 链从没装过），卸载因此在中途以非零码停下。
+    const claudeTimers = [...foot.present.timer];
     // PK3-I249：**按足迹字段拆链**，不做字符串过滤 —— 第 2 步只列 Claude 链自己在 ~/.claude 下的条目，
     //   Codex 的技能（~/.codex/skills/*）只在第 3 步出现（旧版把两链技能并在一起，第 2 步会重复列 8 项）。
     const claudeSkillsPresent = [...foot.present.claudeSkills];
@@ -185,12 +191,12 @@ function makeContext({ home, env, purge }) {
         id: "outbound",
         title: "出站（Claude 链）：hooks + 技能 + 兜底定时器 +（linux）aily daemon 服务",
         why: "入站停掉之后再拆出站；定时器与 daemon 服务先停再删 plist/unit（安装器自己按这个顺序做，停不下来就不删）",
-        present: () => hooksWhich.length > 0 || timerPresent.length > 0 || claudeSkillsPresent.length > 0
+        present: () => hooksWhich.length > 0 || claudeTimers.length > 0 || claudeSkillsPresent.length > 0
           || foot.present.ailyUnit !== null,
         detail: () => [
           ...hooksWhich.map((n) => path.join(home, ".claude", "settings.json") + " 里的 " + n),
           ...claudeSkillsPresent,
-          ...timerPresent,
+          ...claudeTimers,
           ...[foot.present.ailyUnit].filter(Boolean),
         ],
         run: () => runNode("install-outbound.mjs", ["--uninstall", "--apply"]),

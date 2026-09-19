@@ -59015,6 +59015,30 @@ test("PK3-I244-fix3：本桥 hook 出现在非预期事件 → modified；别人
   }
 });
 
+// PK3-I244-fix4（Codex 三轮 P2）：本桥 hook 同时出现在两个非预期事件时，只交换这两个事件键在 JSON 里的顺序 → 不算变化。
+//   拿掉哪行会红：去掉 stray 遍历前的按事件名排序 → changed:true。
+test("PK3-I244-fix4：只交换两个非预期事件在 JSON 里的键顺序、内容不变 → changed:false", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pk3-i244-evorder-"));
+  try {
+    const { file } = i244SettingsFixture(tmp);
+    const stray = (name) => [{ hooks: [{ type: "command", command: "node z.mjs # FEISHU_BRIDGE_HOOK:" + name }] }];
+    const doc = JSON.parse(fs.readFileSync(file, "utf-8"));
+    doc.hooks = { ...doc.hooks, PreToolUse: stray("inbound-hook.mjs"), SubagentStop: stray("stop-hook.mjs") };
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+    const guard = installSurfaceGuard({ files: [file], registerExitHook: false });
+    try {
+      const { PreToolUse, SubagentStop, ...rest } = doc.hooks;
+      fs.writeFileSync(file, JSON.stringify({ ...doc, hooks: { ...rest, SubagentStop, PreToolUse } }, null, 2) + "\n");
+      const res = guard.check();
+      assert.equal(res.changed, false, "只换事件键顺序不该报：" + i244Show(res.diffs));
+    } finally {
+      guard.uninstall();
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("PK3-I244-fix1 ①结构：卫兵与 boot 的**静态** import 只许 node: 内置与彼此", () => {
   // 判据（逐行扫 `^import` 语句的 from 说明符）：只允许两件东西 ——
   //   · `node:` 内置（卫兵要用 crypto / fs / module / os / path）；

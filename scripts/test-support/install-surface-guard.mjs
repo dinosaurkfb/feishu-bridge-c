@@ -127,7 +127,8 @@ const ownedSettingsShaOf = (entry) => {
   //   别人的 hook 不纳入。出现在哪儿、长什么样都进投影，于是新增 / 删除 / 改动都会翻 sha。
   const owns = ownsHookFn();
   const stray = [];
-  for (const [ev, groups] of Object.entries(doc.hooks ?? {})) {
+  // PK3-I244-fix4（Codex 三轮 P2）：按事件名排序遍历——只交换 JSON 里事件键的顺序不该翻投影 sha。
+  for (const [ev, groups] of Object.entries(doc.hooks ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
     for (const group of groups) {
       if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
       const { hooks, ...groupRest } = group;

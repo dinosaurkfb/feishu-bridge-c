@@ -8626,6 +8626,21 @@ test("PK3-U1-fix4 P1-3：aily 磁盘态与 manager 态各自独立 —— 磁盘
 //   · 去掉 tmp 根那一句 → 纯判定那条红在「os.tmpdir() 根本身要拒」。
 // **真 apply 的拒绝形状全部落在夹具自己家里**（指向 home / .codex 的链接、断链）—— 不指向 /etc 这类
 // 系统目录：一旦判据回归，这条用例最多毁掉它自己的临时夹具，不会去动系统路径（Codex 六轮 P1-2）。
+test("PK3-U1-fix6b：显式桥根词法在 home 下、canonical 指到 home 与 tmp 命名空间之外 → 纯判定拒（不喂给删除入口）", () => {
+  // ②b（验收补刀发现的空档）：词法在 home 下、canonical 指到 home 与 tmp 命名空间**之外** → 拒。
+  //   只做**纯判定**（Codex 六轮 P1-2：系统目录不许喂给会执行删除的入口）；链接指向 /etc 只被 realpath 读，不被写。
+  //   拿掉哪行会红：去掉 explicitBridgeRootProblem 里 `if (!under(canonical))` 那一支 → 这里返回 null（/etc 不命中父层禁区）。
+    const outHome = fs.mkdtempSync(path.join(os.tmpdir(), "u1-canon-out-"));
+    try {
+      const link = path.join(outHome, "bridge-link");
+      fs.symlinkSync("/etc", link);
+      const why = explicitBridgeRootProblem(link, outHome);
+      assert.match(String(why), /canonical 路径 .* 在 home 与系统临时目录之外/u, "指向 home 外的符号链接必须拒：" + why);
+    } finally {
+      fs.rmSync(outHome, { recursive: true, force: true });
+    }
+});
+
 test("PK3-U1-fix5 P1-1 + fix6 P1-1：显式桥根边界 —— 指向 home / .codex / 断链一律拒（真 apply 零写）", () => {
   // ① 反例：`<home>/bridge-link -> <home>`（词法在 home 里、canonical 就是 home 本身）与
   //    `-> <home>/.codex` —— 两条都必须拒，而且**沿父链的无关数据一个字节都不许动**。

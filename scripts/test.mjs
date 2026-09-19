@@ -7385,29 +7385,49 @@ test("PK3-I241：装完自检两件事各有各的判据 —— daemon 看 socke
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "i241-home-"));
   const socketDir = path.join(home, ".aily-cli", "sockets");
   fs.mkdirSync(socketDir, { recursive: true });
-  fs.writeFileSync(path.join(socketDir, "aily-cli.sock"), "");
+  // 真 Unix socket inode（python 在目录内 bind 短相对名，绕开 sun_path 104 字节限制）；进程退出后 inode 留在盘上 ——
+  // 正是「存在不证明进程还活着」那种形状（PK3-I241-fix1，Codex 一轮 P1）。
+  const bindSock = (dir) => {
+    const r = spawnSync("python3", ["-c", "import os,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.bind('aily-cli.sock')", dir], { encoding: "utf-8" });
+    assert.equal(r.status, 0, "夹具建 socket 失败：" + r.stderr);
+  };
+  bindSock(socketDir);
+  assert.equal(fs.lstatSync(path.join(socketDir, "aily-cli.sock")).isSocket(), true, "夹具必须是真 socket");
   const lines = [];
   const log = (l) => lines.push(l);
   const reported = () => JSON.stringify([{ name: "m5claude-inbound-router" }]);
 
-  // ① daemon 在不在跑：**只看 socket**（不经 exec、不依赖 PATH）
+  // ① socket 那一行**只陈述事实**（不经 exec、不依赖 PATH）：是 socket 且在 → 「在」但明说不证明进程活着；不许说"在跑"
+  //   拿掉哪行会红：把 isSocket() 判据换回 existsSync / 文案换回"在跑" → 下面 not_socket 与 doesNotMatch 断言红
   const r1 = inboundPostInstallProbe({ home, execFile: reported, log });
-  assert.deepEqual([r1.daemonRunning, r1.scan.state], [true, "reported"], JSON.stringify(r1));
-  assert.match(lines.join("\n"), /aily daemon 是否在跑：在跑（socket 在/u, lines.join("\n"));
+  assert.deepEqual([r1.socketState, r1.socketPresent, r1.scan.state], ["socket", true, "reported"], JSON.stringify(r1));
+  const out1 = lines.join("\n");
+  assert.match(out1, /aily daemon socket：在（/u, out1);
+  assert.match(out1, /存在不证明进程还活着/u, out1);
+  assert.doesNotMatch(out1, /是否在跑：在跑|未运行/u, "socket 在 ≠ 在跑，不许断言：" + out1);
+  // ①b 同名普通文件（残留 / 假绿的老夹具）→ not_socket，不当作在跑
+  lines.length = 0;
+  const homePlain = path.join(home, "plain");
+  fs.mkdirSync(path.join(homePlain, ".aily-cli", "sockets"), { recursive: true });
+  fs.writeFileSync(path.join(homePlain, ".aily-cli", "sockets", "aily-cli.sock"), "");
+  const r1p = inboundPostInstallProbe({ home: homePlain, execFile: reported, log });
+  assert.deepEqual([r1p.socketState, r1p.socketPresent], ["not_socket", false], JSON.stringify(r1p));
+  assert.match(lines.join("\n"), /同名文件在但不是 socket/u, lines.join("\n"));
+  // ①c 不在 → 给启动命令
   lines.length = 0;
   const r1b = inboundPostInstallProbe({ home: path.join(home, "别处"), execFile: reported, log });
   const out1b = lines.join("\n");
-  assert.equal(r1b.daemonRunning, false, out1b);
-  assert.match(out1b, /未运行（socket 不在/u, out1b);
-  assert.match(out1b, /aily-cli daemon start/u, "未运行要给启动命令：" + out1b);
+  assert.deepEqual([r1b.socketState, r1b.socketPresent], ["absent", false], out1b);
+  assert.match(out1b, /aily daemon socket：不在（/u, out1b);
+  assert.match(out1b, /aily-cli daemon start/u, "不在要给启动命令：" + out1b);
 
   // ② 探测本身失败（ENOENT）→ 「查不了」+ 原因原话；**不许**代言 daemon 的状态
   lines.length = 0;
   const enoent = () => { const e = new Error("spawnSync aily-cli ENOENT"); e.code = "ENOENT"; throw e; };
   const r2 = inboundPostInstallProbe({ home, execFile: enoent, log });
   const out2 = lines.join("\n");
-  assert.deepEqual([r2.scan.state, r2.daemonRunning], ["unavailable", true],
-    "探测失败时 daemon 那一行仍是它自己的判据（socket 在 → 在跑）：" + JSON.stringify(r2));
+  assert.deepEqual([r2.scan.state, r2.socketPresent], ["unavailable", true],
+    "探测失败时 socket 那一行仍是它自己的判据（socket 在 → 在）：" + JSON.stringify(r2));
   assert.match(out2, /查不了/u, out2);
   assert.match(out2, /ENOENT|不在 PATH/u, "原因要点名（非交互 ssh 下 PATH 没有 mise shims）：" + out2);
   assert.doesNotMatch(out2, /没跑起来/u, "探测失败不许说成 daemon 没跑起来：" + out2);
@@ -7440,10 +7460,12 @@ test("PK3-I241：真入口也这么说 —— 非交互 ssh（PATH 里没有 ail
   //    探测那行说"查不了 + ENOENT"，而且**两行都不许**出现「没跑起来」。
   const socketDir = path.join(home, ".aily-cli", "sockets");
   fs.mkdirSync(socketDir, { recursive: true });
-  fs.writeFileSync(path.join(socketDir, "aily-cli.sock"), "");
+  const bound = spawnSync("python3", ["-c", "import os,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.bind('aily-cli.sock')", socketDir], { encoding: "utf-8" });
+  assert.equal(bound.status, 0, "夹具建 socket 失败：" + bound.stderr);
   const out = execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"],
     { encoding: "utf-8", env: { ...env, PATH: "/usr/bin:/bin" } });
-  assert.match(out, /aily daemon 是否在跑：在跑（socket 在/u, out);
+  assert.match(out, /aily daemon socket：在（/u, out);
+  assert.doesNotMatch(out, /是否在跑：在跑|未运行/u, "socket 在 ≠ 在跑（PK3-I241-fix1）：" + out);
   assert.match(out, /aily 是否已发现本技能：查不了：/u, out);
   assert.match(out, /ENOENT|不在 PATH/u, out);
   assert.doesNotMatch(out, /没跑起来/u, "这句是 issue #241 的原始误报，不许回来：" + out);

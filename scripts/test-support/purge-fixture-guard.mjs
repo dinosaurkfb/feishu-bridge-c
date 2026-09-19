@@ -46,6 +46,25 @@ export function purgeChildEnv({ env = process.env, home, extra = {} } = {}) {
   return { ...out, ...extra };
 }
 
+/**
+ * **启动安装器 / 卸载入口**的子进程环境（PK3-I247）：就是 `purgeChildEnv`（同一份剔除清单，不另写），
+ * 外加一道"用例**显式**给的写目标必须在夹具内"的断言 —— 全仓每一条 `install-* --apply` /
+ * `codex/install --apply` / `uninstall --apply` 都从这里拿 env，别再手写 `{ ...process.env, … }`。
+ *
+ * 中间为什么是它而不是新写一个：`purgeChildEnv` 剔的正是"继承值会把写目标/删除目标带出夹具"的那一组
+ * （`PURGE_TARGET_ENV_KEYS` + `INSTALL_WRITE_TARGET_ENV_KEYS`），安装器与卸载入口吃的是同一组覆盖点。
+ * `home` 缺省从最终 env 的 `HOME` 取（多数用例的 env 自带 HOME）—— 预检与子进程只有一份 env。
+ */
+export function installerChildEnv({ env = process.env, extra = {}, home = undefined, declaredPrivateRoots = [] } = {}) {
+  const targetHome = typeof home === "string" && home.length > 0 ? home : (extra.HOME ?? env.HOME);
+  const childEnv = purgeChildEnv({ env, home: targetHome, extra });
+  const outside = writeTargetsOutsideFixture({ env: childEnv, declaredPrivateRoots });
+  if (outside.length > 0) {
+    throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(outside));
+  }
+  return childEnv;
+}
+
 /** 一条路径的两种写法：**词法**（原样 resolve）与 **canonical**（最近存在祖先 realpath 再拼回剩余段）。 */
 const pathForms = (p) => {
   const out = new Set([path.resolve(p)]);

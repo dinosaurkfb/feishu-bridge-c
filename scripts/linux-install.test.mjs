@@ -23,6 +23,7 @@ import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
 import { systemctl, timerCmd } from "./timer-exec.mjs";
 import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
+import { installerChildEnv } from "./test-support/purge-fixture-guard.mjs"; // PK3-I247：安装器写目标隔离
 
 // PK3-T2-fix1：这个入口也是测试，也要有本轮私有临时根 —— **在任何 mkdtemp 之前**装，
 // 装上之后越出私有根的 mkdtemp 当场 throw（硬门在退出时把 violations 汇总成非 0）。
@@ -216,11 +217,13 @@ const bridgeStopHook = (node) =>
 
 /** 安装器子进程的隔离环境：只碰夹具 HOME；机器级注入口一律显式清空（免得被外部环境改判）。 */
 function installerEnv(home, extra = {}) {
-  return { ...process.env, HOME: home,
+  // PK3-I247：安装器 / 卸载入口的子进程环境统一走 installerChildEnv（= purgeChildEnv + 写目标断言）——
+  // 继承的写目标 / 删除目标覆盖点（收据、安装面锁、桥根、覆盖文件）一律剔掉；下面这些显式字段照旧生效。
+  return installerChildEnv({ env: process.env, home, extra: {
     FEISHU_BRIDGE_MAINTENANCE_GATE: path.join(home, "maintenance.gate"),
     FEISHU_BRIDGE_INSTALLED_SURFACE: "", FEISHU_BRIDGE_INSTALL_SURFACE_LOCK: "",
     FEISHU_BRIDGE_LAUNCHCTL: "", FEISHU_BRIDGE_SYSTEMCTL: "", FEISHU_BRIDGE_TIMER_PLATFORM: "",
-    ...extra };
+    ...extra } });
 }
 const runInstaller = (env, args) => spawnSync(process.execPath, [INSTALLER, ...args], { encoding: "utf-8", env });
 

@@ -411,7 +411,9 @@ export function runDoctor({
   //     expectedHandler = `<runtime/current>/scripts/inbound.mjs`，正是 README 里
   //     `register-route --init-default --id self --handler <runtime/current/scripts/inbound.mjs>` 写的那个。
   //   两半都不认名字：名叫 self、handler 是别的东西 → **不豁免**、照旧 ✗。
-  const selfRouteRetained = routes.ok && routes.routes.some((r) => r.id === "self" && r.handler === expectedHandler);
+  const selfRouteRetained = routes.ok && routes.routes.some((r) => r.id === "self" && r.isDefault === true && r.handler === expectedHandler);
+  //   fix3（Codex 二轮 P1）：还必须**是默认路由**。self 不是默认、而另一条（有状态入口的）外部路由被标了默认时，
+  //   卸后 ① 会被判不适用、⑦ 的 wrong_default 也会被降级 —— 错误的默认去向就不留 ✗ 了。
   const selfIsBridgeRoute = defaultSelf.status === "runtime" || (foot.clean && selfRouteRetained);
   const selfExempt = selfIsBridgeRoute && unregisteredAll.some((s) => s.id === "self");
   const unregistered = unregisteredAll.filter((s) => !(selfExempt && s.id === "self"));

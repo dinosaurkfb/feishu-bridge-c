@@ -9213,6 +9213,44 @@ test("PK3-I249-fix2 P1-1：豁免要核到本桥路由身份 —— 名字叫 se
   assert.deepEqual([seven.ok, /未安装 —— 不适用/u.test(seven.detail)], [false, false], JSON.stringify(seven));
 });
 
+// 拿掉哪行会红：selfRouteRetained 去掉 `r.isDefault === true` → ① 变「未安装 —— 不适用」、⑦ 被降级成 null。
+test("PK3-I249-fix3 P1：保留的 self 不是默认、外部路由才是默认（且有状态入口）→ 卸后 ① 与 ⑦ 仍 ✗", () => {
+  const home = u1Home();
+  const dir = i249RetainedData(home);
+  fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify({
+    routes: [
+      { id: "self", handler: runtimeScript("inbound.mjs", home) },
+      { id: "ext", handler: path.join(home, "ext-handler.mjs"), default: true },
+    ], sessions: { s1: "self" } }));
+  fs.writeFileSync(path.join(dir, "status-providers.json"), JSON.stringify({ providers: [{
+    id: "ext", protocol: "feishu-bridge-status/v1", executable: process.execPath, script: path.join(home, "ext-status.mjs"),
+    args: [], allowed_kinds: ["transport"], project_root: home }] }));
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+  const rep = runDoctor({ home });
+  const route = rep.checks.find((c) => c.id === "route_without_provider");
+  assert.deepEqual([route.ok, /未安装 —— 不适用/u.test(route.detail)], [false, false], JSON.stringify(route));
+  const seven = rep.checks.find((c) => c.id === "default_route_handler");
+  assert.deepEqual([seven.ok, /未安装 —— 不适用/u.test(seven.detail)], [false, false], JSON.stringify(seven));
+});
+
+// 拿掉哪行会红：selfIsBridgeRoute 的 `(foot.clean && selfRouteRetained)` 换成 false → ① 的红项清单里多出 self，
+//   会误指用户给本桥自己的 self 登记外部状态入口（Codex 二轮 P2：措辞回归钉）。
+test("PK3-I249-fix3 P2：卸后本桥 self 与另一条无状态入口路由并存 → ① ✗ 只点名另一条、不点名 self", () => {
+  const home = u1Home();
+  const dir = i249RetainedData(home);
+  fs.writeFileSync(path.join(dir, "routes.json"), JSON.stringify({
+    routes: [
+      { id: "self", handler: runtimeScript("inbound.mjs", home), default: true },
+      { id: "lonely", handler: path.join(home, "lonely-handler.mjs") },
+    ], sessions: { s1: "self" } }));
+  assert.equal(u1Run(home, "install-outbound.mjs", ["--apply"]).status, 0, "装出站");
+  assert.equal(u1Run(home, "uninstall.mjs", ["--apply"]).status, 0, "一键卸");
+  const route = runDoctor({ home }).checks.find((c) => c.id === "route_without_provider");
+  const listed = (/没有状态入口：([^；]*)/u.exec(route.detail) ?? [])[1] ?? "";
+  assert.deepEqual([route.ok, listed.split(/[，,、\s]+/u).filter(Boolean)], [false, ["lonely"]], JSON.stringify(route));
+});
+
 // 拿掉哪行会红：把 routeVerdict 里的 `tablesUnclear ? …` 那一支删掉（tablesUnclear 排到豁免之后）→
 //   本用例红在①的 detail（会变成「未安装 —— 不适用」而不是「查不清」）。
 test("PK3-I249-fix2 P1-1：表读不出时先说查不清 —— 不许被未安装豁免抢先判「不适用」", () => {

@@ -74,7 +74,9 @@ export const systemctl = (args, { tolerate = false } = {}) => {
     const text = String(err.stderr ?? "").trim() || String(err.message ?? err).split("\n")[0];
     if (!tolerate) console.error("  " + bin + " " + args.join(" ") + " 失败：" + text);
     // `absent`："本来就没有这个单元" —— 干净卸载的常见形态，不箿成失败（判据与 doctor 共用一份）。
-    return { ok: false, text, out: String(err.stdout ?? ""), err: String(err.stderr ?? ""), absent: systemdUnitAbsent(text) };
+    // PK3-U2-fix1：把本次操作的单元名一并交给判据（argv 里最后一个 .service / .timer），复合错误里别的单元"不存在"不算数。
+    const unit = [...args].reverse().find((a) => typeof a === "string" && /\.(service|timer)$/u.test(a)) ?? null;
+    return { ok: false, text, out: String(err.stdout ?? ""), err: String(err.stderr ?? ""), absent: systemdUnitAbsent(text, unit) };
   }
 };
 

@@ -15,7 +15,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { CLAUDE_DRAIN_LAUNCH_LABEL, claudeDrainExpectedJob, installedNodeFrom, resolveNodeForHooks, resolveTimerPlatform, timerKindFor, timerPlatform, TIMER_PLATFORM_ENV } from "./drain-schedule.mjs";
-import { claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan } from "./install-projection.mjs";
+import { ailyDaemonPlan, claudeDrainPlistPath, claudeDrainSystemdPaths, claudeDrainSystemdUnits, drainTimerPlan, systemdUnitAbsent } from "./install-projection.mjs";
 import { runDoctor } from "./doctor.mjs";
 import { larkCliEnv, larkProvisionedSecretPath } from "./chain-template.mjs";
 import { bootoutTimer, bootstrapTimer, timerPhase } from "./maintenance/timers.mjs";
@@ -315,6 +315,51 @@ test("fix2/P1-2 linux 卸载三步顺序：disable --now（文件还在）→ �
   assert.equal(calls.some((l) => l.startsWith("systemctl systemctl")), false, JSON.stringify(calls));
 });
 
+test("PK3-U2 systemdUnitAbsent 认 systemctl 对从未存在单元的原话「Unit x.service does not exist」；真失败不认", () => {
+  assert.equal(systemdUnitAbsent("Failed to disable unit: Unit feishu-bridge-aily.service does not exist."), true);
+  assert.equal(systemdUnitAbsent("Failed to disable unit: Unit file feishu-bridge-aily.service does not exist."), true, "带 file 的老写法照认");
+  assert.equal(systemdUnitAbsent("Failed to disable unit: Access denied"), false, "真失败不许被当成不存在");
+  // PK3-U2-fix1（Codex 一轮 P2）：点名单元时，只认"本单元不存在"；复合错误里别的单元不存在不算
+  const U = "feishu-bridge-aily.service";
+  assert.equal(systemdUnitAbsent("Failed to disable unit: Unit feishu-bridge-aily.service does not exist.", U), true);
+  assert.equal(systemdUnitAbsent("Failed to disable unit: Access denied\nUnit other.service does not exist.", U), false,
+    "真失败 + 别的单元不存在 → 不许判成本单元不存在（否则停用失败后会继续删文件）");
+  assert.equal(systemdUnitAbsent("not-found", U), true, "is-enabled 对缺席单元只回 not-found");
+});
+
+// PK3-U2-fix1（Codex 一轮 P1）：本桥 aily 单元路径是断链符号链接 → 仍算"在盘上"（will-remove 并删掉），不许判 not-installed 留下残骸。
+//   拿掉哪行会红：onDisk 退回 read(file) !== null → 断链判 not-installed、remove 为空，这里红。
+test("PK3-U2-fix1 aily 单元是断链符号链接：卸载计划 will-remove 并列入删除，不判 not-installed", () => {
+  const base = tmpBase("pk3u2f1-dangling-");
+  const home = path.join(base, "home");
+  const file = path.join(home, ".config", "systemd", "user", "feishu-bridge-aily.service");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.symlinkSync(path.join(base, "gone-target.service"), file);
+  const plan = ailyDaemonPlan({ home, platform: "linux", uninstall: true });
+  assert.equal(plan.action, "will-remove", JSON.stringify(plan));
+  assert.deepEqual(plan.remove, [file]);
+});
+
+// PK3-U2（omm 2026-09-19 真机）：本桥从没写过 aily 单元（机器上是 aily-cli 自己的单元），卸载却无条件
+//   disable feishu-bridge-aily.service，systemctl 回「Unit … does not exist」→ 整个卸载中止在半截。
+//   拿掉哪行会红：去掉 systemdUnitAbsent 的「unit \S+ does not exist」→ 卸载退 1、定时器单元还在。
+test("PK3-U2 本桥没写过 aily 单元时卸载不中止：disable 回「does not exist」算本来没有，定时器照常卸干净（子进程 + 注入 systemctl）", () => {
+  const fx = linuxUninstallFixture();
+  assert.equal(runInstaller(fx.env(fx.ok), ["--apply"]).status, 0, "先装一次");
+  const ailyFile = path.join(path.dirname(fx.unitFile), "feishu-bridge-aily.service");
+  fs.rmSync(ailyFile, { force: true });   // omm 形状：磁盘上没有本桥的 aily 单元
+  const notExist = path.join(path.dirname(fx.log), "systemctl-aily-not-exist");
+  fs.writeFileSync(notExist, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PK3_LOG\"\n" +
+    "case \"$*\" in *feishu-bridge-aily.service*) echo 'Failed to disable unit: Unit feishu-bridge-aily.service does not exist.' >&2; exit 1;; esac\nexit 0\n", { mode: 0o755 });
+  const preview = runInstaller(fx.env(notExist), ["--uninstall"]);
+  assert.match(preview.stdout, /aily daemon：not-installed/u, "预览不许说将删除一个不存在的文件：" + preview.stdout);
+  const un = runInstaller(fx.env(notExist), ["--uninstall", "--apply"]);
+  assert.equal(un.status, 0, "卸载不许中止：" + un.stdout + un.stderr);
+  assert.doesNotMatch(un.stderr, /卸载中止/u, un.stderr);
+  assert.equal(fs.existsSync(fx.unitFile), false, "兜底定时器照常卸干净");
+  assert.match(un.stdout, /本来就没装/u, un.stdout);
+});
+
 test("fix2/P1-2 停不下来就不删、不报已卸载、退非零：disable 真失败（子进程 + 注入 systemctl）", () => {
   const fx = linuxUninstallFixture();
   assert.equal(runInstaller(fx.env(fx.ok), ["--apply"]).status, 0, "先装一次");
@@ -328,7 +373,9 @@ test("fix2/P1-2 停不下来就不删、不报已卸载、退非零：disable �
   const fx2 = linuxUninstallFixture();
   assert.equal(runInstaller(fx2.env(fx2.ok), ["--apply"]).status, 0, "先装一次");
   const absent = path.join(path.dirname(fx2.ok), "systemctl-absent");
-  fs.writeFileSync(absent, "#!/bin/sh\nif [ \"$2\" = \"disable\" ]; then echo 'Failed to disable unit: Unit file feishu-bridge-cc-drain.timer does not exist.' >&2; exit 1; fi\nexit 0\n", { mode: 0o755 });
+  // PK3-U2-fix1：假 systemctl 回的"不存在"要点名**被停用的那个单元**（$4）——判据现在只认本单元不存在，
+  //   旧夹具对每个 disable 都回"drain.timer 不存在"，停用 aily 时那句点名的是别的单元，按新口径理应判失败。
+  fs.writeFileSync(absent, "#!/bin/sh\nif [ \"$2\" = \"disable\" ]; then echo \"Failed to disable unit: Unit file $4 does not exist.\" >&2; exit 1; fi\nexit 0\n", { mode: 0o755 });
   const un2 = runInstaller(fx2.env(absent), ["--uninstall", "--apply"]);
   assert.equal(un2.status, 0, un2.stderr);
   assert.equal(fs.existsSync(fx2.unitFile), false, "「本来就没有」照旧卸完");

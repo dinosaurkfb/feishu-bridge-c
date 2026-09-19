@@ -474,7 +474,9 @@ if (!AILY_PLAN.applicable || AILY_PLAN.action === "skipped_foreign" || AILY_PLAN
   }
   ailyNote = ran.some((r) => r.skipped)
     ? "单元已删，但真实 systemd --user 未动（HOME 被重定向到 " + os.homedir() + "）"
-    : "已卸载";
+    : AILY_PLAN.action === "not-installed"
+      ? "本来就没装（没有本桥写的单元；manager 里也没有同名单元）"
+      : "已卸载";
 } else {
   for (const f of AILY_PLAN.files) {
     fs.mkdirSync(path.dirname(f.path), { recursive: true });

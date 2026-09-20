@@ -258,7 +258,7 @@ import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, codexDrainUnitPaths, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
-import { INSTALL_WRITE_TARGET_ENV_KEYS, purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7：真 purge 用例的夹具边界
+import { INSTALL_WRITE_TARGET_ENV_KEYS, installerChildEnv, purgeChildEnv, purgeTargetsOutsideFixture, requireCleansedInstallerEnv, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7 / PK3-I247：真 purge 与安装器写盘的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -7467,7 +7467,7 @@ test("PK3-I241：真入口也这么说 —— 非交互 ssh（PATH 里没有 ail
   const home = path.join(base, "home");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home };
+  const env = installerChildEnv({ env: process.env, home });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
 
   // ① socket 在 + PATH 里没有 aily-cli（非交互 ssh 的真实形状）→ daemon 那行说"在跑"，
@@ -7477,7 +7477,7 @@ test("PK3-I241：真入口也这么说 —— 非交互 ssh（PATH 里没有 ail
   const bound = spawnSync("python3", ["-c", "import os,socket,sys; os.chdir(sys.argv[1]); s=socket.socket(socket.AF_UNIX); s.bind('aily-cli.sock')", socketDir], { encoding: "utf-8" });
   assert.equal(bound.status, 0, "夹具建 socket 失败：" + bound.stderr);
   const out = execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...env, PATH: "/usr/bin:/bin" } });
+    { encoding: "utf-8", env: installerChildEnv({ env: env, extra: { PATH: "/usr/bin:/bin" } }) });
   assert.match(out, /aily daemon socket：在（/u, out);
   assert.doesNotMatch(out, /是否在跑：在跑|未运行/u, "socket 在 ≠ 在跑（PK3-I241-fix1）：" + out);
   assert.match(out, /aily 是否已发现本技能：查不了：/u, out);
@@ -7490,7 +7490,7 @@ test("PK3-I241：真入口也这么说 —— 非交互 ssh（PATH 里没有 ail
   fs.writeFileSync(path.join(binDir, "aily-cli"),
     "#!/bin/sh\nprintf '%s' '[{\"name\":\"m5claude-inbound-router\"}]'\n", { mode: 0o755 });
   const out2 = execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...env, PATH: binDir + ":/usr/bin:/bin" } });
+    { encoding: "utf-8", env: installerChildEnv({ env: env, extra: { PATH: binDir + ":/usr/bin:/bin" } }) });
   assert.match(out2, /aily 是否已发现本技能：scan-local 报到了/u, out2);
   assert.doesNotMatch(out2, /没跑起来/u, out2);
 });
@@ -7505,7 +7505,8 @@ test("runtime 未就绪时，入站 --apply 必须拒绝而不是装一个指不
       return { code: 0, out: execFileSync(process.execPath,
         [path.resolve("scripts", "install-inbound.mjs"), "--dir", dir, ...extra],
         { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env, HOME: fakeHome } }) };
+          // PK3-I247-fix3：转手调用（参数由调用方给，含 --apply）也经夹具环境清洗。
+          env: installerChildEnv({ env: process.env, home: fakeHome, extra: { HOME: fakeHome } }) }) };
     } catch (err) {
       return { code: err.status ?? 1, out: String(err.stdout ?? "") + String(err.stderr ?? "") };
     }
@@ -7672,7 +7673,7 @@ test("预览放行规则与技能正文里那条命令，在真实产物上必�
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
   execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, extra: { HOME: home } }) });
 
   const settings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
   const rules = (settings.permissions?.allow ?? []).filter((r) => r.includes("bind-preview"));
@@ -7699,7 +7700,7 @@ test("含空格 HOME 下，出站装完之后入站也必须能装上", () => {
   const home = path.join(base, "我的 家");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = { ...process.env, HOME: home };
+  const env = installerChildEnv({ env: process.env, home });
   execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
 
@@ -7732,7 +7733,7 @@ test("预览放行归属：认领自己的与旧克隆的，不碰别人的", ()
 
   execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, extra: { HOME: home } }) });
 
   const allow = JSON.parse(fs.readFileSync(
     path.join(home, ".claude", "settings.json"), "utf-8")).permissions.allow;
@@ -7749,7 +7750,7 @@ test("预览放行归属：认领自己的与旧克隆的，不碰别人的", ()
   // 再装一次必须幂等：不能因为认不出自己那条而不断追加。
   execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, extra: { HOME: home } }) });
   const again = JSON.parse(fs.readFileSync(
     path.join(home, ".claude", "settings.json"), "utf-8")).permissions.allow;
   assert.equal(again.filter((r) => r.includes("bind-preview") && !r.includes("--require")).length, 1,
@@ -7777,7 +7778,7 @@ test("HOME 被重定向时，安装器不得碰真实 launchd", () => {
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
   const out = execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), "--apply"],
-    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, extra: { HOME: home } }) });
   assert.match(out, /兜底定时器：已跳过/u, "跳过要说出来，不能让人以为兜底装好了");
   assert.doesNotMatch(out, /兜底定时器：已加载/u);
 });
@@ -7825,37 +7826,91 @@ const u1Run = (home, script, args = [], env = {}, opts = {}) => {
 const u1Footprint = (home, platform = process.platform) => installFootprint({ home, platform });
 // PK3-U1-fix9（Codex 十轮 P1）：u1Run 跑安装器 --apply 时，父环境里的安装写目标覆盖点进不去子进程；用例显式给到夹具外则拒绝启动。
 //   拿掉哪行会红：purgeChildEnv 不剔 INSTALL_WRITE_TARGET_ENV_KEYS → ① 哨兵被写；去掉 u1Run 的写目标守卫 → ② 子进程被启动、哨兵被写。
-// PK3-U1-fix10（Codex 十一轮 P1）结构守卫：U1 新增的用例块（名字带 PK3-U1）里，**每一条**启动安装器 / 卸载入口的
-//   spawnSync / execFileSync 调用，传进去的 env 都必须来自 purgeChildEnv（内联调用，或一个由 purgeChildEnv 赋值的变量）；
-//   走 u1Run 的不在此列（u1Run 自己清洗）。按"每条调用"判，不按整块判——整块判会被同块里别处的 purgeChildEnv 盖过去。
-//   字样拼出来免得扫到自己。拿掉哪行会红：把 Codex 套件封闭性用例的 env 改回 { ...isolatedEnv(), … } → 本用例点名那条。
-test("PK3-U1-fix10：U1 新增用例里每一条启动安装器 / 卸载入口的调用，env 都经过夹具环境清洗", () => {
-  const ENTRY = new RegExp("(install-out" + "bound|install-in" + "bound|uninst" + "all)\\.mjs|\"install\\.mjs\"", "u");
-  const CALL = new RegExp("(?:spawn" + "Sync|execFile" + "Sync)\\(", "gu");
-  const PCE = "purgeChild" + "Env(";
+// PK3-I247 结构守卫（PK3-U1-fix10 的守卫**扩到全部用例块**）：三个测试文件里，**每一条**启动安装器 /
+//   卸载入口（install-outbound / install-inbound / codex/install / uninstall）的 spawnSync / execFileSync
+//   调用，只要带 `--apply` 或 `--uninstall`，传进去的 env 就必须来自清洗入口 —— 内联 `installerChildEnv(` /
+//   `purgeChildEnv(`，或一个由这些入口（含它们在本仓的两个薄包装：test.mjs 的 installerFixtureEnv、
+//   codex 与 linux-install 的 installerEnv）赋值的变量；走 `u1Run` 的不在此列（u1Run 自己清洗）。
+//   按"每条调用"判，不按整块判 —— 整块判会被同块里别处的清洗调用盖过去。
+//   两条反例（都实测过会红）：把某条 install `--apply` 的 env 改回 `{ ...process.env, … }` → 本用例点名那条；
+//   把 installerFixtureEnv / installerEnv 的包装拆掉（不再调 installerChildEnv）→ 第二段"薄包装"断言点名它。
+test("PK3-I247：三个测试文件里每一条启动安装器 / 卸载入口的调用，env 都经过夹具环境清洗（fix10 的守卫扩到全部用例块）", () => {
+  // 字样拼出来免得扫到自己。
+  // PK3-I247-fix3（Codex 一轮）：
+  //   P1 —— 扫**整份文件**（不只用例块）：转手函数（runInstaller 这类）定义在模块顶层、用常量指入口、参数动态展开，
+  //         旧判据只认用例块里字面入口名 + 字面 --apply，把它们整条漏掉。现在：指向入口的常量也算入口；
+  //         参数里有展开（...args）也算会写盘（由调用方决定参数）。env 的判定也收紧：只认 env 属性**本身**就是清洗调用，
+  //         或本调用之前、同一用例块内**最近一次**给该标识符赋值的语句来自清洗入口 / 薄包装（旧版全块搜索、stmt.includes 都会误认）。
+  //   P2 —— 入口名正则里的点号按字面转义（旧版在 JS 字符串里写 \.mjs，构造出的正则里 . 是通配符）。
+  const ENTRY_LIT = "(?:install-out" + "bound|install-in" + "bound|uninst" + "all)\\.mjs|\"install\\.mjs\"";
+  const CALL = new RegExp("(?:spawn" + "Sync|execFile" + "Sync|\\bspawn|\\bexecFile)\\(", "gu");
+  const CLEANSERS = ["installerChild" + "Env", "purgeChild" + "Env", "requireCleansedInstaller" + "Env"];
+  const WRAPPERS = [...CLEANSERS, "installerFixture" + "Env", "installer" + "Env"];
+  const files = [
+    path.resolve("scripts", "test.mjs"),
+    path.resolve("scripts", "codex", "test.mjs"),
+    path.resolve("scripts", "linux-install.test.mjs"),
+  ];
   const offenders = [];
   let scanned = 0;
   let calls = 0;
-  for (const file of [path.resolve("scripts", "test.mjs"), path.resolve("scripts", "codex", "test.mjs")]) {
-    const blocks = fs.readFileSync(file, "utf-8").split(/\ntest\(/u).slice(1);
-    for (const b of blocks) {
-      const name = (b.match(/^"([^"]+)"/u) ?? [null, ""])[1];
-      if (!name.includes("PK3-U1")) continue;
-      scanned += 1;
-      for (const m of b.matchAll(CALL)) {
-        const stmt = b.slice(m.index, b.indexOf(");", m.index) + 2);   // 这一条调用语句
-        if (!ENTRY.test(stmt)) continue;                                 // 不是启动安装器 / 卸载入口
-        calls += 1;
-        const envArg = stmt.match(/\benv:\s*([A-Za-z_$][\w$]*)\s*[,}]/u)?.[1] ?? (/\{[^{}]*\benv\s*[,}]/u.test(stmt) ? "env" : null);
-        const inline = stmt.includes(PCE);
-        const fromVar = envArg !== null && new RegExp("\\b(?:const|let)\\s+" + envArg + "\\s*=\\s*" + PCE.replace("(", "\\("), "u").test(b);
-        if (!inline && !fromVar) offenders.push(path.relative(process.cwd(), file) + "：" + name + " —— " + stmt.slice(0, 120).replace(/\s+/gu, " "));
+  let viaConst = 0;
+  for (const file of files) {
+    const src = fs.readFileSync(file, "utf-8");
+    //   只认**值就是路径**的常量（path.resolve / path.join / 字符串字面量），不认 `const r = spawnSync(…入口…)` 这类结果变量。
+    const consts = [...src.matchAll(new RegExp("\\b(?:const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:path\\.(?:resolve|join)\\([^;\\n()]*(?:" + ENTRY_LIT + ")[^;\\n()]*\\)|\"[^\"\\n]*(?:" + ENTRY_LIT + ")\")", "gu"))]
+      .map((m) => m[1]);
+    const constRe = consts.length > 0 ? new RegExp("\\b(?:" + consts.join("|") + ")\\b", "u") : null;
+    const entryRe = new RegExp(ENTRY_LIT, "u");
+    const testStarts = [...src.matchAll(/\ntest\("([^"]+)"/gu)].map((m) => [m.index, m[1]]);
+    scanned += testStarts.length;
+    const blockOf = (i) => {
+      let at = 0, name = "（模块顶层）";
+      for (const [s, n] of testStarts) { if (s < i) { at = s; name = n; } else break; }
+      return { at, name };
+    };
+    for (const m of src.matchAll(CALL)) {
+      const stmt = src.slice(m.index, src.indexOf(");", m.index) + 2);
+      const literal = entryRe.test(stmt);
+      const byConst = !literal && constRe !== null && constRe.test(stmt);
+      if (!literal && !byConst) continue;                                           // 不是启动安装器 / 卸载入口
+      const argv = stmt.slice(0, stmt.indexOf("]") + 1);                            // 参数数组（第一个 ] 之前）
+      if (!/--apply|--uninstall/u.test(stmt) && !/\.\.\.\s*[A-Za-z_$]/u.test(argv)) continue;   // 只查会写盘的（含参数数组里的动态展开）
+      calls += 1;
+      if (byConst) viaConst += 1;
+      if (new RegExp("\\benv:\\s*(?:" + CLEANSERS.join("|") + ")\\(", "u").test(stmt)) continue;   // env 属性本身就是清洗调用
+      const id = stmt.match(/\benv:\s*([A-Za-z_$][\w$]*)\s*[,}\n]/u)?.[1] ??
+        (/[,{]\s*env\s*[,}]/u.test(stmt) ? "env" : undefined);
+      const block = blockOf(m.index);
+      let ok = false;
+      if (id !== undefined) {
+        const before = src.slice(block.at, m.index);
+        const defs = [...before.matchAll(new RegExp("(?:\\b(?:const|let|var)\\s+|[;{\\n]\\s*)" + id + "\\s*=(?![=>])\\s*([^;\\n]*)", "gu"))];
+        const last = defs.at(-1);
+        ok = last !== undefined &&
+          new RegExp("^(?:\\([^)]*\\)\\s*=>\\s*)?(?:" + WRAPPERS.join("|") + ")\\(", "u").test(last[1]);
       }
+      if (!ok) offenders.push(path.relative(process.cwd(), file) + "：" + block.name + " —— " + stmt.slice(0, 120).replace(/\s+/gu, " "));
     }
   }
-  assert.ok(scanned >= 20, "要真的扫到 U1 的用例块（实际 " + scanned + " 块）");
-  assert.ok(calls >= 2, "要真的找到启动安装器 / 卸载入口的调用（实际 " + calls + " 条）");
-  assert.deepEqual(offenders, [], "这些 U1 用例的调用没经过夹具环境清洗：" + JSON.stringify(offenders));
+  assert.ok(scanned >= 1000, "要真的扫到三个文件的全部用例块（实际 " + scanned + " 块）");
+  assert.ok(calls >= 40, "要真的找到启动安装器 / 卸载入口并写盘的调用（实际 " + calls + " 条）");
+  assert.ok(viaConst >= 1, "要真的认出经常量指入口的转手调用（linux-install.test.mjs 的 runInstaller；实际 " + viaConst + " 条）");
+  assert.deepEqual(offenders, [], "这些用例的调用没经过夹具环境清洗：" + JSON.stringify(offenders));
+
+  // 接受的"薄包装"必须真的是包装（内部调 installerChildEnv）—— 否则上面那段判据就成了空文。
+  const wrappers = [
+    ["scripts/test.mjs", "installerFixture" + "Env"],
+    ["scripts/codex/test.mjs", "installer" + "Env"],
+    ["scripts/linux-install.test.mjs", "installer" + "Env"],
+  ];
+  for (const [rel, name] of wrappers) {
+    const src = fs.readFileSync(path.resolve(rel), "utf-8");
+    const at = src.indexOf("const " + name + " =") >= 0 ? src.indexOf("const " + name + " =") : src.indexOf("function " + name + "(");
+    assert.ok(at >= 0, rel + " 里没找到薄包装 " + name);
+    const body = src.slice(at, at + 400);
+    assert.ok(body.includes("installerChild" + "Env("), rel + " 的 " + name + " 必须内部调 installerChildEnv（否则它不算清洗入口）：" + body.slice(0, 120));
+  }
 });
 
 test("PK3-U1-fix9：安装写目标（收据 / 安装面锁）覆盖点——继承值进不去子进程、显式给到夹具外就拒绝启动", () => {
@@ -10724,7 +10779,8 @@ test("安装不登记项目，也不改动既有登记表", () => {
 
   const run = (extra) => execFileSync(process.execPath,
     [path.resolve("scripts", "install-outbound.mjs"), ...extra],
-    { encoding: "utf-8", env: { ...process.env, HOME: home } });
+    // PK3-I247-fix3：转手调用也经夹具环境清洗。
+    { encoding: "utf-8", env: installerChildEnv({ env: process.env, home, extra: { HOME: home } }) });
 
   run(["--apply"]);
   assert.equal(fs.readFileSync(registryFile, "utf-8"), original,
@@ -19943,6 +19999,13 @@ const gateContext = (fields) => maintenanceContext({ platform: GATE_FIXTURE_PLAT
  * 调用方给的字段优先（想验别的平台就在字段里自己写这个键）。
  */
 const gateChildEnv = (fields = {}) => ({ ...process.env, [TIMER_PLATFORM_ENV]: GATE_FIXTURE_PLATFORM, ...fields });
+/**
+ * 同上的**安装器 / 卸载入口**版本（PK3-I247）：字段完全一样，但环境先过 `installerChildEnv` ——
+ * 继承的写目标 / 删除目标覆盖点（收据、安装面锁、桥根、覆盖文件）一律剔掉，用例显式给的字段照旧生效。
+ * 全仓每一条 `--apply` / `--uninstall` 的调用都用它（或 `u1Run` / 内联 `installerChildEnv`）。
+ */
+const installerFixtureEnv = (fields = {}) =>
+  installerChildEnv({ env: process.env, extra: { [TIMER_PLATFORM_ENV]: GATE_FIXTURE_PLATFORM, ...fields } });
 
 /**
  * 机器级体检的夹具：一台"机器"= 隔离 HOME + 三张表 + 若干项目目录。provider 脚本只打印，不写盘。
@@ -20034,6 +20097,188 @@ function doctorMachine({ installRuntime = false } = {}) {
 }
 const doctorReport = (r) => { assert.ok(r.stdout, r.stderr); return JSON.parse(r.stdout); };
 const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === id); assert.ok(c, "缺检查 " + id + "：" + JSON.stringify(report.checks.map((x) => x.id))); return c; };
+
+// 拿掉哪行会红：把 `installerFixtureEnv` 换回 `{ ...process.env, ... }`（不再调 installerChildEnv）→
+//   子进程会读到父进程设的收据 / 安装面锁覆盖点 → 红在「哨兵必须没被写」（收据或锁落在哨兵路径上）。
+// 拿掉哪行会红：installerChildEnv 里把 derivedRoots 并进 rootCanonicals 那一处（Codex 五轮 P1）→ ① 红；
+//   把 derivedOutside 那一支删掉 → ② 红。
+test("PK3-I247-fix8：Codex 链的写入根（CODEX_HOME / 桥根）也要在夹具内、改向也要拒", () => {
+  const stem = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-outside-"));
+  try {
+    // ① 认证后把夹具内的 CODEX_HOME 换成指向夹具外的链接：环境文本与 HOME 去向都没变，仍必须拒
+    const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-home-"));
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    const env = installerChildEnv({ env: {}, home, extra: { HOME: home, CODEX_HOME: codexHome } });
+    assert.equal(requireCleansedInstallerEnv(env), env, "认证时 CODEX_HOME 在夹具内 → 放行");
+    fs.renameSync(codexHome, path.join(stem, "codex.moved"));
+    fs.symlinkSync(outside, codexHome, "dir");
+    assert.equal(env.CODEX_HOME, codexHome, "环境变量文本没变（HOME 也没动，前几道判据都抓不到）");
+    assert.throws(() => requireCleansedInstallerEnv(env), /夹具根去向变了/u, "CODEX_HOME 改向之后必须拒");
+
+    // ② 认证时桥根就在夹具外 → 当场拒（与显式写目标同一口径）
+    const home2 = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-home2-"));
+    // 位置判据按临时根（既有夹具普遍把 codex-home 放在用例临时目录里、与 home 平级）：指到真实家目录才拒
+    assert.throws(() => installerChildEnv({ env: {}, home: home2,
+      // 用一个**确定不在临时根下**的绝对路径代表"真实家目录"：套件把 HOME 指到临时目录，
+      //   os.homedir() 跟着 HOME 走，拿它当反例会落回临时根内、判不出来。
+      extra: { HOME: home2, FEISHU_CODEX_BRIDGE_HOME: path.join(path.parse(process.cwd()).root, "not-a-temp-root", ".codex", "feishu-bridge") } }),
+      /既不在本用例夹具、也不在本轮私有根下/u, "桥根指到本轮私有根之外（真机家目录那一类）就不许认证");
+    assert.ok(installerChildEnv({ env: {}, home: home2,
+      extra: { HOME: home2, FEISHU_CODEX_BRIDGE_HOME: path.join(outside, "bridge") } }),
+      "指到本轮私有根下的别处（夹具外但仍在本轮根内）照旧放行 —— 既有夹具就是这么摆的");
+    // ③ 放宽只认**套件持有的那棵私有根**：把 TMPDIR 改指另一棵私有目录，它下面的派生根照样要拒
+    //    （否则认证前改一下 TMPDIR 就能把任意位置洗成"临时目录"，canonical 冻结只会把错误去向固定下来）。
+    //    （这棵"别处的临时树"只能写成路径、不能真建：临时目录硬门不许在本轮私有根之外 mkdtemp。）
+    const otherTmp = path.join(path.parse(process.cwd()).root, "not-this-run-tmp");
+    const savedTmpdir = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = otherTmp;
+      assert.throws(() => installerChildEnv({ env: {}, home: home2,
+        extra: { HOME: home2, CODEX_HOME: path.join(otherTmp, ".codex") } }),
+        /既不在本用例夹具、也不在本轮私有根下/u, "TMPDIR 被改指别处时，那下面的派生根不算数");
+      assert.ok(installerChildEnv({ env: {}, home: home2,
+        extra: { HOME: home2, CODEX_HOME: path.join(outside, ".codex") } }),
+        "本轮私有根内的平级目录仍放行（判据取的是套件持有的根，不是 TMPDIR）");
+    } finally {
+      if (savedTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = savedTmpdir;
+    }
+  } finally {
+    fs.rmSync(stem, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：requireCleansedInstallerEnv 里「根的真实去向必须与认证时一致」那一段（Codex 四轮 P1）→
+//   两条都红（根改向之后允许范围跟着挪走，越界判据自己发现不了）。
+test("PK3-I247-fix7：认证后把夹具根本身改指夹具外 —— 允许范围是冻结的，根改向即拒（含默认写目标）", () => {
+  const stem = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-root-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-root-outside-"));
+  try {
+    // ① HOME 本身改向：环境里连写目标都没显式给（安装器按 HOME 派生），认证后把 home 换成指向夹具外的链接
+    const home = path.join(stem, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const env = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    assert.equal(requireCleansedInstallerEnv(env), env, "认证时 home 是真目录 → 放行");
+    fs.renameSync(home, path.join(stem, "home.moved"));
+    fs.symlinkSync(outside, home, "dir");
+    assert.equal(env.HOME, home, "环境变量文本没变（快照与显式写目标都抓不到这一手）");
+    assert.throws(() => requireCleansedInstallerEnv(env), /夹具根去向变了/u, "HOME 改向之后必须拒");
+
+    // ② 声明的私有根改向：写目标落在那个私有根里
+    const home2 = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-root2-"));
+    const priv = path.join(stem, "priv");
+    fs.mkdirSync(priv, { recursive: true });
+    const env2 = installerChildEnv({ env: {}, home: home2,
+      extra: { HOME: home2, [INSTALL_WRITE_TARGET_ENV_KEYS[0]]: path.join(priv, "receipt.json") },
+      declaredPrivateRoots: [priv] });
+    assert.equal(requireCleansedInstallerEnv(env2), env2, "认证时私有根是真目录 → 放行");
+    fs.renameSync(priv, path.join(stem, "priv.moved"));
+    fs.symlinkSync(outside, priv, "dir");
+    assert.throws(() => requireCleansedInstallerEnv(env2), /夹具根去向变了/u, "私有根改向之后必须拒");
+  } finally {
+    fs.rmSync(stem, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：requireCleansedInstallerEnv 里按登记时夹具边界复核真实去向那一段（Codex 三轮 P1）→
+//   symlink 改指夹具外之后仍然放行，本用例红在第二个 assert.throws。
+test("PK3-I247-fix6：认证后把写目标路径上的 symlink 改指夹具外 —— 文本没变，启动边界仍按真实去向拒", () => {
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-link-home-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-link-outside-"));
+  try {
+    const inside = path.join(home, "inside");
+    fs.mkdirSync(inside, { recursive: true });
+    const link = path.join(home, "link");
+    fs.symlinkSync(inside, link, "dir");                       // 认证时：link → 夹具内
+    const key = INSTALL_WRITE_TARGET_ENV_KEYS[0];
+    const env = installerChildEnv({ env: {}, home, extra: { HOME: home, [key]: path.join(link, "receipt.json") } });
+    assert.equal(requireCleansedInstallerEnv(env), env, "认证时链接在夹具内 → 放行");
+    const before = env[key];
+    fs.unlinkSync(link);
+    fs.symlinkSync(outside, link, "dir");                      // 认证后：同一个文本，去向改到夹具外
+    assert.equal(env[key], before, "环境变量文本一个字都没变（快照比对抓不到这一手）");
+    assert.throws(() => requireCleansedInstallerEnv(env), /真实去向越出本用例夹具/u,
+      "symlink 改向之后必须拒 —— 否则安装器会沿新去向写到夹具外");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：requireCleansedInstallerEnv 的快照比对那一支（改回只查身份）→ ① 与 ② 红；
+//   去掉 WeakMap 身份判据 → ③ 与 ④ 红。
+test("PK3-I247-fix4：执行边界核验的是内容不只是身份 —— 认证后改写目标 / 展开复制 / 原样继承都拒绝启动", () => {
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-boundary-home-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-boundary-outside-"));
+  try {
+    // ① 清洗后改写目标 → 拒
+    const mutated = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    mutated[INSTALL_WRITE_TARGET_ENV_KEYS[0]] = path.join(outside, "receipt.json");
+    assert.throws(() => requireCleansedInstallerEnv(mutated), /清洗之后又改了/u, "改了写目标还放行 = 闸门形同虚设");
+    // ② 清洗后改 HOME（把夹具边界挪走）→ 拒
+    const movedHome = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    movedHome.HOME = outside;
+    assert.throws(() => requireCleansedInstallerEnv(movedHome), /清洗之后又改了/u, "改了 HOME 还放行");
+    // ③ 展开复制（内容一模一样）→ 拒：只有清洗入口产出的那一个对象算数
+    const clean = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    assert.throws(() => requireCleansedInstallerEnv({ ...clean }), /必须直接来自/u, "展开复制还放行");
+    // ④ 原样继承 → 拒
+    assert.throws(() => requireCleansedInstallerEnv(process.env), /必须直接来自/u, "原样继承还放行");
+    // ⑤ 没改过的照旧放行（别把闸门做成谁都过不去）
+    assert.equal(requireCleansedInstallerEnv(clean), clean);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// 拿掉哪行会红：installerChildEnv 里 `if (outside.length > 0) { throw … }` 那一支 → 越界的显式写目标被放行，本用例红在 assert.throws。
+test("PK3-I247-fix2：installerChildEnv 对越出夹具的显式写目标拒绝启动（夹具内、声明过的私有根放行）", () => {
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-guard-home-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-guard-outside-"));
+  try {
+    assert.ok(INSTALL_WRITE_TARGET_ENV_KEYS.length >= 2, "写目标清单不许为空：" + JSON.stringify(INSTALL_WRITE_TARGET_ENV_KEYS));
+    for (const k of INSTALL_WRITE_TARGET_ENV_KEYS) {
+      assert.throws(() => installerChildEnv({ env: {}, home, extra: { HOME: home, [k]: path.join(outside, "x") } }),
+        /越出本用例夹具/u, k + " 指到夹具外必须拒绝");
+      assert.equal(installerChildEnv({ env: {}, home, extra: { HOME: home, [k]: path.join(home, "x") } })[k],
+        path.join(home, "x"), k + " 在夹具内照旧生效");
+      assert.equal(installerChildEnv({ env: {}, home, extra: { HOME: home, [k]: path.join(outside, "x") },
+        declaredPrivateRoots: [outside] })[k], path.join(outside, "x"), k + " 在声明过的私有根内放行");
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("PK3-I247：父进程设的安装写目标覆盖点进不了安装器 —— 夹具外哨兵不被写（Claude 链同形调用）", () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "i247-outside-"));
+  const sentinelReceipt = path.join(outside, "installed-surface.json");
+  const sentinelLock = path.join(outside, "install-surface.lock");
+  const saved = Object.fromEntries(INSTALL_WRITE_TARGET_ENV_KEYS.map((k) => [k, process.env[k]]));
+  try {
+    process.env.FEISHU_BRIDGE_INSTALLED_SURFACE = sentinelReceipt;
+    process.env.FEISHU_BRIDGE_INSTALL_SURFACE_LOCK = sentinelLock;
+    // 与主线那条"沙箱真装（含空格 HOME）"用例同形的调用：真 install-outbound --apply
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "i247-claude-"));
+    const home = path.join(base, "我的 家");
+    fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const env = installerFixtureEnv({ HOME: home });
+    execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
+    assert.equal(fs.existsSync(sentinelReceipt), false, "继承的收据覆盖点不许进子进程（哨兵被写了）");
+    assert.equal(fs.existsSync(sentinelLock), false, "继承的安装面锁覆盖点不许进子进程（哨兵被写了）");
+    assert.equal(fs.existsSync(path.join(home, ".claude", "feishu-bridge", "installed-surface.json")), true,
+      "收据照常落在夹具里：" + JSON.stringify(fs.readdirSync(path.join(home, ".claude", "feishu-bridge"))));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
 
 test("doctor：坏机器 —— 六项各自 fail 且点名，退出码 1，只读，不泄露 locator（真实进程）", () => {
   const m = doctorMachine();
@@ -20181,10 +20426,11 @@ test("doctor：好机器 —— 没有 fail（非 darwin 上 Codex 侧 null 允�
   //   旧夹具只写 plist + runtime，是个自相矛盾的机器。这里跑**真安装器**（它自己会写 runtime / hooks / 技能），
   //   别手抄 hooks.json。
   {
+    //   PK3-I247：写盘调用一律经夹具环境清洗（继承的收据 / 安装面锁 / 桥根覆盖点剔掉，显式字段照旧）。
     const codexInstall = spawnSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], {
       encoding: "utf-8",
-      env: { ...process.env, HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
-        FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") },
+      env: installerChildEnv({ env: process.env, home: m.home, extra: { HOME: m.home, CODEX_HOME: path.join(m.home, ".codex"),
+        FEISHU_CODEX_BRIDGE_HOME: path.join(m.home, ".codex", "feishu-bridge") } }),
     });
     assert.equal(codexInstall.status, 0, "Codex 链要真装上：" + codexInstall.stdout + codexInstall.stderr);
   }
@@ -28207,7 +28453,7 @@ test("维护门 · PR B：安装器投影是纯函数且幂等，机器级收据
   assert.deepEqual(manifest.missing, []);
   for (const n of ["stop-hook.mjs", "inbound-hook.mjs", "init-hook.mjs", "bind-preview.mjs", "feishu-rotate.mjs", "drain-outbox.mjs", "watch-and-publish.mjs", "aily-inbound.mjs", "codex/prompt-hook.mjs", "codex/stop-hook.mjs", "codex/bind-task.mjs", "codex/drain-all.mjs", "doctor.mjs", "codex/doctor.mjs"]) assert.ok(manifest.entries.includes(n), "清单缺 " + n);
   // ── 沙箱真装（含空格 HOME）：收据在沙箱里、装完立刻对账通过、线上引用的脚本 ⊆ 清单；无关设置变化不挡，我们的 hook 变了才挡
-  const env = gateChildEnv({ HOME: home });
+  const env = installerFixtureEnv({ HOME: home });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
   const receipt = readInstalledSurface({ file: surface });
@@ -28249,7 +28495,7 @@ test("维护门 · PR C：预检拒绝五种漂移；进门两阶段记账、桩
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-c-"));
   const home = path.join(base, "home 带空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
@@ -28628,7 +28874,7 @@ test("维护门 · PR C 第 2 步：stage 不碰线上 → commit 写前 CAS →
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "gate-d-"));
   const home = path.join(base, "home 带空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
   execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
@@ -31350,7 +31596,7 @@ test("账本维护 operation：init 进门→shadow→B-4 重开→done；崩写
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -31615,7 +31861,7 @@ test("账本维护 CLI + B-3 收据聚合 + inspect 收据不染红 + doctor ⑬
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -31881,7 +32127,7 @@ test("账本维护 R20 二轮：P1-4 阶段矩阵、P1-5 收据聚合、P1-1 顶
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -32060,7 +32306,7 @@ test("账本维护 R21 三轮：P1-1 gate 出口吞租约释放失败仍报已�
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -32211,7 +32457,7 @@ test("账本维护 R22 四轮：P1-1 回退保留完整 rb（active 清不掉不
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -32359,7 +32605,7 @@ test("账本维护 R23 五轮：P1-1 聚合漂移（进行中 WAL 被滤掉仍�
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -32515,7 +32761,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -33198,7 +33444,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+    const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -33498,7 +33744,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+    const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -35655,7 +35901,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+    const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -35929,7 +36175,7 @@ test("账本维护 R25 六轮：P1 三形封闭 current↔operation 桩（prepar
     const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+    const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
       execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
     }
@@ -36014,7 +36260,7 @@ test("R46：init 门内自建 0700 账本根（父净、根缺席）→ 建根�
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -36160,7 +36406,7 @@ test("R46 返修 P1-1/P2：已初始化重跑不留空根（P2）；ledger_reope
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -36254,7 +36500,7 @@ test("R46 返修 P1-2 栅栏（真实流）：provision 在维护段内 advance 
   const home = path.join(base, "home 空格"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }
@@ -41410,7 +41656,7 @@ test("R50 返修七：写路径读回原始字节 SHA 核验变异刀防逃逸�
     const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r52-")));
     const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
     fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const ienv = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+    const ienv = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
     execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
     execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
     execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: ienv });
@@ -53470,7 +53716,7 @@ const r69Fixture = (tag, { inHome = false } = {}) => {
   const home = path.join(base, "home"); const codexHome = path.join(base, "codex-home"); const codexBridge = path.join(base, "codex-bridge");
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
   fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-  const env = gateChildEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome, FEISHU_CODEX_BRIDGE_HOME: codexBridge });
   for (const rel of ["install-outbound.mjs", "install-inbound.mjs", path.join("codex", "install.mjs")]) {
     execFileSync(process.execPath, [path.resolve("scripts", rel), "--apply"], { encoding: "utf-8", env });
   }

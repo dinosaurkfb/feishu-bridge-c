@@ -23,11 +23,18 @@ import { chainFacts, precheckStartupSources } from "./maintenance/precheck.mjs";
 import { enterMaintenance, exitMaintenance, maintenanceContext } from "./maintenance/operation.mjs";
 import { systemctl, timerCmd } from "./timer-exec.mjs";
 import { installSuiteTempRoot } from "./test-support/suite-temp-root.mjs";
+import { installerChildEnv, requireCleansedInstallerEnv } from "./test-support/purge-fixture-guard.mjs"; // PK3-I247：安装器写目标隔离
 
 // PK3-T2-fix1：这个入口也是测试，也要有本轮私有临时根 —— **在任何 mkdtemp 之前**装，
 // 装上之后越出私有根的 mkdtemp 当场 throw（硬门在退出时把 violations 汇总成非 0）。
 // 以前它直接往宿主 TMPDIR 造 pk3* 目录（实测一次全量在宿主 tmp 顶层新增 21 条）。
 installSuiteTempRoot();
+
+// PK3-I247-fix4（Codex 二轮 P1-1）：**这一套件整进程跑在临时 HOME 下**。本文件里有直接 execFileSync 安装器的用例，
+//   结构守卫在**另一套件**里（单跑本文件时它不会先拦）——2026-09-19 一把「把薄包装换成原样继承」的变异刀就是这样
+//   把 install-outbound --apply 打到了真 HOME（钩子与定时器被改坏）。入口先把 HOME 指到私有临时目录：
+//   即使某条调用漏了清洗，落点也在临时目录里，真机碰不到。
+process.env.HOME = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "linux-suite-home-"));
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLER = path.join(REPO, "scripts", "install-outbound.mjs");
@@ -216,13 +223,17 @@ const bridgeStopHook = (node) =>
 
 /** 安装器子进程的隔离环境：只碰夹具 HOME；机器级注入口一律显式清空（免得被外部环境改判）。 */
 function installerEnv(home, extra = {}) {
-  return { ...process.env, HOME: home,
+  // PK3-I247：安装器 / 卸载入口的子进程环境统一走 installerChildEnv（= purgeChildEnv + 写目标断言）——
+  // 继承的写目标 / 删除目标覆盖点（收据、安装面锁、桥根、覆盖文件）一律剔掉；下面这些显式字段照旧生效。
+  return installerChildEnv({ env: process.env, home, extra: {
     FEISHU_BRIDGE_MAINTENANCE_GATE: path.join(home, "maintenance.gate"),
     FEISHU_BRIDGE_INSTALLED_SURFACE: "", FEISHU_BRIDGE_INSTALL_SURFACE_LOCK: "",
     FEISHU_BRIDGE_LAUNCHCTL: "", FEISHU_BRIDGE_SYSTEMCTL: "", FEISHU_BRIDGE_TIMER_PLATFORM: "",
-    ...extra };
+    ...extra } });
 }
-const runInstaller = (env, args) => spawnSync(process.execPath, [INSTALLER, ...args], { encoding: "utf-8", env });
+// PK3-I247-fix3：转手入口在执行边界核验 env 直接来自 installerChildEnv（经 installerEnv）。
+const runInstaller = (env, args) =>
+  spawnSync(process.execPath, [INSTALLER, ...args], { encoding: "utf-8", env: requireCleansedInstallerEnv(env) });
 
 test("fix2/P1-1 installedNodeFrom：收据守门，来源按 hooks → 定时器；只认绝对路径", () => {
   const installed = "/opt/installed/node";
@@ -810,9 +821,11 @@ test("PK3-L3 预检与维护门：Linux + loaded 下正常进门，停定时器�
     FEISHU_CODEX_BRIDGE_HOME: codexBridge,
   });
   // 安装 outbound / inbound / codex
-  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env });
-  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env });
-  execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env });
+  // PK3-I247-fix4：直接调用也在启动前过执行边界核验（不只 runInstaller 那一条路）。
+  const childEnv = requireCleansedInstallerEnv(env);
+  execFileSync(process.execPath, [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", env: childEnv });
+  execFileSync(process.execPath, [path.resolve("scripts", "install-inbound.mjs"), "--apply"], { encoding: "utf-8", env: childEnv });
+  execFileSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", env: childEnv });
 
   // 假 systemctl：loaded 态
   const expected = claudeDrainExpectedJob({ home, node }).args;

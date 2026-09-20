@@ -233,7 +233,13 @@ if (problems.length === 0) {
 
 if (!uninstall) {
   if (!fs.existsSync(skillsRoot)) {
-    problems.push("技能根目录不存在：" + skillsRoot + "（用 --dir 指定别处）");
+    // **不存在 = 正常首次安装，不是"装不了"**（issue #254 同一类判据）：全新机器上
+    // `~/.claude/skills` 还没被建（Claude Code / aily 都没跑过）—— 而落盘那一步的
+    // `mkdirSync(DST, { recursive: true })` 本来就会把技能根一并建出来。
+    // 旧版把它当故障 exit 1，于是全新机器上**预览**（安装文档里的第一步）就跑不过去：
+    // `node scripts/install-inbound.mjs` → 「装不了：技能根目录不存在」，退 1。
+    // 不静默略过：写进计划（notes 会打成「注意」一行）。
+    notes.push("技能根目录不存在，将新建：" + skillsRoot);
   } else {
     // 必须是真实目录。aily 那边扫描时 readdir 不跟随符号链接 ——
     // 装成软链会得到一个「看着装好了、实际不被发现」的状态。

@@ -73,15 +73,27 @@ const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root:
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
 // hooks.json 的合并只有一份（codex/hook-command.mjs 的 renderCodexHooks）：让每个事件下恰好只剩一条我们的 hook，只动自己那一条 child。
+// **ENOENT 是"没有旧文件"**（全新机器上 hooks.json 本来就不存在）→ 空 settings 继续；
+// **文件在但读不了 / 不是合法 JSON** 是另一回事（issue #254 第 2 条，与 Claude 那条同一个口径）：
+// 坏着的全局配置不许被当成空的重写 —— 那里也有别人（以及本链旧版）写进去的钩子。
 let before = "";
 try { before = fs.readFileSync(HOOKS, "utf-8"); }
 catch (err) {
   if (err.code !== "ENOENT") {
-    console.error("hooks.json 读不了：" + err.message);
+    console.error("hooks.json 读不了（" + (err.code ?? "说不清") + "）：" + err.message + "\n" +
+      "  它是全局配置，**不当作空文件**继续（那会把里面别人的钩子一起覆盖掉）。什么都没做。");
     process.exit(1);
   }
 }
-const renderedHooks = renderCodexHooks({ baseText: before === "" ? null : before, promptScript, stopScript, node, home, log, uninstall });
+let renderedHooks;
+try {
+  renderedHooks = renderCodexHooks({ baseText: before === "" ? null : before, promptScript, stopScript, node, home, log, uninstall });
+} catch (err) {
+  console.error("hooks.json 用不了（" +
+    (err instanceof SyntaxError ? "不是合法 JSON：" + err.message : String(err?.message ?? err)) + "）：" + HOOKS + "\n" +
+    "  它不是空文件 —— 按空 settings 继续会把里面别人的钩子一起覆盖掉。请先修好它（或把它移走）再装。什么都没做。");
+  process.exit(1);
+}
 const hooks = renderedHooks.hooks;
 const promptAction = renderedHooks.actions.UserPromptSubmit;
 const stopAction = renderedHooks.actions.Stop;

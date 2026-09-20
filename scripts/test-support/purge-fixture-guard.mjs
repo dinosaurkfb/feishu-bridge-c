@@ -73,7 +73,7 @@ export function requireCleansedInstallerEnv(env) {
   if (env === null || typeof env !== "object" || !CLEANSED_INSTALLER_ENVS.has(env)) {
     throw new Error("安装器 / 卸载入口的子进程环境必须直接来自 installerChildEnv（执行边界核验：展开复制或原样继承都不算）");
   }
-  const { snapshot, home, declaredPrivateRoots } = CLEANSED_INSTALLER_ENVS.get(env);
+  const { snapshot, home, allowedForms, rootCanonicals } = CLEANSED_INSTALLER_ENVS.get(env);
   if (envSnapshot(env) !== snapshot) {
     throw new Error("清洗之后又改了 HOME / 写目标 / 删除目标 —— 拒绝启动安装器（认证过的环境不许再改：" + envSnapshot(env) + "）");
   }
@@ -82,7 +82,16 @@ export function requireCleansedInstallerEnv(env) {
   //   所以启动前按**登记时的夹具边界**（那时的 home 与声明的私有根，不是现在的 env）复核一次真实去向 ——
   //   越界判据里的 canonical 形态会 realpath 到链接的新目标。
   //   （我一度以为这是死分支删掉过，那是错的：symlink 改向正好绕过快照。）
-  const outside = writeTargetsOutsideFixture({ env: { ...env, HOME: home }, declaredPrivateRoots });
+  // PK3-I247-fix7（Codex 四轮 P1）：**允许范围也要冻结**。上一版在边界现算 realpath(home)：
+  //   认证后把 home（或声明的私有根）本身移走、原路径改成指向夹具外的 symlink，允许范围和写目标一起挪出去，
+  //   复核照样通过；默认写目标（没显式给、安装器按 HOME 派生的那些）更是直接跟着 HOME 去向走。
+  //   所以：① 根的真实去向必须与认证时一致（变了就拒，默认写目标也就跟着被拦）；② 越界判据用冻结的允许范围。
+  const movedRoots = rootCanonicals.filter(([root, canonical]) => canonicalPath(root) !== canonical);
+  if (movedRoots.length > 0) {
+    throw new Error("认证时的夹具根去向变了 —— 拒绝启动安装器（" +
+      movedRoots.map(([root, canonical]) => root + "：认证时 " + canonical + " → 现在 " + canonicalPath(root)).join("；") + "）");
+  }
+  const outside = writeTargetsOutsideFixture({ env: { ...env, HOME: home }, allowedForms });
   if (outside.length > 0) {
     throw new Error("安装写目标的真实去向越出本用例夹具 —— 拒绝启动安装器（夹具：" + home + "）：" + JSON.stringify(outside));
   }
@@ -96,8 +105,14 @@ export function installerChildEnv({ env = process.env, extra = {}, home = undefi
   if (outside.length > 0) {
     throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(outside));
   }
-  CLEANSED_INSTALLER_ENVS.set(childEnv,
-    { snapshot: envSnapshot(childEnv), home: targetHome, declaredPrivateRoots: [...declaredPrivateRoots] });
+  const roots = [targetHome, ...declaredPrivateRoots];
+  CLEANSED_INSTALLER_ENVS.set(childEnv, {
+    snapshot: envSnapshot(childEnv),
+    home: targetHome,
+    // 冻结：认证这一刻各根的 canonical 去向 + 由它们算出的允许范围（边界不再现算）。
+    rootCanonicals: roots.map((r) => [r, canonicalPath(r)]),
+    allowedForms: [...new Set(roots.flatMap(pathForms))],
+  });
   return childEnv;
 }
 
@@ -154,12 +169,13 @@ export function purgeTargetsOutsideFixture({ env, declaredPrivateRoots = [] } = 
  * 用例**显式**给的安装写目标（收据 / 安装面锁）越出夹具的那些（空数组 = 在界内或没给）。
  * 与删除目标同一口径：词法与 canonical 两种写法都要落在 home 或 declaredPrivateRoots 之下（PK3-U1-fix9）。
  */
-export function writeTargetsOutsideFixture({ env, declaredPrivateRoots = [] } = {}) {
+export function writeTargetsOutsideFixture({ env, declaredPrivateRoots = [], allowedForms: frozenForms = null } = {}) {
   const home = env?.HOME;
   if (typeof home !== "string" || home.length === 0) {
     throw new Error("写目标守卫：最终子进程环境里没有 HOME —— 没法判定夹具边界（用例写错了）");
   }
-  const allowedForms = [...new Set([home, ...declaredPrivateRoots].flatMap(pathForms))];
+  // frozenForms（PK3-I247-fix7）：执行边界传**认证时冻结**的允许范围 —— 现算会跟着根一起被改向挪走。
+  const allowedForms = frozenForms ?? [...new Set([home, ...declaredPrivateRoots].flatMap(pathForms))];
   return INSTALL_WRITE_TARGET_ENV_KEYS
     .map((k) => [k, env[k]])
     .filter(([, v]) => typeof v === "string" && v.length > 0 && !insideAll(v, allowedForms))

@@ -20100,6 +20100,39 @@ const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === i
 
 // 拿掉哪行会红：把 `installerFixtureEnv` 换回 `{ ...process.env, ... }`（不再调 installerChildEnv）→
 //   子进程会读到父进程设的收据 / 安装面锁覆盖点 → 红在「哨兵必须没被写」（收据或锁落在哨兵路径上）。
+// 拿掉哪行会红：requireCleansedInstallerEnv 里「根的真实去向必须与认证时一致」那一段（Codex 四轮 P1）→
+//   两条都红（根改向之后允许范围跟着挪走，越界判据自己发现不了）。
+test("PK3-I247-fix7：认证后把夹具根本身改指夹具外 —— 允许范围是冻结的，根改向即拒（含默认写目标）", () => {
+  const stem = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-root-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-root-outside-"));
+  try {
+    // ① HOME 本身改向：环境里连写目标都没显式给（安装器按 HOME 派生），认证后把 home 换成指向夹具外的链接
+    const home = path.join(stem, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const env = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    assert.equal(requireCleansedInstallerEnv(env), env, "认证时 home 是真目录 → 放行");
+    fs.renameSync(home, path.join(stem, "home.moved"));
+    fs.symlinkSync(outside, home, "dir");
+    assert.equal(env.HOME, home, "环境变量文本没变（快照与显式写目标都抓不到这一手）");
+    assert.throws(() => requireCleansedInstallerEnv(env), /夹具根去向变了/u, "HOME 改向之后必须拒");
+
+    // ② 声明的私有根改向：写目标落在那个私有根里
+    const home2 = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-root2-"));
+    const priv = path.join(stem, "priv");
+    fs.mkdirSync(priv, { recursive: true });
+    const env2 = installerChildEnv({ env: {}, home: home2,
+      extra: { HOME: home2, [INSTALL_WRITE_TARGET_ENV_KEYS[0]]: path.join(priv, "receipt.json") },
+      declaredPrivateRoots: [priv] });
+    assert.equal(requireCleansedInstallerEnv(env2), env2, "认证时私有根是真目录 → 放行");
+    fs.renameSync(priv, path.join(stem, "priv.moved"));
+    fs.symlinkSync(outside, priv, "dir");
+    assert.throws(() => requireCleansedInstallerEnv(env2), /夹具根去向变了/u, "私有根改向之后必须拒");
+  } finally {
+    fs.rmSync(stem, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 // 拿掉哪行会红：requireCleansedInstallerEnv 里按登记时夹具边界复核真实去向那一段（Codex 三轮 P1）→
 //   symlink 改指夹具外之后仍然放行，本用例红在第二个 assert.throws。
 test("PK3-I247-fix6：认证后把写目标路径上的 symlink 改指夹具外 —— 文本没变，启动边界仍按真实去向拒", () => {

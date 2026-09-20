@@ -20,6 +20,7 @@
  *        被换成指向夹具外的符号链接时，它进不来，它派生的目标会被报成越界；
  *      · 每个删除目标同样两种写法都要落在白名单里，**任一在夹具外即越界**。
  */
+import os from "node:os";
 import path from "node:path";
 
 import { PURGE_TARGET_ENV_KEYS, canonicalPath, machinePurgeTargets } from "../maintenance/install-footprint.mjs";
@@ -32,6 +33,8 @@ import { INSTALL_SURFACE_LOCK_ENV } from "../install-surface-lock.mjs";
  * 这些用例就会写到夹具外。变量名取产品自己的常量（同源），不手抄字符串。
  */
 export const INSTALL_WRITE_TARGET_ENV_KEYS = Object.freeze([INSTALLED_SURFACE_ENV, INSTALL_SURFACE_LOCK_ENV]);
+/** Codex 链安装器实际按它们写盘的根（PK3-I247-fix8）：hooks / 技能 / runtime 在 CODEX_HOME 下，桥目录另有覆盖点。 */
+export const DERIVED_WRITE_ROOT_ENV_KEYS = Object.freeze(["CODEX_HOME", "FEISHU_CODEX_BRIDGE_HOME"]);
 
 /** 子进程环境：剔掉全部删除目标覆盖点（继承值），置 HOME，再叠加用例显式给的 env。 */
 export function purgeChildEnv({ env = process.env, home, extra = {} } = {}) {
@@ -106,12 +109,30 @@ export function installerChildEnv({ env = process.env, extra = {}, home = undefi
     throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(outside));
   }
   const roots = [targetHome, ...declaredPrivateRoots];
+  const allowedForms = [...new Set(roots.flatMap(pathForms))];
+  // PK3-I247-fix8（Codex 五轮 P1）：**Codex 链的派生写入根也要管**。codex/install.mjs 按 CODEX_HOME 写
+  //   hooks / 技能 / runtime，桥目录还可由 FEISHU_CODEX_BRIDGE_HOME 指定 —— 它们是实打实的写入根，
+  //   却既不是 HOME 也不在 declaredPrivateRoots 里。认证后把夹具内的 CODEX_HOME 换成指向夹具外的链接，
+  //   环境文本与 HOME 去向都不变、又没显式给收据 / 锁目标时，旧判据一路放行。
+  //   所以：① 认证时它们必须落在夹具内（与显式写目标同一口径）；② 它们的 canonical 去向一起冻结、边界复核。
+  const derivedRoots = DERIVED_WRITE_ROOT_ENV_KEYS
+    .map((k) => childEnv[k]).filter((v) => typeof v === "string" && v.length > 0);
+  // 位置判据按**临时根**而不是 HOME：既有夹具普遍把 codex-home / codex-bridge 放在用例自己的临时目录里、
+  //   与 home 平级（那本来就在夹具内），按 HOME 判会误伤一大片（实测 170 条）。这里要挡的是"指向真实家目录
+  //   / 任何非临时位置"，所以允许范围 = 夹具（home + 私有根）∪ 本轮临时根。
+  const tempForms = pathForms(os.tmpdir());
+  const derivedOutside = derivedRoots
+    .filter((r) => !insideAll(r, allowedForms) && !insideAll(r, tempForms))
+    .map((r) => pathForms(r).join(" → "));
+  if (derivedOutside.length > 0) {
+    throw new Error("Codex 链的写入根既不在本用例夹具、也不在临时根下 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(derivedOutside));
+  }
   CLEANSED_INSTALLER_ENVS.set(childEnv, {
     snapshot: envSnapshot(childEnv),
     home: targetHome,
-    // 冻结：认证这一刻各根的 canonical 去向 + 由它们算出的允许范围（边界不再现算）。
-    rootCanonicals: roots.map((r) => [r, canonicalPath(r)]),
-    allowedForms: [...new Set(roots.flatMap(pathForms))],
+    // 冻结：认证这一刻各根（含 Codex 派生写入根）的 canonical 去向 + 由 home / 私有根算出的允许范围。
+    rootCanonicals: [...roots, ...derivedRoots].map((r) => [r, canonicalPath(r)]),
+    allowedForms,
   });
   return childEnv;
 }

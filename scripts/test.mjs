@@ -20100,6 +20100,40 @@ const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === i
 
 // 拿掉哪行会红：把 `installerFixtureEnv` 换回 `{ ...process.env, ... }`（不再调 installerChildEnv）→
 //   子进程会读到父进程设的收据 / 安装面锁覆盖点 → 红在「哨兵必须没被写」（收据或锁落在哨兵路径上）。
+// 拿掉哪行会红：installerChildEnv 里把 derivedRoots 并进 rootCanonicals 那一处（Codex 五轮 P1）→ ① 红；
+//   把 derivedOutside 那一支删掉 → ② 红。
+test("PK3-I247-fix8：Codex 链的写入根（CODEX_HOME / 桥根）也要在夹具内、改向也要拒", () => {
+  const stem = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-outside-"));
+  try {
+    // ① 认证后把夹具内的 CODEX_HOME 换成指向夹具外的链接：环境文本与 HOME 去向都没变，仍必须拒
+    const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-home-"));
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    const env = installerChildEnv({ env: {}, home, extra: { HOME: home, CODEX_HOME: codexHome } });
+    assert.equal(requireCleansedInstallerEnv(env), env, "认证时 CODEX_HOME 在夹具内 → 放行");
+    fs.renameSync(codexHome, path.join(stem, "codex.moved"));
+    fs.symlinkSync(outside, codexHome, "dir");
+    assert.equal(env.CODEX_HOME, codexHome, "环境变量文本没变（HOME 也没动，前几道判据都抓不到）");
+    assert.throws(() => requireCleansedInstallerEnv(env), /夹具根去向变了/u, "CODEX_HOME 改向之后必须拒");
+
+    // ② 认证时桥根就在夹具外 → 当场拒（与显式写目标同一口径）
+    const home2 = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-codex-home2-"));
+    // 位置判据按临时根（既有夹具普遍把 codex-home 放在用例临时目录里、与 home 平级）：指到真实家目录才拒
+    assert.throws(() => installerChildEnv({ env: {}, home: home2,
+      // 用一个**确定不在临时根下**的绝对路径代表"真实家目录"：套件把 HOME 指到临时目录，
+      //   os.homedir() 跟着 HOME 走，拿它当反例会落回临时根内、判不出来。
+      extra: { HOME: home2, FEISHU_CODEX_BRIDGE_HOME: path.join(path.parse(process.cwd()).root, "not-a-temp-root", ".codex", "feishu-bridge") } }),
+      /既不在本用例夹具、也不在临时根下/u, "桥根指到临时根之外（真机家目录那一类）就不许认证");
+    assert.ok(installerChildEnv({ env: {}, home: home2,
+      extra: { HOME: home2, FEISHU_CODEX_BRIDGE_HOME: path.join(outside, "bridge") } }),
+      "指到本轮临时根下的别处（夹具外但仍是临时目录）照旧放行 —— 既有夹具就是这么摆的");
+  } finally {
+    fs.rmSync(stem, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 // 拿掉哪行会红：requireCleansedInstallerEnv 里「根的真实去向必须与认证时一致」那一段（Codex 四轮 P1）→
 //   两条都红（根改向之后允许范围跟着挪走，越界判据自己发现不了）。
 test("PK3-I247-fix7：认证后把夹具根本身改指夹具外 —— 允许范围是冻结的，根改向即拒（含默认写目标）", () => {

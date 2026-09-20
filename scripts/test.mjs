@@ -258,7 +258,7 @@ import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, codexDrainUnitPaths, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
-import { INSTALL_WRITE_TARGET_ENV_KEYS, installerChildEnv, purgeChildEnv, purgeTargetsOutsideFixture, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7 / PK3-I247：真 purge 与安装器写盘的夹具边界
+import { INSTALL_WRITE_TARGET_ENV_KEYS, installerChildEnv, purgeChildEnv, purgeTargetsOutsideFixture, requireCleansedInstallerEnv, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7 / PK3-I247：真 purge 与安装器写盘的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
 import { artifactSha, compareInstalledSurface, inspectInstalledSurface, readInstalledSurface, receiptReport, recordInstalledSurface, withInstalledSurfaceLock } from "./installed-surface.mjs";
 import { maintenanceEntryManifest } from "./maintenance/maintenance-entries.mjs";
@@ -20100,6 +20100,33 @@ const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === i
 
 // 拿掉哪行会红：把 `installerFixtureEnv` 换回 `{ ...process.env, ... }`（不再调 installerChildEnv）→
 //   子进程会读到父进程设的收据 / 安装面锁覆盖点 → 红在「哨兵必须没被写」（收据或锁落在哨兵路径上）。
+// 拿掉哪行会红：requireCleansedInstallerEnv 的快照比对那一支（改回只查身份）→ ① 与 ② 红；
+//   去掉 WeakMap 身份判据 → ③ 与 ④ 红。
+test("PK3-I247-fix4：执行边界核验的是内容不只是身份 —— 认证后改写目标 / 展开复制 / 原样继承都拒绝启动", () => {
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-boundary-home-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-boundary-outside-"));
+  try {
+    // ① 清洗后改写目标 → 拒
+    const mutated = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    mutated[INSTALL_WRITE_TARGET_ENV_KEYS[0]] = path.join(outside, "receipt.json");
+    assert.throws(() => requireCleansedInstallerEnv(mutated), /清洗之后又改了/u, "改了写目标还放行 = 闸门形同虚设");
+    // ② 清洗后改 HOME（把夹具边界挪走）→ 拒
+    const movedHome = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    movedHome.HOME = outside;
+    assert.throws(() => requireCleansedInstallerEnv(movedHome), /清洗之后又改了/u, "改了 HOME 还放行");
+    // ③ 展开复制（内容一模一样）→ 拒：只有清洗入口产出的那一个对象算数
+    const clean = installerChildEnv({ env: {}, home, extra: { HOME: home } });
+    assert.throws(() => requireCleansedInstallerEnv({ ...clean }), /必须直接来自/u, "展开复制还放行");
+    // ④ 原样继承 → 拒
+    assert.throws(() => requireCleansedInstallerEnv(process.env), /必须直接来自/u, "原样继承还放行");
+    // ⑤ 没改过的照旧放行（别把闸门做成谁都过不去）
+    assert.equal(requireCleansedInstallerEnv(clean), clean);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 // 拿掉哪行会红：installerChildEnv 里 `if (outside.length > 0) { throw … }` 那一支 → 越界的显式写目标被放行，本用例红在 assert.throws。
 test("PK3-I247-fix2：installerChildEnv 对越出夹具的显式写目标拒绝启动（夹具内、声明过的私有根放行）", () => {
   const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-guard-home-"));

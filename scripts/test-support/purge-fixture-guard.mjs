@@ -61,10 +61,25 @@ export function purgeChildEnv({ env = process.env, home, extra = {} } = {}) {
  * requireCleansedInstallerEnv 核验 —— 只认**同一个对象**，展开复制（{ ...env }）或原样继承（process.env）都不算。
  * 这样即使源码扫描认不出某种写法，把薄包装改回原样继承也会在运行时当场炸，而不是静默写夹具外。
  */
-const CLEANSED_INSTALLER_ENVS = new WeakSet();
+const CLEANSED_INSTALLER_ENVS = new WeakMap();
+/**
+ * PK3-I247-fix4（Codex 二轮 P1-2）：**身份不够，还要核内容**。登记的是可变对象，清洗之后把 HOME 或写目标
+ * 改成夹具外的路径，只查身份就仍然放行。所以登记时按快照记下 HOME、写目标、删除目标与声明的私有根，
+ * 执行边界再比一遍：**改过就拒**（并且重新跑一次越界判据，快照本身也不可信时照样拦）。
+ */
+const envSnapshot = (env) => JSON.stringify([env.HOME ?? null,
+  ...PURGE_TARGET_ENV_KEYS.map((k) => env[k] ?? null), ...INSTALL_WRITE_TARGET_ENV_KEYS.map((k) => env[k] ?? null)]);
 export function requireCleansedInstallerEnv(env) {
   if (env === null || typeof env !== "object" || !CLEANSED_INSTALLER_ENVS.has(env)) {
     throw new Error("安装器 / 卸载入口的子进程环境必须直接来自 installerChildEnv（执行边界核验：展开复制或原样继承都不算）");
+  }
+  const { snapshot, declaredPrivateRoots } = CLEANSED_INSTALLER_ENVS.get(env);
+  if (envSnapshot(env) !== snapshot) {
+    throw new Error("清洗之后又改了 HOME / 写目标 / 删除目标 —— 拒绝启动安装器（认证过的环境不许再改：" + envSnapshot(env) + "）");
+  }
+  const outside = writeTargetsOutsideFixture({ env, declaredPrivateRoots });
+  if (outside.length > 0) {
+    throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器：" + JSON.stringify(outside));
   }
   return env;
 }
@@ -76,7 +91,7 @@ export function installerChildEnv({ env = process.env, extra = {}, home = undefi
   if (outside.length > 0) {
     throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(outside));
   }
-  CLEANSED_INSTALLER_ENVS.add(childEnv);
+  CLEANSED_INSTALLER_ENVS.set(childEnv, { snapshot: envSnapshot(childEnv), declaredPrivateRoots: [...declaredPrivateRoots] });
   return childEnv;
 }
 

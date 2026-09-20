@@ -73,13 +73,19 @@ export function requireCleansedInstallerEnv(env) {
   if (env === null || typeof env !== "object" || !CLEANSED_INSTALLER_ENVS.has(env)) {
     throw new Error("安装器 / 卸载入口的子进程环境必须直接来自 installerChildEnv（执行边界核验：展开复制或原样继承都不算）");
   }
-  const { snapshot } = CLEANSED_INSTALLER_ENVS.get(env);
+  const { snapshot, home, declaredPrivateRoots } = CLEANSED_INSTALLER_ENVS.get(env);
   if (envSnapshot(env) !== snapshot) {
     throw new Error("清洗之后又改了 HOME / 写目标 / 删除目标 —— 拒绝启动安装器（认证过的环境不许再改：" + envSnapshot(env) + "）");
   }
-  // 这里**不再**重跑一遍越界判据：登记发生在 installerChildEnv 里（那时越界已经拒过），
-  //   而快照相等 = HOME 与所有写目标 / 删除目标一个字都没改 —— 再查一遍是永远红不了的死分支
-  //   （刀测证实：删掉它没有任何用例会红）。要守的是"认证之后被改"，那正是上面那一支。
+  // PK3-I247-fix6（Codex 三轮 P1）：**文本没变不等于去向没变**。写目标路径上的某一段是 symlink 时，
+  //   认证之后把它改指夹具外，环境变量一个字都没动（快照照样相等），安装器却会沿新去向写到夹具外。
+  //   所以启动前按**登记时的夹具边界**（那时的 home 与声明的私有根，不是现在的 env）复核一次真实去向 ——
+  //   越界判据里的 canonical 形态会 realpath 到链接的新目标。
+  //   （我一度以为这是死分支删掉过，那是错的：symlink 改向正好绕过快照。）
+  const outside = writeTargetsOutsideFixture({ env: { ...env, HOME: home }, declaredPrivateRoots });
+  if (outside.length > 0) {
+    throw new Error("安装写目标的真实去向越出本用例夹具 —— 拒绝启动安装器（夹具：" + home + "）：" + JSON.stringify(outside));
+  }
   return env;
 }
 
@@ -90,7 +96,8 @@ export function installerChildEnv({ env = process.env, extra = {}, home = undefi
   if (outside.length > 0) {
     throw new Error("安装写目标越出本用例夹具 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(outside));
   }
-  CLEANSED_INSTALLER_ENVS.set(childEnv, { snapshot: envSnapshot(childEnv) });
+  CLEANSED_INSTALLER_ENVS.set(childEnv,
+    { snapshot: envSnapshot(childEnv), home: targetHome, declaredPrivateRoots: [...declaredPrivateRoots] });
   return childEnv;
 }
 

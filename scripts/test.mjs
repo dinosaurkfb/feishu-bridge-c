@@ -20100,6 +20100,31 @@ const checkOf = (report, id) => { const c = report.checks.find((x) => x.id === i
 
 // 拿掉哪行会红：把 `installerFixtureEnv` 换回 `{ ...process.env, ... }`（不再调 installerChildEnv）→
 //   子进程会读到父进程设的收据 / 安装面锁覆盖点 → 红在「哨兵必须没被写」（收据或锁落在哨兵路径上）。
+// 拿掉哪行会红：requireCleansedInstallerEnv 里按登记时夹具边界复核真实去向那一段（Codex 三轮 P1）→
+//   symlink 改指夹具外之后仍然放行，本用例红在第二个 assert.throws。
+test("PK3-I247-fix6：认证后把写目标路径上的 symlink 改指夹具外 —— 文本没变，启动边界仍按真实去向拒", () => {
+  const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-link-home-"));
+  const outside = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "i247-link-outside-"));
+  try {
+    const inside = path.join(home, "inside");
+    fs.mkdirSync(inside, { recursive: true });
+    const link = path.join(home, "link");
+    fs.symlinkSync(inside, link, "dir");                       // 认证时：link → 夹具内
+    const key = INSTALL_WRITE_TARGET_ENV_KEYS[0];
+    const env = installerChildEnv({ env: {}, home, extra: { HOME: home, [key]: path.join(link, "receipt.json") } });
+    assert.equal(requireCleansedInstallerEnv(env), env, "认证时链接在夹具内 → 放行");
+    const before = env[key];
+    fs.unlinkSync(link);
+    fs.symlinkSync(outside, link, "dir");                      // 认证后：同一个文本，去向改到夹具外
+    assert.equal(env[key], before, "环境变量文本一个字都没变（快照比对抓不到这一手）");
+    assert.throws(() => requireCleansedInstallerEnv(env), /真实去向越出本用例夹具/u,
+      "symlink 改向之后必须拒 —— 否则安装器会沿新去向写到夹具外");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 // 拿掉哪行会红：requireCleansedInstallerEnv 的快照比对那一支（改回只查身份）→ ① 与 ② 红；
 //   去掉 WeakMap 身份判据 → ③ 与 ④ 红。
 test("PK3-I247-fix4：执行边界核验的是内容不只是身份 —— 认证后改写目标 / 展开复制 / 原样继承都拒绝启动", () => {

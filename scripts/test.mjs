@@ -20124,10 +20124,26 @@ test("PK3-I247-fix8：Codex 链的写入根（CODEX_HOME / 桥根）也要在夹
       // 用一个**确定不在临时根下**的绝对路径代表"真实家目录"：套件把 HOME 指到临时目录，
       //   os.homedir() 跟着 HOME 走，拿它当反例会落回临时根内、判不出来。
       extra: { HOME: home2, FEISHU_CODEX_BRIDGE_HOME: path.join(path.parse(process.cwd()).root, "not-a-temp-root", ".codex", "feishu-bridge") } }),
-      /既不在本用例夹具、也不在临时根下/u, "桥根指到临时根之外（真机家目录那一类）就不许认证");
+      /既不在本用例夹具、也不在本轮私有根下/u, "桥根指到本轮私有根之外（真机家目录那一类）就不许认证");
     assert.ok(installerChildEnv({ env: {}, home: home2,
       extra: { HOME: home2, FEISHU_CODEX_BRIDGE_HOME: path.join(outside, "bridge") } }),
-      "指到本轮临时根下的别处（夹具外但仍是临时目录）照旧放行 —— 既有夹具就是这么摆的");
+      "指到本轮私有根下的别处（夹具外但仍在本轮根内）照旧放行 —— 既有夹具就是这么摆的");
+    // ③ 放宽只认**套件持有的那棵私有根**：把 TMPDIR 改指另一棵私有目录，它下面的派生根照样要拒
+    //    （否则认证前改一下 TMPDIR 就能把任意位置洗成"临时目录"，canonical 冻结只会把错误去向固定下来）。
+    //    （这棵"别处的临时树"只能写成路径、不能真建：临时目录硬门不许在本轮私有根之外 mkdtemp。）
+    const otherTmp = path.join(path.parse(process.cwd()).root, "not-this-run-tmp");
+    const savedTmpdir = process.env.TMPDIR;
+    try {
+      process.env.TMPDIR = otherTmp;
+      assert.throws(() => installerChildEnv({ env: {}, home: home2,
+        extra: { HOME: home2, CODEX_HOME: path.join(otherTmp, ".codex") } }),
+        /既不在本用例夹具、也不在本轮私有根下/u, "TMPDIR 被改指别处时，那下面的派生根不算数");
+      assert.ok(installerChildEnv({ env: {}, home: home2,
+        extra: { HOME: home2, CODEX_HOME: path.join(outside, ".codex") } }),
+        "本轮私有根内的平级目录仍放行（判据取的是套件持有的根，不是 TMPDIR）");
+    } finally {
+      if (savedTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = savedTmpdir;
+    }
   } finally {
     fs.rmSync(stem, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });

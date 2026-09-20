@@ -25,6 +25,7 @@ import path from "node:path";
 
 import { PURGE_TARGET_ENV_KEYS, canonicalPath, machinePurgeTargets } from "../maintenance/install-footprint.mjs";
 import { INSTALLED_SURFACE_ENV } from "../installed-surface.mjs";
+import { currentSuiteTempRoot } from "./suite-temp-root.mjs";
 import { INSTALL_SURFACE_LOCK_ENV } from "../install-surface-lock.mjs";
 
 /**
@@ -120,12 +121,17 @@ export function installerChildEnv({ env = process.env, extra = {}, home = undefi
   // 位置判据按**临时根**而不是 HOME：既有夹具普遍把 codex-home / codex-bridge 放在用例自己的临时目录里、
   //   与 home 平级（那本来就在夹具内），按 HOME 判会误伤一大片（实测 170 条）。这里要挡的是"指向真实家目录
   //   / 任何非临时位置"，所以允许范围 = 夹具（home + 私有根）∪ 本轮临时根。
-  const tempForms = pathForms(os.tmpdir());
+  //   放宽只认**套件自己持有的那棵私有根**（PK3-I247-fix9，Codex 六轮 P1）：os.tmpdir() 跟着 TMPDIR 走，
+  //   认证前把 TMPDIR 改指夹具外，那下面的 CODEX_HOME 就能混过位置判据，随后的 canonical 冻结只会把这个
+  //   错误去向固定下来。根没装（不是在套件里跑）时**不给这条放宽** —— 那时只认夹具。
+  const suiteRoot = currentSuiteTempRoot()?.root ?? null;
+  const tempForms = typeof suiteRoot === "string" && suiteRoot.length > 0 ? pathForms(suiteRoot) : [];
   const derivedOutside = derivedRoots
     .filter((r) => !insideAll(r, allowedForms) && !insideAll(r, tempForms))
     .map((r) => pathForms(r).join(" → "));
   if (derivedOutside.length > 0) {
-    throw new Error("Codex 链的写入根既不在本用例夹具、也不在临时根下 —— 拒绝启动安装器（夹具：" + targetHome + "）：" + JSON.stringify(derivedOutside));
+    throw new Error("Codex 链的写入根既不在本用例夹具、也不在本轮私有根下 —— 拒绝启动安装器（夹具：" + targetHome +
+      "，本轮私有根：" + (suiteRoot ?? "未安装") + "）：" + JSON.stringify(derivedOutside));
   }
   CLEANSED_INSTALLER_ENVS.set(childEnv, {
     snapshot: envSnapshot(childEnv),

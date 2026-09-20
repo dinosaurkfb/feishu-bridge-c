@@ -10076,13 +10076,18 @@ test("PK3-T2-fix4：判据按「可能生成的名字」——四类边界（三
     const siblingDir = path.dirname(fakeRoot);
     const sibSig = (base) => (n) => n.startsWith(base) && /^[A-Za-z0-9]{6}$/u.test(n.slice(base.length));
     const sibOfRoot = sibSig(path.basename(fakeRoot));
-    // 正控：用装包装前的原函数真造一个“根的兄弟”（就是这条断言要抓的那个形状），断言匹配器认得出它，
-    // 随后再清掉 —— 否则下面那条 [] 是空的（空转的断言改坏了也照样绿）。
+    // 正控（确定性判定，不依赖父目录清单恰好只有这一个匹配项 —— 那条旧断言偶发红，issue #253）：
+    // 用装包装前的原函数真造一个“根的兄弟”（就是这条断言要抓的那个形状），
+    // 直接对它的 basename 跑匹配器断言为真；再钉一个不该匹配的形状为假。造完照旧清掉。
     const fakeSibling = rawMkdtempSync(path.join(siblingDir, path.basename(fakeRoot)));
-    assert.deepEqual(fs.readdirSync(siblingDir).filter(sibOfRoot), [path.basename(fakeSibling)],
-      "正控：匹配器必须认得 Node 生成的 basename(根) + 六位后缀");
-    fs.rmSync(fakeSibling, { recursive: true, force: true });
-    assert.deepEqual(fs.readdirSync(siblingDir).filter(sibOfRoot), [], "正控清掉之后根没有兄弟");
+    try {
+      assert.equal(sibOfRoot(path.basename(fakeSibling)), true,
+        "正控：匹配器必须认得 Node 生成的 basename(根) + 六位后缀（" + path.basename(fakeSibling) + "）");
+      assert.equal(sibOfRoot(path.basename(fakeRoot) + "ab"), false, "反控：后缀位数不对（两位）不许匹配");
+      assert.equal(sibOfRoot(path.basename(fakeRoot) + "a-bcde"), false, "反控：含非字母数字不许匹配");
+    } finally {
+      fs.rmSync(fakeSibling, { recursive: true, force: true });
+    }
     const beforeSiblings = new Set(fs.readdirSync(siblingDir));
     assert.throws(() => fs.mkdtempSync(path.join(fakeRoot, "..", path.basename(fakeRoot))), /临时目录硬门/u, "sync：mkdtempSync(根) 要拒");
     assert.throws(() => fs.mkdtemp(path.join(fakeRoot, "..", path.basename(fakeRoot)), () => {}), /临时目录硬门/u, "callback：同样拒");

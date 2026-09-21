@@ -29,12 +29,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
+import { gitBlobHash, runtimeScript, sourceCommit, verifyRuntime } from "./runtime-install.mjs";
 import { referencedRuntimeScripts, renderClaudeSkill } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
+import { expectCommitVerdict, sourceCommitLine } from "./expect-commit.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 /**
@@ -48,19 +49,28 @@ const RUNTIME_BRIDGE_ROOT = path.dirname(path.dirname(runtimeScript("aily-inboun
 // HOME 含空格时裸路径会被 shell 拆词，入站直接不可用。
 const renderSkill = (text) => renderClaudeSkill(text, { home: os.homedir() });
 
-/**
- * 将要装进去的那份文本 —— **计划、写入、装完自检必须共用它**。
- *
- * 上一版只在写入那一步渲染，比较和自检仍拿未渲染的源码去比：装对了也会永远报 update，
- * 自检还会说"写入后内容不一致"。渲染类安装器最容易在这里裂成两套真相，所以只留一个出口。
- */
-const expectedContent = (f) =>
-  f === "SKILL.md"
-    ? renderSkill(fs.readFileSync(path.join(SRC, f), "utf-8"))
-    : fs.readFileSync(path.join(SRC, f), "utf-8");
 const SKILL_NAME = "m5claude-inbound-router";
 const SRC = path.join(ROOT, "skills", SKILL_NAME);
 const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".claude", "skills");
+
+/** 技能源文件的**唯一一份读**（PK3-I257-fix3）：模块级先声明（expectedContent 是模块级 const，
+ *  闭包只看得到模块作用域），CLI 段在跑之前把它填满。import 这个模块（用例 / doctor）不会因此读任何文件。 */
+let sourceBytes = new Map();
+
+/**
+ * 将要装进去的那份文本 —— **计划、写入、装完自检、收据必须共用它，而且只读一次源**（PK3-I257-fix3）。
+ *
+ * 上一版只在写入那一步渲染，比较和自检仍拿未渲染的源码去比：装对了也会永远报 update，
+ * 自检还会说"写入后内容不一致"。渲染类安装器最容易在这里裂成两套真相，所以只留一个出口。
+ * fix3 P1：这个出口现在必须从 `sourceBytes`（那份**只读一次**的 buffer）渲染 —— 不许再碰磁盘，
+ * 否则“提交核对过的字节”与“装进去的字节”又是两次读取。
+ */
+const expectedContent = (f) => {
+  const buf = sourceBytes.get(f);
+  if (buf === undefined || buf === null) throw new Error("源文件没读进来（该情况已被 problems 拦住）：" + f);
+  const text = buf.toString("utf-8");
+  return f === "SKILL.md" ? renderSkill(text) : text;
+};
 
 /**
  * 探测本身失败的原因（PK3-I241）：**不许**把"命令跑不起来"说成"daemon 没跑"。
@@ -147,25 +157,52 @@ const arg = (n) => {
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
+// ---------- 装之前先验源 ----------
+//
+// **每个源文件只读一次**（PK3-I257-fix3 P1）：读进内存 → 在这份 buffer 上算 git blob（提交核对）
+// → 就用它渲染/落盘/自检/记收据。旧版 `expectedContent` 每次调用都重读一遍源文件（计划、对比、
+// 写入、收据、自检共五次），于是“核对的字节”与“装进去的字节”是两次读取，中间有窗口。
+// 源文件不在 → 记 null（下面照旧报“源文件缺失”，而 inventory 少一项也就会被提交核对点名“少了”）。
+const MANIFEST = "aily-cli-skill.json";
+const files = ["SKILL.md", MANIFEST];
+for (const f of files) {
+  try { sourceBytes.set(f, fs.readFileSync(path.join(SRC, f))); }
+  catch { sourceBytes.set(f, null); }
+}
+// **提交身份与源文件同一时刻取一次**（fix4 P1）：闸与结语共用这个值，后面不再读 HEAD。
+//   （这个安装器没有 runtime 计划可依靠 —— 那就把“读源”与“取身份”放到同一刻，之后一路传下去。）
+const COMMIT = sourceCommit(ROOT);
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
+// （技能 / 收据 / 安装面锁都算）。判据吃的是**上面那份只读一次的 buffer**（fix3 P1）；
+// 卸载路径不拷任何源文件 → 只核 HEAD 那半条。
+const sourceInventory = uninstall ? null : files
+  .filter((f) => sourceBytes.get(f) !== null)
+  .map((f) => ({ path: path.relative(ROOT, path.join(SRC, f)), blob: gitBlobHash(sourceBytes.get(f)) }));
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, actual: COMMIT, inventory: sourceInventory,
+  // 入站只拷 `files` 里那几个文件 —— scope **精确到那几个**（与 files 同源，不写第二份清单）。
+  // 说到整个技能目录的话，以后那个目录里提交一个不安装的普通文件，干净检出也会被误报 "missing"（fix4 P2）。
+  scope: files.map((f) => path.relative(ROOT, path.join(SRC, f))) });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
+
 const skillsRoot = arg("dir") ?? DEFAULT_SKILLS_ROOT;
 const DST = path.join(skillsRoot, SKILL_NAME);
 
 const problems = [];
 const notes = [];
 
-// ---------- 装之前先验源 ----------
-
-const MANIFEST = "aily-cli-skill.json";
-const files = ["SKILL.md", MANIFEST];
-
 for (const f of files) {
-  if (!fs.existsSync(path.join(SRC, f))) problems.push("源文件缺失：" + path.join(SRC, f));
+  if (sourceBytes.get(f) === null) problems.push("源文件缺失：" + path.join(SRC, f));
 }
 
 let manifest = null;
 if (problems.length === 0) {
   try {
-    manifest = JSON.parse(fs.readFileSync(path.join(SRC, MANIFEST), "utf-8"));
+    manifest = JSON.parse(sourceBytes.get(MANIFEST).toString("utf-8"));
   } catch (err) {
     problems.push(MANIFEST + " 不是合法 JSON：" + err.message);
   }
@@ -210,7 +247,7 @@ if (problems.length === 0) {
   //
   // 正确做法是问模板"你声明了哪些脚本"，而不是问渲染产物"你看起来像什么路径"。
   // 声明是受控的（{{SCRIPT:name}}），路径由我们自己拼，不经过 shell 文本这一层。
-  const declared = [...fs.readFileSync(path.join(SRC, "SKILL.md"), "utf-8")
+  const declared = [...sourceBytes.get("SKILL.md").toString("utf-8")
     .matchAll(/\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu)].map((m) => m[1]);
   if (declared.length === 0) problems.push("SKILL.md 里找不到要执行的脚本路径");
   for (const name of new Set(declared)) {
@@ -290,7 +327,9 @@ if (problems.length > 0) {
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
-  process.exit(0);
+  // PK3-I257：预览不写盘，所以它不「拒绝」而是**报告** —— 计划已打完（含上面那行结论），但核对不通过
+  // 必须反映在退出码上。
+  process.exit(GATE.ok ? 0 : 2);
 }
 
 // ---------- 落盘 ----------
@@ -303,9 +342,9 @@ if (uninstall) {
 
 fs.mkdirSync(DST, { recursive: true });
 for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), { mode: 0o600 });
+const installedVersion = verifyRuntime().version ?? null;
 {
   // 机器级安装收据（维护门 PR B）：入站技能也是线上制品，按 path 合并进 claude 链的收据
-  const installedVersion = verifyRuntime().version ?? null;
   const artifacts = files.map((f) => ({ path: path.join(DST, f), kind: "skill", sha256: artifactSha({ kind: "skill", text: expectedContent(f) }) }));
   const scripts = referencedRuntimeScripts(files.map((f) => expectedContent(f)).join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
@@ -317,6 +356,8 @@ for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), {
 // ---------- 装完自检 ----------
 
 console.log("\n已写入。自检：");
+// PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
+console.log(sourceCommitLine({ commit: COMMIT, version: installedVersion }));   // fix4：与闸同一个值
 for (const f of files) {
   const same = expectedContent(f) === fs.readFileSync(path.join(DST, f), "utf-8");
   console.log("  " + (same ? "✓" : "✗") + " " + f + (same ? " 与预期一致" : " 写入后内容不一致"));

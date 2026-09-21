@@ -23,9 +23,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "./direct-run.mjs";
+import { expectCommitVerdict, sourceCommitLine } from "./expect-commit.mjs";
 
 import {
-  applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
+  applyRuntimeSync, planRuntimeSync, runtimeScript, sourceCommit, verifyRuntime,
 } from "./runtime-install.mjs";
 import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, AILY_DAEMON_UNIT, ailyDaemonPlan, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, foreignAilyDaemonUnits, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill, resolveAilyCli } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, readInstalledSurface, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
@@ -73,12 +74,33 @@ const uninstall = process.argv.includes("--uninstall");
 // 顺序很重要：**先同步代码，再改 settings**。反过来的话，中间那一刻钩子已经指向
 // runtime，而 runtime 里还没有脚本 —— 钩子命令的 `[ -r … ]` 守卫会让它静默跳过，
 // 于是那段时间里结束的会话不会有任何出站，也不会有任何报错。
-const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT });
+//
+// `withContents`：把读到的**那份 buffer** 留在计划里（PK3-I257-fix3）—— 技能的渲染与提交核对
+// 都用它，不再回源文件重读一次（那样核对的字节与装进去的字节是两次读取，中间有窗口）。
+const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, withContents: true });
 if (runtimePlan && !runtimePlan.ok) {
   console.error("运行时代码无法准备（" + runtimePlan.reason +
     (runtimePlan.file ? "：" + runtimePlan.file : "") + "）。什么都没做。");
   process.exit(1);
 }
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 必须在**任何写盘之前**（settings / runtime / 技能 /
+// 收据 / 定时器 / 安装面锁都算）。判据吃的是**计划里那份字节**（files[].blob 与 planRuntimeSync 同一次读取），
+// 不是另跑一趟工作树遍历（fix3 P1）。
+//
+// **提交身份也只取一次**（fix4 P1）：就是计划里记的那个 —— 闸与结语共用 `COMMIT`，后面不再读 HEAD。
+// 旧版闸与结语各自 `rev-parse` 一次，于是“在 A 上生成计划 → 闸之前切到 B”会让闸按 B 放行，
+// 而收据（来自计划）记 A、结语说 B。卸载路径没有计划（runtimePlan 为 null）→ 此处现读一次。
+const COMMIT = uninstall || runtimePlan === null ? sourceCommit(ROOT) : runtimePlan.sourceCommit;
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, actual: COMMIT, inventory: runtimePlan?.files ?? null });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  // 参数本身不合法（两种模式都拒）或写盘路径上核对不通过 —— 零写。
+  // 预览不在这里退：它本来就零写，任务是「把结论写进计划」（退出码在下面）。
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
+
 
 // ---------- settings.json（投影在 install-projection.mjs：只动自己的 hook 与预览放行规则）----------
 //
@@ -185,6 +207,21 @@ const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
 // 渲染只有一份（install-projection.mjs）：`{{SCRIPT:x.mjs}}` → 加了 shell 引号的 runtime 路径。
 const renderSkill = (src) => renderClaudeSkill(src, { home: os.homedir() });
+/**
+ * 技能源的**唯一一份读**：从计划里那份 buffer 取（PK3-I257-fix3）。
+ *
+ * 旧版在这里每次调用都回源文件重读一遍，而计划早就自己读过一次 —— 两次读取之间的改动会让
+ * “核对的字节”与“装进去的字节”分开（fix2 的评审点就是这个）。取不到就是计划没读到它
+ *（不该发生），fail-closed 而不是静默回退到再读一次。
+ */
+const sourceText = (rel) => {
+  const buf = runtimePlan?.contents?.get(rel);
+  if (buf === undefined) {
+    console.error("技能源不在本次计划里（" + rel + "）—— 不重读源文件，直接当失败。什么都没做。");
+    process.exit(1);
+  }
+  return buf.toString("utf-8");
+};
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
@@ -194,13 +231,17 @@ const skillPlan = SKILLS.map((sk) => {
   if (uninstall) {
     return { ...sk, srcFile, dstFile, action: fs.existsSync(dstFile) ? "will-remove" : "already-absent" };
   }
-  if (!fs.existsSync(srcFile)) return { ...sk, srcFile, dstFile, action: "source-missing" };
-  const src = renderSkill(fs.readFileSync(srcFile, "utf-8"));
+  const rel = path.relative(ROOT, srcFile);
+  if (runtimePlan?.contents?.get(rel) === undefined) return { ...sk, srcFile, dstFile, action: "source-missing" };
+  // **渲染一次就留着**：写入与收据都用这一份（旧版在这三处各重读+重渲一遍）。
+  const text = renderSkill(sourceText(rel));
   let dst = null;
   try { dst = fs.readFileSync(dstFile, "utf-8"); } catch { /* 还没装 */ }
-  return { ...sk, srcFile, dstFile,
-    action: dst === src ? "unchanged" : dst === null ? "will-install" : "will-update" };
+  return { ...sk, srcFile, dstFile, text,
+    action: dst === text ? "unchanged" : dst === null ? "will-install" : "will-update" };
 });
+/** 计划里那个技能的源文件文本 —— 写入与收据共用它（渲染后已存在 sk.text）。 */
+const skillTextOf = (sk) => sk.text;
 
 const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "source-missing"
   : skillPlan.every((s) => s.action === "unchanged") ? "unchanged"
@@ -305,7 +346,9 @@ if (skillAction === "source-missing") {
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才真的落盘。");
-  process.exit(0);
+  // PK3-I257：预览不做写盘动作，所以它不「拒绝」而是**报告** —— 计划已经打完了（含上面那行期望提交的
+  // 结论），但核对不通过必须反映在退出码上，否则 `&&` 串联的安装步骤照样往下走。
+  process.exit(GATE.ok ? 0 : 2);
 }
 
 // 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
@@ -325,6 +368,9 @@ const writeJsonAtomic = (file, obj) => {
 };
 
 // 先把运行时代码落地，再动 settings。见上面 runtimePlan 处对顺序的说明。
+// `runtimeReceiptCommit`：**版本目录里那份不可变收据**记的来源提交（fix5 P1-2）。同字节再装一次是 no-op，
+//   收据不会被改写 —— 于是它可能与本次核对的 COMMIT 不同，结语要把两个都说出来。
+let runtimeReceiptCommit = null;
 if (runtimePlan) {
   const synced = applyRuntimeSync(runtimePlan);
   if (!synced.ok) {
@@ -339,7 +385,8 @@ if (runtimePlan) {
       "）。settings 未改动。");
     process.exit(1);
   }
-  console.log("运行时   : 已装 " + checked.version + " 并校验通过");
+  runtimeReceiptCommit = checked.sourceCommit ?? null;
+  console.log("运行时   : 已装 " + checked.version + " 并校验通过" + (synced.noop ? "（与线上同一份内容，未重装）" : ""));
 }
 
 // 内容没变就别动这个文件。反复重写只会攒出一堆备份，还平白给一份别人也在用的
@@ -406,7 +453,8 @@ for (const sk of skillPlan) {
     fs.rmSync(path.dirname(sk.dstFile), { recursive: true, force: true });
   } else {
     fs.mkdirSync(path.dirname(sk.dstFile), { recursive: true });
-    fs.writeFileSync(sk.dstFile, renderSkill(fs.readFileSync(sk.srcFile, "utf-8")), { mode: 0o600 });
+    // 写的是计划里那份渲染结果（不重读源文件、也不重渲染）：核对的字节与落盘的字节是同一份。
+    fs.writeFileSync(sk.dstFile, skillTextOf(sk), { mode: 0o600 });
   }
 }
 
@@ -556,20 +604,25 @@ if (!uninstall) {
       sha256: artifactSha({ kind: TIMER_PLAN.kind === "launchd" ? "plist" : "file", text: f.text }) })),
     // aily daemon 的 systemd 单元（linux）：与定时器单元同类 —— 都是本桥写进用户级 systemd 的机器级制品。
     ...AILY_PLAN.files.map((f) => ({ path: f.path, kind: "file", sha256: artifactSha({ kind: "file", text: f.text }) })),
-    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
+    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: skillTextOf(sk) }) })),
   ];
   const timerText = TIMER_FILES.map((f) => f.text).join("\n");
   const timerTextAll = timerText + AILY_PLAN.files.map((f) => f.text).join("\n");
-  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerTextAll, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
+  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerTextAll, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => skillTextOf(sk))].join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
   const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
   console.log("安装收据 : " + report.text);
   if (report.failed) process.exitCode = 1; // 收据没记下或留下残骸：制品已经写了，但下一次维护预检会拿不到当前投影 —— 不能显示成功
 }
 
-console.log("\n" + (backup ? "settings 已改，备份：" + backup
+// PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」—— omm 那次是要靠事后比版本号才发现装错了；
+// 一行放在最显眼处，肉眼复核一秒完成（卸载路径没有「装的提交」，不打）。
+// fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
+console.log("");
+if (!uninstall) console.log(sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit }));
+console.log(backup ? "settings 已改，备份：" + backup
   : settingsCreated ? "settings 已新建（原文件不存在）：" + SETTINGS
-    : "settings 无改动，未重写"));
+    : "settings 无改动，未重写");
 // 说出来：登记表牵着绑定和话题历史，"这次安装到底动没动它"不该靠人去猜。
 console.log("登记表    ：" + registryAction);
 console.log("兜底定时器：" + launchNote);

@@ -87,6 +87,19 @@ export function runtimeScript(name, home = os.homedir(), chain = "claude") {
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
+/**
+ * **git blob 哈希**（PK3-I257-fix3）：`sha1("blob <字节长度>\0" + 内容)`，与 `git hash-object` 逐字节等价。
+ *
+ * 为什么要它而不用 sha256：提交那侧的判据是 `git ls-tree` 记的 blob 哈希。进程内自己算，一是免得为了
+ * 核对再起一堆 git 进程，二是**能算在 planRuntimeSync 同一次读取、同一个 buffer 上** —— 核对与实际
+ * 将安装的字节从此是同一份（旧版内容核对另读一次工作树，两次读取之间源码变了就会装进没核对过的字节）。
+ *
+ * **只在没有 git 过滤时逐字节等价**（autocrlf / .gitattributes 的 clean 过滤器）：本仓没有 .gitattributes，
+ * 算出来的对不上时按“核对不出来”拒绝，不静默放行（expect-commit.mjs 那边负责报）。
+ */
+export const gitBlobHash = (content) => crypto.createHash("sha1")
+  .update("blob " + Buffer.byteLength(content) + "\0").update(content).digest("hex");
+
 const HASH_RE = /^[0-9a-f]{64}$/u;
 
 /** 相对、规范、不含 `..` —— 清单里的路径会被直接拼进文件系统操作，不能是任意字符串。 */
@@ -151,8 +164,29 @@ export function collectRuntimeFiles(sourceRoot) {
   return out.sort();
 }
 
-/** 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。 */
-function sourceCommit(sourceRoot) {
+/**
+ * 这条**相对路径**会被收进 runtime 吗 —— 与 collectRuntimeFiles 同一套 RUNTIME_TREES 规则。
+ *
+ * PK3-I257-fix2 要拿它反过来问一遍：某个提交里「本该被拷的那些文件」是哪些。那一边的清单来自
+ * `git ls-tree`（不是工作树的目录遍历），没有这份规则就没法用同一把尺子筛 —— 而"另写一份遍历/筛选规则"
+ * 正是会让两边静默分叉的做法（多出一个 skills 子目录、改一次 keep 判定，两边就不一致了）。
+ */
+export const keepsRuntimePath = (rel) => {
+  const norm = String(rel).replaceAll("\\", "/");
+  for (const tree of RUNTIME_TREES) {
+    if (!norm.startsWith(tree.dir + "/")) continue;
+    return tree.keep(path.basename(norm));
+  }
+  return false;
+};
+
+/**
+ * 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。
+ *
+ * PK3-I257：现在多了第二个读者 —— `--expect-commit` 那道闸核的正是这个值（expect-commit.mjs）。
+ * 判据只有这一份：各安装器自己去调 git 的话，这句话「查的是哪个根、不是仓库算不算错」就会漂。
+ */
+export function sourceCommit(sourceRoot) {
   try {
     return execFileSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"],
       // stderr 要吞掉：源码目录不是 git 仓库是完全正常的情况（比如测试临时目录），
@@ -167,7 +201,8 @@ function sourceCommit(sourceRoot) {
  * 算出这份源码对应的版本号与逐文件哈希。纯计算，不落盘 —— 于是 dry-run 与 apply
  * 看到的是同一个版本号，不会出现「预览说要装 A、实际装了 B」。
  */
-export function planRuntimeSync({ sourceRoot, home = os.homedir(), chain = "claude", root: rootOverride } = {}) {
+export function planRuntimeSync({ sourceRoot, home = os.homedir(), chain = "claude", root: rootOverride,
+  withContents = false } = {}) {
   if (typeof sourceRoot !== "string" || !path.isAbsolute(sourceRoot)) {
     return { ok: false, reason: "source_root_invalid" };
   }
@@ -176,13 +211,19 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir(), chain = "clau
   if (relPaths.length === 0) return { ok: false, reason: "source_empty" };
 
   const files = [];
+  // `withContents`：把读到的**那份 buffer** 留在计划里（PK3-I257-fix3）。要渲染技能的调用方（出站 /
+  //   Codex 链）必须拿它去渲染 —— 否则“核对的字节”与“装进去的字节”又是两次读取，中间有窗口。
+  const contents = withContents ? new Map() : null;
   for (const rel of relPaths) {
     let content;
     try { content = fs.readFileSync(path.join(sourceRoot, rel)); }
     catch { return { ok: false, reason: "source_unreadable", file: rel }; }
-    files.push({ path: rel, sha256: sha256(content) });
+    // sha256 给落盘/清单用（apply 会核“盘上字节 = 这条”），blob 给**提交核对**用（与 ls-tree 同一种哈希）。
+    files.push({ path: rel, sha256: sha256(content), blob: gitBlobHash(content) });
+    if (contents !== null) contents.set(rel, content);
   }
   // 版本号由内容决定：同样的源码算出同样的版本，重复安装就是无操作。
+  //   （versionFromFiles 只看 path + sha256，多出来的 blob 字段不进版本号 —— 装出来的版本不变。）
   const version = versionFromFiles(files);
   if (!version) return { ok: false, reason: "file_list_invalid" };
   const root = rootOf({ root: rootOverride, home, chain });
@@ -193,6 +234,7 @@ export function planRuntimeSync({ sourceRoot, home = os.homedir(), chain = "clau
     ok: true,
     version,
     files,
+    contents,
     sourceRoot,
     sourceCommit: sourceCommit(sourceRoot),
     runtimeRoot: root,
@@ -257,6 +299,9 @@ function currentIdentity(root, versionDir) {
   } catch (err) { return { unverifiable: true, why: String(err?.code ?? err?.message) }; }
 }
 
+/** 写进 INSTALLED.json 的清单条目：**只有 path 与 sha256**（与 base 同形）。 */
+const manifestFiles = (files) => files.map(({ path, sha256 }) => ({ path, sha256 }));
+
 function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false } = {}) {
   // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写。
   //
@@ -286,7 +331,10 @@ function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false 
       installed_at: new Date().toISOString(),
       source_root: plan.sourceRoot,
       source_commit: plan.sourceCommit,
-      files: plan.files,
+      // 清单条目**只有 path + sha256**（与 base 同形）：`blob` 是本次核对用的**内存**字段，
+      //   `plan.files` 上带着它是为了让闸吃同一份字节 —— 写进不可变收据就成了永久多出来的形状
+      //   （fix5 P2-2：不带 --expect-commit 时的收据也得与 base 完全一致）。
+      files: manifestFiles(plan.files),
     }, null, 2) + "\n");
 
     const staged = verifyVersionDir(staging, plan.files, { checkDirName: false });

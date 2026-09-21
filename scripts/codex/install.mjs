@@ -19,6 +19,7 @@ import { referencedRuntimeScripts, timerPlatform } from "../install-projection.m
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
+import { expectCommitVerdict, sourceCommitLine } from "../expect-commit.mjs";
 import { codexDrainRemovalPlan, linuxDrainScene, uninstallDrainUnitsInLock } from "./drain-service.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
@@ -26,7 +27,7 @@ import {
   bridgeHome, enableAutoPublishForAllTasks, registryFile,
 } from "./state.mjs";
 import {
-  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, verifyRuntime,
+  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, sourceCommit, verifyRuntime,
 } from "../runtime-install.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
@@ -69,8 +70,23 @@ const log = path.join(home, "hook.log");
 // 因为视图滤掉了 enabled:false 的 task 和 root 形状异常的记录。
 const autoPublishPreview = enableAutoPublishForAllTasks({ home });
 // 运行时计划要在 dry-run 打印之前算好 —— 预览必须说清将要装哪一版。
-const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT });
+// `withContents`：把读到的**那份 buffer** 留在计划里（PK3-I257-fix3）—— 技能的渲染与提交核对都用它，
+// 不再回源文件重读一次（那次重读会让“核对的字节”与“装进去的字节”分开）。
+const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT, withContents: true });
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
+// （hooks / 技能 / runtime / 模板 / 收据 / 定时器 / 安装面锁都算）。判据吃的是**计划里那份字节**
+// （files[].blob 与 planRuntimeSync 同一次读取）—— fix3 P1。
+// **提交身份也只取一次**（fix4 P1）：就是计划里记的那个 —— 闸与结语共用 `COMMIT`，后面不再读 HEAD。
+// 卸载路径没有计划（runtimePlan 为 null）→ 此处现读一次。
+const COMMIT = uninstall || runtimePlan === null ? sourceCommit(ROOT) : runtimePlan.sourceCommit;
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, actual: COMMIT, inventory: runtimePlan?.files ?? null });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
 
 // hooks.json 的合并只有一份（codex/hook-command.mjs 的 renderCodexHooks）：让每个事件下恰好只剩一条我们的 hook，只动自己那一条 child。
 // **ENOENT 是"没有旧文件"**（全新机器上 hooks.json 本来就不存在）→ 空 settings 继续；
@@ -105,8 +121,30 @@ const promptAction = renderedHooks.actions.UserPromptSubmit;
 const stopAction = renderedHooks.actions.Stop;
 
 const skills = SKILLS;
-const renderedSkill = (file, name) => expectedSkillContent({
-  sourceFile: file, name, runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home });
+/**
+ * 技能源的**唯一一份读**（PK3-I257-fix3）：从计划里那份 buffer 取。
+ *
+ * 旧版 `expectedSkillContent({ sourceFile })` 每次调用都 `fs.readFileSync` —— 写入与收据各读一次，
+ * 而计划早就自己读过一遍：核对的字节与写出去的字节就成了两次读取。现在三个调用点拿到的都是
+ * 计划里那份（`runtimePlan.contents`），渲染结果也**只算一次**留在 Map 里。
+ */
+const renderedSkillCache = new Map();
+const sourceBytes = (rel) => {
+  const buf = runtimePlan?.contents?.get(rel);
+  if (buf === undefined) {
+    console.error("技能源不在本次计划里（" + rel + "）—— 不重读源文件，直接当失败。什么都没做。");
+    process.exit(1);
+  }
+  return buf;
+};
+const renderedSkill = (file, name) => {
+  const key = name + "\0" + file;
+  if (!renderedSkillCache.has(key)) {
+    renderedSkillCache.set(key, expectedSkillContent({
+      raw: sourceBytes(path.relative(ROOT, file)), name, runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home }));
+  }
+  return renderedSkillCache.get(key);
+};
 
 console.log("hooks       " + HOOKS);
 console.log("  UserPromptSubmit → " + promptAction);
@@ -149,7 +187,8 @@ if (uninstall) {
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
-  process.exit(0);
+  // PK3-I257：预览不写盘，所以它不「拒绝」而是**报告** —— 计划已打完（含上面那行结论），但核对不通过
+  process.exit(GATE.ok ? 0 : 2);
 }
 
 // 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
@@ -169,6 +208,8 @@ const writeAtomic = (file, text) => {
 
 // **先装运行时，再写钩子。**顺序反了的话，钩子会有一段时间指向还不存在的路径 ——
 // 那期间每一轮 Stop 都走 hook-unavailable 分支，进展静默留在本地。
+// 版本目录里那份不可变收据记的来源提交（只在 runtime 真装/校验过之后有意义）—— 见结语那行。
+let runtimeReceiptCommit = null;
 if (!uninstall) {
   if (!runtimePlan?.ok) {
     console.error("运行时计划算不出来（" + (runtimePlan?.reason ?? "unknown") + "），什么都没装。");
@@ -184,7 +225,10 @@ if (!uninstall) {
     console.error("运行时装完校验不过（" + (checked.reason ?? "drift") + "），钩子没动。");
     process.exit(1);
   }
-  console.log("运行时    ：已装 " + runtimePlan.version.slice(0, 16) + " 并校验通过");
+  // 同字节再装一次是 no-op：版本目录里那份**不可变收据**不会被改写，它的 source_commit 可能与本次不同
+  //   （fix5 P1-2）—— 结语要把两个都说出来。
+  runtimeReceiptCommit = checked.sourceCommit ?? null;
+  console.log("运行时    ：已装 " + runtimePlan.version.slice(0, 16) + " 并校验通过" + (synced.noop ? "（与线上同一份内容，未重装）" : ""));
 }
 
 // **把模板的 bridge_root 更新到 runtime/current。**
@@ -288,5 +332,8 @@ if (!uninstall) {
 if (uninstall) {
   console.log("\n已完成本地卸载。");
 } else {
-  console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
+  // PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
+  // fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
+  console.log("\n" + sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit }));
+  console.log("已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
 }

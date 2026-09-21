@@ -10061,22 +10061,20 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
   }
 });
 
-// #253 确定性回归（不靠 1/62 的运气）：直接构造以 X 结尾的前缀，证明 BSD 的 mkdtemp 确实会吃掉它，
-//   从而证明上面那条用例的根名**必须**不以 X 结尾。拿掉 fix4 里的固定名子目录、改回随机根 → 这里不受影响，
-//   但下面那条断言「fix4 的根名不以 X 结尾」会红（见用例末尾的结构断言）。
-test("PK3-T253b：BSD mkdtemp 会替换模板末尾所有大写 X —— 以 X 结尾的前缀造不出以它开头的名字", () => {
+// #253 回归：fix4 的根必须是固定名子目录（不以 X 结尾）。BSD mkdtemp 会把模板末尾所有大写 X 一并替换，
+//   随机根的后缀恰以 X 结尾（约 1/62）时 fix4 会偶红、且那条「不许有兄弟」会假绿。
+//   「根改回随机名」这种回退在行为层面只有约 1/62 概率暴露，所以这里用**逐字结构断言**确定性地拦它（刀 K2 可红）；
+//   BSD 行为本身只做观察、不断言（单次随机输出证明不了「替换进来的字符必不为 X」）。
+test("PK3-T253b：fix4 的根是固定名子目录（BSD mkdtemp 替换模板末尾所有 X 的回归）", () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "t253b-")));
   try {
     const plain = path.basename(fs.mkdtempSync(path.join(dir, "keep-ab")));
     assert.equal(plain.startsWith("keep-ab"), true, "对照：前缀不以 X 结尾时，生成名一定以它开头：" + plain);
-    const withX = path.basename(fs.mkdtempSync(path.join(dir, "keep-aX")));
-    if (process.platform === "darwin" || process.platform.endsWith("bsd")) {
-      assert.equal(withX.startsWith("keep-aX"), false,
-        "BSD：模板末尾的 X 会被一并替换 —— 生成名不再以 keep-aX 开头（" + withX + "）；这正是 #253 偶红的来源");
-    } else {
-      // 非 BSD（例如 glibc）只替换追加的那 6 个 X，行为不同；照实记录，不假装验证了 BSD 行为。
-      assert.equal(typeof withX, "string");
-    }
+    // 以 X 结尾的前缀在 BSD 上会被一并替换 —— 但替换进来的随机字符**也可能恰好又是 X**（约 1/62），
+    //   所以**不对单次随机输出做必然断言**（Codex #262 一轮 P1：那样写本身就是 1/62 的偶红）。
+    //   这里只做观察：真机上跑一次、不断言结果；机制的证明留在 issue #253 的实测记录与刀测 K1
+    //   （把 fix4 的根名故意改成 rootX → 每次都红）。守住回退靠下面那句固定根名的结构断言。
+    fs.mkdtempSync(path.join(dir, "keep-aX"));
     // fix4 的夹具根名：必须是那个固定名，且不以 X 结尾（拿掉固定名子目录、改回随机根 → 这里红）
     const src = fs.readFileSync(new URL(import.meta.url), "utf-8");
     const at = src.indexOf('test("PK3-T2-fix4：判据按');

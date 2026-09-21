@@ -270,12 +270,28 @@ export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot =
  * 只写「装的是提交 A」会让人以为收据也是 A。所以这种时候两个都写出来，并明说没重装。
  * （`installedCommit` 是那份不可变收据记的来源提交；为空/相同就走原来那一行。）
  */
-export const sourceCommitLine = ({ commit, version, installedCommit = null } = {}) => {
-  const planned = typeof commit === "string" && commit.length > 0 ? commit.slice(0, 12) : "（来源不是 git 仓库，追不到）";
-  const recorded = typeof installedCommit === "string" && installedCommit.length > 0 ? installedCommit.slice(0, 12) : null;
-  if (recorded !== null && recorded !== planned) {
-    return "本次来源提交 " + planned + "；**runtime 未重装**（版本 " + (version ?? "（未知）") +
-      " 已是同一份内容，其收据记的来源提交是 " + recorded + "）—— 将装字节与 " + planned + " 一致";
+export const sourceCommitLine = ({ commit, version, installedCommit = null, noop = false } = {}) => {
+  // #260：「有没有重装」由调用方**明说**（applyRuntimeSync 的 noop），不再靠「两个提交号截成 12 位后是否相同」去猜；
+  //   比较一律用**完整** sha，判完再截短展示 —— 共享前 12 位的两个不同提交不许被说成同一个。
+  const full = (c) => (typeof c === "string" && c.length > 0 ? c.toLowerCase() : null);
+  const plannedFull = full(commit);
+  const recordedFull = full(installedCommit);
+  const shown = (c) => (c === null ? null : c.slice(0, 12));
+  const planned = plannedFull === null ? "（来源不是 git 仓库，追不到）" : shown(plannedFull);
+  const v = version ?? "（未知）";
+  if (noop === true) {
+    if (recordedFull === null) {
+      return "本次来源提交 " + planned + "；**runtime 未重装**（版本 " + v +
+        " 已是同一份内容，但其收据**没有记录来源提交**，证明不了它最初来自哪个提交）—— 将装字节与 " + planned + " 一致";
+    }
+    if (plannedFull === null || recordedFull !== plannedFull) {
+      // 前 12 位相同而完整 sha 不同时，12 位展示会把差异藏起来 —— 那种时候两个都给完整 sha。
+      const clash = plannedFull !== null && shown(recordedFull) === shown(plannedFull);
+      const p = clash ? plannedFull : planned;
+      const r = clash ? recordedFull : shown(recordedFull);
+      return "本次来源提交 " + p + "；**runtime 未重装**（版本 " + v +
+        " 已是同一份内容，其收据记的来源提交是 " + r + "）—— 将装字节与 " + p + " 一致";
+    }
   }
-  return "装的是提交 " + planned + "，runtime 版本 " + (version ?? "（未知）");
+  return "装的是提交 " + planned + "，runtime 版本 " + v;
 };

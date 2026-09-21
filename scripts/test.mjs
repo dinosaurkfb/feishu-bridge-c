@@ -10065,6 +10065,34 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
 //   随机根的后缀恰以 X 结尾（约 1/62）时 fix4 会偶红、且那条「不许有兄弟」会假绿。
 //   「根改回随机名」这种回退在行为层面只有约 1/62 概率暴露，所以这里用**逐字结构断言**确定性地拦它（刀 K2 可红）；
 //   BSD 行为本身只做观察、不断言（单次随机输出证明不了「替换进来的字符必不为 X」）。
+// #260：no-op 结语的两个边界。拿掉哪行会红：
+//   sourceCommitLine 里 `recordedFull === null` 那一支 → ① 红（旧收据无来源时又说成「装的是提交 A」）；
+//   把完整 sha 比较改回「截 12 位再比」→ ② 红（共享前 12 位的两个提交被说成同一个）；
+//   把 `noop === true` 的判断拿掉、改回靠提交号是否相同去猜 → ③ 红（真重装了却说未重装）。
+test("PK3-I260：no-op 结语——旧收据无来源时照实说、共享前 12 位时给完整 sha、有没有重装由调用方明说", () => {
+  const A = "a".repeat(12) + "1".repeat(28);
+  const B = "a".repeat(12) + "2".repeat(28);        // 与 A 共享前 12 位，但不是同一个提交
+  // ① 旧 runtime 收据没记来源提交 + 这次没重装 → 不许再说「装的是提交 A」
+  const noRecord = sourceCommitLine({ commit: A, version: "v1", installedCommit: null, noop: true });
+  assert.match(noRecord, /runtime 未重装/u, noRecord);
+  assert.match(noRecord, /没有记录来源提交/u, noRecord);
+  assert.doesNotMatch(noRecord, /^装的是提交/u, noRecord);
+  // ② 共享前 12 位的两个不同提交 → 两个都给完整 sha，不许在 12 位展示里「看起来一样」
+  const clash = sourceCommitLine({ commit: A, version: "v1", installedCommit: B, noop: true });
+  assert.ok(clash.includes(A) && clash.includes(B), "两个完整 sha 都要出现：" + clash);
+  assert.match(clash, /runtime 未重装/u, clash);
+  // ③ 真的重装了（noop:false）→ 收据是刚写的、就是这次的提交，照常一行（哪怕传进来的旧收据值不同）
+  assert.equal(sourceCommitLine({ commit: A, version: "v1", installedCommit: B, noop: false }),
+    "装的是提交 " + A.slice(0, 12) + "，runtime 版本 v1");
+  // ④ 没重装、但收据记的就是这个提交（完整 sha 相同）→ 照常一行
+  assert.equal(sourceCommitLine({ commit: A, version: "v1", installedCommit: A, noop: true }),
+    "装的是提交 " + A.slice(0, 12) + "，runtime 版本 v1");
+  // ⑤ 前 12 位不同的两个提交 + 没重装 → 12 位展示就够（不必给完整 sha）
+  const C = "c".repeat(40);
+  const plain = sourceCommitLine({ commit: A, version: "v1", installedCommit: C, noop: true });
+  assert.ok(plain.includes(A.slice(0, 12)) && plain.includes(C.slice(0, 12)) && !plain.includes(A), plain);
+});
+
 test("PK3-T253b：fix4 的根是固定名子目录（BSD mkdtemp 替换模板末尾所有 X 的回归）", () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "t253b-")));
   try {

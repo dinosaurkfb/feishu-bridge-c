@@ -61886,6 +61886,35 @@ test("PK3-I254 ③：已有 settings 的机器行为不变（别人的条目原�
 
 // 拿掉哪行会红：把 `rendered` 的 try/catch 与读文件那条 `err.code !== "ENOENT"` 分支一起去掉
 //   （回到裸读 + 裸 parse）→ ④ 三条都红在退出码（实得未捕获栈，stderr 里没有人话）。
+// 拿掉哪行会红：codex/install 里把 hooksExisted 去掉、baseText 回到 `before === "" ? null : before` →
+//   本用例红在退出码（零字节 hooks.json 被当成"没有旧文件"，安装照常进行并覆盖它）。
+test("PK3-I254-fix1：磁盘上零字节的 hooks.json 是「用不了」，不是「没有旧文件」——退 1、零写", () => {
+  const home = i254FreshHome();
+  const codexHome = path.join(home, ".codex");
+  const hooks = path.join(codexHome, "hooks.json");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(hooks, "");                       // 存在、可读、零字节
+  assert.equal(fs.statSync(hooks).size, 0, "夹具前提：文件在且是零字节");
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: path.join(codexHome, "feishu-bridge") });
+  const before = fs.readdirSync(codexHome).sort();
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 1, "零字节 = 解析不出来 = 用不了，必须退 1：" + r.stdout + r.stderr);
+  assert.match(r.stderr, /hooks\.json 用不了/u, r.stderr);
+  assert.doesNotMatch(r.stdout + r.stderr, /^\s+at |JSON\.parse/u, "不许是未捕获栈：" + r.stderr);
+  assert.equal(fs.readFileSync(hooks, "utf-8"), "", "零字节文件一个字节都不许动");
+  assert.deepEqual(fs.readdirSync(codexHome).sort(), before, "失败必须发生在任何写入之前（不建 runtime / 技能 / 备份）");
+  // 对照：文件**不存在**时照常装得上（别把闸门做成"Codex 链在新机器上装不了"）
+  const fresh = i254FreshHome();
+  const freshCodex = path.join(fresh, ".codex");
+  const ok = spawnSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env: installerFixtureEnv({ HOME: fresh, CODEX_HOME: freshCodex,
+      FEISHU_CODEX_BRIDGE_HOME: path.join(freshCodex, "feishu-bridge") }) });
+  assert.equal(ok.status, 0, "全新机器（hooks.json 不存在）照常装：" + ok.stdout + ok.stderr);
+  assert.equal(fs.existsSync(path.join(freshCodex, "hooks.json")), true, "装完 hooks.json 被建出来");
+});
+
 test("PK3-I254 ④：settings / hooks.json 存在但用不了（坏 JSON、不是文件）仍然失败，且给的是人话", () => {
   // ① 坏 JSON（Claude 链）：退 1、一句人话、零写
   const home = i254FreshHome();

@@ -152,6 +152,22 @@ export function collectRuntimeFiles(sourceRoot) {
 }
 
 /**
+ * 这条**相对路径**会被收进 runtime 吗 —— 与 collectRuntimeFiles 同一套 RUNTIME_TREES 规则。
+ *
+ * PK3-I257-fix2 要拿它反过来问一遍：某个提交里「本该被拷的那些文件」是哪些。那一边的清单来自
+ * `git ls-tree`（不是工作树的目录遍历），没有这份规则就没法用同一把尺子筛 —— 而"另写一份遍历/筛选规则"
+ * 正是会让两边静默分叉的做法（多出一个 skills 子目录、改一次 keep 判定，两边就不一致了）。
+ */
+export const keepsRuntimePath = (rel) => {
+  const norm = String(rel).replaceAll("\\", "/");
+  for (const tree of RUNTIME_TREES) {
+    if (!norm.startsWith(tree.dir + "/")) continue;
+    return tree.keep(path.basename(norm));
+  }
+  return false;
+};
+
+/**
  * 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。
  *
  * PK3-I257：现在多了第二个读者 —— `--expect-commit` 那道闸核的正是这个值（expect-commit.mjs）。

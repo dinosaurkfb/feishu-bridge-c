@@ -126,7 +126,7 @@ import { applySuppression } from "./feishu-suppress-outbox.mjs";
 import { applySuppressionCore, suppressionDigest } from "./suppress-outbox-core.mjs";
 import { composeCrashReceipt } from "./crash-receipt.mjs";
 import {
-  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
+  applyRuntimeSync, codexRuntimeRoot, collectRuntimeFiles, keepsRuntimePath, planRuntimeSync, runtimeRoot, runtimeScript, verifyRuntime,
   versionFromFiles,
 } from "./runtime-install.mjs";
 import { bindingWarning, checkBinding } from "./binding-health.mjs";
@@ -258,7 +258,7 @@ import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, codexDrainUnitPaths, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
 // PK3-I257：`--expect-commit` 那道闸的判据（用例不必造 git 仓库就能逐条验它的五态）。
-import { EXPECT_COMMIT_FLAG, expectCommitVerdict, sourceCommitLine } from "./expect-commit.mjs";
+import { EXPECT_COMMIT_FLAG, describeContentDiff, expectCommitVerdict, sourceCommitLine, worktreeContentDiff } from "./expect-commit.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
 import { INSTALL_WRITE_TARGET_ENV_KEYS, installerChildEnv, purgeChildEnv, purgeTargetsOutsideFixture, requireCleansedInstallerEnv, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7 / PK3-I247：真 purge 与安装器写盘的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
@@ -62160,6 +62160,156 @@ test("PK3-I257 ⑤：前缀语义与参数形状 —— 7 位起可用；不拿�
   // 结语那一行：追不到来源就如实说，不编一个出来
   assert.equal(sourceCommitLine({ commit: null, version: "abc" }), "装的是提交 （来源不是 git 仓库，追不到），runtime 版本 abc");
   assert.equal(sourceCommitLine({ commit: FULL, version: null }), "装的是提交 " + FULL.slice(0, 12) + "，runtime 版本 （未知）");
+});
+
+// ── PK3-I257-fix2：HEAD 对得上 ≠ 装进去的是那个提交的内容（Codex 一轮 P1）──────────────────
+// runtime 是从**工作树**读字节并据此算版本号的，所以改一个未提交的 .mjs 之后，`--expect-commit <HEAD>`
+// 照样通过、装成功，而结语与 INSTALLED.json 还把这份**不同的内容**标成了那个提交。
+// 给了期望提交时现在还要逐字节核一遍：将要拷的那些文件（collectRuntimeFiles 同一个函数）
+// 必须与那个提交里**同一套 keep 规则**下的文件字节一致 —— 改了 / 多了 / 少了三类都算不一致。
+/** 整棵 HOME 的**字节级**清单（含目录与符号链接去向）—— 零写判据。
+ *  比 u1Snapshot 强的地方：目录也会入单（空的锁目录建了又删要能看见），文件比内容哈希而不是 size+mtime。 */
+const i257Tree = (root) => {
+  const out = [];
+  const walk = (d) => {
+    for (const n of fs.readdirSync(d).sort()) {
+      const p = path.join(d, n);
+      const st = fs.lstatSync(p);
+      const rel = path.relative(root, p);
+      if (st.isDirectory()) { out.push(rel + "/"); walk(p); continue; }
+      if (st.isSymbolicLink()) { out.push(rel + "->" + fs.readlinkSync(p)); continue; }
+      out.push(rel + ":" + crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex").slice(0, 16));
+    }
+  };
+  walk(root);
+  return out.join("\n");
+};
+
+/** 三类形状各探一次：跑一条、断言零写、还原。`prepare` = `{ script, args }`，跑在**拒绝之前**
+ *  （入站安装器单独跑不起来：它要求 runtime 已就位 —— 先按同一道闸把出站装好）。 */
+const i257DirtyShapes = ({ src, home, script, commit, prepare = null }) => {
+  const env = installerFixtureEnv({ HOME: home });
+  const run = (rel, args = []) => spawnSync(process.execPath, [path.join(src, "scripts", rel), ...args],
+    { encoding: "utf-8", timeout: 300_000, env });
+  const out = { prepare: prepare === null ? null : run(prepare.script, prepare.args) };
+  /** 改 → 跑 → 比对 → 还原。**零写**比的是整棵 HOME 的字节级清单（含 settings / runtime / 技能 / 收据 / 锁）。 */
+  const attempt = (mutate, revert) => {
+    mutate();
+    const before = i257Tree(home);
+    const homeBefore = fs.readdirSync(home).sort();
+    const r = run(script, [EXPECT_COMMIT_FLAG, commit, "--apply"]);
+    const after = i257Tree(home);
+    revert();
+    return { ...r, zeroWrite: before === after, homeBefore };
+  };
+  // ① 改了已跟踪的 scripts/*.mjs（未提交的修改）
+  const victim = path.join(src, "scripts", "bind-compose.mjs");
+  const bytes = fs.readFileSync(victim);
+  out.changed = attempt(() => fs.appendFileSync(victim, "\n// 未提交的改动\n"), () => fs.writeFileSync(victim, bytes));
+  // ② 多了：scripts/ 下一个未跟踪的 .mjs（它**真会被拷** —— keep 规则只问后缀）
+  const extra = path.join(src, "scripts", "未跟踪的.mjs");
+  out.added = attempt(() => fs.writeFileSync(extra, "export const 未跟踪 = 1;\n"), () => fs.rmSync(extra));
+  // ③ 少了：删掉一个已跟踪的 skills 文件
+  const gone = path.join(src, "skills", "feishu-bind", "SKILL.md");
+  const goneBytes = fs.readFileSync(gone);
+  out.missing = attempt(() => fs.rmSync(gone), () => fs.writeFileSync(gone, goneBytes));
+  // ④ 对照：工作树干净 + 期望提交 → 照常装
+  out.clean = run(script, [EXPECT_COMMIT_FLAG, commit.slice(0, 7), "--apply"]);
+  // ⑤ 对照：工作树脏但**不给**这个参数 → 照常装（这条闸不该拦住没声明的人）
+  fs.appendFileSync(victim, "\n// 又一次未提交的改动\n");
+  out.dirtyNoFlag = run(script, ["--apply"]);
+  fs.writeFileSync(victim, bytes);
+  return out;
+};
+const i257AssertDirtyShapes = (out, { script }) => {
+  if (out.prepare !== null) assert.equal(out.prepare.status, 0, script + " / 预处理：" + out.prepare.stdout + out.prepare.stderr);
+  for (const [shape, label, pathInMessage] of [
+    ["changed", /改了 1 个（scripts\/bind-compose\.mjs）/u, "scripts/bind-compose.mjs"],
+    ["added", /多了 1 个（scripts\/未跟踪的\.mjs）/u, "scripts/未跟踪的.mjs"],
+    ["missing", /少了 1 个（skills\/feishu-bind\/SKILL\.md）/u, "skills/feishu-bind/SKILL.md"],
+  ]) {
+    const r = out[shape];
+    assert.equal(r.status, 2, script + " / " + shape + "：" + r.stdout + r.stderr);
+    assert.match(r.stderr, /拒绝：你要装 [0-9a-f]+，HEAD 就是它，但\*\*工作树与这个提交的字节不一致\*\*/u, r.stderr);
+    assert.match(r.stderr, label, r.stderr);
+    assert.ok(r.stderr.includes(pathInMessage), "要点名那个路径：" + r.stderr);
+    assert.doesNotMatch(r.stdout + r.stderr, /^\s+at |Error:/mu, "不许是未捕获栈：" + r.stderr);
+    assert.equal(r.zeroWrite, true, script + " / " + shape + "：拒绝时整棵 HOME 一个字节都不许变（settings / runtime / 技能 / 收据 / 锁）");
+  }
+  assert.equal(out.clean.status, 0, "干净的工作树 + 期望提交要照常装：" + out.clean.stdout + out.clean.stderr);
+  assert.match(out.clean.stdout, /与来源检出 [0-9a-f]{12} 一致/u, out.clean.stdout);
+  assert.equal(out.dirtyNoFlag.status, 0, "不给参数时不理工作树脏不脏（行为一字不变）：" + out.dirtyNoFlag.stdout + out.dirtyNoFlag.stderr);
+};
+
+// 拿掉哪行会红：把 expectCommitVerdict 里那段内容核对（`if (sourceRoot !== null && …)`）删掉
+//   → 本用例红在三条形状的退出码（实得 0）与零写（实得写过盘）。
+test("PK3-I257-fix2 ①：outbound —— 工作树与期望提交不一致（改了 / 多了 / 少了）都要零写拒绝", () => {
+  const fx = i257SourceRepo();
+  const out = i257DirtyShapes({ src: fx.src, home: fx.home, script: "install-outbound.mjs", commit: fx.first });
+  i257AssertDirtyShapes(out, { script: "install-outbound.mjs" });
+  // 三次拒绝都发生在**任何写盘之前**：第一次拒绝那一刻 HOME 里连一个空目录都没有
+  assert.deepEqual(out.changed.homeBefore, [], "第一次拒绝时 HOME 还是空的：" + JSON.stringify(out.changed.homeBefore));
+});
+
+// 拿掉哪行会红：同 ① （闸在 install-inbound 那条路径上的一样一段）。
+test("PK3-I257-fix2 ②：inbound —— 同上（三类形状都拒、干净才装）", () => {
+  const fx = i257SourceRepo();
+  // 入站安装器单独跑不起来（它要求 runtime 已就位）—— 先按**同一道闸**把出站装好，再探三类形状
+  const out = i257DirtyShapes({ src: fx.src, home: fx.home, script: "install-inbound.mjs", commit: fx.first,
+    prepare: { script: "install-outbound.mjs", args: [EXPECT_COMMIT_FLAG, fx.first.slice(0, 12), "--apply"] } });
+  i257AssertDirtyShapes(out, { script: "install-inbound.mjs" });
+});
+
+// 拿掉哪行会红：同 ①（闸在 codex/install.mjs 那条路径上的一样一段）。
+test("PK3-I257-fix2 ③：codex —— 同上（三类形状都拒、干净才装）", () => {
+  const fx = i257SourceRepo();
+  const out = i257DirtyShapes({ src: fx.src, home: fx.home, script: path.join("codex", "install.mjs"), commit: fx.first });
+  i257AssertDirtyShapes(out, { script: "codex/install.mjs" });
+});
+
+// 拿掉哪行会红：把 `keepsRuntimePath(file)` 那道筛删掉 → ④ 红在“不是 .mjs 的 scripts/notes.txt 也被算成多了”
+//   （假不一致，刀2）；`MAX_NAMED_PATHS` 改成 99 → 红在“至多 5 个”（刀3）；
+//   把 keepsRuntimePath 里的 `tree.keep(...)` 改成恒 true → 同样红在 notes.txt 那条（两边规则分叉，刀5）。
+//   （“只拿 changed 当不一致”那把刀落在 ①②③：多了/少了两类形状会变成安装成功，刀4。）
+test("PK3-I257-fix2 ④：判据自洽 —— 同一套 keep 规则筛两边、不拿非 .mjs 当不一致、至多点 5 个、不给参数就不核", () => {
+  const fx = i257SourceRepo();
+  const files = collectRuntimeFiles(fx.src);
+  // 干净：两边集合逐字节相同（且**真的比了** runtime 那些文件，不是比空集）
+  const clean = worktreeContentDiff({ sourceRoot: fx.src, commit: fx.first });
+  assert.deepEqual([clean.ok, clean.compared, clean.compared === files.length, clean.compared > 200], [true, files.length, true, true], JSON.stringify(clean));
+  // keep 规则两边同源：scripts 下的非 .mjs 不收，skills 下的任何文件都收
+  assert.deepEqual([keepsRuntimePath("scripts/a.mjs"), keepsRuntimePath("scripts/notes.txt"),
+    keepsRuntimePath("scripts/sub/b.mjs"), keepsRuntimePath("skills/x/.DS_Store"), keepsRuntimePath("docs/a.mjs")],
+    [true, false, true, true, false]);
+  // 非 .mjs 的新文件：不会被拷，就不该算不一致（拿掉 keepsRuntimePath 这道筛就会红在这里）
+  fs.writeFileSync(path.join(fx.src, "scripts", "notes.txt"), "不是 .mjs\n");
+  assert.deepEqual([worktreeContentDiff({ sourceRoot: fx.src, commit: fx.first }).ok, fs.existsSync(path.join(fx.src, "scripts", "notes.txt"))], [true, true]);
+  fs.rmSync(path.join(fx.src, "scripts", "notes.txt"));
+
+  // 三类同时来：一句人话里三类都点名，且每类至多 5 个（多了给总数）
+  const victims = ["bind-compose.mjs", "doctor.mjs", "inbound-routes.mjs", "install-outbound.mjs",
+    "test.mjs", "runtime-install.mjs", "stop-hook.mjs"].map((n) => path.join(fx.src, "scripts", n));
+  for (const p of victims) fs.appendFileSync(p, "\n// dirty\n");
+  fs.writeFileSync(path.join(fx.src, "scripts", "多出来的.mjs"), "export const x = 1;\n");
+  fs.rmSync(path.join(fx.src, "skills", "feishu-bind", "SKILL.md"));
+  const diff = worktreeContentDiff({ sourceRoot: fx.src, commit: fx.first });
+  const said = describeContentDiff(diff);
+  assert.deepEqual([diff.changed.length, diff.added.length, diff.missing.length, diff.ok], [victims.length, 1, 1, false], JSON.stringify(diff));
+  const inner = (label) => new RegExp(label + "（([^）]*)）", "u").exec(said)[1];
+  assert.match(said, /改了 7 个（[^）]* 等 7 个）/u, said);
+  assert.equal(inner("改了 7 个").split("、").length, 5, "改了那一类只点 5 个：" + said);
+  assert.equal(inner("多了 1 个"), "scripts/多出来的.mjs", said);
+  assert.equal(inner("少了 1 个"), "skills/feishu-bind/SKILL.md", said);
+
+  // 判据层：脏 → kind=dirty（与 mismatch 同一个处置）、结论写进计划那行；核对不出来 → 也拒
+  const dirty = expectCommitVerdict({ argv: [EXPECT_COMMIT_FLAG, fx.first], sourceRoot: fx.src });
+  assert.deepEqual([dirty.kind, dirty.ok, dirty.refusal !== null, /工作树与这个提交的字节不一致/u.test(dirty.line)], ["dirty", false, true, true], JSON.stringify(dirty));
+  const unclear = expectCommitVerdict({ argv: [EXPECT_COMMIT_FLAG, fx.first], sourceRoot: fx.src,
+    contentDiff: () => ({ ok: false, why: "工作树算不出 blob 哈希（说不清）" }) });
+  assert.deepEqual([unclear.kind, /算不出 blob 哈希/u.test(unclear.refusal)], ["dirty", true], JSON.stringify(unclear));
+  // **不给参数**就不做内容核对（脏工作树也一样）—— 这是 item 3 那条硬要求
+  const absent = expectCommitVerdict({ argv: [], sourceRoot: fx.src });
+  assert.deepEqual([absent.kind, absent.ok, absent.line], ["absent", true, null]);
 });
 
 sealSummary();

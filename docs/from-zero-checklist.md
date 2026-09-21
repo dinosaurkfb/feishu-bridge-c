@@ -274,6 +274,22 @@ node scripts/codex/install.mjs
 node scripts/codex/install.mjs --apply
 ```
 
+- **推荐：让安装器自己核对「装的就是你要的那个提交」**（issue #257）。三个安装器都认 `--expect-commit <sha>`
+  （完整哈希或至少 7 位前缀；`--expect-commit=<sha>` 同样可以）。给了它，安装器会在**任何写盘之前**核两件事：
+  检出的提交就是它；将要安装的每个源码文件的字节都与那个提交一致（工作树里改了、多了、少了都算不一致）。
+  对不上就**什么都不写**，退出码 2，并用一句话说清是哪一种（提交不对 / 工作树与提交不一致 / 核对不出来）。
+  预览（不带 `--apply`）也做同样的核对，对不上时计划照打、退出码同样是 2，所以用 `&&` 串起来的步骤会停：
+  ```bash
+  WANT=<指定_main_commit_hash>
+  node scripts/install-outbound.mjs --expect-commit "$WANT" \
+    && node scripts/install-outbound.mjs --expect-commit "$WANT" --apply \
+    && node scripts/install-inbound.mjs --expect-commit "$WANT" --apply \
+    && node scripts/codex/install.mjs --expect-commit "$WANT" --apply    # 不启用 Codex 链就去掉这一行
+  ```
+  - 装完结语头一行会写「装的是提交 <前 12 位>，runtime 版本 <版本号>」。
+  - 若这台机器上已经装着**同一份内容**（例如新提交只改了文档），runtime 不会重装，结语会同时写出本次核对的提交与已装收据里记的提交，并注明「runtime 未重装」——这是正常情况，不是装错了。
+  - 不给 `--expect-commit` 时，安装器的行为与以前完全一样（不做这两项核对）。
+
 - **预期关键输出**：
   - `install-outbound.mjs`：
     - `运行时   : .../.claude/feishu-bridge/runtime → 版本 ...`

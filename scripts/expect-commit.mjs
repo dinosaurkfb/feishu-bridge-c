@@ -27,7 +27,9 @@ import { sourceCommit } from "./runtime-install.mjs";
 export const EXPECT_COMMIT_FLAG = "--expect-commit";
 /** sha 前缀的最短长度（git 自己的默认缩写也是 7 位）。 */
 export const MIN_EXPECT_PREFIX = 7;
-const SHA_RE = /^[0-9a-f]{7,40}$/u;
+// 最短位数只有一个来源：判定用的正则从上面的常量生成（原先正则里写死了 7，改常量只改得动报错文案，
+//   判定纹丝不动 —— 刀测把常量放宽到 1 位，全部用例照样绿）。
+const SHA_RE = new RegExp("^[0-9a-f]{" + MIN_EXPECT_PREFIX + ",40}$", "u");
 const USAGE = "（用法：" + EXPECT_COMMIT_FLAG + " <完整 sha 或 ≥" + MIN_EXPECT_PREFIX + " 位前缀>）";
 
 /**

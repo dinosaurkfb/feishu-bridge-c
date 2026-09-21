@@ -29,12 +29,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { runtimeScript, verifyRuntime } from "./runtime-install.mjs";
+import { runtimeScript, sourceCommit, verifyRuntime } from "./runtime-install.mjs";
 import { referencedRuntimeScripts, renderClaudeSkill } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
 import { gateBlocks } from "./maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "./install-surface-lock.mjs";
 import { isDirectRun, moduleRoot } from "./direct-run.mjs";
+import { expectCommitVerdict, sourceCommitLine } from "./expect-commit.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "..");
 /**
@@ -146,6 +147,15 @@ const arg = (n) => {
 };
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
+// （技能 / 收据 / 安装面锁都算）。
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
 
 const skillsRoot = arg("dir") ?? DEFAULT_SKILLS_ROOT;
 const DST = path.join(skillsRoot, SKILL_NAME);
@@ -290,7 +300,9 @@ if (problems.length > 0) {
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才落盘。");
-  process.exit(0);
+  // PK3-I257：预览不写盘，所以它不「拒绝」而是**报告** —— 计划已打完（含上面那行结论），但核对不通过
+  // 必须反映在退出码上。
+  process.exit(GATE.ok ? 0 : 2);
 }
 
 // ---------- 落盘 ----------
@@ -303,9 +315,9 @@ if (uninstall) {
 
 fs.mkdirSync(DST, { recursive: true });
 for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), { mode: 0o600 });
+const installedVersion = verifyRuntime().version ?? null;
 {
   // 机器级安装收据（维护门 PR B）：入站技能也是线上制品，按 path 合并进 claude 链的收据
-  const installedVersion = verifyRuntime().version ?? null;
   const artifacts = files.map((f) => ({ path: path.join(DST, f), kind: "skill", sha256: artifactSha({ kind: "skill", text: expectedContent(f) }) }));
   const scripts = referencedRuntimeScripts(files.map((f) => expectedContent(f)).join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
@@ -317,6 +329,8 @@ for (const f of files) fs.writeFileSync(path.join(DST, f), expectedContent(f), {
 // ---------- 装完自检 ----------
 
 console.log("\n已写入。自检：");
+// PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
+console.log(sourceCommitLine({ commit: sourceCommit(ROOT), version: installedVersion }));
 for (const f of files) {
   const same = expectedContent(f) === fs.readFileSync(path.join(DST, f), "utf-8");
   console.log("  " + (same ? "✓" : "✗") + " " + f + (same ? " 与预期一致" : " 写入后内容不一致"));

@@ -151,8 +151,13 @@ export function collectRuntimeFiles(sourceRoot) {
   return out.sort();
 }
 
-/** 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。 */
-function sourceCommit(sourceRoot) {
+/**
+ * 来源提交，仅用于事后追溯「线上这份代码是哪儿来的」。不是 git 仓库也不算错。
+ *
+ * PK3-I257：现在多了第二个读者 —— `--expect-commit` 那道闸核的正是这个值（expect-commit.mjs）。
+ * 判据只有这一份：各安装器自己去调 git 的话，这句话「查的是哪个根、不是仓库算不算错」就会漂。
+ */
+export function sourceCommit(sourceRoot) {
   try {
     return execFileSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"],
       // stderr 要吞掉：源码目录不是 git 仓库是完全正常的情况（比如测试临时目录），

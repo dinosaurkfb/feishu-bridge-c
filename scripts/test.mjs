@@ -257,6 +257,8 @@ import { applySubscriptionChange, appendSubscriptionAuditLine, buildSubscription
 import { parseRegisterSubscriptionArgs } from "./register-subscription.mjs";
 import { ailyDaemonUnit, claudeDrainPlist, claudeDrainPlistPath, claudeSettingsOwnedEntries, claudeSkillFiles, referencedRuntimeScripts, renderClaudeSettings } from "./install-projection.mjs";
 import { claudeBridgeRoot, codexBridgeRoot, codexDrainUnitPaths, explicitBridgeRootProblem, installFootprint, machinePurgeTargets } from "./maintenance/install-footprint.mjs";
+// PK3-I257：`--expect-commit` 那道闸的判据（用例不必造 git 仓库就能逐条验它的五态）。
+import { EXPECT_COMMIT_FLAG, expectCommitVerdict, sourceCommitLine } from "./expect-commit.mjs";
 import { runUninstallApply } from "./uninstall.mjs"; // PK3-U1-fix4：apply 段是可导入单出口（交错注入走函数参数）
 import { INSTALL_WRITE_TARGET_ENV_KEYS, installerChildEnv, purgeChildEnv, purgeTargetsOutsideFixture, requireCleansedInstallerEnv, writeTargetsOutsideFixture } from "./test-support/purge-fixture-guard.mjs"; // PK3-U1-fix7 / PK3-I247：真 purge 与安装器写盘的夹具边界
 import { inboundPostInstallProbe, probeFailureReason } from "./install-inbound.mjs"; // PK3-I241：装完自检可导入单出口（导入即惰性——没守卫会当场跑安装并退出）
@@ -61957,6 +61959,207 @@ test("PK3-I254 ④：settings / hooks.json 存在但用不了（坏 JSON、不�
   assert.equal(codexBad.status, 1, codexBad.stdout + codexBad.stderr);
   assert.match(codexBad.stderr, /hooks\.json 用不了（不是合法 JSON/u, codexBad.stderr);
   assert.equal(fs.readFileSync(hooks, "utf-8"), "{ 坏\n", "坏文件一个字节都不许动");
+});
+
+// ── PK3-I257：装机「我打算装哪个提交」这道闸（issue #257）────────────────────────────────
+// omm 真机：`fetch → reset --hard → 三个安装器 --apply` 串在一条命令里，fetch 撞上网络错误、后续照常执行，
+// 三个安装器把**旧代码**装了一遍、退出码全是 0。安装器自己看不出漂移（fetch 失败时本地 origin/main 也旧），
+// 所以判据必须由调用方显式声明：`--expect-commit`。
+/**
+ * 造一个**真的** git 仓库当来源：两次提交、**检出停在第一次**（就是那个形状）。
+ * **不拿当前工作树当来源** —— 这里把 scripts / skills / package.json 复制出去（安装器要能在里面真的跑起来），
+ * HEAD 完全由本用例控制。`{ git: false }` 不 init，那是「来源不是 git 仓库」的形状。
+ */
+const i257SourceRepo = ({ git = true } = {}) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "i257-src-"));
+  const src = path.join(base, "src");
+  const home = path.join(base, "home");
+  fs.mkdirSync(src, { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  for (const d of ["scripts", "skills"]) fs.cpSync(path.resolve(d), path.join(src, d), { recursive: true });
+  fs.copyFileSync(path.resolve("package.json"), path.join(src, "package.json"));
+  if (!git) return { base, src, home, first: null, second: null };
+  const G = (...args) => execFileSync("git", ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+    "-C", src, ...args], { encoding: "utf-8" }).trim();
+  G("init", "-q");
+  G("add", "-A");
+  G("commit", "-qm", "第一个提交");
+  const first = G("rev-parse", "HEAD");
+  fs.writeFileSync(path.join(src, "第二个提交.txt"), "第二个提交\n");
+  G("add", "-A");
+  G("commit", "-qm", "第二个提交");
+  const second = G("rev-parse", "HEAD");
+  G("reset", "--hard", first);                                  // 检出停在第一次
+  return { base, src, home, first, second };
+};
+
+// 拿掉哪行会红：把 `if (GATE.line !== null) console.log(GATE.line)` 去掉 → ① 红在「期望提交 : …一致」那一行；
+//   把结语那句 `sourceCommitLine({ … })` 去掉 → ① 红在结语那一行（刀5 / 刀6 实测）。
+test("PK3-I257 ①：期望 = 实际 → 照常装完，结语头一行写清「装的是哪个提交」，INSTALLED.json 记的是它", () => {
+  const fx = i257SourceRepo();
+  const env = installerFixtureEnv({ HOME: fx.home });
+  // ⑦ 位前缀也一样能用（⑤ 的前缀语义走真 CLI 这一遭）
+  const applied = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-outbound.mjs"), "--expect-commit", fx.first.slice(0, 7), "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, new RegExp("期望提交 : " + fx.first.slice(0, 7) + "（--expect-commit）—— 与来源检出 " + fx.first.slice(0, 12) + " 一致", "u"), applied.stdout);
+
+  // 结语（第 2 条）：一行写清「装的是提交 <sha 前 12 位>，runtime 版本 <版本号>」，且在结语靠前
+  const installed = JSON.parse(fs.readFileSync(
+    path.join(fx.home, ".claude", "feishu-bridge", "runtime", "current", "INSTALLED.json"), "utf-8"));
+  const version = installed.version ?? installed.runtime_version;
+  assert.ok(typeof version === "string" && version.length > 0, JSON.stringify(installed).slice(0, 300));
+  assert.match(applied.stdout, new RegExp("\\n装的是提交 " + fx.first.slice(0, 12) + "，runtime 版本 " + version + "\\n", "u"), applied.stdout);
+  // 真的装的是那个提交（不是只打了一行）
+  assert.equal(installed.source_commit, fx.first, JSON.stringify(installed).slice(0, 300));
+  // 结语那一行在 settings / 登记表 / 定时器那几行**之前**
+  const tail = applied.stdout.slice(applied.stdout.indexOf("装的是提交"));
+  assert.ok(tail.indexOf("settings ") < tail.indexOf("登记表") && tail.indexOf("settings ") > -1, tail);
+});
+
+// 拿掉哪行会红：把闸的拒绝条件改成 `false`（回到没有这道闸的安装器）→ 本用例红在退出码（实得 0）
+//   与「refused 时 HOME 一个条目都不许建」（刀1b 实测）。
+test("PK3-I257 ②-outbound：期望 ≠ 实际 → 退 2、一句人话、settings/runtime/技能/收据全零改动", () => {
+  const fx = i257SourceRepo();                    // HEAD = first；打算装 second
+  const env = installerFixtureEnv({ HOME: fx.home });
+  const before = u1Snapshot(fx.home);
+  const r = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-outbound.mjs"), "--expect-commit", fx.second, "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, new RegExp("拒绝：你要装 " + fx.second + "，但这个检出是 " + fx.first.slice(0, 12) + "（可能是更新代码那一步失败了）。什么都没做。", "u"), r.stderr);
+  assert.doesNotMatch(r.stdout + r.stderr, /^\s+at |Error:/mu, "不许是未捕获栈：" + r.stderr);
+  assert.equal(u1Snapshot(fx.home), before, "零写：整棵 HOME 前后一致");
+  assert.deepEqual(fs.readdirSync(fx.home), [], "refused 时 HOME 里一个条目都不许建（settings / runtime / 技能 / 收据都没有）");
+});
+
+// 拿掉哪行会红：同 ②-outbound（闸在 install-inbound 里那一块）。
+test("PK3-I257 ②-inbound：期望 ≠ 实际 → 退 2、零写（技能与收据都没动）", () => {
+  const fx = i257SourceRepo();
+  const env = installerFixtureEnv({ HOME: fx.home });
+  const before = u1Snapshot(fx.home);
+  const r = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-inbound.mjs"), "--expect-commit", fx.second, "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /拒绝：你要装 [0-9a-f]{40}，但这个检出是 [0-9a-f]{12}（可能是更新代码那一步失败了）。什么都没做。/u, r.stderr);
+  assert.equal(u1Snapshot(fx.home), before, "零写：整棵 HOME 前后一致");
+  assert.deepEqual(fs.readdirSync(fx.home), [], "refused 时 HOME 里一个条目都不许建");
+});
+
+// 拿掉哪行会红：同 ②-outbound（闸在 codex/install.mjs 里那一块）。
+test("PK3-I257 ②-codex：期望 ≠ 实际 → 退 2、零写（hooks 与技能都没动）", () => {
+  const fx = i257SourceRepo();
+  const env = installerFixtureEnv({ HOME: fx.home });
+  const before = u1Snapshot(fx.home);
+  const r = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "codex", "install.mjs"), "--expect-commit", fx.second, "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /拒绝：你要装 [0-9a-f]{40}，但这个检出是 [0-9a-f]{12}（可能是更新代码那一步失败了）。什么都没做。/u, r.stderr);
+  assert.equal(u1Snapshot(fx.home), before, "零写：整棵 HOME 前后一致");
+  assert.deepEqual(fs.readdirSync(fx.home), [], "refused 时 HOME 里一个条目都不许建");
+});
+
+// 拿掉哪行会红：把 `sha === null` 那条 not_repo 分支改成 `false` → ③ 红在结论那句：`null` 被当成实际
+//   检出参与比较，结论变成「但这个检出是 null」（把「没有 git」当成「检出不匹配」）（刀9 实测）。
+test("PK3-I257 ③：来源不是 git 仓库 + 给了期望 → 拒绝（预览也退 2）；**不给**期望则照常装", () => {
+  const fx = i257SourceRepo({ git: false });
+  const env = installerFixtureEnv({ HOME: fx.home });
+  const preview = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-outbound.mjs"), "--expect-commit", "a45371b"],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(preview.status, 2, preview.stdout + preview.stderr);
+  // 预览是「报告」：结论写在计划那一行（stdout），不往 stderr 写拒绝句
+  assert.match(preview.stdout, /期望提交 : a45371b —— \*\*核对不出来\*\*：--expect-commit 给了 a45371b，但来源不是 git 仓库（.+i257-src-.+）—— 核对不出来 ≠ 核对通过/u, preview.stdout);
+  assert.equal(preview.stderr.trim(), "", preview.stderr);
+  assert.deepEqual(fs.readdirSync(fx.home), [], "核对不出来也是拒绝，零写");
+
+  // 对照：**不给**这个参数时，非 git 来源照常装（这正是现在天天在跑的形状：从临时目录/夹里装）
+  const ok = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-outbound.mjs"), "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.match(ok.stdout, /装的是提交 （来源不是 git 仓库，追不到），runtime 版本 /u, ok.stdout);
+  assert.ok(fs.existsSync(path.join(fx.home, ".claude", "settings.json")), "不给参数时照常装");
+});
+
+// 拿掉哪行会红：把 absent 那一支改成也拒绝（回到「必须带参数」）→ ④ 红在退出码（实得 2）
+//   （刀11 实测；这也是 item 3 那条硬要求真正防的错）。
+test("PK3-I257 ④：不给 --expect-commit → 预览一个字都不多打、退 0（与现在行为一致）", () => {
+  const fx = i257SourceRepo();
+  const env = installerFixtureEnv({ HOME: fx.home });
+  const r = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-outbound.mjs")],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /期望提交|--expect-commit/u, "没声明就一行都不该打：" + r.stdout);
+  assert.match(r.stdout, /\[dry-run\]/u, r.stdout);
+  assert.deepEqual(fs.readdirSync(fx.home), [], "预览零写");
+});
+
+// 拿掉哪行会红：把 `process.exit(GATE.ok ? 0 : 2)` 改回 `process.exit(0)` → ⑥ 红在退出码（实得 0）。
+test("PK3-I257 ⑥：预览在不一致时退 2 —— 它是「报告」不是「拒绝」（计划照打）", () => {
+  const fx = i257SourceRepo();
+  const env = installerFixtureEnv({ HOME: fx.home });
+  const r = spawnSync(process.execPath,
+    [path.join(fx.src, "scripts", "install-outbound.mjs"), "--expect-commit", fx.second.slice(0, 12)],
+    { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  // 计划照打（含那行结论），不是当场早退
+  assert.match(r.stdout, /期望提交 : [0-9a-f]{12} —— \*\*核对不通过\*\*/u, r.stdout);
+  assert.match(r.stdout, /settings : /u, r.stdout);
+  assert.match(r.stdout, /\[dry-run\] 什么都没写/u, r.stdout);
+  assert.equal(r.stderr.trim(), "", "预览不写盘，所以不「拒绝」：不该往 stderr 写拒绝句：" + r.stderr);
+  assert.deepEqual(fs.readdirSync(fx.home), [], "预览零写");
+});
+
+// 拿掉哪行会红：MIN_EXPECT_PREFIX / SHA_RE 的下限改 6 → ⑤ 红在 6 位那两条（刀7）；
+//   把 `full.startsWith(expected)` 换成相等判定（前缀不算数）→ 红在 7 位前缀那条（刀8）；
+//   去掉重复检测 → 红在重复那条（刀10）；去掉缺值的 `startsWith("--")` 守卫 → 红在缺值那条（刀12）。
+test("PK3-I257 ⑤：前缀语义与参数形状 —— 7 位起可用；不拿前缀去仓库里解析（所以没有「不唯一」态）", () => {
+  const FULL = "a45371bca04eaf469814b21698abdacecfa9fad0";
+  const OTHER = "e6729e33fa16f9aa762341bf96a5a0d961bf3b0e";
+  const v = (argv, actual = FULL) => expectCommitVerdict({ argv, actual });
+
+  // 没给：absent、通过、没有那一行（一个判断都不做）
+  const absent = v([]);
+  assert.deepEqual([absent.kind, absent.ok, absent.line, absent.refusal], ["absent", true, null, null]);
+
+  // 一致：7 位 / 12 位 / 完整 / 大写 / `--k=v` 都收
+  for (const e of [FULL.slice(0, 7), FULL.slice(0, 12), FULL, FULL.slice(0, 12).toUpperCase()]) {
+    const r = v([EXPECT_COMMIT_FLAG, e]);
+    assert.deepEqual([r.kind, r.ok, r.expected, /与来源检出 [0-9a-f]{12} 一致/u.test(r.line)], ["ok", true, e.toLowerCase(), true], e);
+  }
+  assert.equal(v([EXPECT_COMMIT_FLAG + "=" + FULL.slice(0, 7)]).kind, "ok", "等号形式也要认");
+
+  // 太短 / 非十六进制 / 超长 / 带空格 → 用法错（两种模式都拒，且不打计划那行）
+  for (const e of [FULL.slice(0, 6), "zzzzzzz", FULL + "0", FULL.slice(0, 7) + " "]) {
+    const r = v([EXPECT_COMMIT_FLAG, e]);
+    assert.deepEqual([r.kind, r.ok, r.line === null, /不是提交 sha/u.test(r.refusal)], ["bad_argv", false, true, true], e);
+  }
+  // 缺值（最后一个 token / 后面跟着别的参数）与重复出现
+  for (const argv of [[EXPECT_COMMIT_FLAG], [EXPECT_COMMIT_FLAG, "--apply"], [EXPECT_COMMIT_FLAG, FULL.slice(0, 7), EXPECT_COMMIT_FLAG, FULL.slice(0, 7)]]) {
+    const r = v(argv);
+    assert.deepEqual([r.kind, /缺值|重复出现/u.test(r.refusal)], ["bad_argv", true], JSON.stringify(argv));
+  }
+
+  // **不拿前缀去仓库里解析**：同一个 7 位前缀只是拿来和**当前检出**比 ——
+  //   检出换了它就变成不一致（“不唯一”这个失败态不存在，因为没问过仓库里哪个对象以它开头）
+  assert.deepEqual([v([EXPECT_COMMIT_FLAG, FULL.slice(0, 7)], FULL).ok, v([EXPECT_COMMIT_FLAG, FULL.slice(0, 7)], OTHER).kind],
+    [true, "mismatch"]);
+  // 期望是**另一个提交**的前缀（落后的检出对着打算装的提交）：这就是 omm 那次的实际形状
+  const stale = v([EXPECT_COMMIT_FLAG, OTHER.slice(0, 7)], FULL);
+  assert.deepEqual([stale.kind, stale.ok], ["mismatch", false]);
+
+  // 来源不是 git 仓库：核对不出来 ≠ 核对通过
+  const noRepo = v([EXPECT_COMMIT_FLAG, FULL.slice(0, 7)], null);
+  assert.deepEqual([noRepo.kind, noRepo.ok, /核对不出来 ≠ 核对通过/u.test(noRepo.refusal)], ["not_repo", false, true]);
+
+  // 结语那一行：追不到来源就如实说，不编一个出来
+  assert.equal(sourceCommitLine({ commit: null, version: "abc" }), "装的是提交 （来源不是 git 仓库，追不到），runtime 版本 abc");
+  assert.equal(sourceCommitLine({ commit: FULL, version: null }), "装的是提交 " + FULL.slice(0, 12) + "，runtime 版本 （未知）");
 });
 
 sealSummary();

@@ -23,9 +23,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { moduleRoot } from "./direct-run.mjs";
+import { expectCommitVerdict, sourceCommitLine } from "./expect-commit.mjs";
 
 import {
-  applyRuntimeSync, planRuntimeSync, runtimeScript, verifyRuntime,
+  applyRuntimeSync, planRuntimeSync, runtimeScript, sourceCommit, verifyRuntime,
 } from "./runtime-install.mjs";
 import { CLAUDE_DRAIN_SYSTEMD_UNIT, CLAUDE_SKILLS, AILY_DAEMON_UNIT, ailyDaemonPlan, claudeDrainPlist, claudeDrainPlistPath, drainTimerPlan, foreignAilyDaemonUnits, installedClaudeNode, referencedRuntimeScripts, renderClaudeSettings, renderClaudeSkill, resolveAilyCli } from "./install-projection.mjs";
 import { artifactSha, installedSurfacePath, readInstalledSurface, receiptReport, recordInstalledSurface } from "./installed-surface.mjs";
@@ -67,6 +68,17 @@ const TIMER_PLATFORM = timerPlatform({ home: os.homedir() });
 
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 必须在**任何写盘之前**（settings / runtime / 技能 /
+// 收据 / 定时器 / 安装面锁都算），所以放在最前面：这条命令的全部写入都在它后面。
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  // 参数本身不合法（两种模式都拒）或写盘路径上核对不通过 —— 零写。
+  // 预览不在这里退：它本来就零写，任务是「把结论写进计划」（退出码在下面）。
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
 
 // ---------- 运行时代码：先落到固定位置，全局配置才有东西可指 ----------
 //
@@ -305,7 +317,9 @@ if (skillAction === "source-missing") {
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才真的落盘。");
-  process.exit(0);
+  // PK3-I257：预览不做写盘动作，所以它不「拒绝」而是**报告** —— 计划已经打完了（含上面那行期望提交的
+  // 结论），但核对不通过必须反映在退出码上，否则 `&&` 串联的安装步骤照样往下走。
+  process.exit(GATE.ok ? 0 : 2);
 }
 
 // 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
@@ -567,9 +581,13 @@ if (!uninstall) {
   if (report.failed) process.exitCode = 1; // 收据没记下或留下残骸：制品已经写了，但下一次维护预检会拿不到当前投影 —— 不能显示成功
 }
 
-console.log("\n" + (backup ? "settings 已改，备份：" + backup
+// PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」—— omm 那次是要靠事后比版本号才发现装错了；
+// 一行放在最显眼处，肉眼复核一秒完成（卸载路径没有「装的提交」，不打）。
+console.log("");
+if (!uninstall) console.log(sourceCommitLine({ commit: sourceCommit(ROOT), version: runtimePlan?.version }));
+console.log(backup ? "settings 已改，备份：" + backup
   : settingsCreated ? "settings 已新建（原文件不存在）：" + SETTINGS
-    : "settings 无改动，未重写"));
+    : "settings 无改动，未重写");
 // 说出来：登记表牵着绑定和话题历史，"这次安装到底动没动它"不该靠人去猜。
 console.log("登记表    ：" + registryAction);
 console.log("兜底定时器：" + launchNote);

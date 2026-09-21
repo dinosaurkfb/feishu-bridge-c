@@ -19,6 +19,7 @@ import { referencedRuntimeScripts, timerPlatform } from "../install-projection.m
 import { artifactSha, installedSurfacePath, receiptReport, recordInstalledSurface } from "../installed-surface.mjs";
 import { gateBlocks } from "../maintenance-gate-core.mjs";
 import { holdInstallSurfaceLockOrExit } from "../install-surface-lock.mjs";
+import { expectCommitVerdict, sourceCommitLine } from "../expect-commit.mjs";
 import { codexDrainRemovalPlan, linuxDrainScene, uninstallDrainUnitsInLock } from "./drain-service.mjs";
 import { SKILLS, expectedSkillContent } from "./skill-content.mjs";
 
@@ -26,7 +27,7 @@ import {
   bridgeHome, enableAutoPublishForAllTasks, registryFile,
 } from "./state.mjs";
 import {
-  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, verifyRuntime,
+  applyRuntimeSync, codexRuntimeRoot, planRuntimeSync, sourceCommit, verifyRuntime,
 } from "../runtime-install.mjs";
 
 const ROOT = moduleRoot(import.meta.url, "../..");
@@ -34,6 +35,15 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
+// （hooks / 技能 / runtime / 模板 / 收据 / 定时器 / 安装面锁都算）。
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
 
 // **只在 linux 构造现场**（PK3-L7-fix5 P1-1）：darwin 真机上根本没有 systemd，这里连一次 systemctl
 // 都不该调 —— 旧版 `uninstall ? linuxDrainScene() : null` 会在 Mac 上把探询打成"查不清"，
@@ -149,7 +159,8 @@ if (uninstall) {
 
 if (!apply) {
   console.log("\n[dry-run] 什么都没写。加 --apply 才安装。");
-  process.exit(0);
+  // PK3-I257：预览不写盘，所以它不「拒绝」而是**报告** —— 计划已打完（含上面那行结论），但核对不通过
+  process.exit(GATE.ok ? 0 : 2);
 }
 
 // 安装面锁 + 维护门（issue #81）：先取安装面锁（与维护流程共用一把，持有到本进程退出），**再**看门 ——
@@ -288,5 +299,7 @@ if (!uninstall) {
 if (uninstall) {
   console.log("\n已完成本地卸载。");
 } else {
-  console.log("\n已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
+  // PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
+  console.log("\n" + sourceCommitLine({ commit: sourceCommit(ROOT), version: runtimePlan?.version }));
+  console.log("已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
 }

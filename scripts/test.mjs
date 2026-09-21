@@ -10090,6 +10090,8 @@ test("PK3-I260：结语按收据实际记的提交说话——相同照常一行
   const noRepo = sourceCommitLine({ commit: null, version: "v1", installedCommit: C });
   assert.match(noRepo, /来源不是 git 仓库/u, noRepo);
   assert.ok(noRepo.includes(C.slice(0, 12)), noRepo);
+  // ⑦ 调用方**没传**收据（入站安装器没有自己的 runtime 收据）→ 照常一行，不许说成「收据没有记录」
+  assert.equal(sourceCommitLine({ commit: A, version: "v1" }), "装的是提交 " + A.slice(0, 12) + "，runtime 版本 v1");
   // ⑥ 两边都没有 → 照常一行（来源不是 git 仓库）
   assert.equal(sourceCommitLine({ commit: null, version: "v1", installedCommit: null }), "装的是提交 （来源不是 git 仓库，追不到），runtime 版本 v1");
 });

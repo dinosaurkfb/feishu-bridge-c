@@ -270,14 +270,19 @@ export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot =
  * 只写「装的是提交 A」会让人以为收据也是 A。所以这种时候两个都写出来，并明说没重装。
  * （`installedCommit` 是那份不可变收据记的来源提交；为空/相同就走原来那一行。）
  */
-export const sourceCommitLine = ({ commit, version, installedCommit = null } = {}) => {
+export const sourceCommitLine = ({ commit, version, installedCommit } = {}) => {
   // #260：判据是**装完之后线上那份收据实际记的来源提交**，不是「这次有没有重装」。
   //   版本目录内容寻址且不可变：同字节再装是 no-op（收据不改写）；切回一个**已存在**的版本目录也不是 no-op，
   //   但那个目录里的收据同样是当初写的（Codex #263 一轮 P1：B 装 V → C 装 W → A 切回 V）。
   //   所以一律拿收据说话：只要它与本次提交不同、或没有记录，就照实说出来。
   //   比较用完整 sha（小写），判完再截短；前 12 位相同而完整不同时两个都给完整 sha。
+  //   **没传 installedCommit（undefined）≠ 收据没记录（null）**：入站安装器没有自己的 runtime 收据，
+  //   它不传这个参数，那时照常一行；只有调用方明确给了收据的值（字符串或 null）才拿它比较。
   const full = (c) => (typeof c === "string" && c.length > 0 ? c.toLowerCase() : null);
   const plannedFull = full(commit);
+  if (installedCommit === undefined) {
+    return "装的是提交 " + (plannedFull === null ? "（来源不是 git 仓库，追不到）" : plannedFull.slice(0, 12)) + "，runtime 版本 " + (version ?? "（未知）");
+  }
   const recordedFull = full(installedCommit);
   const shown = (c) => c.slice(0, 12);
   const v = version ?? "（未知）";
@@ -298,4 +303,3 @@ export const sourceCommitLine = ({ commit, version, installedCommit = null } = {
   return "本次来源提交 " + p + "；runtime 版本 " + v + " **沿用已有的同一份内容**（版本目录不可变，其收据记的来源提交是 " +
     r + "）—— 将装字节与 " + p + " 一致";
 };
-

@@ -210,7 +210,6 @@ const writeAtomic = (file, text) => {
 // 那期间每一轮 Stop 都走 hook-unavailable 分支，进展静默留在本地。
 // 版本目录里那份不可变收据记的来源提交（只在 runtime 真装/校验过之后有意义）—— 见结语那行。
 let runtimeReceiptCommit = null;
-let runtimeNoop = false;   // #260：结语要明说有没有重装，别让它去猜
 if (!uninstall) {
   if (!runtimePlan?.ok) {
     console.error("运行时计划算不出来（" + (runtimePlan?.reason ?? "unknown") + "），什么都没装。");
@@ -229,7 +228,6 @@ if (!uninstall) {
   // 同字节再装一次是 no-op：版本目录里那份**不可变收据**不会被改写，它的 source_commit 可能与本次不同
   //   （fix5 P1-2）—— 结语要把两个都说出来。
   runtimeReceiptCommit = checked.sourceCommit ?? null;
-  runtimeNoop = synced.noop === true;
   console.log("运行时    ：已装 " + runtimePlan.version.slice(0, 16) + " 并校验通过" + (synced.noop ? "（与线上同一份内容，未重装）" : ""));
 }
 
@@ -336,6 +334,6 @@ if (uninstall) {
 } else {
   // PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
   // fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
-  console.log("\n" + sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit, noop: runtimeNoop }));
+  console.log("\n" + sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit }));
   console.log("已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
 }

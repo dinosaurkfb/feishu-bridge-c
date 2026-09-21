@@ -371,7 +371,6 @@ const writeJsonAtomic = (file, obj) => {
 // `runtimeReceiptCommit`：**版本目录里那份不可变收据**记的来源提交（fix5 P1-2）。同字节再装一次是 no-op，
 //   收据不会被改写 —— 于是它可能与本次核对的 COMMIT 不同，结语要把两个都说出来。
 let runtimeReceiptCommit = null;
-let runtimeNoop = false;   // #260：结语要明说有没有重装，别让它去猜
 if (runtimePlan) {
   const synced = applyRuntimeSync(runtimePlan);
   if (!synced.ok) {
@@ -387,7 +386,6 @@ if (runtimePlan) {
     process.exit(1);
   }
   runtimeReceiptCommit = checked.sourceCommit ?? null;
-  runtimeNoop = synced.noop === true;
   console.log("运行时   : 已装 " + checked.version + " 并校验通过" + (synced.noop ? "（与线上同一份内容，未重装）" : ""));
 }
 
@@ -621,7 +619,7 @@ if (!uninstall) {
 // 一行放在最显眼处，肉眼复核一秒完成（卸载路径没有「装的提交」，不打）。
 // fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
 console.log("");
-if (!uninstall) console.log(sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit, noop: runtimeNoop }));
+if (!uninstall) console.log(sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit }));
 console.log(backup ? "settings 已改，备份：" + backup
   : settingsCreated ? "settings 已新建（原文件不存在）：" + SETTINGS
     : "settings 无改动，未重写");

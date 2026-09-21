@@ -10065,32 +10065,33 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
 //   随机根的后缀恰以 X 结尾（约 1/62）时 fix4 会偶红、且那条「不许有兄弟」会假绿。
 //   「根改回随机名」这种回退在行为层面只有约 1/62 概率暴露，所以这里用**逐字结构断言**确定性地拦它（刀 K2 可红）；
 //   BSD 行为本身只做观察、不断言（单次随机输出证明不了「替换进来的字符必不为 X」）。
-// #260：no-op 结语的两个边界。拿掉哪行会红：
-//   sourceCommitLine 里 `recordedFull === null` 那一支 → ① 红（旧收据无来源时又说成「装的是提交 A」）；
-//   把完整 sha 比较改回「截 12 位再比」→ ② 红（共享前 12 位的两个提交被说成同一个）；
-//   把 `noop === true` 的判断拿掉、改回靠提交号是否相同去猜 → ③ 红（真重装了却说未重装）。
-test("PK3-I260：no-op 结语——旧收据无来源时照实说、共享前 12 位时给完整 sha、有没有重装由调用方明说", () => {
+// #260 / Codex #263 一轮：结语的判据是**装完后线上收据实际记的来源提交**，不是「有没有重装」。拿掉哪行会红：
+//   `recordedFull === null` 那一支 → ② 红（收据无来源时又说成「装的是提交 A」）；
+//   把完整 sha 比较改回截 12 位再比 → ③ 红（共享前 12 位的两个提交被说成同一个）；
+//   把 `recordedFull === plannedFull` 的相等判据改成恒真 → ②③④⑤ 红（差异被吞掉）。
+test("PK3-I260：结语按收据实际记的提交说话——相同照常一行；无记录、不同、共享前 12 位都照实说", () => {
   const A = "a".repeat(12) + "1".repeat(28);
   const B = "a".repeat(12) + "2".repeat(28);        // 与 A 共享前 12 位，但不是同一个提交
-  // ① 旧 runtime 收据没记来源提交 + 这次没重装 → 不许再说「装的是提交 A」
-  const noRecord = sourceCommitLine({ commit: A, version: "v1", installedCommit: null, noop: true });
-  assert.match(noRecord, /runtime 未重装/u, noRecord);
+  const C = "c".repeat(40);
+  // ① 收据记的就是这次的提交 → 照常一行
+  assert.equal(sourceCommitLine({ commit: A, version: "v1", installedCommit: A }), "装的是提交 " + A.slice(0, 12) + "，runtime 版本 v1");
+  // ② 收据没有记录来源提交 → 不许说「装的是提交 A」
+  const noRecord = sourceCommitLine({ commit: A, version: "v1", installedCommit: null });
   assert.match(noRecord, /没有记录来源提交/u, noRecord);
   assert.doesNotMatch(noRecord, /^装的是提交/u, noRecord);
-  // ② 共享前 12 位的两个不同提交 → 两个都给完整 sha，不许在 12 位展示里「看起来一样」
-  const clash = sourceCommitLine({ commit: A, version: "v1", installedCommit: B, noop: true });
+  // ③ 共享前 12 位的两个不同提交 → 两个都给完整 sha
+  const clash = sourceCommitLine({ commit: A, version: "v1", installedCommit: B });
   assert.ok(clash.includes(A) && clash.includes(B), "两个完整 sha 都要出现：" + clash);
-  assert.match(clash, /runtime 未重装/u, clash);
-  // ③ 真的重装了（noop:false）→ 收据是刚写的、就是这次的提交，照常一行（哪怕传进来的旧收据值不同）
-  assert.equal(sourceCommitLine({ commit: A, version: "v1", installedCommit: B, noop: false }),
-    "装的是提交 " + A.slice(0, 12) + "，runtime 版本 v1");
-  // ④ 没重装、但收据记的就是这个提交（完整 sha 相同）→ 照常一行
-  assert.equal(sourceCommitLine({ commit: A, version: "v1", installedCommit: A, noop: true }),
-    "装的是提交 " + A.slice(0, 12) + "，runtime 版本 v1");
-  // ⑤ 前 12 位不同的两个提交 + 没重装 → 12 位展示就够（不必给完整 sha）
-  const C = "c".repeat(40);
-  const plain = sourceCommitLine({ commit: A, version: "v1", installedCommit: C, noop: true });
+  assert.match(clash, /沿用已有的同一份内容/u, clash);
+  // ④ 前 12 位不同 → 12 位展示就够
+  const plain = sourceCommitLine({ commit: A, version: "v1", installedCommit: C });
   assert.ok(plain.includes(A.slice(0, 12)) && plain.includes(C.slice(0, 12)) && !plain.includes(A), plain);
+  // ⑤ 来源不是 git 仓库、但线上收据记着某个提交 → 照实说沿用
+  const noRepo = sourceCommitLine({ commit: null, version: "v1", installedCommit: C });
+  assert.match(noRepo, /来源不是 git 仓库/u, noRepo);
+  assert.ok(noRepo.includes(C.slice(0, 12)), noRepo);
+  // ⑥ 两边都没有 → 照常一行（来源不是 git 仓库）
+  assert.equal(sourceCommitLine({ commit: null, version: "v1", installedCommit: null }), "装的是提交 （来源不是 git 仓库，追不到），runtime 版本 v1");
 });
 
 test("PK3-T253b：fix4 的根是固定名子目录（BSD mkdtemp 替换模板末尾所有 X 的回归）", () => {
@@ -62778,11 +62779,55 @@ test("PK3-I257-fix5 ③：同字节不同提交的重复安装 —— runtime �
     const line = (second.stdout.split("\n").find((l) => /本次来源提交|装的是提交/u.test(l))) ?? "";
     assert.ok(line.includes(fx.first.slice(0, 12)), "结语要写出本次核对的提交：" + line);
     assert.ok(line.includes(fx.second.slice(0, 12)), "结语要写出收据里那个旧的来源提交：" + line);
-    assert.match(line, /runtime 未重装/u, line);
+    assert.match(line, /沿用已有的同一份内容/u, line);
     assert.match(line, /将装字节与 /u, line);
     // 收据**不改写**：仍是 B（版本目录不可变）
     assert.equal(JSON.parse(fs.readFileSync(path.join(home, entry.manifest), "utf-8")).source_commit, fx.second,
       entry.script + "：不可变收据里那份 source_commit 不许被改写");
+  }
+});
+
+// Codex #263 一轮 P1 的三步回归：切回一个**已存在**的版本目录不是 no-op，但那份目录里的收据仍是当初写的。
+//   B 装版本 V → C 装另一版本 W → A（字节与 B 相同）切回 V：结语必须交代收据仍记 B。两个安装器都覆盖。
+//   拿掉哪行会红：结语改回「只在 no-op 时才比较收据」（上一版写法）→ 本用例红（切回旧版本时 noop 为 false）。
+test("PK3-I260：B 装 → C 装另一版本 → A（与 B 同字节）切回旧版本 —— 结语交代收据仍记 B（两安装器）", () => {
+  for (const entry of [{ script: "install-outbound.mjs", manifest: path.join(".claude", "feishu-bridge", "runtime", "current", "INSTALLED.json") },
+    { script: path.join("codex", "install.mjs"), manifest: path.join(".codex", "feishu-bridge", "runtime", "current", "INSTALLED.json") }]) {
+    const fx = i257SourceRepo();   // first = A，second = B（只多一个不被安装的文件 → 将装字节相同）
+    const home = path.join(fx.base, "home3-" + path.basename(entry.script));
+    fs.mkdirSync(home, { recursive: true });
+    const env = installerFixtureEnv({ HOME: home });
+    const git = (...a) => execFileSync("git", ["-C", fx.src, ...a], { encoding: "utf-8" }).trim();
+    const run = (commit) => spawnSync(process.execPath,
+      [path.join(fx.src, "scripts", entry.script), EXPECT_COMMIT_FLAG, commit, "--apply"],
+      { encoding: "utf-8", timeout: 300_000, env });
+    const manifest = () => JSON.parse(fs.readFileSync(path.join(home, entry.manifest), "utf-8"));
+    // C：在 B 上改一个**会被安装**的文件（只加一行注释），得到另一份 runtime 内容
+    git("reset", "--hard", fx.second);
+    fs.appendFileSync(path.join(fx.src, "scripts", "expect-commit.mjs"), "\n// fixture C\n");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-am", "C");
+    const C = git("rev-parse", "HEAD");
+    // ① 以 B 装 → 版本 V，收据记 B
+    git("reset", "--hard", fx.second);
+    const r1 = run(fx.second);
+    assert.equal(r1.status, 0, "以 B 装：" + r1.stdout + r1.stderr);
+    const V = manifest().version;
+    assert.equal(manifest().source_commit, fx.second);
+    // ② 以 C 装 → 另一版本 W，收据记 C
+    git("reset", "--hard", C);
+    const r2 = run(C);
+    assert.equal(r2.status, 0, "以 C 装：" + r2.stdout + r2.stderr);
+    assert.notEqual(manifest().version, V, "C 的 runtime 内容不同，版本号必须不同（否则这条回归没意义）");
+    // ③ 以 A 装（字节与 B 相同）→ 切回已存在的版本 V：不是 no-op，但 V 目录里的收据仍记 B
+    git("reset", "--hard", fx.first);
+    const r3 = run(fx.first);
+    assert.equal(r3.status, 0, "以 A 装：" + r3.stdout + r3.stderr);
+    assert.equal(manifest().version, V, "切回了已存在的版本 V");
+    assert.equal(manifest().source_commit, fx.second, "V 目录里的不可变收据仍记 B");
+    const line = (r3.stdout.split("\n").find((l) => /本次来源提交|装的是提交/u.test(l))) ?? "";
+    assert.ok(line.includes(fx.first.slice(0, 12)), entry.script + "：结语要写出本次的提交 A：" + line);
+    assert.ok(line.includes(fx.second.slice(0, 12)), entry.script + "：结语要交代收据仍记 B：" + line);
+    assert.match(line, /沿用已有的同一份内容/u, line);
   }
 });
 

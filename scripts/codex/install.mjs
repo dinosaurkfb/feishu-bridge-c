@@ -73,15 +73,33 @@ const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root:
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
 
 // hooks.json 的合并只有一份（codex/hook-command.mjs 的 renderCodexHooks）：让每个事件下恰好只剩一条我们的 hook，只动自己那一条 child。
-let before = "";
-try { before = fs.readFileSync(HOOKS, "utf-8"); }
+// **ENOENT 是"没有旧文件"**（全新机器上 hooks.json 本来就不存在）→ 空 settings 继续；
+// **文件在但读不了 / 不是合法 JSON** 是另一回事（issue #254 第 2 条，与 Claude 那条同一个口径）：
+// 坏着的全局配置不许被当成空的重写 —— 那里也有别人（以及本链旧版）写进去的钩子。
+// fix1（Codex 一轮 P1）：**「文件不存在」与「存在但是空文件」是两回事**，不许用同一个 "" 表示 ——
+//   混在一起时，磁盘上一个零字节的 hooks.json 会被当成全新文件放行并覆盖，而不是按「用不了」零写拒绝。
+//   所以用独立的 hooksExisted 记在不在；读成功的内容（**包括 ""**）原样交给解析器去判。
+let before = null;
+let hooksExisted = false;
+try { before = fs.readFileSync(HOOKS, "utf-8"); hooksExisted = true; }
 catch (err) {
   if (err.code !== "ENOENT") {
-    console.error("hooks.json 读不了：" + err.message);
+    console.error("hooks.json 读不了（" + (err.code ?? "说不清") + "）：" + err.message + "\n" +
+      "  它是全局配置，**不当作空文件**继续（那会把里面别人的钩子一起覆盖掉）。什么都没做。");
     process.exit(1);
   }
 }
-const renderedHooks = renderCodexHooks({ baseText: before === "" ? null : before, promptScript, stopScript, node, home, log, uninstall });
+let renderedHooks;
+try {
+  //   没有旧文件 → baseText 给 null（从空表算起）；文件在（哪怕是零字节）→ 原样交给解析器，
+  //   零字节解析不出来就落到下面那个 catch，按「用不了」零写退出 1。
+  renderedHooks = renderCodexHooks({ baseText: hooksExisted ? before : null, promptScript, stopScript, node, home, log, uninstall });
+} catch (err) {
+  console.error("hooks.json 用不了（" +
+    (err instanceof SyntaxError ? "不是合法 JSON：" + err.message : String(err?.message ?? err)) + "）：" + HOOKS + "\n" +
+    "  它在磁盘上（哪怕是零字节）—— 按空 settings 继续会把里面别人的钩子一起覆盖掉。请先修好它（或把它移走）再装。什么都没做。");
+  process.exit(1);
+}
 const hooks = renderedHooks.hooks;
 const promptAction = renderedHooks.actions.UserPromptSubmit;
 const stopAction = renderedHooks.actions.Stop;

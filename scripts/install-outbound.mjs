@@ -81,8 +81,26 @@ if (runtimePlan && !runtimePlan.ok) {
 }
 
 // ---------- settings.json（投影在 install-projection.mjs：只动自己的 hook 与预览放行规则）----------
-
-const settingsBefore = fs.readFileSync(SETTINGS, "utf-8");
+//
+// **全新机器上本来就没有 `~/.claude/settings.json`**（Claude Code 还没跑过的机器尤其如此）——
+// 而预览是安装文档里第一步会跑的东西，它必须给出计划，而不是抛一个 ENOENT 栈（issue #254）。
+// 所以只对 **ENOENT** 放行：那就是"没有旧文件"，等于空 settings + 这次会新建。
+// **文件在那儿却读不了**（权限、设备错）是另一回事：那不是"没有旧文件"，而是"有一个读不出内容的
+// 旧文件"——当成空 settings 继续就是拿一次静默覆盖去改别人的全局配置（那里面有 .orca 一整套钩子）。
+// 不存在时用的 baseText 是**规范空 settings**（不是空串）：卸载路径上"从空表算出空表"要能与它逐字节
+// 相等，那样全新 HOME 上 `--uninstall` 不会凭空建出一个 settings.json。
+let settingsBefore = "{}\n";
+let settingsFileExisted = false;
+try {
+  settingsBefore = fs.readFileSync(SETTINGS, "utf-8");
+  settingsFileExisted = true;
+} catch (err) {
+  if (err.code !== "ENOENT") {
+    console.error("settings.json 读不了（" + (err.code ?? "说不清") + "）：" + err.message + "\n" +
+      "  它是全局配置，**不当作空文件**继续（那会把里面别人的设置一起覆盖掉）。什么都没做。");
+    process.exit(1);
+  }
+}
 /**
  * **现有安装里那个 node**（PK3-L1-fix2 P1-1）：收据里的 claude 链 + settings.json 里我们自己的 hook
  * 命令 + 现有 plist / unit → installed；它仍然可执行（X_OK）就沿用，不再按当前偏好顺序改写现网。
@@ -93,7 +111,19 @@ const installedReceipt = (() => {
   return r.state === "valid" ? r.doc : null;
 })();
 const NODE_BIN = pickClaudeNode({ installed: installedClaudeNode({ home: os.homedir(), platform: TIMER_PLATFORM, receipt: installedReceipt }) });
-const rendered = renderClaudeSettings({ baseText: settingsBefore, home: os.homedir(), node: NODE_BIN, uninstall });
+/**
+ * 投影里唯一会**抛**的一处是 `JSON.parse(baseText)`（坏 JSON、或顶层不是对象）。那也不是"没有旧文件"：
+ * 与上面读不了那条同一个道理 —— 坏着的全局配置不许被当成空的重写。在这里变成一句人话（issue #254 第 2 条）。
+ */
+let rendered;
+try {
+  rendered = renderClaudeSettings({ baseText: settingsBefore, home: os.homedir(), node: NODE_BIN, uninstall });
+} catch (err) {
+  console.error("settings.json 用不了（" +
+    (err instanceof SyntaxError ? "不是合法 JSON：" + err.message : String(err?.message ?? err)) + "）：" + SETTINGS + "\n" +
+    "  它不是空文件 —— 按空 settings 继续会把里面别人的设置一起覆盖掉。请先修好它（或把它移走）再装。什么都没做。");
+  process.exit(1);
+}
 const settings = rendered.settings;
 // 卸载路径上 renderClaudeSettings 会把**空掉的** hooks / permissions 容器一并清掉（PK3-U1：让 settings 回到
 // 装前的样子），所以这里按"可能已经不在"读 —— 安装路径上它们一定在（投影刚建好）。
@@ -233,7 +263,11 @@ if (runtimePlan) {
     (runtimePlan.sourceCommit ? runtimePlan.sourceCommit.slice(0, 12) : "非 git 仓库") +
     " @ " + runtimePlan.sourceRoot);
 }
-console.log("settings : " + SETTINGS + "  → " + action);
+console.log("settings : " + SETTINGS +
+  (settingsFileExisted ? ""
+    : uninstall ? "（不存在 —— 按空 settings 处理，不会新建）"
+      : "（不存在 —— 将新建；没有旧文件，因此没有备份这一步）") +
+  "  → " + action);
 // 把选中的 node 打出来：它决定三条 hook 与定时器跑哪个二进制，而"选了哪个"以前只藏在命令文本里 ——
 // 「保留已安装路径」这件事得能在预览里看见（产品级用例也拿它当断言点）。
 console.log("node     : " + NODE_BIN + "（三条 hook 与兜底定时器都用它）");
@@ -312,9 +346,16 @@ if (runtimePlan) {
 // 全局配置增加被写坏的机会。
 const settingsAfter = JSON.stringify(settings, null, 2) + "\n";
 let backup = null;
+let settingsCreated = false;
 if (settingsAfter !== settingsBefore) {
-  backup = SETTINGS + ".bak." + new Date().toISOString().replace(/[:.]/g, "-");
-  fs.copyFileSync(SETTINGS, backup);
+  if (settingsFileExisted) {
+    backup = SETTINGS + ".bak." + new Date().toISOString().replace(/[:.]/g, "-");
+    fs.copyFileSync(SETTINGS, backup);
+  } else {
+    // **没有旧文件就没有备份这一步**（预览里已经写明，issue #254）。
+    // 旧版这里无条件 `copyFileSync(SETTINGS, backup)` —— 全新 HOME 上它自己就是下一个 ENOENT。
+    settingsCreated = true;
+  }
   writeJsonAtomic(SETTINGS, settings);
 }
 
@@ -526,7 +567,9 @@ if (!uninstall) {
   if (report.failed) process.exitCode = 1; // 收据没记下或留下残骸：制品已经写了，但下一次维护预检会拿不到当前投影 —— 不能显示成功
 }
 
-console.log("\n" + (backup ? "settings 已改，备份：" + backup : "settings 无改动，未重写"));
+console.log("\n" + (backup ? "settings 已改，备份：" + backup
+  : settingsCreated ? "settings 已新建（原文件不存在）：" + SETTINGS
+    : "settings 无改动，未重写"));
 // 说出来：登记表牵着绑定和话题历史，"这次安装到底动没动它"不该靠人去猜。
 console.log("登记表    ：" + registryAction);
 console.log("兜底定时器：" + launchNote);

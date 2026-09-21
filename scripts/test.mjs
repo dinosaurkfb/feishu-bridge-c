@@ -61785,6 +61785,180 @@ test("PK3-W232：doctor ⑯ 入站转发结果文案包含「只统计本链 liv
   assert.match(cHasRuns.detail, /外部处理器（routes\.json 非默认路由）的转发结果不在此项/u);
 });
 
+// ── PK3-I254：全新 HOME 上安装器预览不许崩（issue #254）──────────────────────────────
+// 产品目标是「装完即用」，而**全新机器上本来就没有 ~/.claude/settings.json**（Claude Code 还没跑过的
+// 机器尤其如此），~/.claude/skills 也一样。预览是安装文档里第一步会跑的东西 —— 它必须给出计划，
+// 而不是抛一个 ENOENT 栈（旧版在 install-outbound 那一处直接 readFileSync）。
+const i254FreshHome = () => fs.mkdtempSync(path.join(os.tmpdir(), "i254-fresh-"));
+
+// 拿掉哪行会红：把 settings 那段改回裸 `fs.readFileSync(SETTINGS, "utf-8")` →
+//   ① 红在 install-outbound 预览的退出码（实得 1 + ENOENT 栈）；把 install-inbound 的
+//   `notes.push("技能根目录不存在，将新建：…")` 改回 `problems.push(…)` → ① 红在 install-inbound 的退出码。
+test("PK3-I254 ①：全新 HOME 上三个安装器预览都退 0，且都把「会新建什么」写进计划", () => {
+  const home = i254FreshHome();
+  const env = installerFixtureEnv({ HOME: home });
+  const run = (script, args = []) => spawnSync(process.execPath,
+    [path.resolve("scripts", script), ...args], { encoding: "utf-8", timeout: 300_000, env });
+
+  const out = run("install-outbound.mjs");
+  assert.equal(out.status, 0, out.stdout + out.stderr);
+  assert.doesNotMatch(out.stdout + out.stderr, /ENOENT|readFileSync/u, "不许是 Node 异常栈：" + out.stderr);
+  assert.match(out.stdout, /settings\.json（不存在 —— 将新建；没有旧文件，因此没有备份这一步）/u, out.stdout);
+  assert.match(out.stdout, /\[dry-run\]/u, out.stdout);
+
+  const inb = run("install-inbound.mjs");
+  assert.equal(inb.status, 0, inb.stdout + inb.stderr);
+  assert.match(inb.stdout, /注意\s+技能根目录不存在，将新建/u, inb.stdout);
+  assert.match(inb.stdout, /\[dry-run\]/u, inb.stdout);
+
+  const cod = run(path.join("codex", "install.mjs"));
+  assert.equal(cod.status, 0, cod.stdout + cod.stderr);
+  assert.match(cod.stdout, /\[dry-run\]/u, cod.stdout);
+
+  // 预览（不带 --apply）一个条目都不许建
+  assert.deepEqual(fs.readdirSync(home), [], "预览不许在全新 HOME 里建任何东西");
+
+  // 全新 HOME 上 `--uninstall --apply` 不该凭空建出一个 settings.json（"从空表算出空表"逐字节相等 → 不写）。
+  // 拿掉哪行会红：把 `let settingsBefore = "{}\n"` 改成 `null`（或 `""`）→ 空基文本与投影结果不再逐字节相等
+  //   （`""` 更早：JSON.parse 直接抛，本步退 1）。
+  const home2 = i254FreshHome();
+  const env2 = installerFixtureEnv({ HOME: home2 });
+  const un = spawnSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--uninstall", "--apply"], { encoding: "utf-8", timeout: 300_000, env: env2 });
+  assert.equal(un.status, 0, un.stdout + un.stderr);
+  assert.match(un.stdout, /（不存在 —— 按空 settings 处理，不会新建）/u, un.stdout);
+  assert.equal(fs.existsSync(path.join(home2, ".claude", "settings.json")), false, "卸载不该新建 settings.json");
+});
+
+// 拿掉哪行会红：把 `if (settingsFileExisted) { … } else { settingsCreated = true; }` 那层分支去掉
+//   （回到无条件 `copyFileSync(SETTINGS, backup)`）→ ② 红在 apply 的退出码（ENOENT：copyfile）
+//   与「settings 被建出来」。
+test("PK3-I254 ②：全新 HOME 上 --apply 真的把 settings 建出来（合法 JSON、三条钩子各一条、没有备份）", () => {
+  const home = i254FreshHome();
+  const env = installerFixtureEnv({ HOME: home });
+  const applied = spawnSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /settings 已新建（原文件不存在）/u, applied.stdout);
+
+  const dir = path.join(home, ".claude");
+  const text = fs.readFileSync(path.join(dir, "settings.json"), "utf-8");
+  JSON.parse(text);                       // 必须是合法 JSON（坏了当场抛）
+  // 三条钩子各一条 —— 用产品自己的归属判据，不用子串扫
+  const owned = claudeSettingsOwnedEntries(text, { home, node: pickClaudeNodeB() });
+  assert.deepEqual([owned.Stop.length, owned.inbound.length, owned.init.length], [1, 1, 1], JSON.stringify(owned));
+  assert.equal(owned.allow.length, 1, JSON.stringify(owned));
+  // 没有旧文件 → 没有备份这一步（预览里已经写明）
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".bak.")), [], "不存在的文件没有可备份的东西");
+});
+
+// 拿掉哪行会红：把备份那一段的 `if (settingsFileExisted)` 删掉（不管有没有旧文件都不备份）→
+//   ③ 红在「备份与装前字节相同」（实得 0 个备份文件）。
+test("PK3-I254 ③：已有 settings 的机器行为不变（别人的条目原样、我们的三条各一条、先备份）", () => {
+  const home = i254FreshHome();
+  const dir = path.join(home, ".claude");
+  const file = path.join(dir, "settings.json");
+  fs.mkdirSync(dir, { recursive: true });
+  const before = JSON.stringify({
+    model: "opus",
+    hooks: { Stop: [{ hooks: [{ type: "command", command: "node /opt/orca/scripts/stop-hook.mjs # ORCA" }] }] },
+    permissions: { allow: ["Bash(git status:*)"] },
+  }, null, 2) + "\n";
+  fs.writeFileSync(file, before);
+  const env = installerFixtureEnv({ HOME: home });
+  const applied = spawnSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(applied.status, 0, applied.stdout + applied.stderr);
+  assert.match(applied.stdout, /settings 已改，备份：/u, applied.stdout);
+
+  const after = fs.readFileSync(file, "utf-8");
+  const j = JSON.parse(after);
+  assert.equal(j.model, "opus", "无关设置原样保留");
+  assert.deepEqual(j.permissions.allow.filter((r) => r === "Bash(git status:*)"), ["Bash(git status:*)"], "别人的放行规则原样保留");
+  assert.ok(j.hooks.Stop.some((e) => (e.hooks ?? []).some((h) => String(h.command).includes("ORCA"))), "别人的钩子原样保留");
+  const owned = claudeSettingsOwnedEntries(after, { home, node: pickClaudeNodeB() });
+  assert.deepEqual([owned.Stop.length, owned.inbound.length, owned.init.length], [1, 1, 1], JSON.stringify(owned));
+
+  const baks = fs.readdirSync(dir).filter((n) => n.includes(".bak."));
+  assert.equal(baks.length, 1, "有旧文件就必须先备份：" + JSON.stringify(fs.readdirSync(dir)));
+  assert.equal(fs.readFileSync(path.join(dir, baks[0]), "utf-8"), before, "备份必须是装前**字节**");
+});
+
+// 拿掉哪行会红：把 `rendered` 的 try/catch 与读文件那条 `err.code !== "ENOENT"` 分支一起去掉
+//   （回到裸读 + 裸 parse）→ ④ 三条都红在退出码（实得未捕获栈，stderr 里没有人话）。
+// 拿掉哪行会红：codex/install 里把 hooksExisted 去掉、baseText 回到 `before === "" ? null : before` →
+//   本用例红在退出码（零字节 hooks.json 被当成"没有旧文件"，安装照常进行并覆盖它）。
+test("PK3-I254-fix1：磁盘上零字节的 hooks.json 是「用不了」，不是「没有旧文件」——退 1、零写", () => {
+  const home = i254FreshHome();
+  const codexHome = path.join(home, ".codex");
+  const hooks = path.join(codexHome, "hooks.json");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(hooks, "");                       // 存在、可读、零字节
+  assert.equal(fs.statSync(hooks).size, 0, "夹具前提：文件在且是零字节");
+  const env = installerFixtureEnv({ HOME: home, CODEX_HOME: codexHome,
+    FEISHU_CODEX_BRIDGE_HOME: path.join(codexHome, "feishu-bridge") });
+  const before = fs.readdirSync(codexHome).sort();
+  const r = spawnSync(process.execPath,
+    [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(r.status, 1, "零字节 = 解析不出来 = 用不了，必须退 1：" + r.stdout + r.stderr);
+  assert.match(r.stderr, /hooks\.json 用不了/u, r.stderr);
+  assert.doesNotMatch(r.stdout + r.stderr, /^\s+at |JSON\.parse/u, "不许是未捕获栈：" + r.stderr);
+  assert.equal(fs.readFileSync(hooks, "utf-8"), "", "零字节文件一个字节都不许动");
+  assert.deepEqual(fs.readdirSync(codexHome).sort(), before, "失败必须发生在任何写入之前（不建 runtime / 技能 / 备份）");
+  // 对照：文件**不存在**时照常装得上（别把闸门做成"Codex 链在新机器上装不了"）
+  const fresh = i254FreshHome();
+  const freshCodex = path.join(fresh, ".codex");
+  // env 先赋值再用：结构守卫（PK3-I247）只认「内联清洗入口」或「本块内由薄包装赋值的变量」，
+  //   薄包装内联在参数上不算（它只认 installerChildEnv / purgeChildEnv / requireCleansedInstallerEnv 三个名字）。
+  const freshEnv = installerFixtureEnv({ HOME: fresh, CODEX_HOME: freshCodex,
+    FEISHU_CODEX_BRIDGE_HOME: path.join(freshCodex, "feishu-bridge") });
+  const ok = spawnSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"],
+    { encoding: "utf-8", timeout: 300_000, env: freshEnv });
+  assert.equal(ok.status, 0, "全新机器（hooks.json 不存在）照常装：" + ok.stdout + ok.stderr);
+  assert.equal(fs.existsSync(path.join(freshCodex, "hooks.json")), true, "装完 hooks.json 被建出来");
+});
+
+test("PK3-I254 ④：settings / hooks.json 存在但用不了（坏 JSON、不是文件）仍然失败，且给的是人话", () => {
+  // ① 坏 JSON（Claude 链）：退 1、一句人话、零写
+  const home = i254FreshHome();
+  const dir = path.join(home, ".claude");
+  const file = path.join(dir, "settings.json");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, "{ 这不是 JSON\n");
+  const env = installerFixtureEnv({ HOME: home });
+  const bad = spawnSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env });
+  assert.equal(bad.status, 1, bad.stdout + bad.stderr);
+  assert.match(bad.stderr, /settings\.json 用不了（不是合法 JSON/u, bad.stderr);
+  assert.doesNotMatch(bad.stdout + bad.stderr, /^\s+at |JSON\.parse/u, "不许是未捕获栈：" + bad.stderr);
+  assert.equal(fs.readFileSync(file, "utf-8"), "{ 这不是 JSON\n", "坏文件一个字节都不许动");
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".bak.")), [], "不许先备份再失败");
+  assert.equal(fs.existsSync(path.join(dir, "skills")), false, "失败必须发生在任何写入之前（技能 / runtime 都还没动）");
+
+  // ② 「存在但读不了」：用目录占位 —— chmod 000 对 root 不成立，目录对谁都读不了（确定性）
+  const home2 = i254FreshHome();
+  const asDir = path.join(home2, ".claude", "settings.json");
+  fs.mkdirSync(asDir, { recursive: true });
+  const env2 = installerFixtureEnv({ HOME: home2 });
+  const unreadable = spawnSync(process.execPath,
+    [path.resolve("scripts", "install-outbound.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env: env2 });
+  assert.equal(unreadable.status, 1, unreadable.stdout + unreadable.stderr);
+  assert.match(unreadable.stderr, /settings\.json 读不了（EISDIR）/u, unreadable.stderr);
+  assert.ok(fs.statSync(asDir).isDirectory(), "那个占位的目录还在");
+
+  // ③ Codex 链同一处（hooks.json）：ENOENT 本来就放行，坏 JSON 也是同一条口径
+  const home3 = i254FreshHome();
+  const hooks = path.join(home3, ".codex", "hooks.json");
+  fs.mkdirSync(path.dirname(hooks), { recursive: true });
+  fs.writeFileSync(hooks, "{ 坏\n");
+  const env3 = installerFixtureEnv({ HOME: home3 });
+  const codexBad = spawnSync(process.execPath,
+    [path.resolve("scripts", "codex", "install.mjs"), "--apply"], { encoding: "utf-8", timeout: 300_000, env: env3 });
+  assert.equal(codexBad.status, 1, codexBad.stdout + codexBad.stderr);
+  assert.match(codexBad.stderr, /hooks\.json 用不了（不是合法 JSON/u, codexBad.stderr);
+  assert.equal(fs.readFileSync(hooks, "utf-8"), "{ 坏\n", "坏文件一个字节都不许动");
+});
+
 sealSummary();
 
 printSummary({ printFailures: true });

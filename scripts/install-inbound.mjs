@@ -169,6 +169,9 @@ for (const f of files) {
   try { sourceBytes.set(f, fs.readFileSync(path.join(SRC, f))); }
   catch { sourceBytes.set(f, null); }
 }
+// **提交身份与源文件同一时刻取一次**（fix4 P1）：闸与结语共用这个值，后面不再读 HEAD。
+//   （这个安装器没有 runtime 计划可依靠 —— 那就把“读源”与“取身份”放到同一刻，之后一路传下去。）
+const COMMIT = sourceCommit(ROOT);
 
 // ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
 // （技能 / 收据 / 安装面锁都算）。判据吃的是**上面那份只读一次的 buffer**（fix3 P1）；
@@ -176,9 +179,10 @@ for (const f of files) {
 const sourceInventory = uninstall ? null : files
   .filter((f) => sourceBytes.get(f) !== null)
   .map((f) => ({ path: path.relative(ROOT, path.join(SRC, f)), blob: gitBlobHash(sourceBytes.get(f)) }));
-const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, inventory: sourceInventory,
-  // 入站只拷自己那一个技能目录下的文件 —— 不告诉核对这一条，它会把整仓的 runtime 文件说成"少了"。
-  scope: [path.relative(ROOT, SRC)] });
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, actual: COMMIT, inventory: sourceInventory,
+  // 入站只拷 `files` 里那几个文件 —— scope **精确到那几个**（与 files 同源，不写第二份清单）。
+  // 说到整个技能目录的话，以后那个目录里提交一个不安装的普通文件，干净检出也会被误报 "missing"（fix4 P2）。
+  scope: files.map((f) => path.relative(ROOT, path.join(SRC, f))) });
 if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
   console.error(GATE.refusal);
   process.exit(2);
@@ -353,7 +357,7 @@ const installedVersion = verifyRuntime().version ?? null;
 
 console.log("\n已写入。自检：");
 // PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
-console.log(sourceCommitLine({ commit: sourceCommit(ROOT), version: installedVersion }));
+console.log(sourceCommitLine({ commit: COMMIT, version: installedVersion }));   // fix4：与闸同一个值
 for (const f of files) {
   const same = expectedContent(f) === fs.readFileSync(path.join(DST, f), "utf-8");
   console.log("  " + (same ? "✓" : "✗") + " " + f + (same ? " 与预期一致" : " 写入后内容不一致"));

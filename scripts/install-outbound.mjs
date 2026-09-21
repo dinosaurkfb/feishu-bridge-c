@@ -86,8 +86,13 @@ if (runtimePlan && !runtimePlan.ok) {
 
 // ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 必须在**任何写盘之前**（settings / runtime / 技能 /
 // 收据 / 定时器 / 安装面锁都算）。判据吃的是**计划里那份字节**（files[].blob 与 planRuntimeSync 同一次读取），
-// 不是另跑一趟工作树遍历（fix3 P1）。卸载路径没有可拷的源码（runtimePlan 为 null）→ 只核 HEAD 那半条。
-const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, inventory: runtimePlan?.files ?? null });
+// 不是另跑一趟工作树遍历（fix3 P1）。
+//
+// **提交身份也只取一次**（fix4 P1）：就是计划里记的那个 —— 闸与结语共用 `COMMIT`，后面不再读 HEAD。
+// 旧版闸与结语各自 `rev-parse` 一次，于是“在 A 上生成计划 → 闸之前切到 B”会让闸按 B 放行，
+// 而收据（来自计划）记 A、结语说 B。卸载路径没有计划（runtimePlan 为 null）→ 此处现读一次。
+const COMMIT = uninstall || runtimePlan === null ? sourceCommit(ROOT) : runtimePlan.sourceCommit;
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, actual: COMMIT, inventory: runtimePlan?.files ?? null });
 if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
   // 参数本身不合法（两种模式都拒）或写盘路径上核对不通过 —— 零写。
   // 预览不在这里退：它本来就零写，任务是「把结论写进计划」（退出码在下面）。
@@ -608,8 +613,9 @@ if (!uninstall) {
 
 // PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」—— omm 那次是要靠事后比版本号才发现装错了；
 // 一行放在最显眼处，肉眼复核一秒完成（卸载路径没有「装的提交」，不打）。
+// fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
 console.log("");
-if (!uninstall) console.log(sourceCommitLine({ commit: sourceCommit(ROOT), version: runtimePlan?.version }));
+if (!uninstall) console.log(sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version }));
 console.log(backup ? "settings 已改，备份：" + backup
   : settingsCreated ? "settings 已新建（原文件不存在）：" + SETTINGS
     : "settings 无改动，未重写");

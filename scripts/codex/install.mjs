@@ -77,8 +77,11 @@ const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.cha
 
 // ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
 // （hooks / 技能 / runtime / 模板 / 收据 / 定时器 / 安装面锁都算）。判据吃的是**计划里那份字节**
-// （files[].blob 与 planRuntimeSync 同一次读取）—— fix3 P1。卸载路径没有可拷的源码 → 只核 HEAD。
-const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, inventory: runtimePlan?.files ?? null });
+// （files[].blob 与 planRuntimeSync 同一次读取）—— fix3 P1。
+// **提交身份也只取一次**（fix4 P1）：就是计划里记的那个 —— 闸与结语共用 `COMMIT`，后面不再读 HEAD。
+// 卸载路径没有计划（runtimePlan 为 null）→ 此处现读一次。
+const COMMIT = uninstall || runtimePlan === null ? sourceCommit(ROOT) : runtimePlan.sourceCommit;
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, actual: COMMIT, inventory: runtimePlan?.files ?? null });
 if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
   console.error(GATE.refusal);
   process.exit(2);
@@ -325,6 +328,7 @@ if (uninstall) {
   console.log("\n已完成本地卸载。");
 } else {
   // PK3-I257 第 2 条：结语头一行写清「装的是哪个提交」（与另两个安装器同一句话）。
-  console.log("\n" + sourceCommitLine({ commit: sourceCommit(ROOT), version: runtimePlan?.version }));
+  // fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
+  console.log("\n" + sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version }));
   console.log("已完成本地安装。下一次 Codex 载入 hook 时会要求信任；请核对命令后再确认。");
 }

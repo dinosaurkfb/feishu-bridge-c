@@ -28,6 +28,11 @@
  *   · 入站技能：安装器把每个源文件**只读一次**进内存，在那份 buffer 上算 `gitBlobHash`。
  * 于是“期望提交 → 计划/inventory → 落盘（apply 本来就核 sha256）”串成一条，中间不再有第二次未核对的读取。
  *
+ * **提交身份也只取一次**（fix4 P1）：`actual` 是**计划记下的那一个**（出站/Codex = `runtimePlan.sourceCommit`；
+ * 入站 = 读源文件那一刻取的同一个变量），闸与结语共用它。本模块**不再自己读 HEAD** —— 旧版闸会
+ * `rev-parse` 一次、结语再读一次，于是“在 A 上生成计划 → 闸之前切到 B”会让闸按 B 放行，
+ * 而收据（来自计划）记的是 A。
+ *
  * **前缀语义**：接受完整 sha 或 ≥7 位前缀，按「期望值是不是检出 sha 的前缀」比 ——
  * 不拿这个前缀去仓库里 `rev-parse` 解析。于是**不存在"前缀不唯一"这个失败态**：我们没有问
  * 「仓库里哪个对象以它开头」，只问「你声明的那个提交是不是就是当前检出的这个」。git 自己的
@@ -35,7 +40,7 @@
  */
 import { execFileSync } from "node:child_process";
 
-import { keepsRuntimePath, sourceCommit } from "./runtime-install.mjs";
+import { keepsRuntimePath } from "./runtime-install.mjs";
 
 export const EXPECT_COMMIT_FLAG = "--expect-commit";
 /** sha 前缀的最短长度（git 自己的默认缩写也是 7 位）。 */
@@ -166,23 +171,27 @@ export function describeContentDiff(diff) {
 }
 
 /**
- * 核对结论。`kind` 六态：
+ * **核对结论。`kind` 七态**：
  *   absent        没给参数 —— **一行都不打、什么都不做**（现有流程的行为一个字不变）；
- *   ok            给了且一致（HEAD 对得上，且工作树字节与那个提交一致）—— `line` 写进计划；
- *   mismatch      给了但 HEAD 不是那个提交 —— `line` 写进计划（预览用），`refusal` 是写盘路径上的拒绝句；
- *   dirty         给了、HEAD 对得上，但**工作树与那个提交的字节不一致**（未提交的修改/多/少）——
+ *   ok            给了且一致（身份对得上，且将装的那份字节与那个提交一致）—— `line` 写进计划；
+ *   mismatch      给了但身份不是那个提交 —— `line` 写进计划（预览用），`refusal` 是写盘路径上的拒绝句；
+ *   dirty         给了、身份对得上，但**将要安装的那份字节与那个提交不一致**（未提交的修改/多/少）——
  *                 与 mismatch **同一个处置**（--apply 零写退 2；预览照打计划、结论一行、退 2）；
- *   not_repo      来源不是 git 仓库 —— 同上；
+ *   not_repo      调用方看了、说来源不是 git 仓库（`actual: null`）—— 同上；
+ *   no_identity   调用方**根本没把提交身份传进来**（`actual` 缺省）—— 接线错，fail-closed：同上。
+ *                 这条存在的理由：身份必须**只取一次**（计划记下的那个），决不能让这个函数自己
+ *                 `rev-parse HEAD` 补一个 —— 那就是 fix4 那个分叉（计划说 A、闸按 B 放行）。
  *   bad_argv      参数本身不合法 —— `line` 为 null（连计划都不该打，两种模式都当场拒）。
  * `ok` 只表示"核对通过"（absent 也算通过：这条闸不该拦住没声明的人）。
  *
  *   期望提交 → 计划/inventory → 落盘（apply 本来就核「盘上字节 = 计划 sha256」）串成一条。
  * `inventory` 缺省 `null` = **这次不装任何源码字节**（卸载路径：它一个源文件都不拷），
- * 于是只核对 HEAD 那半条 —— “核对不出来 ≠ 核对通过”仍适用，但“没有字节可核”不是“核不过”。
- * `scope` 透给内容核对（缺省整个 runtime 树 `scripts` + `skills`；入站只拷一个技能目录时要说清楚）。
+ * 于是只核对身份那半条 —— “核对不出来 ≠ 核对通过”仍适用，但“没有字节可核”不是“核不过”。
+ * `scope` 透给内容核对（缺省整个 runtime 树 `scripts` + `skills`；入站只拷固定几个文件时要**精确到那几个**，
+ *   与它自己的 files 清单同源）。
  *
- * `actual` / `contentDiff` 可注入（用例不必造 git 仓库就能验判据）；不给 actual 就按 `sourceRoot`
- * 现读一次 HEAD。
+ * **本函数不调 git 取身份**（fix4）：`actual` 由调用方给 —— 出站/Codex 是计划里记的 `sourceCommit`，
+ * 入站是读源文件的那一刻取的那一个（与结语用同一个变量）。
  */
 export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot = null, actual = undefined,
   inventory = null, scope = undefined, contentDiff = commitContentDiff } = {}) {
@@ -194,14 +203,18 @@ export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot =
   if (parsed.expected === null) {
     return { kind: "absent", given: false, expected: null, actual: actual ?? null, ok: true, line: null, refusal: null };
   }
-  const sha = actual === undefined ? sourceCommit(sourceRoot) : actual;
-  if (sha === null || sha === undefined) {
+  if (actual === undefined) {
+    const core = "调用方没把提交身份传进来（" + EXPECT_COMMIT_FLAG + " 要核的那个值）—— 接线错，核对不出来 ≠ 核对通过";
+    return { kind: "no_identity", given: true, expected: parsed.expected, actual: null, ok: false,
+      line: "期望提交 : " + parsed.expected + " —— **核对不出来**：" + core, refusal: "拒绝：" + core + "。什么都没做。" };
+  }
+  if (actual === null) {
     const core = EXPECT_COMMIT_FLAG + " 给了 " + parsed.expected + "，但来源不是 git 仓库（" + String(sourceRoot) +
       "）—— 核对不出来 ≠ 核对通过";
     return { kind: "not_repo", given: true, expected: parsed.expected, actual: null, ok: false,
       line: "期望提交 : " + parsed.expected + " —— **核对不出来**：" + core, refusal: "拒绝：" + core + "。什么都没做。" };
   }
-  const full = String(sha).toLowerCase();
+  const full = String(actual).toLowerCase();
   if (!full.startsWith(parsed.expected)) {
     const core = "你要装 " + parsed.expected + "，但这个检出是 " + full.slice(0, 12) + "（可能是更新代码那一步失败了）";
     return { kind: "mismatch", given: true, expected: parsed.expected, actual: full, ok: false,

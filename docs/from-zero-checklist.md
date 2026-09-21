@@ -114,6 +114,44 @@ git checkout <指定_main_commit_hash>
   # 预期输出：HEAD detached at <commit_hash>，working tree clean
   ```
 
+- **硬核对：检出就是你要装的那个提交**（`git status` 只说明检出在某个提交上，不说明是不是**你要的**那个）：
+  ```bash
+  WANT=<指定_main_commit_hash>          # 完整哈希或至少 7 位前缀
+  case "$(git rev-parse HEAD)" in
+    "$WANT"*) echo "检出正确：$(git rev-parse --short=12 HEAD)" ;;
+    *) echo "检出不是要装的提交（要 $WANT，实际 $(git rev-parse --short=12 HEAD)）—— 停下，别往下装"; false ;;
+  esac
+  ```
+
+### 1.1 升级已有检出（机器上已经装过一版）
+
+升级时最容易踩的坑：**更新代码那一步失败了，后面照样用旧代码装完，而且每一步都报成功**
+（2026-09-21 omm 真机实测：`git fetch` 撞上网络错误失败，三个安装器把旧代码装了一遍，退出码全是 0）。
+安装器自己察觉不了——fetch 失败时本地的 `origin/main` 也是旧的，两边看起来一致。所以**更新代码必须短路**：
+任何一步失败就停，不许往下走。
+
+```bash
+cd feishu-bridge-c
+WANT=<指定_main_commit_hash>
+git fetch origin \
+  && git checkout "$WANT" \
+  && case "$(git rev-parse HEAD)" in "$WANT"*) true ;; *) false ;; esac \
+  && echo "代码已到 $(git rev-parse --short=12 HEAD)，可以装" \
+  || echo "更新代码没成功 —— 停下，别装（先查网络或手工核对检出）"
+```
+
+- 只有看到「代码已到 …，可以装」才进入第 3 节。
+- **这台机器连不上代码仓库时**（例如 `git fetch` 报 SSL / 超时错误），可以从另一台能连上的机器用离线包中转：
+  ```bash
+  # 在能连上的机器上（本地已有新提交）：<旧> 是目标机器当前的提交
+  git bundle create /tmp/fb.bundle <旧>..main
+  scp /tmp/fb.bundle <目标机器>:/tmp/fb.bundle
+
+  # 在目标机器上：
+  git fetch /tmp/fb.bundle main:refs/remotes/origin/main && git checkout "$WANT"
+  ```
+  导入后照样做上面的硬核对。
+
 □ 在 omm 复核于 ____________________
 
 ---
@@ -258,6 +296,17 @@ node scripts/codex/install.mjs --apply
   systemctl --user list-timers --user | grep feishu
   # 预期输出：每 30 分钟触发排空
   ```
+
+- **装完核对：装进去的就是你要的那个提交**（安装器的「已完成本地安装」只说明装了**某个**版本）。
+  运行时目录里的 `INSTALLED.json` 记着这份代码来自哪个提交（`source_commit`），拿它和第 1 节的 `WANT` 比：
+  ```bash
+  GOT=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.claude/feishu-bridge/runtime/current/INSTALLED.json")))["source_commit"] or "")')
+  case "$GOT" in
+    "$WANT"*) echo "装的是要装的提交：${GOT:0:12}" ;;
+    *) echo "装进去的不是要装的提交（要 $WANT，实际 ${GOT:-说不清}）—— 回第 1.1 节查代码更新那一步" ;;
+  esac
+  ```
+  启用了 Codex 链的，把路径换成 `~/.codex/feishu-bridge/runtime/current/INSTALLED.json` 再核一次。
 
 □ 在 omm 复核于 ____________________
 

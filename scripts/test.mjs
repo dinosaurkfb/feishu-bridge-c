@@ -10061,13 +10061,42 @@ test("PK3-T2：mkdtemp 越出私有根当场 throw（sync / callback / promises 
   }
 });
 
+// #253 回归：fix4 的根必须是固定名子目录（不以 X 结尾）。BSD mkdtemp 会把模板末尾所有大写 X 一并替换，
+//   随机根的后缀恰以 X 结尾（约 1/62）时 fix4 会偶红、且那条「不许有兄弟」会假绿。
+//   「根改回随机名」这种回退在行为层面只有约 1/62 概率暴露，所以这里用**逐字结构断言**确定性地拦它（刀 K2 可红）；
+//   BSD 行为本身只做观察、不断言（单次随机输出证明不了「替换进来的字符必不为 X」）。
+test("PK3-T253b：fix4 的根是固定名子目录（BSD mkdtemp 替换模板末尾所有 X 的回归）", () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "t253b-")));
+  try {
+    const plain = path.basename(fs.mkdtempSync(path.join(dir, "keep-ab")));
+    assert.equal(plain.startsWith("keep-ab"), true, "对照：前缀不以 X 结尾时，生成名一定以它开头：" + plain);
+    // 以 X 结尾的前缀在 BSD 上会被一并替换 —— 但替换进来的随机字符**也可能恰好又是 X**（约 1/62），
+    //   所以**不对单次随机输出做必然断言**（Codex #262 一轮 P1：那样写本身就是 1/62 的偶红）。
+    //   这里只做观察：真机上跑一次、不断言结果；机制的证明留在 issue #253 的实测记录与刀测 K1
+    //   （把 fix4 的根名故意改成 rootX → 每次都红）。守住回退靠下面那句固定根名的结构断言。
+    fs.mkdtempSync(path.join(dir, "keep-aX"));
+    // fix4 的夹具根名：必须是那个固定名，且不以 X 结尾（拿掉固定名子目录、改回随机根 → 这里红）
+    const src = fs.readFileSync(new URL(import.meta.url), "utf-8");
+    const at = src.indexOf('test("PK3-T2-fix4：判据按');
+    const body = src.slice(at, at + 1600);
+    assert.match(body, /const fakeRoot = path\.join\(base, "root"\); fs\.mkdirSync\(fakeRoot\);/u, "fix4 的根必须是固定名子目录（不以 X 结尾）");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("PK3-T2-fix4：判据按「可能生成的名字」——四类边界（三路覆盖）", () => {
   // Codex 三轮实测：mkdtemp 造的是 prefix + 6 位随机后缀，判 prefix 本身两头都错：
   //   · `mkdtempSync(<根>)` 生成的是根的**兄弟**（根外）却被放行 —— 绕过硬门还留宿主 tmp 残骸；
   //   · prefix 最后一段本身是 symlink 时（`mkdtempSync(<根>/jump)`）实际造的是 `<根>/jumpXXXXXX`
   //     （根内的新目录，不穿过那个链接）却被误拒。
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "t2-fix4-"));
-  const fakeRoot = fs.realpathSync(base);
+  // #253（重开后的真根因）：macOS / BSD 的 mkdtemp 会把模板末尾**所有**大写 X 一并替换，不止追加的那 6 个。
+  //   旧夹具直接拿 mkdtemp("t2-fix4-") 的随机目录当根：它的随机后缀恰以 X 结尾（约 1/62）时，
+  //   下面用 basename(根) 当前缀造出的兄弟目录名就不再以 basename(根) 开头 —— 正控偶红，
+  //   而「不许有 basename(根)+六位 的兄弟」那条会认不出真兄弟（假绿）。
+  //   所以根用一个**固定名**子目录，确定不以 X 结尾；它的父目录就是这个私有目录（兄弟都落在这里）。
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "t2-fix4-")));
+  const fakeRoot = path.join(base, "root"); fs.mkdirSync(fakeRoot);
   const hostTmp = SUITE_TMP.hostTmp;
   const violations = [];
   // 装包装**之前**的原函数：正控需要一个“真 Node 生成的名字”，而装之后在假根之外造东西会被硬门拦（那正是被测的行为）

@@ -11,16 +11,22 @@
  *
  * 语义（三个安装器完全一致）：
  *   · **不给这个参数** → 一行都不打、一个判断都不做（现有装机流程不许被迫带参数）；
- *   · 给了且与来源检出的 HEAD 一致**且工作树字节就是那个提交的字节** → 计划里写一行结论，照常装；
+ *   · 给了且与来源检出的 HEAD 一致**且将要安装的那份字节就是那个提交的字节** → 计划里写一行结论，照常装；
  *   · 给了但不一致 → 写盘路径上在**任何写盘之前**拒绝（非 0、零写）；预览路径本来就零写，
  *     所以它是「报告」：照常打出计划，退出码非 0；
  *   · 来源不是 git 仓库 → 一样拒绝：**核对不出来 ≠ 核对通过**（从 runtime 里跑安装器就是这种情形）；
  *   · 参数本身不合法（缺值 / 重复 / 不是十六进制 sha）→ 用法错，两种模式都当场拒绝。
  *
- * **HEAD 对得上不等于装进去的是那个提交的内容**（fix2 P1）：runtime 是从**工作树**读字节的，
+ * **HEAD 对得上不等于装进去的是那个提交的内容**（fix2 P1）：runtime 从**工作树**读字节，
  * 所以改一个未提交的 .mjs 之后 `--expect-commit <HEAD>` 照样通过、装成功，而结语与 INSTALLED.json
- * 还把这份**不同的内容**标成了那个提交（"收据撒了谎"）。所以给了期望提交时要逐字节核一遍：
- * 将要安装的源码（collectRuntimeFiles 实际会拷的那些）必须与那个提交的字节一致。
+ * 还把这份**不同的内容**标成了那个提交（"收据撒了谎"）。所以给了期望提交时要逐字节核一遍。
+ *
+ * **核的是“将要安装的那一份字节”，不是“再去读一次工作树”**（fix3 P1）：fix2 的内容核对自己读一次工作树，
+ * 之后安装器**又读一次**才生成运行时计划（planRuntimeSync）—— 两次读取之间源码变了，计划就收下了没核对过的
+ * 字节，而 apply 只核“落盘 = 计划”。现在判据吃的是调用方给的那份 **inventory**：
+ *   · 出站 / Codex 链：`planRuntimeSync` 在同一次读取、同一个 buffer 上算出的 `files[].blob`（出站还用它渲染技能）；
+ *   · 入站技能：安装器把每个源文件**只读一次**进内存，在那份 buffer 上算 `gitBlobHash`。
+ * 于是“期望提交 → 计划/inventory → 落盘（apply 本来就核 sha256）”串成一条，中间不再有第二次未核对的读取。
  *
  * **前缀语义**：接受完整 sha 或 ≥7 位前缀，按「期望值是不是检出 sha 的前缀」比 ——
  * 不拿这个前缀去仓库里 `rev-parse` 解析。于是**不存在"前缀不唯一"这个失败态**：我们没有问
@@ -29,7 +35,7 @@
  */
 import { execFileSync } from "node:child_process";
 
-import { collectRuntimeFiles, keepsRuntimePath, sourceCommit } from "./runtime-install.mjs";
+import { keepsRuntimePath, sourceCommit } from "./runtime-install.mjs";
 
 export const EXPECT_COMMIT_FLAG = "--expect-commit";
 /** sha 前缀的最短长度（git 自己的默认缩写也是 7 位）。 */
@@ -68,57 +74,55 @@ export function parseExpectCommit(argv = []) {
 }
 
 /**
- * 将要安装的**源码字节**与某个提交的字节逐字节核对（fix2 P1）。
+ * 将要安装的**那一份字节**（inventory）与某个提交的字节逐字节核对（fix3 P1）。
  *
- * 一侧是**将要拷的那些文件**：`collectRuntimeFiles(sourceRoot)` —— 与安装器**同一个函数**，
- * 不另写一份目录遍历规则（另写一份就会漂：多出一个 skills 子目录、改一次 keep 判定，两边就不一致）。
- * 另一侧是那个提交里**同一套 keep 规则**下应有的文件：`git ls-tree -r <commit> -- scripts skills`，
- * 用 keepsRuntimePath 过一遍筛。
+ * `inventory` 是调用方给的 `[{ path, blob }]`：**路径相对 sourceRoot**，blob 是 git blob 哈希。
+ * 它必须来自**将要落盘的那一次读取**（出站/Codex：planRuntimeSync 的 `files[].blob`；
+ * 入站：那份只读一次的源文件缓存）—— 不再另跑一趟工作树遍历。
  *
- * 比的是 **git blob 哈希**：工作树侧一次 `git hash-object --stdin-paths` 算完（scripts/ 下两百多个
- * 文件，每个文件起一个 git 进程不可接受），提交侧 ls-tree 本来就带哈希。
+ * `scope` = 这个安装器的文件集住在哪儿（相对 sourceRoot 的前缀，至少一项）。为什么要它：`missing`
+ * 不能拿整个 `scripts/` + `skills/` 去比 —— 入站安装器只拷自己那一个技能目录下的两个文件，
+ * 拿全仓比会把它没打算装的 238 个 runtime 文件全说成“少了”（假不一致）。同理：**scope 之外的
+ * 东西既不算多也不算少**，inventory 里有什么才算“这一趟真要装的”。
+ *
+ * 提交那侧：`git ls-tree -r <commit> -- scripts skills`，用**同一套 keep 规则**（keepsRuntimePath，
+ * 与 collectRuntimeFiles 同源）过一遍筛。只认普通文件（100644 / 100755）：符号链接（120000）与
+ * gitlink（160000）不会被 collectRuntimeFiles 收（它按 isFile() 判），拿它们当"应有的文件"
+ * 会造出假的不一致。
  *
  * 三类不一致都算：
  *   changed  两边都有、blob 不同（未提交的修改）
- *   added    只在工作树侧（未跟踪 / 被忽略但真会被拷的，例如 skills/ 下的 .DS_Store）
- *   missing  只在提交侧（工作树删了）
+ *   added    只在 inventory 侧（未跟踪 / 被忽略但真会被拷的，例如 skills/ 下的 .DS_Store）
+ *   missing  只在提交侧（工作树删了 / 没读进来）
  *
- * 读不清（不是仓库 / 算不出哈希 / ls-tree 失败 / 文件在两次调用之间消失了）→ `ok:false` + `why`：
- * **核对不出来 ≠ 核对通过**。
+ * 读不清（inventory 形状不对 / ls-tree 失败）→ `ok:false` + `why`：**核对不出来 ≠ 核对通过**。
  */
-export function worktreeContentDiff({ sourceRoot, commit } = {}) {
-  const git = (args, { input } = {}) => execFileSync("git", ["-C", sourceRoot, ...args], {
-    encoding: "utf-8", timeout: 30_000,
-    // stderr 吞掉：失败了下面对 err 自己写人话，不让 git 的英文错误漏到调用者的 stderr 上。
-    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
-    ...(input === undefined ? {} : { input }),
-  });
+export function commitContentDiff({ sourceRoot, commit, inventory, scope = ["scripts", "skills"] } = {}) {
   const whyLine = (err) => String(err?.message ?? err).split("\n")[0];
   if (typeof sourceRoot !== "string" || sourceRoot.length === 0 || typeof commit !== "string" || commit.length === 0) {
     return { ok: false, why: "核对参数不全（sourceRoot / commit）" };
   }
-  const mine = collectRuntimeFiles(sourceRoot);
-  let prefix;
-  try { prefix = git(["rev-parse", "--show-prefix"]).trim(); }
-  catch (err) { return { ok: false, why: "git 读不出仓库边界（" + whyLine(err) + "）" }; }
-  let hashed;
-  try {
-    // 路径按**仓库根**解析（不是 cwd），所以补上 prefix —— sourceRoot 是仓库子目录时才不会解错；
-    // 报出来的仍是 collectRuntimeFiles 那份**相对 sourceRoot**的路径，两侧路径字面量因此可比。
-    hashed = git(["hash-object", "--stdin-paths"], { input: mine.map((p) => prefix + p).join("\n") + "\n" })
-      .split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
-  } catch (err) {
-    return { ok: false, why: "工作树算不出 blob 哈希（" + whyLine(err) + "）—— 算不出来就不当核对通过" };
+  if (!Array.isArray(scope) || scope.length === 0 || scope.some((s) => typeof s !== "string" || s.length === 0)) {
+    return { ok: false, why: "scope 不合法（要一串非空前缀）" };
   }
-  if (hashed.length !== mine.length) {
-    return { ok: false, why: "hash-object 的返回行数与文件数对不上（" + hashed.length + " vs " + mine.length + "）" };
+  const inScope = (p) => scope.some((s) => p === s.replace(/\/$/u, "") || p.startsWith((s.endsWith("/") ? s : s + "/")));
+  if (!Array.isArray(inventory)) return { ok: false, why: "inventory 不是数组（没有可核的字节）" };
+  const mine = new Map();
+  for (const item of inventory) {
+    const p = item?.path, blob = item?.blob;
+    if (typeof p !== "string" || p.length === 0 || typeof blob !== "string" || !/^[0-9a-f]{40,64}$/u.test(blob)) {
+      return { ok: false, why: "inventory 的条目形状不对（要 { path, blob(十六进制) }）：" + JSON.stringify(item?.path ?? item) };
+    }
+    if (mine.has(p)) return { ok: false, why: "inventory 里有重复路径：" + p };
+    mine.set(p, blob);
   }
-  const worktree = new Map(mine.map((p, i) => [p, hashed[i]]));
 
   let listing;
   try {
     // core.quotePath=false：路径里有非 ASCII 时默认会被转义并加引号，那样两边路径字面量永远对不上。
-    listing = git(["-c", "core.quotePath=false", "ls-tree", "-r", commit, "--", "scripts", "skills"]);
+    listing = execFileSync("git", ["-C", sourceRoot, "-c", "core.quotePath=false", "ls-tree", "-r", commit, "--", "scripts", "skills"],
+      // stderr 吞掉：失败了下面对 err 自己写人话，不让 git 的英文错误漏到调用者的 stderr 上。
+      { encoding: "utf-8", timeout: 30_000, stdio: ["ignore", "pipe", "ignore"] });
   } catch (err) {
     return { ok: false, why: "git ls-tree 读不出 " + commit.slice(0, 12) + "（" + whyLine(err) + "）" };
   }
@@ -128,24 +132,23 @@ export function worktreeContentDiff({ sourceRoot, commit } = {}) {
     const m = /^(\d{6}) (\w+) ([0-9a-f]{40,64})\t(.*)$/u.exec(line);
     if (m === null) continue;
     const [, mode, , sha, file] = m;
-    // 只认**普通文件**（100644 / 100755）：符号链接（120000）与 gitlink（160000）不会被
-    // collectRuntimeFiles 收（它按 isFile() 判），拿它们当"应有的文件"会造出假的不一致。
     if (mode !== "100644" && mode !== "100755") continue;
     if (!keepsRuntimePath(file)) continue;
+    if (!inScope(file)) continue;
     committed.set(file, sha);
   }
 
   const changed = [];
   const added = [];
   const missing = [];
-  for (const [p, sha] of worktree) {
+  for (const [p, blob] of mine) {
     if (!committed.has(p)) added.push(p);
-    else if (committed.get(p) !== sha) changed.push(p);
+    else if (committed.get(p) !== blob) changed.push(p);
   }
-  for (const p of committed.keys()) if (!worktree.has(p)) missing.push(p);
+  for (const p of committed.keys()) if (!mine.has(p)) missing.push(p);
   const dirty = changed.length + added.length + missing.length;
   return {
-    ok: dirty === 0, compared: worktree.size,
+    ok: dirty === 0, compared: mine.size,
     changed: changed.sort(), added: added.sort(), missing: missing.sort(), why: null,
   };
 }
@@ -173,11 +176,16 @@ export function describeContentDiff(diff) {
  *   bad_argv      参数本身不合法 —— `line` 为 null（连计划都不该打，两种模式都当场拒）。
  * `ok` 只表示"核对通过"（absent 也算通过：这条闸不该拦住没声明的人）。
  *
+ *   期望提交 → 计划/inventory → 落盘（apply 本来就核「盘上字节 = 计划 sha256」）串成一条。
+ * `inventory` 缺省 `null` = **这次不装任何源码字节**（卸载路径：它一个源文件都不拷），
+ * 于是只核对 HEAD 那半条 —— “核对不出来 ≠ 核对通过”仍适用，但“没有字节可核”不是“核不过”。
+ * `scope` 透给内容核对（缺省整个 runtime 树 `scripts` + `skills`；入站只拷一个技能目录时要说清楚）。
+ *
  * `actual` / `contentDiff` 可注入（用例不必造 git 仓库就能验判据）；不给 actual 就按 `sourceRoot`
- * 现读一次 HEAD，给了 `sourceRoot` 就**连着核工作树内容**（不给 sourceRoot = 纯 HEAD 判据）。
+ * 现读一次 HEAD。
  */
 export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot = null, actual = undefined,
-  contentDiff = worktreeContentDiff } = {}) {
+  inventory = null, scope = undefined, contentDiff = commitContentDiff } = {}) {
   const parsed = parseExpectCommit(argv);
   if (!parsed.ok) {
     return { kind: "bad_argv", given: true, expected: null, actual: null, ok: false, line: null,
@@ -199,13 +207,13 @@ export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot =
     return { kind: "mismatch", given: true, expected: parsed.expected, actual: full, ok: false,
       line: "期望提交 : " + parsed.expected + " —— **核对不通过**：" + core, refusal: "拒绝：" + core + "。什么都没做。" };
   }
-  // HEAD 对上了 —— **但装的是工作树的字节**，所以还要核内容（fix2 P1）。sourceRoot 没给 = 纯 HEAD 判据
-  //   （用例注入 actual 时走这条，不必造仓库）。
-  if (sourceRoot !== null && typeof contentDiff === "function") {
-    const diff = contentDiff({ sourceRoot, commit: full });
+  // HEAD 对上了 —— **但装的是那次读取的字节**，所以还要核 inventory（fix3 P1）。
+  //   `inventory === null` = 这次没有要装的源码字节（卸载路径）→ 只有 HEAD 那半条。
+  if (inventory !== null && typeof contentDiff === "function") {
+    const diff = contentDiff({ sourceRoot, commit: full, inventory, ...(scope === undefined ? {} : { scope }) });
     if (!diff.ok) {
       const why = diff.why ?? describeContentDiff(diff);
-      const core = "你要装 " + parsed.expected + "，HEAD 就是它，但**工作树与这个提交的字节不一致**（" + why +
+      const core = "你要装 " + parsed.expected + "，HEAD 就是它，但**将要安装的那份字节与这个提交不一致**（" + why +
         "）—— 装进去的会是改过的代码，而收据会把它记成 " + full.slice(0, 12);
       return { kind: "dirty", given: true, expected: parsed.expected, actual: full, ok: false,
         line: "期望提交 : " + parsed.expected + " —— **核对不通过**：" + core,

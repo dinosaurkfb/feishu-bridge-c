@@ -31,10 +31,12 @@ export const SKILL_NAMES = SKILLS.map((s) => s.name);
  * 不是模板作者的记性。模板里原来写的是 node "{{BRIDGE_ROOT}}/scripts/…"，
  * 双引号挡得住空格但挡不住 `$`、反引号和反斜杠；单引号才是 POSIX 里唯一完全字面的。
  */
-export function expectedSkillContent({ sourceFile, name, runtimeCurrent, bridgeHome }) {
-  const raw = fs.readFileSync(sourceFile);
-  if (name !== "SKILL.md") return raw;                       // 非模板文件原样拷
-  return Buffer.from(raw.toString("utf-8")
+export function expectedSkillContent({ sourceFile, raw = null, name, runtimeCurrent, bridgeHome }) {
+  // `raw` 优先（PK3-I257-fix3）：调用方从**将要安装的那一次读取**里把字节递进来，
+  //   不再在这里重读源文件 —— 否则“核对的字节”与“装进去的字节”是两次读取。
+  const bytes = raw ?? fs.readFileSync(sourceFile);
+  if (name !== "SKILL.md") return bytes;                   // 非模板文件原样拷
+  return Buffer.from(bytes.toString("utf-8")
     .replaceAll(/\{\{SCRIPT:([A-Za-z0-9_./-]+)\}\}/gu,
       (_, script) => shellQuote(path.join(runtimeCurrent, "scripts", script)))
     .replaceAll("{{BRIDGE_ROOT}}", runtimeCurrent)

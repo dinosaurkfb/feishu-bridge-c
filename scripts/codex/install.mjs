@@ -36,15 +36,6 @@ const HOOKS = path.join(CODEX_HOME, "hooks.json");
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
-// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
-// （hooks / 技能 / runtime / 模板 / 收据 / 定时器 / 安装面锁都算）。
-const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT });
-if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
-  console.error(GATE.refusal);
-  process.exit(2);
-}
-if (GATE.line !== null) console.log(GATE.line);
-
 // **只在 linux 构造现场**（PK3-L7-fix5 P1-1）：darwin 真机上根本没有 systemd，这里连一次 systemctl
 // 都不该调 —— 旧版 `uninstall ? linuxDrainScene() : null` 会在 Mac 上把探询打成"查不清"，
 // 于是 --uninstall --apply 在任何卸载动作之前就 exit 1（真回归，隔离探针已复现）。
@@ -79,8 +70,20 @@ const log = path.join(home, "hook.log");
 // 因为视图滤掉了 enabled:false 的 task 和 root 形状异常的记录。
 const autoPublishPreview = enableAutoPublishForAllTasks({ home });
 // 运行时计划要在 dry-run 打印之前算好 —— 预览必须说清将要装哪一版。
-const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT });
+// `withContents`：把读到的**那份 buffer** 留在计划里（PK3-I257-fix3）—— 技能的渲染与提交核对都用它，
+// 不再回源文件重读一次（那次重读会让“核对的字节”与“装进去的字节”分开）。
+const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, root: RUNTIME_ROOT, withContents: true });
 const autoPublishMigrationCount = autoPublishPreview.ok ? autoPublishPreview.changed : null;
+
+// ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 与另两个安装器同一份判据，放在**任何写盘之前**
+// （hooks / 技能 / runtime / 模板 / 收据 / 定时器 / 安装面锁都算）。判据吃的是**计划里那份字节**
+// （files[].blob 与 planRuntimeSync 同一次读取）—— fix3 P1。卸载路径没有可拷的源码 → 只核 HEAD。
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, inventory: runtimePlan?.files ?? null });
+if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
+  console.error(GATE.refusal);
+  process.exit(2);
+}
+if (GATE.line !== null) console.log(GATE.line);
 
 // hooks.json 的合并只有一份（codex/hook-command.mjs 的 renderCodexHooks）：让每个事件下恰好只剩一条我们的 hook，只动自己那一条 child。
 // **ENOENT 是"没有旧文件"**（全新机器上 hooks.json 本来就不存在）→ 空 settings 继续；
@@ -115,8 +118,30 @@ const promptAction = renderedHooks.actions.UserPromptSubmit;
 const stopAction = renderedHooks.actions.Stop;
 
 const skills = SKILLS;
-const renderedSkill = (file, name) => expectedSkillContent({
-  sourceFile: file, name, runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home });
+/**
+ * 技能源的**唯一一份读**（PK3-I257-fix3）：从计划里那份 buffer 取。
+ *
+ * 旧版 `expectedSkillContent({ sourceFile })` 每次调用都 `fs.readFileSync` —— 写入与收据各读一次，
+ * 而计划早就自己读过一遍：核对的字节与写出去的字节就成了两次读取。现在三个调用点拿到的都是
+ * 计划里那份（`runtimePlan.contents`），渲染结果也**只算一次**留在 Map 里。
+ */
+const renderedSkillCache = new Map();
+const sourceBytes = (rel) => {
+  const buf = runtimePlan?.contents?.get(rel);
+  if (buf === undefined) {
+    console.error("技能源不在本次计划里（" + rel + "）—— 不重读源文件，直接当失败。什么都没做。");
+    process.exit(1);
+  }
+  return buf;
+};
+const renderedSkill = (file, name) => {
+  const key = name + "\0" + file;
+  if (!renderedSkillCache.has(key)) {
+    renderedSkillCache.set(key, expectedSkillContent({
+      raw: sourceBytes(path.relative(ROOT, file)), name, runtimeCurrent: RUNTIME_CURRENT, bridgeHome: home }));
+  }
+  return renderedSkillCache.get(key);
+};
 
 console.log("hooks       " + HOOKS);
 console.log("  UserPromptSubmit → " + promptAction);

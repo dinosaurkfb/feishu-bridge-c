@@ -69,9 +69,25 @@ const TIMER_PLATFORM = timerPlatform({ home: os.homedir() });
 const apply = process.argv.includes("--apply");
 const uninstall = process.argv.includes("--uninstall");
 
+// ---------- 运行时代码：先落到固定位置，全局配置才有东西可指 ----------
+//
+// 顺序很重要：**先同步代码，再改 settings**。反过来的话，中间那一刻钩子已经指向
+// runtime，而 runtime 里还没有脚本 —— 钩子命令的 `[ -r … ]` 守卫会让它静默跳过，
+// 于是那段时间里结束的会话不会有任何出站，也不会有任何报错。
+//
+// `withContents`：把读到的**那份 buffer** 留在计划里（PK3-I257-fix3）—— 技能的渲染与提交核对
+// 都用它，不再回源文件重读一次（那样核对的字节与装进去的字节是两次读取，中间有窗口）。
+const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT, withContents: true });
+if (runtimePlan && !runtimePlan.ok) {
+  console.error("运行时代码无法准备（" + runtimePlan.reason +
+    (runtimePlan.file ? "：" + runtimePlan.file : "") + "）。什么都没做。");
+  process.exit(1);
+}
+
 // ---------- 「我打算装哪个提交」的闸（PK3-I257）—— 必须在**任何写盘之前**（settings / runtime / 技能 /
-// 收据 / 定时器 / 安装面锁都算），所以放在最前面：这条命令的全部写入都在它后面。
-const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT });
+// 收据 / 定时器 / 安装面锁都算）。判据吃的是**计划里那份字节**（files[].blob 与 planRuntimeSync 同一次读取），
+// 不是另跑一趟工作树遍历（fix3 P1）。卸载路径没有可拷的源码（runtimePlan 为 null）→ 只核 HEAD 那半条。
+const GATE = expectCommitVerdict({ argv: process.argv.slice(2), sourceRoot: ROOT, inventory: runtimePlan?.files ?? null });
 if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
   // 参数本身不合法（两种模式都拒）或写盘路径上核对不通过 —— 零写。
   // 预览不在这里退：它本来就零写，任务是「把结论写进计划」（退出码在下面）。
@@ -80,17 +96,6 @@ if (GATE.kind === "bad_argv" || (apply && GATE.refusal !== null)) {
 }
 if (GATE.line !== null) console.log(GATE.line);
 
-// ---------- 运行时代码：先落到固定位置，全局配置才有东西可指 ----------
-//
-// 顺序很重要：**先同步代码，再改 settings**。反过来的话，中间那一刻钩子已经指向
-// runtime，而 runtime 里还没有脚本 —— 钩子命令的 `[ -r … ]` 守卫会让它静默跳过，
-// 于是那段时间里结束的会话不会有任何出站，也不会有任何报错。
-const runtimePlan = uninstall ? null : planRuntimeSync({ sourceRoot: ROOT });
-if (runtimePlan && !runtimePlan.ok) {
-  console.error("运行时代码无法准备（" + runtimePlan.reason +
-    (runtimePlan.file ? "：" + runtimePlan.file : "") + "）。什么都没做。");
-  process.exit(1);
-}
 
 // ---------- settings.json（投影在 install-projection.mjs：只动自己的 hook 与预览放行规则）----------
 //
@@ -197,6 +202,21 @@ const skillSrcOf = (n) => path.join(ROOT, "skills", n, "SKILL.md");
 const skillDstOf = (n) => path.join(os.homedir(), ".claude", "skills", n, "SKILL.md");
 // 渲染只有一份（install-projection.mjs）：`{{SCRIPT:x.mjs}}` → 加了 shell 引号的 runtime 路径。
 const renderSkill = (src) => renderClaudeSkill(src, { home: os.homedir() });
+/**
+ * 技能源的**唯一一份读**：从计划里那份 buffer 取（PK3-I257-fix3）。
+ *
+ * 旧版在这里每次调用都回源文件重读一遍，而计划早就自己读过一次 —— 两次读取之间的改动会让
+ * “核对的字节”与“装进去的字节”分开（fix2 的评审点就是这个）。取不到就是计划没读到它
+ *（不该发生），fail-closed 而不是静默回退到再读一次。
+ */
+const sourceText = (rel) => {
+  const buf = runtimePlan?.contents?.get(rel);
+  if (buf === undefined) {
+    console.error("技能源不在本次计划里（" + rel + "）—— 不重读源文件，直接当失败。什么都没做。");
+    process.exit(1);
+  }
+  return buf.toString("utf-8");
+};
 
 // 拷贝而不是软链：软链一旦仓库被移动或删除就变成悬空文件，而且各家扫描器
 // 对 readdir 是否跟随软链的处理并不一致（入站技能就在这上面栽过）。
@@ -206,13 +226,17 @@ const skillPlan = SKILLS.map((sk) => {
   if (uninstall) {
     return { ...sk, srcFile, dstFile, action: fs.existsSync(dstFile) ? "will-remove" : "already-absent" };
   }
-  if (!fs.existsSync(srcFile)) return { ...sk, srcFile, dstFile, action: "source-missing" };
-  const src = renderSkill(fs.readFileSync(srcFile, "utf-8"));
+  const rel = path.relative(ROOT, srcFile);
+  if (runtimePlan?.contents?.get(rel) === undefined) return { ...sk, srcFile, dstFile, action: "source-missing" };
+  // **渲染一次就留着**：写入与收据都用这一份（旧版在这三处各重读+重渲一遍）。
+  const text = renderSkill(sourceText(rel));
   let dst = null;
   try { dst = fs.readFileSync(dstFile, "utf-8"); } catch { /* 还没装 */ }
-  return { ...sk, srcFile, dstFile,
-    action: dst === src ? "unchanged" : dst === null ? "will-install" : "will-update" };
+  return { ...sk, srcFile, dstFile, text,
+    action: dst === text ? "unchanged" : dst === null ? "will-install" : "will-update" };
 });
+/** 计划里那个技能的源文件文本 —— 写入与收据共用它（渲染后已存在 sk.text）。 */
+const skillTextOf = (sk) => sk.text;
 
 const skillAction = skillPlan.some((s) => s.action === "source-missing") ? "source-missing"
   : skillPlan.every((s) => s.action === "unchanged") ? "unchanged"
@@ -420,7 +444,8 @@ for (const sk of skillPlan) {
     fs.rmSync(path.dirname(sk.dstFile), { recursive: true, force: true });
   } else {
     fs.mkdirSync(path.dirname(sk.dstFile), { recursive: true });
-    fs.writeFileSync(sk.dstFile, renderSkill(fs.readFileSync(sk.srcFile, "utf-8")), { mode: 0o600 });
+    // 写的是计划里那份渲染结果（不重读源文件、也不重渲染）：核对的字节与落盘的字节是同一份。
+    fs.writeFileSync(sk.dstFile, skillTextOf(sk), { mode: 0o600 });
   }
 }
 
@@ -570,11 +595,11 @@ if (!uninstall) {
       sha256: artifactSha({ kind: TIMER_PLAN.kind === "launchd" ? "plist" : "file", text: f.text }) })),
     // aily daemon 的 systemd 单元（linux）：与定时器单元同类 —— 都是本桥写进用户级 systemd 的机器级制品。
     ...AILY_PLAN.files.map((f) => ({ path: f.path, kind: "file", sha256: artifactSha({ kind: "file", text: f.text }) })),
-    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: renderSkill(fs.readFileSync(sk.srcFile, "utf-8")) }) })),
+    ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => ({ path: sk.dstFile, kind: "skill", sha256: artifactSha({ kind: "skill", text: skillTextOf(sk) }) })),
   ];
   const timerText = TIMER_FILES.map((f) => f.text).join("\n");
   const timerTextAll = timerText + AILY_PLAN.files.map((f) => f.text).join("\n");
-  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerTextAll, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => renderSkill(fs.readFileSync(sk.srcFile, "utf-8")))].join("\n"));
+  const scripts = referencedRuntimeScripts([settingsAfter, plistBody, timerTextAll, ...skillPlan.filter((sk) => sk.action !== "source-missing").map((sk) => skillTextOf(sk))].join("\n"));
   const receipt = installedVersion ? recordInstalledSurface({ chain: "claude", version: installedVersion, artifacts, scripts, file: installedSurfacePath({ chain: "claude", home: os.homedir() }) }) : { ok: false, reason: "runtime_version_unknown" };
   const report = receiptReport(receipt, { artifacts: artifacts.length, scripts: scripts.length });
   console.log("安装收据 : " + report.text);

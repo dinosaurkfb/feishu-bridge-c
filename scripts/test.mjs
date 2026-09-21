@@ -61908,9 +61908,12 @@ test("PK3-I254-fix1：磁盘上零字节的 hooks.json 是「用不了」，不�
   // 对照：文件**不存在**时照常装得上（别把闸门做成"Codex 链在新机器上装不了"）
   const fresh = i254FreshHome();
   const freshCodex = path.join(fresh, ".codex");
+  // env 先赋值再用：结构守卫（PK3-I247）只认「内联清洗入口」或「本块内由薄包装赋值的变量」，
+  //   薄包装内联在参数上不算（它只认 installerChildEnv / purgeChildEnv / requireCleansedInstallerEnv 三个名字）。
+  const freshEnv = installerFixtureEnv({ HOME: fresh, CODEX_HOME: freshCodex,
+    FEISHU_CODEX_BRIDGE_HOME: path.join(freshCodex, "feishu-bridge") });
   const ok = spawnSync(process.execPath, [path.resolve("scripts", "codex", "install.mjs"), "--apply"],
-    { encoding: "utf-8", timeout: 300_000, env: installerFixtureEnv({ HOME: fresh, CODEX_HOME: freshCodex,
-      FEISHU_CODEX_BRIDGE_HOME: path.join(freshCodex, "feishu-bridge") }) });
+    { encoding: "utf-8", timeout: 300_000, env: freshEnv });
   assert.equal(ok.status, 0, "全新机器（hooks.json 不存在）照常装：" + ok.stdout + ok.stderr);
   assert.equal(fs.existsSync(path.join(freshCodex, "hooks.json")), true, "装完 hooks.json 被建出来");
 });

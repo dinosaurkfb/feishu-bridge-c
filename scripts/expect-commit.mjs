@@ -90,17 +90,20 @@ export function parseExpectCommit(argv = []) {
  * 拿全仓比会把它没打算装的 238 个 runtime 文件全说成“少了”（假不一致）。同理：**scope 之外的
  * 东西既不算多也不算少**，inventory 里有什么才算“这一趟真要装的”。
  *
- * 提交那侧：`git ls-tree -r <commit> -- scripts skills`，用**同一套 keep 规则**（keepsRuntimePath，
- * 与 collectRuntimeFiles 同源）过一遍筛。只认普通文件（100644 / 100755）：符号链接（120000）与
- * gitlink（160000）不会被 collectRuntimeFiles 收（它按 isFile() 判），拿它们当"应有的文件"
- * 会造出假的不一致。
+ * 提交那侧：`git ls-tree -r -z <commit> -- scripts skills`（**`-z` + 按 NUL 切分**：带引号/换行的合法文件名
+ * 在按行的输出里会被引号包住/含裸换行，按行解析会把它们静默跳过或解错 —— fix5 P1-1），
+ * 用**同一套 keep 规则**（keepsRuntimePath，与 collectRuntimeFiles 同源）过一遍筛。只认普通文件
+ * （100644 / 100755）：符号链接（120000）与 gitlink（160000）不会被 collectRuntimeFiles 收（它按 isFile()
+ * 判），拿它们当"应有的文件"会造出假的不一致。
  *
  * 三类不一致都算：
  *   changed  两边都有、blob 不同（未提交的修改）
  *   added    只在 inventory 侧（未跟踪 / 被忽略但真会被拷的，例如 skills/ 下的 .DS_Store）
  *   missing  只在提交侧（工作树删了 / 没读进来）
  *
- * 读不清（inventory 形状不对 / ls-tree 失败）→ `ok:false` + `why`：**核对不出来 ≠ 核对通过**。
+ * 读不清（inventory 形状不对 / ls-tree 失败 / **某条记录解析不了**）→ `ok:false` + `why`：
+ * **核对不出来 ≠ 核对通过**（解析不了就拒，不许跳过 —— 跳过会让那个文件两边都不在，“闸说一致”而
+ * 它早已从工作树消失）。
  */
 export function commitContentDiff({ sourceRoot, commit, inventory, scope = ["scripts", "skills"] } = {}) {
   const whyLine = (err) => String(err?.message ?? err).split("\n")[0];
@@ -124,18 +127,23 @@ export function commitContentDiff({ sourceRoot, commit, inventory, scope = ["scr
 
   let listing;
   try {
-    // core.quotePath=false：路径里有非 ASCII 时默认会被转义并加引号，那样两边路径字面量永远对不上。
-    listing = execFileSync("git", ["-C", sourceRoot, "-c", "core.quotePath=false", "ls-tree", "-r", commit, "--", "scripts", "skills"],
+    // `-z`：记录按 NUL 切分、路径**原样**输出（不引号不转义）—— 含换行 / 引号 / 非 ASCII 的合法文件名
+    // 只有这样才拿得到。按行读的旧写法遇到它们会跳过或解错（那两类文件会两边都不在 → 误报一致）。
+    listing = execFileSync("git", ["-C", sourceRoot, "ls-tree", "-r", "-z", commit, "--", "scripts", "skills"],
       // stderr 吞掉：失败了下面对 err 自己写人话，不让 git 的英文错误漏到调用者的 stderr 上。
       { encoding: "utf-8", timeout: 30_000, stdio: ["ignore", "pipe", "ignore"] });
   } catch (err) {
     return { ok: false, why: "git ls-tree 读不出 " + commit.slice(0, 12) + "（" + whyLine(err) + "）" };
   }
+  const records = listing.split("\0");
+  if (records.length > 0 && records[records.length - 1] === "") records.pop();   // 末尾的 NUL 终止符
   const committed = new Map();
-  for (const line of listing.split("\n")) {
-    if (line.length === 0) continue;
-    const m = /^(\d{6}) (\w+) ([0-9a-f]{40,64})\t(.*)$/u.exec(line);
-    if (m === null) continue;
+  for (const record of records) {
+    // `<mode> SP <type> SP <object> TAB <path>` —— path 可能含换行，所以用 [\s\S]。
+    const m = /^(\d{6}) (\w+) ([0-9a-f]{40,64})\t([\s\S]+)$/u.exec(record);
+    if (m === null) {
+      return { ok: false, why: "ls-tree 有一条记录解析不了（核对不出来 ≠ 核对通过）：" + JSON.stringify(String(record).slice(0, 120)) };
+    }
     const [, mode, , sha, file] = m;
     if (mode !== "100644" && mode !== "100755") continue;
     if (!keepsRuntimePath(file)) continue;
@@ -171,13 +179,15 @@ export function describeContentDiff(diff) {
 }
 
 /**
- * **核对结论。`kind` 七态**：
+ * **核对结论。`kind` 八态**：
  *   absent        没给参数 —— **一行都不打、什么都不做**（现有流程的行为一个字不变）；
  *   ok            给了且一致（身份对得上，且将装的那份字节与那个提交一致）—— `line` 写进计划；
  *   mismatch      给了但身份不是那个提交 —— `line` 写进计划（预览用），`refusal` 是写盘路径上的拒绝句；
  *   dirty         给了、身份对得上，但**将要安装的那份字节与那个提交不一致**（未提交的修改/多/少）——
  *                 与 mismatch **同一个处置**（--apply 零写退 2；预览照打计划、结论一行、退 2）；
  *   not_repo      调用方看了、说来源不是 git 仓库（`actual: null`）—— 同上；
+ *   no_checker    有 inventory 却没给可用的核对函数（fix5 P2-1）—— 接线错，fail-closed：同上。
+ *                 （旧写法在 `typeof contentDiff !== "function"` 时**直接放行**，那是 fail-open。）
  *   no_identity   调用方**根本没把提交身份传进来**（`actual` 缺省）—— 接线错，fail-closed：同上。
  *                 这条存在的理由：身份必须**只取一次**（计划记下的那个），决不能让这个函数自己
  *                 `rev-parse HEAD` 补一个 —— 那就是 fix4 那个分叉（计划说 A、闸按 B 放行）。
@@ -221,13 +231,25 @@ export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot =
       line: "期望提交 : " + parsed.expected + " —— **核对不通过**：" + core, refusal: "拒绝：" + core + "。什么都没做。" };
   }
   // HEAD 对上了 —— **但装的是那次读取的字节**，所以还要核 inventory（fix3 P1）。
-  //   `inventory === null` = 这次没有要装的源码字节（卸载路径）→ 只有 HEAD 那半条。
-  if (inventory !== null && typeof contentDiff === "function") {
+  //   `inventory === null` = 这次没有要装的源码字节（卸载路径）→ 只有身份那半条。
+  //   有 inventory 却没有可用的核对函数 = 接线错（fix5 P2-1）：**拒绝，不许跳过** ——
+  //   旧写法 `typeof contentDiff === "function"` 为假时直接放行，那是 fail-open。
+  if (inventory !== null) {
+    if (typeof contentDiff !== "function") {
+      const core = "要核将装字节却没有核对函数（contentDiff 不是函数）—— 接线错，核对不出来 ≠ 核对通过";
+      return { kind: "no_checker", given: true, expected: parsed.expected, actual: full, ok: false,
+        line: "期望提交 : " + parsed.expected + " —— **核对不出来**：" + core,
+        refusal: "拒绝：" + core + "。什么都没做。" };
+    }
     const diff = contentDiff({ sourceRoot, commit: full, inventory, ...(scope === undefined ? {} : { scope }) });
     if (!diff.ok) {
       const why = diff.why ?? describeContentDiff(diff);
-      const core = "你要装 " + parsed.expected + "，HEAD 就是它，但**将要安装的那份字节与这个提交不一致**（" + why +
-        "）—— 装进去的会是改过的代码，而收据会把它记成 " + full.slice(0, 12);
+      // 「核不出来」（why 有值：inventory 形状不对 / ls-tree 解析不了）与「真的不一致」措辞要分开 ——
+      // 两者处置相同（都拒绝），但把人往不同方向指。
+      const core = diff.why
+        ? "你要装 " + parsed.expected + "，但要核的那份字节**核不出来**（" + why + "）—— 核对不出来 ≠ 核对通过"
+        : "你要装 " + parsed.expected + "，HEAD 就是它，但**将要安装的那份字节与这个提交不一致**（" + why +
+          "）—— 装进去的会是改过的代码，而收据会把它记成 " + full.slice(0, 12);
       return { kind: "dirty", given: true, expected: parsed.expected, actual: full, ok: false,
         line: "期望提交 : " + parsed.expected + " —— **核对不通过**：" + core,
         refusal: "拒绝：" + core + "。什么都没做。" };
@@ -241,7 +263,19 @@ export function expectCommitVerdict({ argv = process.argv.slice(2), sourceRoot =
 /**
  * 结语那一行（issue #257 第 2 条）：肉眼复核一秒完成 —— `--apply` 装完必须一眼看到「装的是哪个提交」。
  * 来源不是 git 仓库就如实说（追不到 ≠ 编一个出来）。措辞只写一处：三个安装器的结语必须长一样。
+ *
+ * **runtime 没重装的例外**（fix5 P1-2）：版本目录是**内容寻址且不可变**的，同一份字节再装一次
+ * 就是 no-op —— 目录里那份 INSTALLED.json（及其 `source_commit`）**不会**被改写。于是
+ * “先以 B 装、再检出 A（只差文档）装同一份内容”会出现：本次核对的提交是 A，而收据记的还是 B。
+ * 只写「装的是提交 A」会让人以为收据也是 A。所以这种时候两个都写出来，并明说没重装。
+ * （`installedCommit` 是那份不可变收据记的来源提交；为空/相同就走原来那一行。）
  */
-export const sourceCommitLine = ({ commit, version } = {}) =>
-  "装的是提交 " + (typeof commit === "string" && commit.length > 0 ? commit.slice(0, 12) : "（来源不是 git 仓库，追不到）") +
-  "，runtime 版本 " + (version ?? "（未知）");
+export const sourceCommitLine = ({ commit, version, installedCommit = null } = {}) => {
+  const planned = typeof commit === "string" && commit.length > 0 ? commit.slice(0, 12) : "（来源不是 git 仓库，追不到）";
+  const recorded = typeof installedCommit === "string" && installedCommit.length > 0 ? installedCommit.slice(0, 12) : null;
+  if (recorded !== null && recorded !== planned) {
+    return "本次来源提交 " + planned + "；**runtime 未重装**（版本 " + (version ?? "（未知）") +
+      " 已是同一份内容，其收据记的来源提交是 " + recorded + "）—— 将装字节与 " + planned + " 一致";
+  }
+  return "装的是提交 " + planned + "，runtime 版本 " + (version ?? "（未知）");
+};

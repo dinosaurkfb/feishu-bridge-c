@@ -368,6 +368,9 @@ const writeJsonAtomic = (file, obj) => {
 };
 
 // 先把运行时代码落地，再动 settings。见上面 runtimePlan 处对顺序的说明。
+// `runtimeReceiptCommit`：**版本目录里那份不可变收据**记的来源提交（fix5 P1-2）。同字节再装一次是 no-op，
+//   收据不会被改写 —— 于是它可能与本次核对的 COMMIT 不同，结语要把两个都说出来。
+let runtimeReceiptCommit = null;
 if (runtimePlan) {
   const synced = applyRuntimeSync(runtimePlan);
   if (!synced.ok) {
@@ -382,7 +385,8 @@ if (runtimePlan) {
       "）。settings 未改动。");
     process.exit(1);
   }
-  console.log("运行时   : 已装 " + checked.version + " 并校验通过");
+  runtimeReceiptCommit = checked.sourceCommit ?? null;
+  console.log("运行时   : 已装 " + checked.version + " 并校验通过" + (synced.noop ? "（与线上同一份内容，未重装）" : ""));
 }
 
 // 内容没变就别动这个文件。反复重写只会攒出一堆备份，还平白给一份别人也在用的
@@ -615,7 +619,7 @@ if (!uninstall) {
 // 一行放在最显眼处，肉眼复核一秒完成（卸载路径没有「装的提交」，不打）。
 // fix4：用的是**计划记下的那一个** `COMMIT`（与闸同一个值），不在这里重读 HEAD。
 console.log("");
-if (!uninstall) console.log(sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version }));
+if (!uninstall) console.log(sourceCommitLine({ commit: COMMIT, version: runtimePlan?.version, installedCommit: runtimeReceiptCommit }));
 console.log(backup ? "settings 已改，备份：" + backup
   : settingsCreated ? "settings 已新建（原文件不存在）：" + SETTINGS
     : "settings 无改动，未重写");

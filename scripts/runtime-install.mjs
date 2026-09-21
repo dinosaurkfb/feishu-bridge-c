@@ -299,6 +299,9 @@ function currentIdentity(root, versionDir) {
   } catch (err) { return { unverifiable: true, why: String(err?.code ?? err?.message) }; }
 }
 
+/** 写进 INSTALLED.json 的清单条目：**只有 path 与 sha256**（与 base 同形）。 */
+const manifestFiles = (files) => files.map(({ path, sha256 }) => ({ path, sha256 }));
+
 function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false } = {}) {
   // 版本目录内容寻址、不可变。"存在但校验不过"只能整体换掉，不能原地补写。
   //
@@ -328,7 +331,10 @@ function stageVersionDirUnlocked(plan, root, versionDir, { replaceInUse = false 
       installed_at: new Date().toISOString(),
       source_root: plan.sourceRoot,
       source_commit: plan.sourceCommit,
-      files: plan.files,
+      // 清单条目**只有 path + sha256**（与 base 同形）：`blob` 是本次核对用的**内存**字段，
+      //   `plan.files` 上带着它是为了让闸吃同一份字节 —— 写进不可变收据就成了永久多出来的形状
+      //   （fix5 P2-2：不带 --expect-commit 时的收据也得与 base 完全一致）。
+      files: manifestFiles(plan.files),
     }, null, 2) + "\n");
 
     const staged = verifyVersionDir(staging, plan.files, { checkDirName: false });

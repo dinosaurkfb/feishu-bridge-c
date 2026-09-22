@@ -2579,8 +2579,10 @@ printf '%s' "$prompt" > "$last"
   } });
   assert.equal(r.status, 0, r.stderr);
   const args = fs.readFileSync(argsOut, "utf-8").trim().split("\n");
-  assert.deepEqual(args.slice(0, 5), ["exec", "resume", "--skip-git-repo-check", "--json",
-    "--output-last-message"]);
+  // 拿掉哪行会红：run-resume 里的 `"-c", "sandbox_workspace_write.network_access=true"` → 本断言红
+  //   （经飞书投递的 task 会被沙箱断网，peer-say --apply 连不上飞书；Frank 2026-09-22 授权开网）。
+  assert.deepEqual(args.slice(0, 7), ["exec", "resume", "--skip-git-repo-check", "--json",
+    "-c", "sandbox_workspace_write.network_access=true", "--output-last-message"]);
   assert.equal(args.includes(THREAD_A), true);
   assert.equal(args.at(-1), "-");
   assert.equal(fs.readFileSync(envOut, "utf-8"), "unset|unset|codex-run");

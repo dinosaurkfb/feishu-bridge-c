@@ -88,7 +88,10 @@ const child = spawn(codexBin, [
 ], {
   cwd: projectDir,
   // 双保险：即使 runner 被其他入口直接调用，也不把 M5Codex/Aily 入站身份传进目标 task。
-  env: sanitizeCodexRunEnv(process.env),
+  // 目标 codex home 由 handOffCodex 按「哪里真装着这个 thread」定下来、经 FEISHU_CODEX_TARGET_HOME 传来（#266）；
+  //   这里再清理一遍时以它为准，不让第二遍的判据改掉第一遍已经核实过的答案。
+  env: sanitizeCodexRunEnv(process.env,
+    process.env.FEISHU_CODEX_TARGET_HOME ? { CODEX_HOME: process.env.FEISHU_CODEX_TARGET_HOME } : {}),
   stdio: ["pipe", out, err],
 });
 

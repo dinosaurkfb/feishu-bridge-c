@@ -3,6 +3,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "../claim.mjs";
@@ -26,7 +27,16 @@ const RUNNER = path.join(HERE, "run-resume.mjs");
  */
 const CALLER_CODEX_VARS = /^CODEX_(THREAD_ID|SESSION_ID|CI|SANDBOX(_[A-Z0-9_]+)?)$/u;
 const posixPath = (p) => String(p).replaceAll("\\", "/");
-const isTransientCodexHome = (value) => /\/\.aily-cli\/session\//u.test(posixPath(value));
+// 判据按**规范化后的词法路径**与**实际落点（realpath）**两种写法（#266 一轮 P2）：
+//   指向 Aily session 的符号链接别名要认得出；含 `/.aily-cli/session/../..`、实际落在稳定目录的也不许误删。
+const underAilySession = (p) => /\/\.aily-cli\/session\//u.test(posixPath(p) + "/");
+const isTransientCodexHome = (value) => {
+  if (typeof value !== "string" || value.length === 0) return false;
+  const lexical = path.resolve(value);
+  let real = null;
+  try { real = fs.realpathSync(lexical); } catch { /* 不存在就只看词法 */ }
+  return underAilySession(lexical) || (real !== null && underAilySession(real));
+};
 const isCodexArg0Dir = (segment) => /\/tmp\/arg0\/codex-arg0[^/]*\/?$/u.test(posixPath(segment));
 export function sanitizeCodexRunEnv(env = process.env, overrides = {}) {
   const clean = {};
@@ -42,33 +52,82 @@ export function sanitizeCodexRunEnv(env = process.env, overrides = {}) {
   return { ...clean, ...overrides };
 }
 
-export function assertCodexAvailable(codexBin = "codex") {
+/**
+ * 预检必须用**最终子进程环境**（#266 一轮 P1）：清理会从 PATH 里剔掉调用方的 arg0 临时目录，
+ * 若 codex 恰好只在那里，拿未清理的 PATH 预检会放行、受理投递，runner 随后却 spawn_failed。
+ */
+export function assertCodexAvailable(codexBin = "codex", env = process.env) {
   if (codexBin.includes("/")) {
     fs.accessSync(codexBin, fs.constants.X_OK);
     return;
   }
   try {
-    execFileSync("command", ["-v", codexBin], { shell: "/bin/sh", stdio: "ignore", timeout: 5000 });
+    execFileSync("command", ["-v", codexBin], { shell: "/bin/sh", stdio: "ignore", timeout: 5000, env });
   } catch {
-    throw new Error("codex 不在 PATH 上，无法投递");
+    throw new Error("codex 不在 PATH 上（按清理后的最终环境查），无法投递");
   }
 }
 
+/**
+ * 目标 thread 真正住在哪个 codex home（#266 一轮 P1）：**哪个候选的会话目录里真有这个 thread 的 rollout，
+ * 就是它**。thread id 是精确 UUID，不会有歧义；一个都找不到就说不清 —— 调用方据此拒绝投递，
+ * 而不是让续接的进程退回默认目录、找不到 thread 再在后台失败。
+ */
+const ROLLOUT_ROOTS = ["sessions", "archived_sessions"];
+const holdsRollout = (dir, suffix, depth = 0) => {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+  for (const e of entries) {
+    if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(suffix)) return true;
+  }
+  if (depth >= 3) return false;   // sessions/YYYY/MM/DD/rollout-…
+  return entries.some((e) => e.isDirectory() && holdsRollout(path.join(dir, e.name), suffix, depth + 1));
+};
+export function codexHomeHoldingThread(homes, threadId) {
+  const suffix = "-" + String(threadId).toLowerCase() + ".jsonl";
+  for (const home of homes) {
+    if (typeof home !== "string" || !path.isAbsolute(home)) continue;
+    if (ROLLOUT_ROOTS.some((root) => holdsRollout(path.join(home, root), suffix))) return home;
+  }
+  return null;
+}
+
 export function handOffCodex({
-  projectDir, threadId, instruction, runsDir, key, taskKey, bridgeHome, codexBin = "codex",
+  projectDir, threadId, instruction, runsDir, key, taskKey, bridgeHome, codexBin = "codex", env = process.env,
 }) {
   // **key 先验，在任何可观察动作之前。**评审实测 key="../escaped"：prompt 与
   // runner log 被写到 runsDir 外面，runner 随后才拒绝 —— 已经太晚。
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
     throw new Error("claim key 形状不对，拒绝投递");
   }
-  assertCodexAvailable(codexBin);
   if (typeof threadId !== "string" ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
     throw new Error("绑定里的 codex_thread_id 不是精确 UUID，拒绝使用名字或 --last");
   }
   if (!path.isAbsolute(projectDir)) throw new Error("projectDir 必须是绝对路径");
   if (!fs.statSync(projectDir).isDirectory()) throw new Error("绑定的 projectDir 不再是目录");
+  // 目标 codex home（#266 一轮 P1）：调用方（Aily 运输 Codex）会把 CODEX_HOME 覆盖成自己会话的临时目录，
+  //   所以不能直接信环境；按候选依次找「哪里真装着这个 thread」：环境里原本的值、桥根的上一级
+  //   （安装器把 Codex 桥根装在 <codex home>/feishu-bridge）、默认 ~/.codex。
+  const candidates = [...new Set([
+    env.CODEX_HOME,
+    typeof bridgeHome === "string" && path.basename(bridgeHome) === "feishu-bridge" ? path.dirname(bridgeHome) : null,
+    path.join(env.HOME || os.homedir(), ".codex"),
+  ].filter((v) => typeof v === "string" && v.length > 0))];
+  const targetCodexHome = codexHomeHoldingThread(candidates, threadId);
+  if (targetCodexHome === null) {
+    throw new Error("在 " + candidates.join("、") + " 下都找不到 thread " + threadId +
+      " 的会话记录 —— 目标 task 的 codex home 说不清，拒绝投递");
+  }
+  const childEnv = sanitizeCodexRunEnv(env, {
+    FEISHU_BRIDGE_ROLE: "codex-run",
+    FEISHU_BRIDGE_CLAIM_KEY: key,
+    FEISHU_BRIDGE_TASK_KEY: taskKey,
+    CODEX_HOME: targetCodexHome,
+    FEISHU_CODEX_TARGET_HOME: targetCodexHome,
+    ...(bridgeHome ? { FEISHU_CODEX_BRIDGE_HOME: bridgeHome } : {}),
+  });
+  assertCodexAvailable(codexBin, childEnv);
 
   fs.mkdirSync(runsDir, { recursive: true, mode: 0o700 });
   const instructionPath = path.join(runsDir, key + ".prompt.txt");
@@ -95,12 +154,7 @@ export function handOffCodex({
     cwd: projectDir,
     detached: true,
     stdio: ["ignore", fs.openSync(runnerLog, "a"), fs.openSync(runnerLog, "a")],
-    env: sanitizeCodexRunEnv(process.env, {
-      FEISHU_BRIDGE_ROLE: "codex-run",
-      FEISHU_BRIDGE_CLAIM_KEY: key,
-      FEISHU_BRIDGE_TASK_KEY: taskKey,
-      ...(bridgeHome ? { FEISHU_CODEX_BRIDGE_HOME: bridgeHome } : {}),
-    }),
+    env: childEnv,
   });
   child.unref();
 

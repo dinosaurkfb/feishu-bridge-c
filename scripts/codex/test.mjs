@@ -2453,7 +2453,8 @@ test("PK3-E265-fix2：FEISHU_CODEX_BIN 是绝对路径、本身或实际落点�
   }
 });
 
-// 拿掉哪行会红：handOffCodex 里 `CODEX_HOME: targetCodexHome` 那条覆盖 → ① 红；resolveTargetCodexHome 改回从环境 /
+// 拿掉哪行会红：handOffCodex 里 `CODEX_HOME: targetCodexHome` 与 run-resume 里 FEISHU_CODEX_TARGET_HOME 那条覆盖**两道一起**拆 → ① 红
+//   （两道互为兜底，单拆一道仍绿，已实测）；resolveTargetCodexHome 改回从环境 /
 //   桥根上一级猜 → ① 红（二轮 P1：桥根与 codex home 无关时猜不到）；rollout 核对那条 → ③ 红（找不到也照样投递）。
 test("PK3-E265-fix2：目标 codex home 用绑定时记下的值——调用方覆盖了 CODEX_HOME、桥根也与它无关，照样送对（真进程）", () => {
   const dir = temp();

@@ -2454,7 +2454,9 @@ test("PK3-E265-fix1：临时 home 判据按规范化与实际落点——符号�
   // ② `..` 规范化后落在稳定目录 → 要留
   const stable = path.join(dir, "stable-home");
   fs.mkdirSync(stable);
-  const tricky = path.join(dir, ".aily-cli", "session", "..", "..", "stable-home");
+  // 手写拼接：path.join 会把 `..` 化简掉，那样根本没测到 `..`（刀 F5 当初不红就是因为这个）。
+  const tricky = dir + "/.aily-cli/session/../../stable-home";
+  assert.match(tricky, /\/\.aily-cli\/session\/\.\.\//u, "夹具前提：原样带着 /.aily-cli/session/../");
   assert.equal(sanitizeCodexRunEnv({ CODEX_HOME: tricky }).CODEX_HOME, tricky, "含 /.aily-cli/session/../.. 实际落在稳定目录的不许误删");
 });
 

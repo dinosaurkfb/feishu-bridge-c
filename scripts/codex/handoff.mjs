@@ -11,11 +11,33 @@ import { moduleDir } from "../direct-run.mjs";
 const HERE = moduleDir(import.meta.url);
 const RUNNER = path.join(HERE, "run-resume.mjs");
 
-/** 目标 Codex task 不能继承 M5Codex/Aily 入站身份，否则 hook 会把它再次路由。 */
+/**
+ * 目标 Codex task 不能继承**调用方**的东西。投递是在 Aily 的运输 Codex 回合里发起的（它的 shell 工具跑入站
+ * 路由器 → 本函数 → runner → `codex exec resume`），所以 process.env 里装着那个运输 Codex 的一整套现场：
+ *   - `AILY_CLI_*`：M5Codex/Aily 入站身份，不去掉的话 hook 会把目标 task 再次路由；
+ *   - `CODEX_THREAD_ID` / `CODEX_SESSION_ID` / `CODEX_CI` / `CODEX_SANDBOX*`：描述的是**运输 Codex 那个会话**，
+ *     不是被续接的 thread —— 目标 task 带着别人的会话号与沙箱标记跑，身份就错了；
+ *   - `CODEX_HOME` 指向 Aily 会话的临时 codex-home（`~/.aily-cli/session/<id>/…/codex-homes/…`）：
+ *     目标 task 会把它当自己的家，执行命令用的辅助程序（arg0 目录）也落在那里，而那个目录随运输回合结束被清掉；
+ *   - `PATH` 里运输 Codex 自己的 arg0 临时目录（`…/tmp/arg0/codex-arg0XXXX`）：同上，回合结束即消失。
+ * 2026-09-22 omm 实测（cc2cd 任务）：续接的 thread 每条命令都报
+ * `Failed to create unified exec process: No such file or directory`，shell 快照里的 CODEX_HOME / PATH 正是上面这些。
+ * `CODEX_HOME` 只在它指向 Aily 会话临时目录时去掉：用户自己配的非默认 codex home 要保留（thread 就住在那里）。
+ */
+const CALLER_CODEX_VARS = /^CODEX_(THREAD_ID|SESSION_ID|CI|SANDBOX(_[A-Z0-9_]+)?)$/u;
+const posixPath = (p) => String(p).replaceAll("\\", "/");
+const isTransientCodexHome = (value) => /\/\.aily-cli\/session\//u.test(posixPath(value));
+const isCodexArg0Dir = (segment) => /\/tmp\/arg0\/codex-arg0[^/]*\/?$/u.test(posixPath(segment));
 export function sanitizeCodexRunEnv(env = process.env, overrides = {}) {
   const clean = {};
   for (const [name, value] of Object.entries(env)) {
-    if (!name.startsWith("AILY_CLI_")) clean[name] = value;
+    if (name.startsWith("AILY_CLI_")) continue;
+    if (CALLER_CODEX_VARS.test(name)) continue;
+    if (name === "CODEX_HOME" && isTransientCodexHome(value)) continue;
+    clean[name] = value;
+  }
+  if (typeof clean.PATH === "string") {
+    clean.PATH = clean.PATH.split(path.delimiter).filter((segment) => !isCodexArg0Dir(segment)).join(path.delimiter);
   }
   return { ...clean, ...overrides };
 }

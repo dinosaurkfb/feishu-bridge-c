@@ -2292,6 +2292,86 @@ test("Codex 启动前 Git 预检失败不会误报 thread_mismatch", () => {
     "未知 stderr 不应进入飞书风险回执");
 });
 
+// PK3-E265（2026-09-22 omm 实测）：投递发生在 Aily 运输 Codex 的回合里，process.env 带着**调用方** Codex 的整套现场。
+//   拿掉哪行会红：sanitizeCodexRunEnv 里 CALLER_CODEX_VARS 那条 continue → ① 红（会话号 / CI / 沙箱标记漏进去）；
+//   `CODEX_HOME && isTransientCodexHome` 那条 → ① 红（临时 codex-home 漏进去）；PATH 过滤那段 → ① 红（arg0 临时目录漏进去）；
+//   把 CODEX_HOME 改成无条件去掉 → ② 红（用户自己配的 codex home 被抹掉，thread 就找不到了）。
+test("PK3-E265：投递给目标 task 时剥掉调用方 Codex 的会话号、临时 codex-home 与 arg0 临时目录（纯函数）", () => {
+  const ailyHome = "/home/u/.aily-cli/session/session_x/workdir/.aily-cli/codex-homes/506af";
+  const arg0 = ailyHome + "/tmp/arg0/codex-arg0uRHxSx";
+  const caller = {
+    PATH: ["/home/u/.local/bin", arg0, "/usr/bin", "/home/u/.codex/tmp/arg0/codex-arg0Abc123/"].join(path.delimiter),
+    CODEX_HOME: ailyHome,
+    CODEX_THREAD_ID: "01a0b213-b6a7-7d51-b269-5c71aef055cc",
+    CODEX_SESSION_ID: "01a0b213-b6a7-7d51-b269-5c71aef055cc",
+    CODEX_CI: "1",
+    CODEX_SANDBOX: "seatbelt",
+    CODEX_SANDBOX_NETWORK_DISABLED: "1",
+    CODEX_MANAGED_BY_NPM: "1",
+    HOME: "/home/u",
+    AILY_CLI_SESSION_ID: "x",
+  };
+  const out = sanitizeCodexRunEnv(caller);
+  // ① 调用方的东西一样不剩
+  for (const k of ["CODEX_HOME", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_CI", "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED", "AILY_CLI_SESSION_ID"]) {
+    assert.equal(Object.hasOwn(out, k), false, k + " 不许漏进目标 task：" + JSON.stringify(out));
+  }
+  assert.equal(out.PATH, ["/home/u/.local/bin", "/usr/bin"].join(path.delimiter), "arg0 临时目录要从 PATH 里剔掉：" + out.PATH);
+  // 与调用方会话无关的照旧保留
+  assert.equal(out.HOME, "/home/u");
+  assert.equal(out.CODEX_MANAGED_BY_NPM, "1");
+  // ② 用户自己配的（非 Aily 临时）codex home 必须保留：thread 就住在那里
+  assert.equal(sanitizeCodexRunEnv({ CODEX_HOME: "/data/my-codex" }).CODEX_HOME, "/data/my-codex");
+  // overrides 仍然最后生效
+  assert.equal(sanitizeCodexRunEnv({ CODEX_CI: "1" }, { CODEX_CI: "0" }).CODEX_CI, "0");
+});
+
+// 真进程：runner 起的那个 codex 进程里**实际**拿到的环境（假 codex 把它们记下来）。拿掉 run-resume.mjs 里
+//   `env: sanitizeCodexRunEnv(process.env)` → 本用例红。
+test("PK3-E265：真进程——runner 起的 codex 拿不到调用方的会话号、临时 codex-home 与 arg0 临时目录", () => {
+  const dir = temp();
+  const fake = path.join(dir, "fake-codex.sh");
+  const envOut = path.join(dir, "env.txt");
+  fs.writeFileSync(fake, `#!/bin/sh
+printf 'HOME_V=%s\\nTHREAD=%s\\nSESSION=%s\\nCI=%s\\nSANDBOX=%s\\nPATH_V=%s\\n' "\${CODEX_HOME-unset}" "\${CODEX_THREAD_ID-unset}" "\${CODEX_SESSION_ID-unset}" "\${CODEX_CI-unset}" "\${CODEX_SANDBOX_NETWORK_DISABLED-unset}" "$PATH" > "$ENV_OUT"
+last=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then last="$2"; shift 2; else shift; fi
+done
+cat > /dev/null
+printf '{"type":"thread.started","thread_id":"%s"}\\n' "$EXPECTED_THREAD"
+printf '{"type":"turn.started"}\\n'
+printf '{"type":"turn.completed"}\\n'
+printf 'ok' > "$last"
+`, { mode: 0o700 });
+  const instruction = path.join(dir, "prompt.txt");
+  fs.writeFileSync(instruction, "x");
+  const ailyHome = path.join(dir, ".aily-cli", "session", "session_x", "workdir", ".aily-cli", "codex-homes", "506af");
+  const arg0 = path.join(ailyHome, "tmp", "arg0", "codex-arg0uRHxSx");
+  const base = isolatedEnv();
+  const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "run-resume.mjs"),
+    "--thread-id", THREAD_A, "--project", dir, "--instruction-file", instruction,
+    "--log", path.join(dir, "run.jsonl"), "--stderr", path.join(dir, "stderr.log"),
+    "--last-message", path.join(dir, "last.txt"), "--exit-receipt", path.join(dir, "exit.json"),
+    "--claim-key", "b".repeat(64), "--codex-bin", fake,
+  ], { encoding: "utf-8", env: {
+    ...base,
+    EXPECTED_THREAD: THREAD_A,
+    ENV_OUT: envOut,
+    PATH: [arg0, base.PATH ?? "/usr/bin:/bin"].join(path.delimiter),
+    CODEX_HOME: ailyHome,
+    CODEX_THREAD_ID: "01a0b213-b6a7-7d51-b269-5c71aef055cc",
+    CODEX_SESSION_ID: "01a0b213-b6a7-7d51-b269-5c71aef055cc",
+    CODEX_CI: "1",
+    CODEX_SANDBOX_NETWORK_DISABLED: "1",
+  } });
+  assert.equal(r.status, 0, r.stderr);
+  const got = Object.fromEntries(fs.readFileSync(envOut, "utf-8").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+  assert.deepEqual([got.HOME_V, got.THREAD, got.SESSION, got.CI, got.SANDBOX], ["unset", "unset", "unset", "unset", "unset"], JSON.stringify(got));
+  assert.equal(got.PATH_V.split(path.delimiter).includes(arg0), false, "arg0 临时目录不许出现在 codex 的 PATH 里：" + got.PATH_V);
+});
+
 test("run-resume 用精确 UUID、stdin prompt 和 last-message 形成可观察终局", () => {
   const dir = temp();
   const fake = path.join(dir, "fake-codex.sh");

@@ -11,13 +11,25 @@ import {
 } from "./bind-compose.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  addTask, bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
+  addTask, bridgeHome, codexHomeOf, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
 import { wireBind, wirePauseResume, uncleanWired, emitUncleanReceipt } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
+
+// #266：绑定这一刻，目标 Codex 会话自己的 codex home（$feishu-bind 在目标会话里跑，这里的环境就是它的）。
+//   规范化到文件系统的实际落点（realpath：符号链接与 .. 都按真实访问语义解开），投递时交给 Codex 的就是这一个路径。
+//   落在飞书运输会话临时目录下的不记（那种 home 回合结束就被清掉），投递时退回默认并核实。
+function bindingCodexHome() {
+  try {
+    const real = fs.realpathSync.native(codexHomeOf({ env: process.env }));
+    return /\/\.aily-cli\/session\//u.test(real.replaceAll("\\", "/") + "/") ? null : real;
+  } catch {
+    return null;
+  }
+}
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -193,6 +205,7 @@ const wired = wireBind({
       root, threadId: thread.threadId, name: d.name, purpose: d.purpose, rootMessageId,
       token: d.token, inboundPrefix: tpl.template.inbound_prefix,
       chatId: target.chatId, chatName: target.chatName,
+      codexHome: bindingCodexHome(),
     });
     const added = addTask(task);
     if (!added.ok) {

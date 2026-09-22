@@ -1408,7 +1408,7 @@ export function logicalTaskKeyFor(root, threadId) {
 
 export function makeTaskEntry({
   root, threadId, name, purpose, rootMessageId, token,
-  inboundPrefix = DEFAULT_INBOUND_PREFIX, chatId, chatName, now = Date.now(),
+  inboundPrefix = DEFAULT_INBOUND_PREFIX, chatId, chatName, codexHome, now = Date.now(),
 }) {
   const logicalTaskKey = logicalTaskKeyFor(root, threadId);
   const base = {
@@ -1419,6 +1419,9 @@ export function makeTaskEntry({
     task_display_name: name,
     purpose: purpose ?? null,
     codex_thread_id: threadId,
+    // #266：目标 thread 真正住在哪个 codex home —— **在绑定这一刻**从目标 Codex 会话自己的环境取下来。
+    //   投递时由 Aily 运输 Codex 发起，那时的 CODEX_HOME 已被覆盖成运输会话的临时目录，猜不回来。
+    ...(typeof codexHome === "string" && codexHome ? { codex_home: codexHome } : {}),
     root_message_id: rootMessageId,
     ...(typeof chatId === "string" && chatId ? { chat_id: chatId } : {}),
     ...(typeof chatName === "string" && chatName ? { chat_name: chatName } : {}),

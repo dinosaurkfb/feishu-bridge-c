@@ -82,8 +82,13 @@ const prompt = fs.readFileSync(instructionFile);
 
 const child = spawn(codexBin, [
   // task.root 来自用户明确确认后写入的精确绑定，可能是包含多个仓库的 Codex workspace，
-  // 不一定自身带 .git。这里只跳过 Git 仓库前置检查，不改变 sandbox 或 approval 权限。
+  // 不一定自身带 .git。这里跳过 Git 仓库前置检查。
   "exec", "resume", "--skip-git-repo-check", "--json",
+  // **开网络**（Frank 2026-09-22 授权：「要给 codex 开放联网能力」）。经飞书投递的 task 常要自己对外发消息
+  //   （cc2cd 的 peer-say --apply 要连飞书），而 workspace-write 沙箱默认 network_access=false ——
+  //   omm 实测连 open.feishu.cn 都解析不了。续接时这条 -c 会覆盖 thread 里记的旧网络设置（已实测）。
+  //   只动 workspace-write 模式的网络开关；沙箱模式本身（读写范围）与 approval 不变。
+  "-c", "sandbox_workspace_write.network_access=true",
   "--output-last-message", lastMessagePath, threadId, "-",
 ], {
   cwd: projectDir,

@@ -9,15 +9,27 @@ import { publishDraft, sendToChat } from "../outbound.mjs";
 import {
   composeCodexBinding, displayThread, resolveBindingTarget, resolveThreadId,
 } from "./bind-compose.mjs";
+import { resolveTargetCodexHome } from "./handoff.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  addTask, bridgeHome, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry,
+  addTask, bridgeHome, codexHomeOf, findRegisteredTaskForCodexThread, loadCodexTemplate, makeTaskEntry, recordTaskCodexHome,
   refreshPendingTaskBinding, setTaskConnectionStatus, setTaskDisplayName,
 } from "./state.mjs";
 import { buildIntentParams, requireIntent } from "./intent.mjs";
 import { wireBind, wirePauseResume, uncleanWired, emitUncleanReceipt } from "../m1a/wiring.mjs";
 import { legacyEndpointId } from "../subscription.mjs";
 import { gateBlocks, exitForGate } from "../maintenance-gate-core.mjs";
+
+// #266：绑定这一刻，目标 Codex 会话自己的 codex home（$feishu-bind 在目标会话里跑，这里的环境就是它的）。
+//   与投递用同一个核实（resolveTargetCodexHome）：实际落点（realpath(3)）、不在运输会话临时目录下、装着这个 thread。
+//   **核实不了就不建话题**（三轮 P1）——否则会建出一条投递必然失败的绑定。
+function verifiedBindingCodexHome(threadId) {
+  try {
+    return { ok: true, home: resolveTargetCodexHome({ recorded: codexHomeOf({ env: process.env }), threadId }) };
+  } catch (err) {
+    return { ok: false, why: err.message };
+  }
+}
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -48,6 +60,25 @@ if (!intent.ok) die(intent.text);
 const tpl = loadCodexTemplate();
 const transportAgentName = tpl.ok ? (tpl.template?.transport_agent_name || "运输 agent") : "运输 agent";
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
+// 只有「明确没登记」才走新建（#266 四轮 P1）：登记表读不出、校验不过（如坏 codex_home）也是 ok:false，
+//   若当成没绑过，会先向飞书发根话题、登记时才失败。其它失败一律在任何飞书调用之前拒。
+if (!existing.ok && existing.reason !== "thread_not_registered") {
+  die("读不出绑定登记表（" + existing.reason + (existing.detail ? "：" + existing.detail : "") +
+    (existing.error ? "；" + existing.error : "") + "），没有建话题。");
+}
+const homeCheck = verifiedBindingCodexHome(thread.threadId);
+if (existing.ok && !Object.hasOwn(existing.task, "codex_home")) {
+  // 旧绑定没记 codex home（#266 三轮 P1）：重跑绑定就是补记入口 —— 核实过才写，dry-run 只说会写什么。
+  if (!homeCheck.ok) {
+    console.log("注意：这条绑定没记 Codex 数据目录，当前会话的也核实不了（" + homeCheck.why + "）；飞书投递会退回默认目录并核实。");
+  } else if (!apply) {
+    console.log("[dry-run] 这条绑定没记 Codex 数据目录；加 --apply 会补记 " + homeCheck.home);
+  } else {
+    const recorded = recordTaskCodexHome({ threadId: thread.threadId, codexHome: homeCheck.home });
+    if (!recorded.ok) die("补记 Codex 数据目录失败：" + recorded.reason + (recorded.error ? "（" + recorded.error + "）" : ""));
+    console.log("已补记 Codex 数据目录：" + homeCheck.home);
+  }
+}
 if (existing.ok) {
   if ((existing.task.status ?? "active") === "active") {
     const awaitingFirstMention = existing.task.inbound_state === "pending" && !existing.task.session_id;
@@ -138,6 +169,7 @@ if (existing.ok) {
   console.log("已恢复当前 Codex task 的飞书接入，继续使用原话题。");
   process.exit(0);
 }
+if (!homeCheck.ok) die("核实不了目标 Codex 会话的数据目录，没有建话题：" + homeCheck.why);
 if (!tpl.ok) die("Codex 单智能体模板不可用（" + tpl.reason + "）");
 const target = resolveBindingTarget({
   template: tpl.template,
@@ -193,6 +225,7 @@ const wired = wireBind({
       root, threadId: thread.threadId, name: d.name, purpose: d.purpose, rootMessageId,
       token: d.token, inboundPrefix: tpl.template.inbound_prefix,
       chatId: target.chatId, chatName: target.chatName,
+      codexHome: homeCheck.home,
     });
     const added = addTask(task);
     if (!added.ok) {

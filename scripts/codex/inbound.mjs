@@ -28,7 +28,7 @@ import {
   DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_TURN_STATUS,
   applyInteractionPolicyToAdmission, handleDialoguePolicy,
 } from "../interaction-policy.mjs";
-import { handOffCodex } from "./handoff.mjs";
+import { HandoffRefusal, handOffCodex } from "./handoff.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
@@ -909,6 +909,7 @@ try {
     key: policyRun.runRequest.runId,
     taskKey: task.logical_task_key,
     bridgeHome: HOME,
+    codexHome: Object.hasOwn(task, "codex_home") ? task.codex_home : undefined,
     codexBin: process.env.FEISHU_CODEX_BIN ?? "codex",
   });
 } catch (err) {
@@ -924,7 +925,9 @@ try {
     status: "error", reason: "handoff_failed", message_id: verdict.messageId,
     claim_acquired: true, handed_off: false,
   });
-  finish("error", { detail: "投递失败：" + err.message }, { reason: "handoff_failed" });
+  // 发到飞书的只有封闭文案（#266 二轮 P1）；err.message 里的路径与 thread 号只留在上面的本机 claim 里。
+  finish("error", { detail: "投递失败：" + (err instanceof HandoffRefusal ? err.publicText : "本机投递出错（详情见本机日志）") },
+    { reason: "handoff_failed" });
 }
 
 stampSessionLock(paths.sessionLock, { pid: run.pid, logPath: run.logPath });

@@ -60,6 +60,12 @@ if (!intent.ok) die(intent.text);
 const tpl = loadCodexTemplate();
 const transportAgentName = tpl.ok ? (tpl.template?.transport_agent_name || "运输 agent") : "运输 agent";
 const existing = findRegisteredTaskForCodexThread({ threadId: thread.threadId });
+// 只有「明确没登记」才走新建（#266 四轮 P1）：登记表读不出、校验不过（如坏 codex_home）也是 ok:false，
+//   若当成没绑过，会先向飞书发根话题、登记时才失败。其它失败一律在任何飞书调用之前拒。
+if (!existing.ok && existing.reason !== "thread_not_registered") {
+  die("读不出绑定登记表（" + existing.reason + (existing.detail ? "：" + existing.detail : "") +
+    (existing.error ? "；" + existing.error : "") + "），没有建话题。");
+}
 const homeCheck = verifiedBindingCodexHome(thread.threadId);
 if (existing.ok && !Object.hasOwn(existing.task, "codex_home")) {
   // 旧绑定没记 codex home（#266 三轮 P1）：重跑绑定就是补记入口 —— 核实过才写，dry-run 只说会写什么。

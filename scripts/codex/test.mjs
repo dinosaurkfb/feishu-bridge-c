@@ -3444,6 +3444,28 @@ test("PK3-E265-fix3：新建绑定前核实目标 codex home——临时目录�
   assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).ok, false, "不许登记");
 });
 
+// 拿掉哪行会红：bind-task.mjs 里 `existing.reason !== "thread_not_registered"` 那条 die → 本用例红（坏登记表被当成没绑过，先发根话题）。
+test("PK3-E265-fix4：登记表读不出或校验不过（坏 codex_home / 坏 JSON）→ 不当成没绑过，飞书零调用、登记表原样", () => {
+  const { home, root, calls, bind } = bindHarness();
+  const codexHome = path.join(home, "codex-home");
+  plantRollout(codexHome);                                         // 目标 home 本身没问题：拒绝只能来自登记表
+  const task = makeTaskEntry({ root, threadId: THREAD_B, name: "Other", rootMessageId: "om_b", token: "b" });
+  const registry = path.join(home, "registry.json");
+  for (const [label, content] of [
+    ["坏 codex_home", JSON.stringify({ tasks: [{ ...task, codex_home: "" }] })],
+    ["坏 JSON", "{ not json"],
+  ]) {
+    fs.writeFileSync(registry, content);
+    for (const apply of [false, true]) {
+      const r = bind(codexHome, { apply });
+      assert.equal(r.status, 1, label + (apply ? " apply" : " dry-run") + " 应当拒：" + r.stdout + r.stderr);
+      assert.match(r.stderr, /读不出绑定登记表.*没有建话题/u, r.stderr);
+    }
+    assert.equal(fs.readFileSync(registry, "utf-8"), content, label + "：登记表原样");
+  }
+  assert.equal(fs.existsSync(calls), false, "一次飞书调用都不许有");
+});
+
 // 拿掉哪行会红：bind-task.mjs 里补记分支的 recordTaskCodexHome → ② 红；dry-run 分支改成也写 → ① 红；
 //   recordTaskCodexHome 里 `codex_home_already_recorded` 那条 → ④ 红（已记着的被静默改掉）。
 test("PK3-E265-fix3：旧活跃绑定重跑 bind 补记 codex home——核实过才写、dry-run 不写、已记的不改；补记后自定义 home 能投递", () => {

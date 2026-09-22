@@ -70,31 +70,34 @@ const REFUSE_HOME_UNKNOWN = "说不清目标 Codex 会话的数据目录，未�
  * 若 codex 恰好只在那里，拿未清理的 PATH 预检会放行、受理投递，runner 随后却 spawn_failed。
  */
 export function assertCodexAvailable(codexBin = "codex", env = process.env) {
-  if (codexBin.includes("/")) {
-    // 绝对路径不经 PATH 过滤（#266 二轮 P2）：它本身或其实际落点在运输回合的临时目录里，照样随回合消失。
-    const real = actualPath(codexBin);
-    if (real === null) throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 路径不存在 " + codexBin);
-    for (const where of [codexBin, real]) {
-      if (isCodexArg0Dir(path.dirname(where)) || underAilySession(where)) {
-        throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 落在运输回合的临时目录 " + where);
-      }
+  let found = codexBin;
+  if (!codexBin.includes("/")) {
+    try {
+      found = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "sh", codexBin],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, env }).trim();
+    } catch {
+      throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不在 PATH 上（按清理后的最终环境查）");
     }
-    try { fs.accessSync(real, fs.constants.X_OK); } catch {
-      throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不可执行 " + codexBin);
-    }
-    return;
+    if (!path.isAbsolute(found)) throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不是一个程序文件：" + found);
   }
-  try {
-    execFileSync("command", ["-v", codexBin], { shell: "/bin/sh", stdio: "ignore", timeout: 5000, env });
-  } catch {
-    throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不在 PATH 上（按清理后的最终环境查）");
+  // 不经 PATH 过滤的绝对路径（#266 二轮 P2）、以及按 PATH 找到的程序（三轮 P2：稳定目录里的符号链接可以指向
+  //   运输回合的 arg0 临时目录，字面过滤留得住它）都要核本身与实际落点：在临时目录里就会随回合消失。
+  const real = actualPath(found);
+  if (real === null) throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 路径不存在 " + found);
+  for (const where of [found, real]) {
+    if (isCodexArg0Dir(path.dirname(where)) || underAilySession(where)) {
+      throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 落在运输回合的临时目录 " + where);
+    }
+  }
+  try { fs.accessSync(real, fs.constants.X_OK); } catch {
+    throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不可执行 " + found);
   }
 }
 
 /**
  * 目标 thread 住在哪个 codex home（#266）。**不猜**：只有一个来源 —— 绑定那一刻从目标 Codex 会话自己的环境
  * 记下的 `codex_home`（投递时的环境属于 Aily 运输 Codex，CODEX_HOME 早被它覆盖，桥根也可以和它无关）；
- * 旧绑定没记，才退回默认 `~/.codex`。然后：
+ * 旧绑定**缺这个字段**才退回默认 `~/.codex`（显式坏值拒）。然后：
  *   - 规范化成实际落点（realpath），**核对与交给 Codex 的是同一个路径**，符号链接别名随运输回合消失也不受影响；
  *   - 实际落点在 Aily 运输会话临时目录下 → 拒绝；
  *   - 那里没有这个 thread 的 rollout → 拒绝（让用户重绑，而不是让续接进程在后台找不到 thread 再失败）。
@@ -110,9 +113,11 @@ const holdsRollout = (dir, suffix, depth = 0) => {
   return entries.some((e) => e.isDirectory() && holdsRollout(path.join(dir, e.name), suffix, depth + 1));
 };
 export function resolveTargetCodexHome({ recorded, threadId, env = process.env }) {
-  const raw = typeof recorded === "string" && recorded.length > 0
-    ? recorded
-    : path.join(env.HOME || os.homedir(), ".codex");
+  // 只有**真正缺这个字段**（undefined）的旧绑定才退回默认；显式写着的坏值（空串、null、非字符串）是说不清，拒（三轮 P2）。
+  if (recorded !== undefined && (typeof recorded !== "string" || recorded.length === 0)) {
+    throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "绑定里的 codex_home 是无效值 " + JSON.stringify(recorded));
+  }
+  const raw = recorded ?? path.join(env.HOME || os.homedir(), ".codex");
   if (!path.isAbsolute(raw)) throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "codex home 不是绝对路径 " + raw);
   const real = actualPath(raw);
   if (real === null) throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "codex home 不存在 " + raw);

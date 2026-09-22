@@ -80,7 +80,7 @@ import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  classifyRunnerDiagnostic, HandoffRefusal, handOffCodex, isCodexInboundExecution, readCodexRunOutcome, resolveTargetCodexHome,
+  assertCodexAvailable, classifyRunnerDiagnostic, HandoffRefusal, handOffCodex, isCodexInboundExecution, readCodexRunOutcome, resolveTargetCodexHome,
   sanitizeCodexRunEnv, verifyCodexRunCredential,
 } from "./handoff.mjs";
 import {
@@ -106,7 +106,7 @@ import {
   isThreadBusy, loadCodexTemplate, loadRegistry, makeTaskEntry, mappingForTask, recordThreadActivity, resolveTask,
   closeTaskTopicRotation, prepareTaskTopicRotation, promoteTask, recordTaskTopicActivity,
   finalizeTaskDialogueTurn, interactionPolicyForTask, reserveTaskDialogueTurn,
-  refreshPendingTaskBinding,
+  recordTaskCodexHome, refreshPendingTaskBinding,
   addTask, findRawTask, mutateRegistryDocument, registerTaskTopicRotation,
   validateRegistryDocument, resolveTaskOutboundGeneration,
   setTaskConnectionStatus,
@@ -3397,6 +3397,147 @@ test("task 级目标群覆盖只进入 Git 外运行映射，不改变机器模�
   assert.equal(loadCodexTemplate(path.join(home, "chain-config.json")).template.chat_id, TEMPLATE.chat_id);
 });
 
+// #266 三轮的绑定生命周期。共用：一套能真发根话题的假 lark（记下每次调用）。
+const bindHarness = () => {
+  const home = temp();
+  const root = path.join(home, "project");
+  const bin = path.join(home, "fake-lark.sh");
+  const calls = path.join(home, "calls.txt");
+  const configBase = path.join(home, "agents");
+  const credentialDir = path.join(configBase, TEMPLATE.agent_uid);
+  fs.mkdirSync(root);
+  fs.mkdirSync(credentialDir, { recursive: true });
+  fs.writeFileSync(path.join(root, "README.md"), "# Lab\n");
+  fs.writeFileSync(path.join(credentialDir, "config.json"), JSON.stringify({
+    apps: [{ name: TEMPLATE.lark_cli_profile, appId: TEMPLATE.transport_app_id }],
+  }));
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({
+    ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase,
+  }));
+  fs.writeFileSync(bin, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CALLS_FILE\"\nprintf '%s' '{\"ok\":true,\"data\":{\"message_id\":\"om_root\"}}'\n", { mode: 0o700 });
+  // 凭证一次一张、按参数签：每次调用换一个群号参数（新建绑定在核实那一步就拒、已有绑定的分支不读群号）。
+  let n = 0;
+  const bind = (codexHome, { apply = true } = {}) => { n += 1; const chat = "oc_lab_" + n; return spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+    "--project", root, "--thread-id", THREAD_A, "--name", "Lab", "--chat-id", chat,
+    ...(apply ? ["--apply", ...withIntent("bind", THREAD_A, home, { project: root, chat, name: "Lab" })] : [])], {
+    encoding: "utf-8",
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home, FAKE_CALLS_FILE: calls, CODEX_HOME: codexHome },
+  }); };
+  return { home, root, calls, bind };
+};
+
+// 拿掉哪行会红：bind-task.mjs 里 `if (!homeCheck.ok) die(...)` → ①② 红（照样发根话题、登记一条投递必败的绑定）。
+test("PK3-E265-fix3：新建绑定前核实目标 codex home——临时目录或没有这个 thread 的 rollout → 不发根话题、不登记", () => {
+  const { home, calls, bind } = bindHarness();
+  const aily = path.join(home, ".aily-cli", "session", "s", "workdir", ".aily-cli", "codex-homes", "h");
+  plantRollout(aily);
+  const empty = path.join(home, "empty-codex-home");
+  fs.mkdirSync(empty);
+  for (const [label, codexHome] of [["① 运输会话临时 home", aily], ["② 没有这个 thread", empty]]) {
+    for (const apply of [false, true]) {
+      const r = bind(codexHome, { apply });
+      assert.equal(r.status, 1, label + (apply ? " apply" : " dry-run") + " 应当拒：" + r.stdout + r.stderr);
+      assert.match(r.stderr, /核实不了目标 Codex 会话的数据目录，没有建话题/u, r.stderr);
+    }
+  }
+  assert.equal(fs.existsSync(calls), false, "一次飞书调用都不许有");
+  assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).ok, false, "不许登记");
+});
+
+// 拿掉哪行会红：bind-task.mjs 里补记分支的 recordTaskCodexHome → ② 红；dry-run 分支改成也写 → ① 红；
+//   recordTaskCodexHome 里 `codex_home_already_recorded` 那条 → ④ 红（已记着的被静默改掉）。
+test("PK3-E265-fix3：旧活跃绑定重跑 bind 补记 codex home——核实过才写、dry-run 不写、已记的不改；补记后自定义 home 能投递", () => {
+  const { home, root, calls, bind } = bindHarness();
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Lab", rootMessageId: "om_a", token: "a" });
+  task.session_id = "aily_sess_a";
+  task.inbound_state = "bound";
+  writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
+  const customHome = path.join(home, "my-codex");                 // 自定义 home，默认 ~/.codex 里没有
+  plantRollout(customHome);
+  const fakeHome = path.join(home, "fake-user-home");
+  fs.mkdirSync(fakeHome);
+  // 前提：不补记，投递只能退回默认 home，而那里没有 → 拒（Codex 三轮的实测形状）
+  assert.throws(() => resolveTargetCodexHome({ recorded: undefined, threadId: THREAD_A, env: { HOME: fakeHome } }), HandoffRefusal);
+  // ① dry-run：说会补记什么，但不写
+  const dry = bind(customHome, { apply: false });
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /加 --apply 会补记/u, dry.stdout);
+  assert.equal(Object.hasOwn(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, "codex_home"), false, "dry-run 不许写");
+  // ② apply：补记核实过的实际落点
+  const applied = bind(customHome);
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.match(applied.stdout, /已补记 Codex 数据目录/u, applied.stdout);
+  const after = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task;
+  assert.equal(after.codex_home, fs.realpathSync.native(customHome));
+  // ③ 补记后，投递用它 —— 不再依赖默认 home
+  assert.equal(resolveTargetCodexHome({ recorded: after.codex_home, threadId: THREAD_A, env: { HOME: fakeHome } }), fs.realpathSync.native(customHome));
+  // ④ 已记着的不改：换一个也装着 thread 的 home 重跑，登记不变
+  const other = path.join(home, "other-codex");
+  plantRollout(other);
+  const again = bind(other);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.codex_home, fs.realpathSync.native(customHome));
+  assert.equal(recordTaskCodexHome({ threadId: THREAD_A, codexHome: fs.realpathSync.native(other), home }).reason, "codex_home_already_recorded");
+  // ⑤ 核实不了时只提示、不写、不挡原有流程
+  const task2 = { ...task };
+  delete task2.codex_home;
+  writeRegistryFixtureUnvalidated([task2], path.join(home, "registry.json"));
+  const empty = path.join(home, "empty");
+  fs.mkdirSync(empty);
+  const warn = bind(empty);
+  assert.equal(warn.status, 0, warn.stderr);
+  assert.match(warn.stdout, /没记 Codex 数据目录，当前会话的也核实不了/u, warn.stdout);
+  assert.equal(Object.hasOwn(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task, "codex_home"), false);
+  assert.equal(fs.existsSync(calls), false, "补记路径不碰飞书");
+});
+
+// 拿掉哪行会红：resolveTargetCodexHome 里显式坏值那条 → ① 红（null / 空串退回默认、默认里又恰好有 thread → 静默送到默认）；
+//   validateRegistryDocument 里 codex_home 那条 → ② 红。
+test("PK3-E265-fix3：codex_home 写着但无效（空串 / null / 非字符串 / 相对路径）→ 投递拒、登记表校验拒；只有缺字段才退回默认", () => {
+  const dir = temp();
+  const defaultHome = path.join(dir, ".codex");
+  plantRollout(defaultHome);
+  const env = { HOME: dir };
+  // ① 显式坏值：拒，哪怕默认 home 里就有这个 thread
+  for (const bad of ["", null, 42, {}]) {
+    assertRefused(() => resolveTargetCodexHome({ recorded: bad, threadId: THREAD_A, env }), /说不清/u, dir);
+  }
+  // 缺字段（undefined）才退回默认
+  assert.equal(resolveTargetCodexHome({ recorded: undefined, threadId: THREAD_A, env }), fs.realpathSync.native(defaultHome));
+  // ② 登记表：写着就必须是绝对路径
+  const base = makeTaskEntry({ root: dir, threadId: THREAD_A, name: "A", rootMessageId: "om_a", token: "a" });
+  for (const bad of ["", null, 42, "relative/home"]) {
+    const v = validateRegistryDocument({ tasks: [{ ...base, codex_home: bad }] });
+    assert.equal(v.ok, false, JSON.stringify(bad) + " 应当被拒");
+    assert.match(v.detail, /codex_home 不是绝对路径/u, v.detail);
+  }
+  assert.equal(validateRegistryDocument({ tasks: [base] }).ok, true, "缺字段的旧记录合法");
+  assert.equal(validateRegistryDocument({ tasks: [{ ...base, codex_home: defaultHome }] }).ok, true);
+});
+
+// 拿掉哪行会红：assertCodexAvailable 里按 PATH 找到后核实际落点那段（让 PATH 找到的直接放行）→ 本用例红。
+test("PK3-E265-fix3：PATH 里稳定名称的符号链接实际指向 arg0 临时目录 → 投递前就拒、零文件", () => {
+  const dir = temp();
+  const codexHome = path.join(dir, "codex-home");
+  plantRollout(codexHome);
+  const arg0 = path.join(dir, "t", "tmp", "arg0", "codex-arg0Z9");
+  fs.mkdirSync(arg0, { recursive: true });
+  fs.writeFileSync(path.join(arg0, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const stableBin = path.join(dir, "stable-bin");
+  fs.mkdirSync(stableBin);
+  fs.symlinkSync(path.join(arg0, "codex"), path.join(stableBin, "codex"));
+  const runsDir = path.join(dir, "runs");
+  fs.mkdirSync(runsDir);
+  assertRefused(() => handOffCodex({ projectDir: dir, threadId: THREAD_A, instruction: "x", runsDir,
+    key: "c".repeat(64), taskKey: "t", bridgeHome: path.join(dir, "bridge"), codexHome, codexBin: "codex",
+    env: { HOME: dir, PATH: [stableBin, "/usr/bin", "/bin"].join(path.delimiter) } }), /找不到可用的 codex/u, dir);
+  assert.deepEqual(fs.readdirSync(runsDir), [], "零文件");
+  // 反向：PATH 里的稳定程序照常放行
+  fs.rmSync(path.join(stableBin, "codex"));
+  fs.writeFileSync(path.join(stableBin, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  assert.doesNotThrow(() => assertCodexAvailable("codex", { PATH: [stableBin, "/usr/bin", "/bin"].join(path.delimiter) }));
+});
+
 test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 的群", () => {
   const home = temp();
   const root = path.join(home, "project");
@@ -3423,7 +3564,7 @@ test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 
   ].join("\n") + "\n", { mode: 0o700 });
   // #266：绑定时记下目标 Codex 会话自己的 codex home 的实际落点（这里给一个符号链接别名，记下的应是它指向的真目录）。
   const realCodexHome = path.join(home, "real-codex-home");
-  fs.mkdirSync(realCodexHome);
+  plantRollout(realCodexHome);
   const aliasCodexHome = path.join(home, "alias-codex-home");
   fs.symlinkSync(realCodexHome, aliasCodexHome, "dir");
 
@@ -3447,7 +3588,7 @@ test("bind-task 显式跨群 apply 把根消息发到目标群并登记该 task 
   assert.equal(task.root_message_id, "om_lab_root");
   assert.equal(task.chat_id, "oc_lab");
   assert.equal(task.chat_name, "智能体进化");
-  // 拿掉 bind-task.mjs 里 `codexHome: bindingCodexHome()` → 本断言红
+  // 拿掉 bind-task.mjs 里 `codexHome: homeCheck.home` → 本断言红
   assert.equal(task.codex_home, fs.realpathSync(realCodexHome), "绑定记下 codex home 的实际落点");
 });
 
@@ -10770,12 +10911,12 @@ test("bind-task 首次接入：已启用端点强制双写镜像 shadow create_b
     "process.stdout.write('{\"ok\":true,\"data\":{\"message_id\":\"om_sent\"}}');\n", { mode: 0o700 });
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE, lark_cli_bin: bin, lark_cli_config_base: configBase }));
   const m = seedM1aEndpoint({ home, chain: "codex" });
-  // #266：在飞书运输会话的临时 codex home 里绑定 → 不记（那种目录回合结束就被清掉），投递时退回默认并核实。
-  const ailyCodexHome = path.join(home, ".aily-cli", "session", "s", "workdir", ".aily-cli", "codex-homes", "h");
-  fs.mkdirSync(ailyCodexHome, { recursive: true });
+  // #266：绑定前要核实目标会话的 codex home 装着这个 thread。
+  const codexHome = path.join(home, "codex-home");
+  plantRollout(codexHome);
   const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
     FEISHU_BRIDGE_MAINTENANCE_DIR: m.maintDir, FEISHU_BRIDGE_LEDGER_DIR: m.ledgerRoot,
-    __LARK_LOG: logFile, CODEX_HOME: ailyCodexHome };
+    __LARK_LOG: logFile, CODEX_HOME: codexHome };
   const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "Alpha", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "Alpha" })], {
     encoding: "utf-8", env,
@@ -10784,8 +10925,7 @@ test("bind-task 首次接入：已启用端点强制双写镜像 shadow create_b
   const regt = findRegisteredTaskForCodexThread({ threadId: THREAD_A, home });
   assert.equal(regt.ok, true, JSON.stringify(regt));
   assert.equal(regt.task.root_message_id, "om_sent");
-  // 拿掉 bindingCodexHome 里的 Aily 会话判据 → 本断言红
-  assert.equal(Object.hasOwn(regt.task, "codex_home"), false, "运输会话临时 home 不记进绑定：" + regt.task.codex_home);
+  assert.equal(regt.task.codex_home, fs.realpathSync.native(codexHome), "绑定记下核实过的 codex home");
   // shadow ledger：应有 create_b1 镜像 B1（codex target 精确）。
   const l = TAL.loadLedger(path.join(m.ledgerRoot, m.ep), { endpointId: m.ep });
   assert.equal(l.ok, true, JSON.stringify(l));

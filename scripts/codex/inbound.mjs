@@ -909,7 +909,7 @@ try {
     key: policyRun.runRequest.runId,
     taskKey: task.logical_task_key,
     bridgeHome: HOME,
-    codexHome: task.codex_home,
+    codexHome: Object.hasOwn(task, "codex_home") ? task.codex_home : undefined,
     codexBin: process.env.FEISHU_CODEX_BIN ?? "codex",
   });
 } catch (err) {

@@ -207,6 +207,11 @@ export function validateRegistryDocument(parsed) {
     if (!hasKey) {
       malformed.push({ index: i, why: "缺 logical_task_key" }); continue;
     }
+    // codex_home（#266）：缺字段 = 旧绑定，合法；**写着就必须是绝对路径** —— 显式坏值不许被当成缺字段退回默认。
+    if (!disabled && Object.hasOwn(raw, "codex_home") &&
+        (typeof raw.codex_home !== "string" || !path.isAbsolute(raw.codex_home))) {
+      malformed.push({ index: i, why: "codex_home 不是绝对路径" }); continue;
+    }
     // **key 的字符集要跟生成端一致。**存储目录是 safeKey(key) 算出来的，
     // 它把非法字符统一换成 `_`：`a/b` 和 `a?b` 会落到同一个 tasks/a_b/。
     if (!/^[A-Za-z0-9_-]+$/u.test(raw.logical_task_key)) {
@@ -714,6 +719,39 @@ export function setTaskDisplayName({ threadId, name, home = bridgeHome() } = {})
     const wrote = mutateRegistryDocument(file, (rawTasks) => {
       const done = replaceRawTask(rawTasks, task);
       if (!done.ok) return done;            // 找不到 / 有歧义 → 错误，不是"没改动"
+      return true;
+    });
+    if (!wrote.ok) return wrote;
+    return { ok: true, task };
+  } catch (err) {
+    return { ok: false, reason: "registry_unwritable", error: err.message };
+  } finally {
+    releasePublishLock(lockDir);
+  }
+}
+
+/**
+ * 给**没记 codex_home 的旧绑定**补记（#266 三轮 P1）。只补缺字段：已经记着的不改（换目录要重绑，不静默迁移）。
+ * 调用方负责先核实 codexHome（实际落点、非运输临时目录、装着这个 thread）。
+ */
+export function recordTaskCodexHome({ threadId, codexHome, home = bridgeHome() } = {}) {
+  if (typeof threadId !== "string" || !threadId) return { ok: false, reason: "no_thread_id" };
+  if (typeof codexHome !== "string" || !path.isAbsolute(codexHome)) return { ok: false, reason: "invalid_codex_home" };
+  const lockDir = registryLockPath(home);
+  const lock = acquirePublishLock(lockDir);
+  if (!lock.ok) return lockFailure(lock);
+  try {
+    const file = registryFile(home);
+    const reg = loadRegistry(file);
+    if (!reg.ok) return reg;
+    const task = reg.tasks.find((t) => t.codex_thread_id === threadId);
+    if (!task) return { ok: false, reason: "thread_not_registered" };
+    if (Object.hasOwn(task, "codex_home")) return { ok: false, reason: "codex_home_already_recorded" };
+    task.codex_home = codexHome;
+    // 同 setTaskDisplayName：就地改原文档里的那一条，不拿视图重建整表。
+    const wrote = mutateRegistryDocument(file, (rawTasks) => {
+      const done = replaceRawTask(rawTasks, task);
+      if (!done.ok) return done;
       return true;
     });
     if (!wrote.ok) return wrote;

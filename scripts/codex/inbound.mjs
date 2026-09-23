@@ -28,7 +28,8 @@ import {
   DIALOGUE_POLICY_ID, DIALOGUE_REASON, DIALOGUE_TURN_STATUS,
   applyInteractionPolicyToAdmission, handleDialoguePolicy,
 } from "../interaction-policy.mjs";
-import { HandoffRefusal, handOffCodex } from "./handoff.mjs";
+import { handOffCodex } from "./handoff.mjs";
+import { CodexTargetRefusal, assertNoUserHomeOverride, resolveCodexTarget } from "./target-session.mjs";
 import { recordCodexActivityAndMaybeRotate } from "./automatic-topic-rotation.mjs";
 import {
   buildLegacyDialogueBoundAuthorizationContext,
@@ -139,6 +140,10 @@ export function ackText(kind, detail, { transportAgentName } = {}) {
 }
 
 export async function main({ selectAdmissionFn = selectAdmission } = {}) {
+
+// 账簿不接受任何命令行覆盖（ADR-0001）：aily-inbound 把自身 argv 原样转交到这里，
+//   所以"生产不传"只是约定 —— 见到就拒，且**在任何副作用之前**。
+assertNoUserHomeOverride();
 
 // 维护门（issue #81）：确定性回"维护中"，不 claim、不写回执、不重放
 { const gate = gateBlocks(); if (gate.blocked) exitForGate("inbound", gate); }
@@ -901,16 +906,20 @@ const stamped = [
 ].join("\n");
 let run;
 try {
+  // 目标会话一处定、一路带（C1）：账簿只认 passwd 家目录下那本（ADR-0001），这里不传 userHome。
+  const target = resolveCodexTarget({
+    threadId: task.codex_thread_id,
+    env: process.env,
+    codexBin: process.env.FEISHU_CODEX_BIN ?? "codex",
+  });
   run = handOffCodex({
     projectDir: task.root,
-    threadId: task.codex_thread_id,
+    target,
     instruction: stamped,
     runsDir: paths.runs,
     key: policyRun.runRequest.runId,
     taskKey: task.logical_task_key,
     bridgeHome: HOME,
-    codexHome: Object.hasOwn(task, "codex_home") ? task.codex_home : undefined,
-    codexBin: process.env.FEISHU_CODEX_BIN ?? "codex",
   });
 } catch (err) {
   releaseSessionLock(paths.sessionLock);
@@ -920,13 +929,14 @@ try {
       status: DIALOGUE_TURN_STATUS.FAILED, reason: "handoff_failed", home: HOME,
     });
   }
-  recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed", detail: { error: err.message } });
+  recordClaimState({ claimsDir: paths.claims, key: claim.key, state: "failed",
+    detail: { error: err.message, ...(err instanceof CodexTargetRefusal ? { code: err.code } : {}) } });
   writeReceipt("handoff-failed-" + verdict.messageId, {
     status: "error", reason: "handoff_failed", message_id: verdict.messageId,
     claim_acquired: true, handed_off: false,
   });
   // 发到飞书的只有封闭文案（#266 二轮 P1）；err.message 里的路径与 thread 号只留在上面的本机 claim 里。
-  finish("error", { detail: "投递失败：" + (err instanceof HandoffRefusal ? err.publicText : "本机投递出错（详情见本机日志）") },
+  finish("error", { detail: "投递失败：" + (err instanceof CodexTargetRefusal ? err.publicText : "本机投递出错（详情见本机日志）") },
     { reason: "handoff_failed" });
 }
 

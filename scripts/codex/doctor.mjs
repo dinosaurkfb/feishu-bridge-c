@@ -203,6 +203,13 @@ const bound = active.filter((task) => task.inbound_state === "bound");
 add("task 登记表", registry.ok,
   registry.ok ? "已登记 " + tasks.length + " 个，启用 " + active.length + " 个，入站绑定 " + bound.length + " 个" : registry.reason,
   "安装器会创建空登记表；随后在目标 task 中运行 `$feishu-bind`");
+// 已废弃字段（C1 / ADR-0001）：账簿只认 passwd 家目录下那本，登记表里的 codex_home 一律忽略。
+//   只报事实、不判故障 —— 它不影响投递，但留着不说会让人以为还在生效。
+const legacyHome = tasks.filter((task) => Object.hasOwn(task, "codex_home")).length;
+if (legacyHome > 0) {
+  add("已废弃字段", null, legacyHome + " 条绑定带着已废弃的 codex_home 字段（忽略，不影响投递）",
+    "想清掉可在下次重绑时自然消失；账簿只认 passwd 家目录下的 .codex（ADR-0001）");
+}
 
 // **三态，不是两态。**ok === null 表示"这件事本地查不出来"，
 // 它既不是通过、也不是故障。上一版只有真/假，于是"查不清"被画成 ✗ ——

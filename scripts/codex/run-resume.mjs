@@ -19,7 +19,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 
 import { CLAIM_KEY_SHAPE } from "../claim.mjs";
-import { sanitizeCodexRunEnv } from "./handoff.mjs";
+import { codexRunEnv } from "./target-session.mjs";
 
 const arg = (name) => {
   const at = process.argv.indexOf("--" + name);
@@ -42,7 +42,9 @@ const exitPath = required("exit-receipt");
 // 显式参数，不从环境变量隐式取 —— 凭据里的身份必须来自调用方明确给的值。
 const claimKey = required("claim-key");
 if (!CLAIM_KEY_SHAPE.test(claimKey)) throw new Error("--claim-key 不是 claim key 的形状");
-const codexBin = arg("codex-bin") ?? "codex";
+// 目标字段由 handOffCodex 明文传来（C1 重构）：runner 自己不推导账簿、不按 PATH 解析程序。
+const codexHome = required("codex-home");
+const codexBin = required("codex-bin");
 
 let settled = false;
 /**
@@ -92,11 +94,9 @@ const child = spawn(codexBin, [
   "--output-last-message", lastMessagePath, threadId, "-",
 ], {
   cwd: projectDir,
-  // 双保险：即使 runner 被其他入口直接调用，也不把 M5Codex/Aily 入站身份传进目标 task。
-  // 目标 codex home 由 handOffCodex 按绑定时记下的实际落点定下来（并核实那里装着这个 thread）、经 FEISHU_CODEX_TARGET_HOME 传来（#266）；
-  //   这里再清理一遍时以它为准，不让第二遍的判据改掉第一遍已经核实过的答案。
-  env: sanitizeCodexRunEnv(process.env,
-    process.env.FEISHU_CODEX_TARGET_HOME ? { CODEX_HOME: process.env.FEISHU_CODEX_TARGET_HOME } : {}),
+  // 双保险：即使 runner 被其他入口直接调用，也不把 M5Codex/Aily 入站身份传进目标会话。
+  //   用的是**同一份** codexRunEnv（幂等）：目标三件套全部来自 argv，这里不重新判定、不再自行推导。
+  env: codexRunEnv({ threadId, codexHome, codexBin }, { env: process.env, claimKey }),
   stdio: ["pipe", out, err],
 });
 

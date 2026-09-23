@@ -8,154 +8,63 @@ import path from "node:path";
 import { isCanonicalIso } from "../canonical-time.mjs";
 import { CLAIM_KEY_SHAPE } from "../claim.mjs";
 import { moduleDir } from "../direct-run.mjs";
+import { codexRunEnv } from "./target-session.mjs";
 
 const HERE = moduleDir(import.meta.url);
 const RUNNER = path.join(HERE, "run-resume.mjs");
 
 /**
- * 目标 Codex task 不能继承**调用方**的东西。投递是在 Aily 的运输 Codex 回合里发起的（它的 shell 工具跑入站
- * 路由器 → 本函数 → runner → `codex exec resume`），所以 process.env 里装着那个运输 Codex 的一整套现场：
- *   - `AILY_CLI_*`：M5Codex/Aily 入站身份，不去掉的话 hook 会把目标 task 再次路由；
- *   - `CODEX_THREAD_ID` / `CODEX_SESSION_ID` / `CODEX_CI` / `CODEX_SANDBOX*`：描述的是**运输 Codex 那个会话**，
- *     不是被续接的 thread —— 目标 task 带着别人的会话号与沙箱标记跑，身份就错了；
- *   - `CODEX_HOME` 指向 Aily 会话的临时 codex-home（`~/.aily-cli/session/<id>/…/codex-homes/…`）：
- *     目标 task 会把它当自己的家，执行命令用的辅助程序（arg0 目录）也落在那里，而那个目录随运输回合结束被清掉；
- *   - `PATH` 里运输 Codex 自己的 arg0 临时目录（`…/tmp/arg0/codex-arg0XXXX`）：同上，回合结束即消失。
- * 2026-09-22 omm 实测（cc2cd 任务）：续接的 thread 每条命令都报
- * `Failed to create unified exec process: No such file or directory`，shell 快照里的 CODEX_HOME / PATH 正是上面这些。
- * `CODEX_HOME` 只在它指向 Aily 会话临时目录时去掉：用户自己配的非默认 codex home 要保留（thread 就住在那里）。
+ * 目标会话（thread / 账簿 / codex 程序 / 子进程环境）由 `target-session.mjs` 一处定下来（#266 之后的 C1 重构）：
+ * 本 module 只负责「按定下来的目标起进程、把终局解析成可验证的证据」，不再自己推导目标。
  */
-const CALLER_CODEX_VARS = /^CODEX_(THREAD_ID|SESSION_ID|CI|SANDBOX(_[A-Z0-9_]+)?)$/u;
-const posixPath = (p) => String(p).replaceAll("\\", "/");
-// 判据按**实际落点**（realpath(3)，即 fs.realpathSync.native：符号链接与 `..` 都按真实访问语义解开；
-//   JS 版 fs.realpathSync 会先按字面化简 `..`，与实际访问对不上）——与 Codex 打开这个路径时看到的是同一个
-//   位置（#266 二轮 P1：先做词法 path.resolve 会把「符号链接/..」折成另一个目录，判据与实际访问对不上）。
-//   路径不存在时只能看原串。
-const underAilySession = (p) => /\/\.aily-cli\/session\//u.test(posixPath(p) + "/");
-const actualPath = (p) => { try { return fs.realpathSync.native(p); } catch { return null; } };
-const isTransientCodexHome = (value) => {
-  if (typeof value !== "string" || value.length === 0) return false;
-  return underAilySession(actualPath(value) ?? value);
-};
-const isCodexArg0Dir = (segment) => /\/tmp\/arg0\/codex-arg0[^/]*\/?$/u.test(posixPath(segment));
-export function sanitizeCodexRunEnv(env = process.env, overrides = {}) {
-  const clean = {};
-  for (const [name, value] of Object.entries(env)) {
-    if (name.startsWith("AILY_CLI_")) continue;
-    if (CALLER_CODEX_VARS.test(name)) continue;
-    if (name === "CODEX_HOME" && isTransientCodexHome(value)) continue;
-    clean[name] = value;
-  }
-  if (typeof clean.PATH === "string") {
-    clean.PATH = clean.PATH.split(path.delimiter).filter((segment) => !isCodexArg0Dir(segment)).join(path.delimiter);
-  }
-  return { ...clean, ...overrides };
-}
 
 /**
- * 投递被拒时有两份文字：`message` 带路径、thread 号等本机诊断，只进本机 claim / 日志；
- * `publicText` 是封闭文案，入站会原样发到飞书话题（#266 二轮 P1：绝对路径与完整 UUID 不许出本机）。
+ * runner 的启动计划：**argv 与环境都在这里成形**（C1）。
+ *
+ * 抽成纯函数是为了让 handoff→runner 这条 seam 可观察：传了什么、环境干不干净，可以直接断言，
+ * 不必去读子进程的命令行。**只看最终 codex 的环境是不够的** —— runner 自己也会清洗一遍，
+ * 于是第一层被改坏时用例照样绿（Codex 实现一轮 P2 实测）。
  */
-export class HandoffRefusal extends Error {
-  constructor(publicText, detail) {
-    super(detail ? publicText + "：" + detail : publicText);
-    this.publicText = publicText;
-  }
-}
-const REFUSE_CODEX_MISSING = "本机找不到可用的 codex 程序，未投递";
-const REFUSE_HOME_UNKNOWN = "说不清目标 Codex 会话的数据目录，未投递（详情见本机日志）";
-
-/**
- * 预检必须用**最终子进程环境**（#266 一轮 P1）：清理会从 PATH 里剔掉调用方的 arg0 临时目录，
- * 若 codex 恰好只在那里，拿未清理的 PATH 预检会放行、受理投递，runner 随后却 spawn_failed。
- */
-export function assertCodexAvailable(codexBin = "codex", env = process.env) {
-  let found = codexBin;
-  if (!codexBin.includes("/")) {
-    try {
-      found = execFileSync("/bin/sh", ["-c", 'command -v -- "$1"', "sh", codexBin],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, env }).trim();
-    } catch {
-      throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不在 PATH 上（按清理后的最终环境查）");
-    }
-    if (!path.isAbsolute(found)) throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不是一个程序文件：" + found);
-  }
-  // 不经 PATH 过滤的绝对路径（#266 二轮 P2）、以及按 PATH 找到的程序（三轮 P2：稳定目录里的符号链接可以指向
-  //   运输回合的 arg0 临时目录，字面过滤留得住它）都要核本身与实际落点：在临时目录里就会随回合消失。
-  const real = actualPath(found);
-  if (real === null) throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 路径不存在 " + found);
-  for (const where of [found, real]) {
-    if (isCodexArg0Dir(path.dirname(where)) || underAilySession(where)) {
-      throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 落在运输回合的临时目录 " + where);
-    }
-  }
-  try { fs.accessSync(real, fs.constants.X_OK); } catch {
-    throw new HandoffRefusal(REFUSE_CODEX_MISSING, "codex 不可执行 " + found);
-  }
+export function runnerPlan({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath,
+  key, taskKey, bridgeHome, env = process.env }) {
+  return {
+    argv: runnerArgv({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath, key }),
+    env: codexRunEnv(target, { env, claimKey: key, taskKey, bridgeHome }),
+  };
 }
 
-/**
- * 目标 thread 住在哪个 codex home（#266）。**不猜**：只有一个来源 —— 绑定那一刻从目标 Codex 会话自己的环境
- * 记下的 `codex_home`（投递时的环境属于 Aily 运输 Codex，CODEX_HOME 早被它覆盖，桥根也可以和它无关）；
- * 旧绑定**缺这个字段**才退回默认 `~/.codex`（显式坏值拒）。然后：
- *   - 规范化成实际落点（realpath），**核对与交给 Codex 的是同一个路径**，符号链接别名随运输回合消失也不受影响；
- *   - 实际落点在 Aily 运输会话临时目录下 → 拒绝；
- *   - 那里没有这个 thread 的 rollout → 拒绝（让用户重绑，而不是让续接进程在后台找不到 thread 再失败）。
- */
-const ROLLOUT_ROOTS = ["sessions", "archived_sessions"];
-const holdsRollout = (dir, suffix, depth = 0) => {
-  let entries;
-  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
-  for (const e of entries) {
-    if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(suffix)) return true;
-  }
-  if (depth >= 3) return false;   // sessions/YYYY/MM/DD/rollout-…
-  return entries.some((e) => e.isDirectory() && holdsRollout(path.join(dir, e.name), suffix, depth + 1));
-};
-export function resolveTargetCodexHome({ recorded, threadId, env = process.env }) {
-  // 只有**真正缺这个字段**（undefined）的旧绑定才退回默认；显式写着的坏值（空串、null、非字符串）是说不清，拒（三轮 P2）。
-  if (recorded !== undefined && (typeof recorded !== "string" || recorded.length === 0)) {
-    throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "绑定里的 codex_home 是无效值 " + JSON.stringify(recorded));
-  }
-  const raw = recorded ?? path.join(env.HOME || os.homedir(), ".codex");
-  if (!path.isAbsolute(raw)) throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "codex home 不是绝对路径 " + raw);
-  const real = actualPath(raw);
-  if (real === null) throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "codex home 不存在 " + raw);
-  if (underAilySession(real)) {
-    throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, "codex home 实际落在运输会话临时目录 " + real);
-  }
-  const suffix = "-" + String(threadId).toLowerCase() + ".jsonl";
-  if (!ROLLOUT_ROOTS.some((root) => holdsRollout(path.join(real, root), suffix))) {
-    throw new HandoffRefusal(REFUSE_HOME_UNKNOWN, real + " 下没有 thread " + threadId + " 的会话记录");
-  }
-  return real;
+/** runner 的 argv：目标字段与运行元数据都走明文（不再用 `FEISHU_CODEX_TARGET_HOME` 那个暗号）。 */
+export function runnerArgv({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath, key }) {
+  return [
+    // 目标字段
+    "--thread-id", target.threadId,
+    "--codex-home", target.codexHome,
+    "--codex-bin", target.codexBin,
+    // 运行元数据
+    "--project", projectDir,
+    "--instruction-file", instructionPath,
+    "--log", logPath,
+    "--stderr", errPath,
+    "--last-message", lastMessagePath,
+    "--exit-receipt", exitPath,
+    // 回执里的身份来自显式参数，不从环境变量隐式取。
+    "--claim-key", key,
+  ];
 }
 
-export function handOffCodex({
-  projectDir, threadId, instruction, runsDir, key, taskKey, bridgeHome, codexHome, codexBin = "codex", env = process.env,
-}) {
+export function handOffCodex({ projectDir, target, instruction, runsDir, key, taskKey, bridgeHome, env = process.env }) {
   // **key 先验，在任何可观察动作之前。**评审实测 key="../escaped"：prompt 与
   // runner log 被写到 runsDir 外面，runner 随后才拒绝 —— 已经太晚。
   if (typeof key !== "string" || !CLAIM_KEY_SHAPE.test(key)) {
     throw new Error("claim key 形状不对，拒绝投递");
   }
-  if (typeof threadId !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) {
-    throw new Error("绑定里的 codex_thread_id 不是精确 UUID，拒绝使用名字或 --last");
+  // target 必须是 resolveCodexTarget 的返回值：本 module 不再自行核实，也不接受散装的 thread / 账簿。
+  if (!target || typeof target.threadId !== "string" || typeof target.codexHome !== "string" ||
+      typeof target.codexBin !== "string") {
+    throw new Error("handOffCodex 需要 resolveCodexTarget 的返回值");
   }
   if (!path.isAbsolute(projectDir)) throw new Error("projectDir 必须是绝对路径");
   if (!fs.statSync(projectDir).isDirectory()) throw new Error("绑定的 projectDir 不再是目录");
-  const targetCodexHome = resolveTargetCodexHome({ recorded: codexHome, threadId, env });
-  const childEnv = sanitizeCodexRunEnv(env, {
-    FEISHU_BRIDGE_ROLE: "codex-run",
-    FEISHU_BRIDGE_CLAIM_KEY: key,
-    FEISHU_BRIDGE_TASK_KEY: taskKey,
-    CODEX_HOME: targetCodexHome,
-    FEISHU_CODEX_TARGET_HOME: targetCodexHome,
-    ...(bridgeHome ? { FEISHU_CODEX_BRIDGE_HOME: bridgeHome } : {}),
-  });
-  assertCodexAvailable(codexBin, childEnv);
-
   fs.mkdirSync(runsDir, { recursive: true, mode: 0o700 });
   const instructionPath = path.join(runsDir, key + ".prompt.txt");
   const logPath = path.join(runsDir, key + ".jsonl");
@@ -165,23 +74,13 @@ export function handOffCodex({
   const runnerLog = path.join(runsDir, key + ".runner.log");
   fs.writeFileSync(instructionPath, instruction, { mode: 0o600 });
 
-  const child = spawn(process.execPath, [
-    RUNNER,
-    "--thread-id", threadId,
-    "--project", projectDir,
-    "--instruction-file", instructionPath,
-    "--log", logPath,
-    "--stderr", errPath,
-    "--last-message", lastMessagePath,
-    "--exit-receipt", exitPath,
-    // 回执里的身份来自显式参数，不从环境变量隐式取。
-    "--claim-key", key,
-    "--codex-bin", codexBin,
-  ], {
+  const plan = runnerPlan({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath,
+    key, taskKey, bridgeHome, env });
+  const child = spawn(process.execPath, [RUNNER, ...plan.argv], {
     cwd: projectDir,
     detached: true,
     stdio: ["ignore", fs.openSync(runnerLog, "a"), fs.openSync(runnerLog, "a")],
-    env: childEnv,
+    env: plan.env,
   });
   child.unref();
 
@@ -193,7 +92,7 @@ export function handOffCodex({
     lastMessagePath,
     exitPath,
     instructionPath,
-    targetSessionId: threadId,
+    targetSessionId: target.threadId,
     startedAt: new Date().toISOString(),
   };
 }

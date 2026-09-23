@@ -2527,7 +2527,8 @@ test("PK3-C1：run-resume 缺 --codex-home 直接失败，不回落到环境或�
 });
 
 // 真进程：runner 起的那个 codex 实际拿到的环境与账簿。
-//   拿掉 handOffCodex 里 codexRunEnv 那行（改回原样传 env）→ ① 红。
+//   handOffCodex 的 codexRunEnv 与 run-resume 的 codexRunEnv **互为兜底**：单拆一层仍绿，
+//   两层一起拆才红（已实测）—— runner 那层守的是"被别的入口直接调用"，不是多余的重复。
 test("PK3-C1：真进程——runner 起的 codex 拿到核实过的账簿，且没有运输会话现场", () => {
   const dir = temp();
   const userHome = userHomeWithThread(dir);

@@ -1,10 +1,19 @@
 # Codex 目标会话（target session）契约
 
-> 状态：设计第三版，待 Codex 复评。对应架构复核候选 C1。实现前不改任何代码。
+> 状态：**已实现**（第四版，PR #268）。对应架构复核候选 C1。实现落在 `scripts/codex/target-session.mjs`
+> 及其四个调用点；本文件描述的是**现行行为**，不是计划。
 > 词汇按 `CONTEXT.md`；「只认默认账簿」这条决定记在 `docs/adr/0001-codex-home-default-only.md`。
-> 二版按 Codex 一轮（P1 2 / P2 4）改：预检与启动同源、家目录不从 `$HOME` 推、拒绝类加 code、
-> argv 口径写实、端到端断言换成可观察面。
-> 三版按 Codex 二轮（P1 1 / P2 1）改：删掉 `--user-home` 这个生产可达的账簿覆盖口、枚举钉死序列化值。
+>
+> 沿革：设计经 Codex 三轮评审放行（一轮 P1 2 / P2 4：预检与启动同源、家目录不从 `$HOME` 推、拒绝类加 code、
+> argv 口径写实、端到端断言换成可观察面；二轮 P1 1 / P2 1：删掉 `--user-home` 这个生产可达的账簿覆盖口、
+> 枚举钉死序列化值）。实现经 Codex 评审一轮返修（P1 3 / P2 3），六项闭环：
+>
+> 1. 守卫上移到最外层 `aily-inbound.mjs`、dispatch 之前 —— dispatcher 的 dry-run 分支不启动 handler，装在下游够不着；
+> 2. 已有绑定的写路径（刷新待认领 / 改标题 / 恢复暂停）同样 fail-closed，dry-run 与 apply 都拒；
+> 3. codex 程序必须是普通文件（`BIN_NOT_FILE`）—— 可搜索的目录同样通过 `X_OK`；
+> 4. `cleanEnv` 剥掉已废弃的 `FEISHU_CODEX_TARGET_HOME`，端到端主动注入它来验证两层都清掉；
+> 5. 失败回执与 claim 都带稳定的 `target_refusal_code`；
+> 6. `runnerPlan` 让 handoff → runner 这一层的 argv 与环境可单独断言（此前只观察最终 codex，第一层改坏了照样绿）。
 
 ## 为什么改
 

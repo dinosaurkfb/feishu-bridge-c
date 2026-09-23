@@ -18,8 +18,9 @@
 ## 为什么改
 
 一次投递要回答四个问题：**哪个 thread、哪本账簿（codex home）、哪个 codex 程序、什么子进程环境**。
-今天这四个问题在四处各答一次：`bind-task.mjs`（绑定时核实并记账簿）、`inbound.mjs`（拼 codexBin / codexHome）、
-`handoff.mjs:resolveTargetCodexHome`（投递时再核一次）、`run-resume.mjs`（第二次清洗、用环境变量覆盖 CODEX_HOME）。
+**改造前**这四个问题在四处各答一次：`bind-task.mjs`（绑定时核实并记账簿）、`inbound.mjs`（拼 codexBin / codexHome）、
+`handoff.mjs` 里已删除的 `resolveTargetCodexHome`（投递时再核一次）、`run-resume.mjs`（第二次清洗、
+用已删除的环境变量 `FEISHU_CODEX_TARGET_HOME` 覆盖 `CODEX_HOME`）。
 
 #266 五轮评审的四个 P1（临时别名、桥根与账簿脱钩、符号链接后接 `..` 的词法/实际落点错位、报错外泄本机路径）
 全部落在「同一件事答四遍」这个形状上，不是四个独立缺陷。
@@ -75,7 +76,10 @@ export function codexRunEnv(target, { env, claimKey, taskKey, bridgeHome })
   **产品代码里不存在对应分支**，这是它与 CLI 参数的本质区别：后者是产品 interface 的一部分，前者不是。
   （同类先例：套件已用包装 `fs.mkdirSync` / `mkdtemp` 做隔离。）
 
-账簿 = `realpath(3)(path.join(userHome, ".codex"))`，**不读 `CODEX_HOME`**（ADR-0001）。
+账簿的求法**顺序是判据的一部分**：先 `realpath(3)(userHome)`，再拼 `.codex`，再 `realpath(3)` 一次。
+写成 `realpath(3)(path.join(userHome, ".codex"))` 是错的 —— `path.join` 会先按字面化简 `..`，
+「符号链接后接 `..`」于是又落回字面位置（#266 二轮 P1 的同一个坑，实现时我照这个错写法写过一次，被用例拦下）。
+全程**不读 `CODEX_HOME`**（ADR-0001）。
 
 ### 五步判据
 
@@ -133,7 +137,8 @@ Frank 决定先不实现。）
 
 ## 测试
 
-**新增第一条端到端真进程用例**（今天为止，投递路径的真进程用例全部止于拒绝分支，从未执行到投递）：
+**投递路径的第一条端到端真进程用例**（已落地。在它之前，该路径的真进程用例全部止于拒绝分支，从未执行到投递 ——
+2026-09-22 omm 上接连两个故障没被测试拦住，根因就在这儿）：
 隔离 HOME + 测试专用启动注入（`--import test-support/user-home-bootstrap.mjs` 覆写 `os.userInfo`，产品代码无此分支）
 → 在 `<注入的 home>/.codex` 植入目标 thread 的 rollout → 假 codex（记录自己的 argv 与 env）
 → 真入口 `aily-inbound.mjs` → 断言：

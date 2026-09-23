@@ -33,6 +33,7 @@ export const REFUSE = Object.freeze({
   ROLLOUT_MISSING: "rollout_missing",
   BIN_MISSING: "bin_missing",
   BIN_TRANSIENT: "bin_transient",
+  BIN_NOT_FILE: "bin_not_file",
   BIN_NOT_EXECUTABLE: "bin_not_executable",
 });
 
@@ -74,6 +75,8 @@ const cleanEnv = (env) => {
     if (name.startsWith("AILY_CLI_")) continue;
     if (CALLER_CODEX_VARS.test(name)) continue;
     if (name === "CODEX_HOME") continue;            // 账簿只由本 module 定（ADR-0001），调用方给的一律丢掉
+    // 已废弃的旧暗号：C1 之前账簿靠它跨进程传。留着会让"改回旧写法"在测试里看不出来（Codex 实现一轮 P2）。
+    if (name === "FEISHU_CODEX_TARGET_HOME") continue;
     clean[name] = value;
   }
   if (typeof clean.PATH === "string") {
@@ -151,6 +154,13 @@ export function resolveCodexTarget({ threadId, userHome = os.userInfo().homedir,
       throw new CodexTargetRefusal(REFUSE.BIN_TRANSIENT, PUBLIC_CODEX_MISSING,
         "codex 落在运输回合的临时目录 " + where);
     }
+  }
+  // **必须是普通文件**：可搜索的目录同样通过 X_OK（Codex 实现一轮 P1）——那会让入站先回"已受理"，
+  //   真正 spawn 时才失败，把一个可以当场拒绝的错误拖成事后失败。
+  let stat = null;
+  try { stat = fs.statSync(realBin); } catch { /* 下面按不是文件处理 */ }
+  if (stat === null || !stat.isFile()) {
+    throw new CodexTargetRefusal(REFUSE.BIN_NOT_FILE, PUBLIC_CODEX_MISSING, "codex 不是普通文件 " + found);
   }
   try { fs.accessSync(realBin, fs.constants.X_OK); } catch {
     throw new CodexTargetRefusal(REFUSE.BIN_NOT_EXECUTABLE, PUBLIC_CODEX_MISSING, "codex 不可执行 " + found);

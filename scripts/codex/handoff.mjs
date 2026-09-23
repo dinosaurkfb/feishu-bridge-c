@@ -19,9 +19,21 @@ const RUNNER = path.join(HERE, "run-resume.mjs");
  */
 
 /**
- * runner 的 argv：**目标字段与运行元数据都走明文**（C1；不再用 `FEISHU_CODEX_TARGET_HOME` 那个暗号）。
- * 抽成纯函数是为了让这条 seam 可观察 —— 传了什么可以直接断言，不必去读子进程的命令行。
+ * runner 的启动计划：**argv 与环境都在这里成形**（C1）。
+ *
+ * 抽成纯函数是为了让 handoff→runner 这条 seam 可观察：传了什么、环境干不干净，可以直接断言，
+ * 不必去读子进程的命令行。**只看最终 codex 的环境是不够的** —— runner 自己也会清洗一遍，
+ * 于是第一层被改坏时用例照样绿（Codex 实现一轮 P2 实测）。
  */
+export function runnerPlan({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath,
+  key, taskKey, bridgeHome, env = process.env }) {
+  return {
+    argv: runnerArgv({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath, key }),
+    env: codexRunEnv(target, { env, claimKey: key, taskKey, bridgeHome }),
+  };
+}
+
+/** runner 的 argv：目标字段与运行元数据都走明文（不再用 `FEISHU_CODEX_TARGET_HOME` 那个暗号）。 */
 export function runnerArgv({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath, key }) {
   return [
     // 目标字段
@@ -53,8 +65,6 @@ export function handOffCodex({ projectDir, target, instruction, runsDir, key, ta
   }
   if (!path.isAbsolute(projectDir)) throw new Error("projectDir 必须是绝对路径");
   if (!fs.statSync(projectDir).isDirectory()) throw new Error("绑定的 projectDir 不再是目录");
-  const childEnv = codexRunEnv(target, { env, claimKey: key, taskKey, bridgeHome });
-
   fs.mkdirSync(runsDir, { recursive: true, mode: 0o700 });
   const instructionPath = path.join(runsDir, key + ".prompt.txt");
   const logPath = path.join(runsDir, key + ".jsonl");
@@ -64,13 +74,13 @@ export function handOffCodex({ projectDir, target, instruction, runsDir, key, ta
   const runnerLog = path.join(runsDir, key + ".runner.log");
   fs.writeFileSync(instructionPath, instruction, { mode: 0o600 });
 
-  const child = spawn(process.execPath, [RUNNER, ...runnerArgv({
-    target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath, key,
-  })], {
+  const plan = runnerPlan({ target, projectDir, instructionPath, logPath, errPath, lastMessagePath, exitPath,
+    key, taskKey, bridgeHome, env });
+  const child = spawn(process.execPath, [RUNNER, ...plan.argv], {
     cwd: projectDir,
     detached: true,
     stdio: ["ignore", fs.openSync(runnerLog, "a"), fs.openSync(runnerLog, "a")],
-    env: childEnv,
+    env: plan.env,
   });
   child.unref();
 

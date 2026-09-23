@@ -80,7 +80,7 @@ import { composeCodexBinding, resolveBindingTarget, validThreadId } from "./bind
 import { readCodexThreadTitle, sanitizeThreadTitle } from "./thread-title.mjs";
 import { updateTextMessage } from "./lark-message.mjs";
 import {
-  classifyRunnerDiagnostic, handOffCodex, isCodexInboundExecution, readCodexRunOutcome, runnerArgv,
+  classifyRunnerDiagnostic, handOffCodex, isCodexInboundExecution, readCodexRunOutcome, runnerArgv, runnerPlan,
   verifyCodexRunCredential,
 } from "./handoff.mjs";
 import {
@@ -191,6 +191,49 @@ const installerEnv = (extra = {}) =>
   installerChildEnv({ env: process.env, extra: { FEISHU_BRIDGE_LAUNCHCTL: FAKE_LAUNCHCTL, ...extra } });
 const THREAD_A = "01911111-2222-7333-8444-555555555555";
 const THREAD_B = "01922222-3333-7444-8555-666666666666";
+// ── C1 共用夹具（目标会话：账簿 / 程序 / 启动注入）──────────────────────────────
+const USER_HOME_BOOTSTRAP = path.join(ROOT, "scripts", "test-support", "user-home-bootstrap.mjs");
+const plantRollout = (codexHome, threadId = THREAD_A) => {
+  const d = path.join(codexHome, "sessions", "2026", "09", "22");
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "rollout-2026-09-22T00-00-00-" + threadId + ".jsonl"), "{}\n");
+  return codexHome;
+};
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const argvIndexOf = (argv, flag) => argv.indexOf(flag) + 1;
+
+// 一个"像样的用户家目录"：<dir>/home 下有 .codex，账簿里装着 THREAD_A。
+const userHomeWithThread = (dir, threadId = THREAD_A) => {
+  const home = path.join(dir, "home");
+  plantRollout(path.join(home, ".codex"), threadId);
+  return home;
+};
+// 稳定目录里的可执行假 codex（只用于"能不能解析到"，不执行）。
+const stableCodexBin = (dir, name = "bin") => {
+  const binDir = path.join(dir, name);
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  return binDir;
+};
+// 运输回合的 arg0 临时目录，里面也有一个同名 codex（回合结束即删的那种）。
+const arg0CodexBin = (dir) => {
+  const arg0 = path.join(dir, ".aily-cli", "session", "s", "workdir", "tmp", "arg0", "codex-arg0X1");
+  fs.mkdirSync(arg0, { recursive: true });
+  fs.writeFileSync(path.join(arg0, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  return arg0;
+};
+// 拒绝：带稳定 code，且对外文案不许带路径或 thread 号。
+const assertRefusal = (fn, code, dir) => {
+  let caught = null;
+  try { fn(); } catch (err) { caught = err; }
+  assert.ok(caught instanceof CodexTargetRefusal, "应当以 CodexTargetRefusal 拒绝：" + (caught?.stack ?? "没抛"));
+  assert.equal(caught.code, code, "拒绝码：" + caught.code + " / " + caught.message);
+  assert.doesNotMatch(caught.publicText, /\/|[0-9a-f]{8}-[0-9a-f]{4}-/iu, "对外文案不许带路径或 thread 号：" + caught.publicText);
+  if (dir) assert.equal(caught.publicText.includes(dir), false);
+  return caught;
+};
+
+
 const TEMPLATE = {
   schema_version: "1.0", chain: "codex",
   transport_agent_name: "M5Codex", transport_app_id: "cli_same", transport_open_id: "ou_same",
@@ -1491,10 +1534,13 @@ test("bind-task 重跑只续期 active pending，不创建或回复第二个话�
   delete task.channel_generation_id;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
-  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+  const run = spawnSync(process.execPath, ["--import", USER_HOME_BOOTSTRAP,
+    path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "A", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "A" })], {
     encoding: "utf-8",
-    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_TEST_USER_HOME: userHomeWithThread(home),
+      PATH: [stableCodexBin(home, "codex-bin"), process.env.PATH].join(path.delimiter) },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /刷新首次绑定窗口/u);
@@ -1527,10 +1573,13 @@ test("pending 续期不被超过编辑时限的旧话题标题阻断", () => {
   task.pending_expires_at = "2026-01-02T00:00:00.000Z"; // 旧登记写了显式截止且已过
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
 
-  const run = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+  const run = spawnSync(process.execPath, ["--import", USER_HOME_BOOTSTRAP,
+    path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--name", "New", "--apply", ...withIntent("bind", THREAD_A, home, { project: root, name: "New" })], {
     encoding: "utf-8",
-    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home },
+    env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+      FEISHU_TEST_USER_HOME: userHomeWithThread(home),
+      PATH: [stableCodexBin(home, "codex-bin"), process.env.PATH].join(path.delimiter) },
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stdout, /刷新首次绑定窗口/u);
@@ -1551,7 +1600,10 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   delete task.channel_generation_id;
   writeRegistryFixtureUnvalidated([task], path.join(home, "registry.json"));
   const env = { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
-    FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(home, ".maint-never-init") };
+    FEISHU_BRIDGE_MAINTENANCE_DIR: path.join(home, ".maint-never-init"),
+    // 恢复接入也是写路径：C1 之后要先核实目标会话（账簿由 passwd 家目录派生，测试经启动注入换掉）。
+    FEISHU_TEST_USER_HOME: userHomeWithThread(home),
+    PATH: [stableCodexBin(home, "codex-bin"), process.env.PATH].join(path.delimiter) };
   fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify({ ...TEMPLATE })); // P1-2 ③：模板提供 agent_uid，否则 fail-closed
 
   const status = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "feishu-status.mjs"),
@@ -1580,7 +1632,8 @@ test("task 控制脚本不猜 thread，暂停和恢复都不调用飞书", () =>
   assert.match(paused.stdout, /已暂停/);
   assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).task.status, "paused");
 
-  const resumed = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
+  const resumed = spawnSync(process.execPath, ["--import", USER_HOME_BOOTSTRAP,
+    path.join(ROOT, "scripts", "codex", "bind-task.mjs"),
     "--project", root, "--thread-id", THREAD_A, "--apply", ...withIntent("bind", THREAD_A, home, { project: root })], { encoding: "utf-8", env });
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.match(resumed.stdout, /复用原话题|继续使用原话题/);
@@ -2299,45 +2352,6 @@ test("Codex 启动前 Git 预检失败不会误报 thread_mismatch", () => {
 //   契约 docs/implementation/codex-target-session-contract.md，决定 docs/adr/0001-codex-home-default-only.md。
 //   背景（2026-09-22 omm 实测）：投递发生在 Aily 运输 Codex 的回合里，process.env 带着调用方的整套现场。
 
-const plantRollout = (codexHome, threadId = THREAD_A) => {
-  const d = path.join(codexHome, "sessions", "2026", "09", "22");
-  fs.mkdirSync(d, { recursive: true });
-  fs.writeFileSync(path.join(d, "rollout-2026-09-22T00-00-00-" + threadId + ".jsonl"), "{}\n");
-  return codexHome;
-};
-const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-
-// 一个"像样的用户家目录"：<dir>/home 下有 .codex，账簿里装着 THREAD_A。
-const userHomeWithThread = (dir, threadId = THREAD_A) => {
-  const home = path.join(dir, "home");
-  plantRollout(path.join(home, ".codex"), threadId);
-  return home;
-};
-// 稳定目录里的可执行假 codex（只用于"能不能解析到"，不执行）。
-const stableCodexBin = (dir, name = "bin") => {
-  const binDir = path.join(dir, name);
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.writeFileSync(path.join(binDir, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  return binDir;
-};
-// 运输回合的 arg0 临时目录，里面也有一个同名 codex（回合结束即删的那种）。
-const arg0CodexBin = (dir) => {
-  const arg0 = path.join(dir, ".aily-cli", "session", "s", "workdir", "tmp", "arg0", "codex-arg0X1");
-  fs.mkdirSync(arg0, { recursive: true });
-  fs.writeFileSync(path.join(arg0, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  return arg0;
-};
-// 拒绝：带稳定 code，且对外文案不许带路径或 thread 号。
-const assertRefusal = (fn, code, dir) => {
-  let caught = null;
-  try { fn(); } catch (err) { caught = err; }
-  assert.ok(caught instanceof CodexTargetRefusal, "应当以 CodexTargetRefusal 拒绝：" + (caught?.stack ?? "没抛"));
-  assert.equal(caught.code, code, "拒绝码：" + caught.code + " / " + caught.message);
-  assert.doesNotMatch(caught.publicText, /\/|[0-9a-f]{8}-[0-9a-f]{4}-/iu, "对外文案不许带路径或 thread 号：" + caught.publicText);
-  if (dir) assert.equal(caught.publicText.includes(dir), false);
-  return caught;
-};
-
 // 拿掉哪行会红：cleanEnv 里 AILY_CLI_ / CALLER_CODEX_VARS / CODEX_HOME / arg0 过滤各一条 → 对应断言红；
 //   codexRunEnv 末尾 `CODEX_HOME: target.codexHome` → ⑤ 红。
 test("PK3-C1：codexRunEnv 从源环境剥掉运输会话现场，并钉死账簿（纯函数）", () => {
@@ -2476,6 +2490,25 @@ test("PK3-C1：默认账簿取 passwd 家目录，不跟随 $HOME", () => {
 });
 
 // 真入口不接受任何切换账簿的参数（Codex 设计二轮 P1）。拿掉 assertNoUserHomeOverride 的调用 → 本用例红。
+// 拿掉哪行会红：aily-inbound.mjs 里 assertNoUserHomeOverride 那段 → 本用例红
+//   （dispatcher 的 dry-run 分支根本不启动 handler，装在下游的守卫够不着）。
+test("PK3-C1：最外层入口 aily-inbound 拒 --user-home，dry-run 分支也拒", () => {
+  const home = temp();
+  fs.writeFileSync(path.join(home, "chain-config.json"), JSON.stringify(TEMPLATE));
+  const bin = path.join(home, "bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "aily-cli"), ["#!/usr/bin/env node",
+    "process.stdout.write(process.env.FAKE_AILY_ENVELOPE || '{\"envelopes\":[]}');"].join("\n") + "\n", { mode: 0o700 });
+  for (const extra of [["--user-home", home], ["--dry-run", "--user-home", home], ["--user-home=" + home]]) {
+    const r = spawnSync(process.execPath, [path.join(ROOT, "scripts", "codex", "aily-inbound.mjs"), ...extra],
+      { encoding: "utf-8", env: { ...isolatedEnv(), FEISHU_CODEX_BRIDGE_HOME: home,
+        PATH: bin + path.delimiter + process.env.PATH, AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid } });
+    assert.notEqual(r.status, 0, extra.join(" ") + " 应当拒：" + r.stdout + r.stderr);
+    assert.match(r.stdout, /不接受切换 Codex 账簿的参数/u, r.stdout);
+    assert.match(r.stdout, /没有被投递/u, r.stdout);
+  }
+});
+
 test("PK3-C1：真入口带 --user-home 被拒——既不切换账簿，也不静默忽略", () => {
   const dir = temp();
   const home = temp();
@@ -3443,7 +3476,6 @@ test("task 级目标群覆盖只进入 Git 外运行映射，不改变机器模�
 // C1 绑定生命周期：绑定前用与投递同一个实现核实目标会话，核实不了就不建话题。
 //   账簿由 passwd 家目录派生，测试用只有套件才挂的启动注入（--import bootstrap 覆写 os.userInfo）——
 //   产品代码里没有对应分支，真入口的 --user-home 一律拒（ADR-0001）。
-const USER_HOME_BOOTSTRAP = path.join(ROOT, "scripts", "test-support", "user-home-bootstrap.mjs");
 const bindHarness = () => {
   const home = temp();
   const root = path.join(home, "project");
@@ -3496,6 +3528,32 @@ test("PK3-C1：新建绑定前核实目标会话——账簿落在临时目录�
   assert.equal(findRegisteredTaskForCodexThread({ threadId: THREAD_A, home }).ok, false, "不许登记");
 });
 
+// 拿掉哪行会红：bind-task.mjs 里 `if (existing.ok && !homeCheck.ok) die(...)` → 本用例红
+//   （目标已经不可用，却还能刷新待认领 / 改飞书标题 / 把暂停的绑定恢复成启用）。
+test("PK3-C1：已有绑定的写路径同样 fail-closed——目标核实不了就不改这条绑定", () => {
+  const { home, root, calls, bind } = bindHarness();
+  const badHome = path.join(home, "no-such-user-home");          // 账簿都没有
+  const task = makeTaskEntry({ root, threadId: THREAD_A, name: "Lab", rootMessageId: "om_a", token: "a" });
+  task.pending_expires_at = "2026-01-02T00:00:00.000Z";
+  for (const [label, mutate] of [
+    ["待认领刷新", (t) => { t.inbound_state = "pending"; delete t.session_id; }],
+    ["已接入改标题", (t) => { t.inbound_state = "bound"; t.session_id = "aily_sess_a"; t.task_display_name = "旧名"; }],
+    ["恢复暂停", (t) => { t.status = "paused"; t.inbound_state = "bound"; t.session_id = "aily_sess_a"; }],
+  ]) {
+    const one = { ...task };
+    mutate(one);
+    writeRegistryFixtureUnvalidated([one], path.join(home, "registry.json"));
+    const before = fs.readFileSync(path.join(home, "registry.json"), "utf-8");
+    for (const apply of [false, true]) {
+      const r = bind(badHome, { apply });
+      assert.equal(r.status, 1, label + (apply ? " apply" : " dry-run") + " 应当拒：" + r.stdout + r.stderr);
+      assert.match(r.stderr, /核实不了目标 Codex 会话，没有改动这条绑定/u, r.stderr);
+    }
+    assert.equal(fs.readFileSync(path.join(home, "registry.json"), "utf-8"), before, label + "：登记表原样");
+  }
+  assert.equal(fs.existsSync(calls), false, "一次飞书调用都不许有");
+});
+
 // 拿掉哪行会红：bind-task.mjs 里 `existing.reason !== "thread_not_registered"` 那条 die → 本用例红（坏登记表被当成没绑过，先发根话题）。
 test("PK3-C1：登记表读不出或校验不过 → 不当成没绑过，飞书零调用、登记表原样", () => {
   const { home, root, calls, bind } = bindHarness();
@@ -3538,6 +3596,43 @@ test("PK3-C1：登记表里残留的 codex_home 被忽略，未知顶层字段�
   assert.equal(after.task_display_name, "改名");
   assert.equal(after.codex_home, "/legacy/home", "遗留字段不许被改写顺手删掉");
   assert.deepEqual(after.future_field, { keep: true }, "未知顶层字段不许丢");
+});
+
+// 拿掉哪行会红：resolveCodexTarget 里 stat.isFile() 那段 → 本用例红
+//   （可搜索的目录同样通过 X_OK，会被当成 codex 收下，入站先回"已受理"、spawn 时才失败）。
+test("PK3-C1：可执行的目录不是 codex 程序（bin_not_file）", () => {
+  const dir = temp();
+  const userHome = userHomeWithThread(dir);
+  const asDir = path.join(dir, "codex-as-dir", "codex");
+  fs.mkdirSync(asDir, { recursive: true, mode: 0o755 });        // 目录：X_OK 通过（可搜索）
+  assert.doesNotThrow(() => fs.accessSync(asDir, fs.constants.X_OK), "夹具前提：目录能通过 X_OK");
+  assertRefusal(() => resolveCodexTarget({ threadId: THREAD_A, userHome, codexBin: asDir, env: {} }),
+    "bin_not_file", dir);
+  // PATH 形式：command -v 本身就不会把目录当命令，所以那条路上是"找不到"而不是"不是文件"——
+  //   两条路都不许把目录收下，但拒绝码不同，逐字钉住免得将来混用。
+  assertRefusal(() => resolveCodexTarget({ threadId: THREAD_A, userHome,
+    env: { PATH: path.dirname(asDir) } }), "bin_missing", dir);
+});
+
+// 第一层（handoff → runner）的环境要能单独断言。拿掉 runnerPlan 里的 codexRunEnv（改成原样传 env）→ 本用例红；
+//   只看最终 codex 的环境不够：runner 自己还会清洗一遍，第一层改坏了照样绿（已实测）。
+test("PK3-C1：runnerPlan 把第一层环境也钉住——旧暗号与运输现场都不许过", () => {
+  const target = { threadId: THREAD_A, codexHome: "/u/home/.codex", codexBin: "/opt/bin/codex" };
+  const plan = runnerPlan({ target, projectDir: "/p", instructionPath: "/r/p.txt", logPath: "/r/l.jsonl",
+    errPath: "/r/e.log", lastMessagePath: "/r/last.txt", exitPath: "/r/x.json",
+    key: "a".repeat(64), taskKey: "t", bridgeHome: "/b",
+    env: { KEEP: "yes", FEISHU_CODEX_TARGET_HOME: "/legacy/home", CODEX_HOME: "/aily/tmp/.codex",
+      CODEX_THREAD_ID: "01a0b213-b6a7-7d51-b269-5c71aef055cc", AILY_CLI_RUN_ID: "r",
+      PATH: ["/usr/bin", "/x/tmp/arg0/codex-arg0Z"].join(path.delimiter) },
+  });
+  assert.equal(plan.argv[argvIndexOf(plan.argv, "--codex-home")], "/u/home/.codex");
+  assert.equal(Object.hasOwn(plan.env, "FEISHU_CODEX_TARGET_HOME"), false, "已废弃的旧暗号不许过第一层");
+  assert.equal(Object.hasOwn(plan.env, "CODEX_THREAD_ID"), false);
+  assert.equal(Object.hasOwn(plan.env, "AILY_CLI_RUN_ID"), false);
+  assert.equal(plan.env.CODEX_HOME, "/u/home/.codex", "账簿钉死成核实过的那本");
+  assert.equal(plan.env.PATH, "/usr/bin", "arg0 临时目录不许过第一层");
+  assert.equal(plan.env.KEEP, "yes");
+  assert.equal(plan.env.FEISHU_BRIDGE_CLAIM_KEY, "a".repeat(64));
 });
 
 // 拿掉哪行会红：resolveCodexTarget 第 5 步里 `for (const where of [found, realBin])` 改成只看 found → 本用例红。
@@ -10805,6 +10900,8 @@ printf '真的执行了' > "$last"
       env: { ...isolatedEnv(), PATH: bin + path.delimiter + process.env.PATH, FEISHU_CODEX_BRIDGE_HOME: home,
         NODE_OPTIONS: "--import " + USER_HOME_BOOTSTRAP,
         FEISHU_TEST_USER_HOME: userHome,
+        // 主动把已废弃的旧暗号注进源环境：两层都必须清掉它（Codex 实现一轮 P2）。
+        FEISHU_CODEX_TARGET_HOME: path.join(home, "legacy-sneaky-home"),
         AILY_CLI_CALLER_AGENT_UID: TEMPLATE.agent_uid, AILY_CLI_SESSION_ID: "aily_sess_a", AILY_CLI_RUN_ID: "run_acc", FAKE_AILY_ENVELOPE: envelope } });
   };
   return { run, home, userHome, taskKey: task.logical_task_key, bin,
@@ -10814,12 +10911,20 @@ printf '真的执行了' > "$last"
 // 投递被拒时发到飞书（stdout）的只有封闭文案；路径与 thread 号只留在本机 claim（#266 二轮 P1）。
 //   拿掉哪行会红：inbound.mjs 里 finish("error") 改回拼 err.message → 本用例红。
 test("PK3-C1：真入口——目标会话说不清时拒绝投递，飞书文案不带路径与 thread 号", () => {
-  const { run, home } = codexChanAccept({ plant: false });
+  const { run, home, taskKey } = codexChanAccept({ plant: false });
   const r = run("msg_refuse_cx");
   const out = r.stdout + r.stderr;
   assert.match(r.stdout, /投递失败：说不清目标 Codex 会话/u, out);
   assert.equal(out.includes(home), false, "不许带本机路径：" + out);
   assert.equal(out.toLowerCase().includes(THREAD_A.toLowerCase()), false, "不许带 thread 号：" + out);
+  // 稳定拒绝码进回执与 claim（Codex 实现一轮 P2）：回执里不能只有笼统的 handoff_failed。
+  const receiptsDir = taskPaths({ logical_task_key: taskKey }, home).receipts;
+  const failed = fs.readdirSync(receiptsDir).filter((n) => n.startsWith("handoff-failed-"));
+  assert.equal(failed.length, 1, "应当落一条投递失败回执：" + fs.readdirSync(receiptsDir).join("、"));
+  const receipt = JSON.parse(fs.readFileSync(path.join(receiptsDir, failed[0]), "utf-8"));
+  assert.equal(receipt.reason, "handoff_failed");
+  assert.equal(receipt.target_refusal_code, REFUSE.ROLLOUT_MISSING, JSON.stringify(receipt));
+  assert.equal(receipt.handed_off, false);
 });
 
 test("#R19 同构守卫：M1a codex 快照的 state 物化 ≡ mappingForTask（防两处实现漂移）", () => {
@@ -10887,7 +10992,7 @@ test("PK3-C1 端到端：飞书 → 入站 → 投递 → codex 真的执行（�
   assert.equal(fs.readFileSync(fx.codexSelf, "utf-8"), fs.realpathSync.native(path.join(fx.bin, "codex")));
   // ⑥ 两处环境都没有旧暗号，也没有运输会话现场
   assert.deepEqual([thread, ci, legacyHint], ["unset", "unset", "unset"],
-    "运输会话现场与 FEISHU_CODEX_TARGET_HOME 都不许出现");
+    "运输会话现场与（源环境里主动注入的）FEISHU_CODEX_TARGET_HOME 都不许出现");
   assert.equal(envPath.split(path.delimiter).some((seg) => /codex-arg0/u.test(seg)), false, "PATH 里不许有 arg0 临时目录");
 });
 

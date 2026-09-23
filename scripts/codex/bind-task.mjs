@@ -70,6 +70,9 @@ if (!existing.ok && existing.reason !== "thread_not_registered") {
     (existing.error ? "；" + existing.error : "") + "），没有建话题。");
 }
 const homeCheck = verifiedTarget(thread.threadId);
+// **已有绑定的分支也要 fail-closed**（Codex 实现一轮 P1）：刷新待认领、改飞书标题、恢复暂停都是写路径，
+//   目标已经不可用时做这些，只会让一条投不进去的绑定看起来更正常。核实不了一律拒，dry-run 也拒。
+if (existing.ok && !homeCheck.ok) die("核实不了目标 Codex 会话，没有改动这条绑定：" + homeCheck.why);
 if (existing.ok) {
   if ((existing.task.status ?? "active") === "active") {
     const awaitingFirstMention = existing.task.inbound_state === "pending" && !existing.task.session_id;

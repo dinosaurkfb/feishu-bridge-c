@@ -28,6 +28,7 @@ export const REFUSE = Object.freeze({
   ROLLOUT_MISSING:    "rollout_missing",
   BIN_MISSING:        "bin_missing",
   BIN_TRANSIENT:      "bin_transient",
+  BIN_NOT_FILE:       "bin_not_file",
   BIN_NOT_EXECUTABLE: "bin_not_executable",
 });                                             // 将来的 active writer 占用在这里加一枚（如 "target_busy"）
 
@@ -77,7 +78,8 @@ export function codexRunEnv(target, { env, claimKey, taskKey, bridgeHome })
 4. 账簿的 `sessions/` 或 `archived_sessions/` 里有该 thread 的 rollout → 否则 `ROLLOUT_MISSING`
    （找不到即拒，不试投；理由见 Q8：codex 自己也是从这本账簿找，试投只是把同一个失败推后）；
 5. codex 程序：在清洗后的 PATH 上解析（绝对路径则直接用）→ `BIN_MISSING`；本身与 realpath 落点都不在
-   arg0 临时目录或 Aily 会话下 → `BIN_TRANSIENT`；可执行 → `BIN_NOT_EXECUTABLE`。
+   arg0 临时目录或 Aily 会话下 → `BIN_TRANSIENT`；实际落点是**普通文件** → `BIN_NOT_FILE`
+   （可搜索的目录同样通过 `X_OK`，收下它会让入站先回「已受理」、spawn 时才失败）；可执行 → `BIN_NOT_EXECUTABLE`。
 
 **「目标现在能不能用」这一类判据只加在第 4 步之后、第 5 步之前这一处。**
 （2026-09-22 omm 出现的 `thread already has an active writer` 将来若要拦，就加在这里、加一枚 code，不另开地方。

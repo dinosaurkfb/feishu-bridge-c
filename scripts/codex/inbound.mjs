@@ -934,6 +934,8 @@ try {
   writeReceipt("handoff-failed-" + verdict.messageId, {
     status: "error", reason: "handoff_failed", message_id: verdict.messageId,
     claim_acquired: true, handed_off: false,
+    // 稳定拒绝码进回执（Codex 实现一轮 P2）：回执、claim、日志共用同一套枚举，不各自解释。
+    ...(err instanceof CodexTargetRefusal ? { target_refusal_code: err.code } : {}),
   });
   // 发到飞书的只有封闭文案（#266 二轮 P1）；err.message 里的路径与 thread 号只留在上面的本机 claim 里。
   finish("error", { detail: "投递失败：" + (err instanceof CodexTargetRefusal ? err.publicText : "本机投递出错（详情见本机日志）") },

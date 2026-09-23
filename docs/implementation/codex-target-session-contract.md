@@ -1,9 +1,10 @@
 # Codex 目标会话（target session）契约
 
-> 状态：设计第二版，待 Codex 复评。对应架构复核候选 C1。实现前不改任何代码。
+> 状态：设计第三版，待 Codex 复评。对应架构复核候选 C1。实现前不改任何代码。
 > 词汇按 `CONTEXT.md`；「只认默认账簿」这条决定记在 `docs/adr/0001-codex-home-default-only.md`。
-> 第二版按 Codex 一轮（P1 2 / P2 4）改：预检与启动同源、家目录不从 `$HOME` 推、拒绝类加 code、
+> 二版按 Codex 一轮（P1 2 / P2 4）改：预检与启动同源、家目录不从 `$HOME` 推、拒绝类加 code、
 > argv 口径写实、端到端断言换成可观察面。
+> 三版按 Codex 二轮（P1 1 / P2 1）改：删掉 `--user-home` 这个生产可达的账簿覆盖口、枚举钉死序列化值。
 
 ## 为什么改
 
@@ -19,15 +20,21 @@
 一个 deep module：`scripts/codex/target-session.mjs`。
 
 ```js
-export const REFUSE = Object.freeze({           // 稳定枚举，机器可判定（Codex 一轮 P2-1）
-  THREAD_SHAPE, HOME_MISSING, HOME_TRANSIENT, ROLLOUT_MISSING,
-  BIN_MISSING, BIN_TRANSIENT, BIN_NOT_EXECUTABLE,
-});                                             // 将来的 active writer 占用也在这里加一枚
+// 稳定枚举，机器可判定；**序列化值逐字钉死**，回执 / 日志 / 调用方都用这些字符串，不各自解释（Codex 一、二轮 P2）
+export const REFUSE = Object.freeze({
+  THREAD_SHAPE:       "thread_shape",
+  HOME_MISSING:       "home_missing",
+  HOME_TRANSIENT:     "home_transient",
+  ROLLOUT_MISSING:    "rollout_missing",
+  BIN_MISSING:        "bin_missing",
+  BIN_TRANSIENT:      "bin_transient",
+  BIN_NOT_EXECUTABLE: "bin_not_executable",
+});                                             // 将来的 active writer 占用在这里加一枚（如 "target_busy"）
 
 export class CodexTargetRefusal extends Error {} // .code（上表）/ .publicText（封闭文案，可进飞书）/ .message（带路径，只进本机）
 
 // 唯一的核实实现。绑定时与投递前都调它，禁止第三处自行判断。
-export function resolveCodexTarget({ threadId, userHome, env, codexBin = "codex" })
+export function resolveCodexTarget({ threadId, userHome = os.userInfo().homedir, env, codexBin = "codex" })
 //   → { threadId, codexHome, codexBin }
 //     codexHome：realpath(3) 后的账簿实际落点
 //     codexBin ：在**清洗后的 PATH** 上解析、再 realpath(3) 的绝对路径（runner 直接执行它，不再二次解析）
@@ -45,12 +52,18 @@ export function codexRunEnv(target, { env, claimKey, taskKey, bridgeHome })
 
 ### 账簿从哪来（Codex 一轮 P1-2）
 
-`userHome` **不由 resolver 从环境推导**，由入口显式传入：
+`userHome` **不由环境推导，也不由任何 CLI 参数决定**（Codex 二轮 P1）：
 
-- 生产：入口取 `os.userInfo().homedir`（passwd 记录，**不跟随 `$HOME`**）。
+- 生产：默认值 `os.userInfo().homedir`（passwd 记录，**不跟随 `$HOME`**）。
   实测：改 `process.env.HOME` 后 `os.homedir()` 随之改变，`os.userInfo().homedir` 不变。
-- 测试：真入口接受 `--user-home`（生产调用不传）。argv 由我们自己的安装器写死，运输会话改不了它 ——
-  这比再认一个环境变量强；测试也因此不必读真实家目录。
+  入站 / 绑定两个入口**都不传** `userHome`，也**不接受**任何指定账簿的命令行参数。
+- **真入口必须显式拒绝 `--user-home`**：`aily-inbound.mjs` 会把自身 argv 原样转交 handler
+  （`scripts/inbound-dispatcher.mjs`），所以"生产不传"只是约定 —— 留着这个参数等于开了一个
+  ADR-0001 明确排除的自定义账簿入口。真入口见到它就报错退出，绝不据此切换账簿。
+- 测试怎么注入：① 单元层直接 import 这个 module 并传 `userHome` 形参；② 端到端层用只有测试才挂的
+  启动注入（spawn 真入口时加 `--import <test-support/user-home-bootstrap.mjs>` 覆写 `os.userInfo`）。
+  **产品代码里不存在对应分支**，这是它与 CLI 参数的本质区别：后者是产品 interface 的一部分，前者不是。
+  （同类先例：套件已用包装 `fs.mkdirSync` / `mkdtemp` 做隔离。）
 
 账簿 = `realpath(3)(path.join(userHome, ".codex"))`，**不读 `CODEX_HOME`**（ADR-0001）。
 
@@ -110,12 +123,13 @@ Frank 决定先不实现。）
 ## 测试
 
 **新增第一条端到端真进程用例**（今天为止，投递路径的真进程用例全部止于拒绝分支，从未执行到投递）：
-隔离 HOME + `--user-home <临时>` → 在 `<临时>/.codex` 植入目标 thread 的 rollout → 假 codex（记录自己的 argv 与 env）
+隔离 HOME + 测试专用启动注入（`--import test-support/user-home-bootstrap.mjs` 覆写 `os.userInfo`，产品代码无此分支）
+→ 在 `<注入的 home>/.codex` 植入目标 thread 的 rollout → 假 codex（记录自己的 argv 与 env）
 → 真入口 `aily-inbound.mjs` → 断言：
 
 1. 飞书面 stdout 为「已受理」，且不含本机路径与 thread 号；
 2. runner 真的起了，退出回执是**合法终态**（不是「文件存在」而已）；
-3. 假 codex 拿到的 `CODEX_HOME` = 临时 home 下的账簿实际落点；
+3. 假 codex 拿到的 `CODEX_HOME` = 注入的 home 下的账簿实际落点（**不是真实家目录下那本**）；
 4. 假 codex 拿到的 thread 参数 = 绑定里那个精确 UUID；
 5. **实际被执行的程序** = resolver 解析出的那个绝对路径（假 codex 自报 `argv[0]` / 自身路径）；
 6. runner 进程的 argv 里有 `--codex-home` 与 `--codex-bin`，值与上面一致
@@ -134,6 +148,7 @@ Frank 决定先不实现。）
 - 不传 `--codex-home`；
 - runner 拿到 `--codex-bin` 后仍按 PATH 二次解析；
 - `userHome` 改回 `os.homedir()`（`$HOME` 被改写的用例）；
+- **真入口带 `--user-home` 必须被拒**：既不得切换账簿，也不得当成未知参数静默忽略（Codex 二轮 P1）；
 - 五步判据各自的拒绝分支与 code。
 
 ## 不在本次范围
